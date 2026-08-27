@@ -36,7 +36,8 @@ canonical chat.
 | Check-in pacing, off real work done | `first-build.ts` |
 | Kickoff + handoff + check-in delivery | `../../app/contrib/onboarding-handoff.ts` |
 | The parting signpost (accent tour step) | `signpost.ts` |
-| The "Sign in to Hermes" pill | `../../store/suggestion-providers/hermes-account.ts` |
+| The cloud-or-local offer (both pills) | `../../store/suggestion-providers/hermes-account.ts` |
+| The local-model download (a stand-in) | `../../store/suggestion-providers/local-model.ts` |
 
 ## Script (the model's runbook)
 
@@ -77,6 +78,12 @@ Do not reintroduce a per-beat save.
    screen, then one `action="start"` with 4–6 steps built from the stable
    targets); "I'll figure it out" is one line and on. Whichever they pick,
    the turn closes by saying the tour is always on offer.
+
+    What the tour can point at is `data-tour` handles on the chat surfaces
+    (`app/chat/tour-marker.ts`) — sidebar, new chat, composer, send, model pill,
+    transcript, terminal, settings, profile rail. They go to the PRIMARY chat
+    only: session tiles mount the same tree, and a handle on all of them makes
+    the collector discard the target rather than pick one.
 
     Lightest first, deliberately: the three-line version should be the one
     their eye lands on, so the full tour reads as a step up rather than the
@@ -151,12 +158,25 @@ the box first.
   - Only ever at a turn boundary (`message.complete`), because a note injected
     mid-loop is a synthetic user message inside an assistant turn.
   - Never stacked under a turn that already asked something.
-- The **account offer** rides the same counter: after five real tool calls a
-  single "Sign in to Hermes" pill appears in the composer's suggestion strip
-  (`store/suggestion-providers/hermes-account.ts`), and only when the install
-  is not already signed in. One pill, no counter-pill — staying on this machine
-  is the default, not an action. Placeholder placement; the real anchor for the
-  cloud-vs-local moment is still being found.
+- **Where should this run** rides the same counter: after five real tool calls
+  two pills appear in the composer's suggestion strip
+  (`store/suggestion-providers/hermes-account.ts`), and only when the install is
+  not already signed in. Sign in, or put a model on this machine. It used to be
+  one pill on the reasoning that declining needs no click — true while "local"
+  meant doing nothing, and false now that Hermes can offer to fetch the model.
+  Both are real actions with a real cost, so both get a pill; ignoring the pair
+  still leaves the user mid-task on whatever they already use.
+
+  The download reports `progress` on the suggestion contract, so the pill fills
+  itself rather than raising a bar that would have to explain which pill it
+  belongs to. Sign-in reports nothing and keeps the spinner — an OAuth
+  round-trip finishes when the user finishes. **The download is a stand-in**
+  (`local-model.ts`): it reports time, not bytes. The offer, the fill, the
+  cancel path and the failure path are all real, so landing the actual fetch is
+  replacing one function body.
+
+  Placeholder placement; the real anchor for the cloud-vs-local moment is still
+  being found.
 - If opening the build session fails, the whisper says so instead and Hermes
   builds the task in the welcome chat, so the flow never dead-ends.
 
