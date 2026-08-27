@@ -16,6 +16,8 @@ interface Flow {
   reject: (error: unknown) => void
   /** Latest value of the invoke context's `cancelled()` poll. */
   cancelled: () => boolean
+  /** The invoke context's progress channel, for the measured-work cases. */
+  progress: (fraction: number) => void
 }
 
 function pill(id: string, provider = 'mcp'): { suggestion: ComposerSuggestion; flow: Flow } {
@@ -30,6 +32,7 @@ function pill(id: string, provider = 'mcp'): { suggestion: ComposerSuggestion; f
         flow.resolve = resolve
         flow.reject = reject
         flow.cancelled = context.cancelled
+        flow.progress = context.progress
       }),
     label: `Add ${id}`,
     provider,
@@ -179,5 +182,43 @@ describe('SuggestionPills', () => {
 
     expect(labels(container)).toEqual(['Connecting github…', 'Add linear'])
     expect(invoke).not.toHaveBeenCalled()
+  })
+
+  // Measured work fills the pill it was started from. Unmeasured work must NOT
+  // — a bar that guesses at how far along an OAuth round-trip is, is a bar that
+  // lies, so silence on the channel has to keep the spinner.
+  it('fills the pill only once the provider reports progress', async () => {
+    const { flow, suggestion } = pill('local-model')
+    const { container } = render(<SuggestionPills sessionId="s1" />)
+
+    act(() => offerSuggestions('s1', 'mcp', [suggestion]))
+    await click(container)
+
+    const button = () => container.querySelector('button')!
+
+    expect(button().style.getPropertyValue('--pill-progress')).toBe('')
+
+    await act(async () => flow.progress(0.42))
+
+    expect(button().style.getPropertyValue('--pill-progress')).toBe('42%')
+
+    // Finishing hands the story back to the phase, so the fill lets go rather
+    // than freezing a part-full pill behind a "done" label.
+    await act(async () => flow.resolve())
+
+    expect(labels(container)).toEqual(['Added local-model'])
+    expect(button().style.getPropertyValue('--pill-progress')).toBe('')
+  })
+
+  it('clamps a provider that reports outside 0…1', async () => {
+    const { flow, suggestion } = pill('local-model')
+    const { container } = render(<SuggestionPills sessionId="s1" />)
+
+    act(() => offerSuggestions('s1', 'mcp', [suggestion]))
+    await click(container)
+
+    await act(async () => flow.progress(4))
+
+    expect(container.querySelector('button')!.style.getPropertyValue('--pill-progress')).toBe('100%')
   })
 })

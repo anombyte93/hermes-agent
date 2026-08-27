@@ -103,7 +103,11 @@ describe('composer suggestion bus', () => {
     offer('first')
     offer('second')
 
-    await ($composerSuggestionsBySession.get().s8 ?? [])[0]!.invoke({ cancelled: () => false, sessionId: 's8' })
+    await ($composerSuggestionsBySession.get().s8 ?? [])[0]!.invoke({
+      cancelled: () => false,
+      progress: () => undefined,
+      sessionId: 's8'
+    })
 
     // A pinned first object means the pill runs work built for a draft the
     // user has since changed.

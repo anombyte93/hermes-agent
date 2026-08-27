@@ -42,8 +42,20 @@ export interface ComposerSuggestion {
   icon?: string
   /** Runs the whole action; the pill shows `workingLabel` while it's
    *  in flight and `doneLabel` on success. Reject to return to idle
-   *  (provider surfaces its own error toast). */
-  invoke: (context: { cancelled: () => boolean; sessionId: string | null }) => Promise<void>
+   *  (provider surfaces its own error toast).
+   *
+   *  `progress` is optional narration for work that has a measurable end — a
+   *  model download, a large install. Report 0…1 and the pill fills itself;
+   *  say nothing and it spins, which is the honest presentation for work whose
+   *  length nobody knows (an OAuth round-trip finishes when the user finishes).
+   *  It is a channel on the existing lifecycle rather than a second widget,
+   *  because a pill that says what it is doing and how far along it is beats a
+   *  separate bar that has to explain which pill it belongs to. */
+  invoke: (context: {
+    cancelled: () => boolean
+    progress: (fraction: number) => void
+    sessionId: string | null
+  }) => Promise<void>
   /** Label while `invoke` runs ("Connecting Atlassian…"). */
   workingLabel: string
   /** Tooltip while working; clicking a working pill requests cancel. */

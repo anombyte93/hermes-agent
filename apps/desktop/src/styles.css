@@ -1681,6 +1681,45 @@ body.guest-pointer-lock :is(webview, iframe) {
   inherits: true;
 }
 
+/* A SUGGESTION PILL THAT IS ALSO ITS OWN PROGRESS BAR.
+
+   Work with a measurable end (a model download) fills the pill it was started
+   from, rather than raising a second element that then has to explain which
+   pill it belongs to.
+
+   The band is the user's accent, thinned to a tint. Not the hover lift, which
+   was the first instinct and is wrong twice over: it is deliberately almost
+   invisible, and the pill paints it on hover — so pointing at a half-done
+   download would flood the rest of the pill the same colour and read as
+   finished. The accent cannot collide with anything the pill does on its own,
+   and it is the colour this run has been speaking in since the swatch picker.
+
+   A registered property, so the percentage is a real animatable value: a
+   download reports in coarse jumps and the band glides between them instead of
+   ticking. `background-image` paints over `--composer-fill`, so the pill's own
+   surface, border and blur are untouched and the rounding clips the band. */
+
+@property --pill-progress {
+  syntax: '<percentage>';
+  initial-value: 0%;
+  inherits: false;
+}
+
+/* Brightest at the leading edge and fading back behind it, so the head of the
+   fill is the thing the eye lands on — a flat band at one strength reads as a
+   coloured pill rather than a moving quantity. */
+.composer-pill-progress {
+  background-image: linear-gradient(
+    to right,
+    color-mix(in oklab, var(--ui-accent-secondary) 10%, transparent) 0,
+    color-mix(in oklab, var(--ui-accent-secondary) 24%, transparent) var(--pill-progress),
+    transparent var(--pill-progress)
+  );
+  transition:
+    --pill-progress 300ms linear,
+    color 150ms;
+}
+
 /* The dock column owns the composer's width; the composer keeps the 5px
    transparent grab margin that the peel-out drag needs. +10px width compensates
    that padding so the visible surface keeps its exact width/position. */
@@ -2985,7 +3024,8 @@ button[data-slot='aui_msg-reactions'] svg {
    Widgets on the shared shell (components/chat/widget-shell.ts →
    `--ui-widget-surface-background`) and any chat-surface card are matched on
    their class, so new ones inherit this without touching the list. */
-[data-hud-shell] [data-slot='composer-bounds']
+[data-hud-shell]
+  [data-slot='composer-bounds']
   :is(
     [data-slot='clarify-inline'],
     [data-slot='tool-block'],

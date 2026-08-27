@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { type CSSProperties, useEffect, useState } from 'react'
 
 import { composerFloatingPill } from '@/components/chat/composer-dock'
 import { Codicon } from '@/components/ui/codicon'
@@ -32,6 +32,8 @@ import { $composerSuggestionsBySession, markSuggestionInvoked, suggestionKey } f
 
 type PillPhase = 'done' | 'idle' | 'working'
 
+const clamp = (fraction: number): number => (Number.isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : 0)
+
 /**
  * Phase belongs to the pill the user is looking at, so it lives and dies with
  * that pill — the bus owns whether a suggestion exists, this owns only how far
@@ -47,6 +49,8 @@ export function SuggestionPills({ sessionId }: { sessionId: null | string }) {
 function SessionSuggestionPills({ sessionId }: { sessionId: null | string }) {
   const suggestions = useSessionSlice($composerSuggestionsBySession, sessionId)
   const [phases, setPhases] = useState<Record<string, PillPhase>>({})
+  // Fraction done, for the providers that can measure it. Absent = a spinner.
+  const [fractions, setFractions] = useState<Record<string, number>>({})
   // Cancel flags outlive renders but never trigger them (poll-boundary abort).
   const [cancels] = useState(() => new Map<string, boolean>())
 
@@ -79,11 +83,14 @@ function SessionSuggestionPills({ sessionId }: { sessionId: null | string }) {
       }
     }
 
-    setPhases(current => {
+    const prune = <T,>(current: Record<string, T>): Record<string, T> => {
       const kept = Object.entries(current).filter(([key]) => live.has(key))
 
       return kept.length === Object.keys(current).length ? current : Object.fromEntries(kept)
-    })
+    }
+
+    setPhases(prune)
+    setFractions(prune)
   }, [cancels, suggestions])
 
   // Unmount withdraws everything at once (composer closing, session switch
@@ -116,7 +123,11 @@ function SessionSuggestionPills({ sessionId }: { sessionId: null | string }) {
       markSuggestionInvoked(sessionId, key)
 
       try {
-        await suggestion.invoke({ cancelled: () => cancels.get(key) === true, sessionId })
+        await suggestion.invoke({
+          cancelled: () => cancels.get(key) === true,
+          progress: fraction => setFractions(current => ({ ...current, [key]: clamp(fraction) })),
+          sessionId
+        })
         triggerHaptic('submit')
         setPhase(key, 'done')
       } catch {
@@ -125,13 +136,26 @@ function SessionSuggestionPills({ sessionId }: { sessionId: null | string }) {
         setPhase(key, 'idle')
       } finally {
         cancels.delete(key)
+        // Whatever it reached, the phase now tells the story.
+        setFractions(current => {
+          const { [key]: _done, ...rest } = current
+
+          return rest
+        })
       }
     }
+
+    const fraction = phase === 'working' ? fractions[key] : undefined
 
     return (
       <Tip key={key} label={tip}>
         <button
-          className={cn(composerFloatingPill, 'max-w-56', phase === 'done' && 'cursor-default')}
+          className={cn(
+            composerFloatingPill,
+            'max-w-56',
+            phase === 'done' && 'cursor-default',
+            fraction != null && 'composer-pill-progress'
+          )}
           onClick={() => {
             if (phase === 'working') {
               // Second click requests cancel (a stuck OAuth tab, etc.).
@@ -140,9 +164,15 @@ function SessionSuggestionPills({ sessionId }: { sessionId: null | string }) {
               void invoke()
             }
           }}
+          style={
+            fraction == null ? undefined : ({ '--pill-progress': `${Math.round(fraction * 100)}%` } as CSSProperties)
+          }
           type="button"
         >
-          {phase === 'working' ? (
+          {/* Measured work fills the pill, so a spinner beside it would be
+              saying the same thing twice — it keeps its own glyph and lets the
+              fill do the talking. */}
+          {phase === 'working' && fraction == null ? (
             <Codicon className="shrink-0 opacity-70" name="loading" size="0.75rem" spinning />
           ) : phase === 'done' ? (
             <Codicon className="shrink-0 text-emerald-400" name="check" size="0.75rem" />
