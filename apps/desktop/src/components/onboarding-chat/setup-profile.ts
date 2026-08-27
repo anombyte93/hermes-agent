@@ -27,7 +27,7 @@ import { atom } from 'nanostores'
 import type { GatewayRequest } from '@/app/session/hooks/use-prompt-actions/utils'
 import { readKey, writeKey } from '@/lib/storage'
 import { machineDescription } from '@/store/machine'
-import { VOICE_RULES } from '@/store/onboarding-first-screen'
+import { PLAIN_SPEECH } from '@/store/onboarding-script'
 import type { WizardAnswers } from '@/store/onboarding-wizard'
 
 /** Profile name of the onboarding guide. Prefixed so it can't collide with a
@@ -151,13 +151,11 @@ export function buildFirstTaskRunbook(task: string, answers: WizardAnswers, plan
     ...(plan === 'machine-setup' ? machineSetupRunbook() : [NO_AUTH_RULE]),
     'While the work runs, place ::onboarding{step="progress" title="what you\'re doing"} as its own paragraph at the start of each status turn — the card shows the build breathing live. Keep the titles short and present-tense ("Scaffolding the project", "Wiring the reminder"). Emit each exactly like that, alone on its own line.',
     'When the first pass of the build is DONE: end that turn with ::ask{question="Does this match what you wanted?" options="Looks right|Change something|Take it further"} alone as its own paragraph, emitted EXACTLY as written. Act on their pick immediately. One unreviewed first output is how a build reads as broken; the ask is how it reads as a collaboration.',
-    VOICE_RULE
+    PLAIN_SPEECH
   ]
     .filter(Boolean)
     .join(' ')
 }
-
-const VOICE_RULE = `${VOICE_RULES} Write every visible line the way you would say it out loud to someone sitting next to you: plain words, short sentences, no headers, no bullet lists, no emoji, no "Great question" or "Certainly" or "Let me go ahead and". Say the thing itself, not a description of the thing.`
 
 const NO_AUTH_RULE =
   'CRITICAL: this first build must need NO external account or OAuth (no Gmail, no Slack, no Google sign-in) — connectors get wired later, on their request. Everything else is fair game and the more visible the better: web research with the browser shown to the user as you work, scripts, computer use, a small app, a file-based tracker, a scheduled reminder, a generated page. If the idea needs an account, build the no-auth core first and say the connection is a later step.'

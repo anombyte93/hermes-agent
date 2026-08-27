@@ -28,17 +28,18 @@ canonical chat.
 
 | Piece | Path |
 | --- | --- |
-| The model's runbook (the whole script) | `../../store/onboarding-wizard.ts` |
+| The model's runbook (the whole script) | `../../store/onboarding-script.ts` |
 | Profile, persona, fast lane, seed messages | `setup-profile.ts` |
 | Greeting bank, solo mode, layout assembly | `assembly.ts` |
-| The cards (`::onboarding` directives) | `directive.tsx` |
+| Which step renders what (`::onboarding`) | `directive.tsx` |
+| The cards themselves | `cards/{setup,build,first-screen}.tsx` |
 | Check-in pacing, off real work done | `first-build.ts` |
 | Kickoff + handoff + check-in delivery | `../../app/contrib/onboarding-handoff.ts` |
 | The "Sign in to Hermes" pill | `../../store/suggestion-providers/hermes-account.ts` |
 
 ## Script (the model's runbook)
 
-Lives in `store/onboarding-wizard.ts::buildChatOnboardingPrompt` — keep this
+Lives in `store/onboarding-script.ts::buildChatOnboardingPrompt` — keep this
 document in sync with it.
 
 **The card beats carry no tool calls, and memory is written once.** This is

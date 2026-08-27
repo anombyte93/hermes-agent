@@ -84,7 +84,7 @@ describe('onboarding wizard guide mode', () => {
 
 describe('pre-banked greeting', () => {
   it('the seed rows carry the exact on-screen greeting and the runbook forbids re-greeting', async () => {
-    const { buildChatOnboardingSeedMessages } = await import('./onboarding-wizard')
+    const { buildChatOnboardingSeedMessages } = await import('./onboarding-script')
     const greeting = 'Hey, welcome to Hermes. What should I call you?'
     const seeds = buildChatOnboardingSeedMessages(greeting)
 
@@ -127,7 +127,7 @@ describe('the OS-name suggestion', () => {
   })
 
   it('seeds the same suggested name into the hidden runbook so a one-word yes resolves', async () => {
-    const { buildChatOnboardingSeedMessages } = await import('./onboarding-wizard')
+    const { buildChatOnboardingSeedMessages } = await import('./onboarding-script')
 
     $machine.set({ ageDays: 400, arch: 'x64', model: '', nvidia: false, platform: 'darwin', release: '24.6.0', username: 'alex' })
 
@@ -139,7 +139,7 @@ describe('the OS-name suggestion', () => {
   })
 
   it('leaves both clean when the account name is not suggestable', async () => {
-    const { buildChatOnboardingSeedMessages } = await import('./onboarding-wizard')
+    const { buildChatOnboardingSeedMessages } = await import('./onboarding-script')
     const { $onboardingGreeting, pickOnboardingGreeting } = await import('@/components/onboarding-chat/assembly')
 
     // Blocklisted handle — a login name nobody should be called.

@@ -37,7 +37,8 @@ import {
 import { setActiveTreePane } from '@/components/pane-shell/tree/store'
 import { requestGatewayForProfile } from '@/store/gateway'
 import { loadMachineProfile } from '@/store/machine'
-import { $wizardAnswers, buildChatOnboardingSeedMessages, buildKickoffPrompt, markGuideKickoffStarted } from '@/store/onboarding-wizard'
+import { buildChatOnboardingSeedMessages, buildKickoffPrompt } from '@/store/onboarding-script'
+import { $wizardAnswers, markGuideKickoffStarted } from '@/store/onboarding-wizard'
 import { $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,

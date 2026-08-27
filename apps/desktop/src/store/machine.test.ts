@@ -11,7 +11,7 @@ import {
   machineSetupLeads,
   machineUserName
 } from './machine'
-import { forkFallbackOptions, forkOptions, machineForkOption } from './onboarding-wizard'
+import { forkFallbackOptions, forkOptions, machineForkOption } from './onboarding-script'
 
 const profile = (patch: Partial<DesktopMachineProfile>): DesktopMachineProfile => ({
   ageDays: 900,

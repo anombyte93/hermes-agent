@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { $machine } from './machine'
-import { buildChatOnboardingPrompt } from './onboarding-wizard'
+import { buildChatOnboardingPrompt } from './onboarding-script'
 
 /** Every `::onboarding{step="…"}` the runbook tells Setup to place. */
 function cardsIn(runbook: string): string[] {
