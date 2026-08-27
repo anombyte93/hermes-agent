@@ -2495,6 +2495,14 @@ export const en: Translations = {
       done: 'Signed in',
       doneTip: 'This machine is linked to your account'
     },
+    localModel: {
+      label: 'Run it here',
+      tip: 'Download a model that runs on this machine. Nothing leaves it, and it works with the wifi off.',
+      working: 'Downloading…',
+      workingTip: 'Click to cancel',
+      done: 'Ready here',
+      doneTip: 'The model is on this machine and ready to use'
+    },
     snippets: {
       codeReview: {
         label: 'Code review',

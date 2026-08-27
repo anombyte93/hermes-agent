@@ -2675,6 +2675,14 @@ export const zh: Translations = {
       done: '已登录',
       doneTip: '这台设备已关联到你的账户'
     },
+    localModel: {
+      label: '在本机运行',
+      tip: '下载一个在本机运行的模型。数据不会离开这台设备，断网也能用。',
+      working: '正在下载…',
+      workingTip: '点击取消',
+      done: '本机已就绪',
+      doneTip: '模型已下载到这台设备，可以直接使用'
+    },
     snippets: {
       codeReview: {
         label: '代码审查',

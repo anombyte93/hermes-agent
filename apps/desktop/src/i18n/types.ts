@@ -2125,6 +2125,14 @@ export interface Translations {
       done: string
       doneTip: string
     }
+    localModel: {
+      label: string
+      tip: string
+      working: string
+      workingTip: string
+      done: string
+      doneTip: string
+    }
   }
 
   statusStack: {
