@@ -18,11 +18,11 @@
 import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
 import { TOUR_OPTIONS } from '@/store/onboarding-script'
 
-/** The rail's own handle, already in the sidebar (profile-switcher.tsx). It is
- *  a `data-slot`, not a `data-tour`, and that is fine — the engine takes any
- *  selector, and inventing a second handle for the same node is how a durable
- *  one goes stale. */
-const RAIL = '[data-slot="profile-rail"]'
+/** The rail's tour handle (profile-switcher.tsx). `data-tour` rather than the
+ *  `data-slot` beside it because only the former is identity to
+ *  collectTourTargets — so this is the same selector the model gets back when
+ *  it scans for targets, not a private one this file made up. */
+const RAIL = '[data-tour="profile-rail"]'
 
 /** Did they wave off the look around? Read from the guide transcript, because
  *  the pick IS a user turn there and the option text is pinned by the script

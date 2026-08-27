@@ -392,7 +392,17 @@ export function ProfileRail() {
   )
 
   return (
-    <div aria-label={p.title} className="flex min-w-0 items-center gap-0.5" data-slot="profile-rail" role="group">
+    // `data-tour` as well as `data-slot`: only the former is identity to
+    // collectTourTargets, so without it the rail is invisible to a tour the
+    // model builds — and its one other durable handle is a TRANSLATED
+    // aria-label, which stops matching the moment the app isn't in English.
+    <div
+      aria-label={p.title}
+      className="flex min-w-0 items-center gap-0.5"
+      data-slot="profile-rail"
+      data-tour="profile-rail"
+      role="group"
+    >
       {/* Fleet: every gateway carries its own home square inside its group, so
           the pinned pill is purely the "all profiles on this gateway" toggle. */}
       {fleet && (
