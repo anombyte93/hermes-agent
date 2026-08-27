@@ -1467,6 +1467,7 @@ export function ChatSidebar({
         'border-(--sidebar-edge-border) bg-(--ui-sidebar-surface-background) opacity-100'
       )}
       collapsible="none"
+      data-tour="sessions-sidebar"
     >
       <SidebarContent className="gap-0 overflow-hidden bg-transparent px-2.5">
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
@@ -1505,6 +1506,9 @@ export function ChatSidebar({
                       // seen gets a gentle attention shimmer until it's viewed.
                       item.isNew && 'border-(--ui-stroke-tertiary)'
                     )}
+                    // Only this row: every nav item renders through this same
+                    // tag, so an ungated handle would name five elements.
+                    data-tour={isNewSession ? 'new-chat' : undefined}
                     onClick={() => {
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →

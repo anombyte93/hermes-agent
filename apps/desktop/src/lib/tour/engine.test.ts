@@ -111,6 +111,23 @@ describe('collectTourTargets', () => {
     }
   })
 
+  // An inactive keep-alive tab stays mounted under `visibility: hidden` and
+  // KEEPS its layout box, so its rect is identical to the live tab's — no
+  // geometry test can separate them. Offering one as a target points the
+  // spotlight at something nobody can see.
+  it('never offers an affordance inside an inactive keep-alive pane', () => {
+    seedDom()
+    document.body.insertAdjacentHTML(
+      'afterbegin',
+      '<div data-pane-hidden><button aria-label="Background tab send">Send</button></div>'
+    )
+
+    const targets = collectTourTargets(document, 150)
+
+    expect(targets.some(t => t.label === 'Background tab send')).toBe(false)
+    expect(targets.some(t => t.selector === '[data-tour="composer"]')).toBe(true)
+  })
+
   it('flags identity selectors stable and nth-child paths not', () => {
     seedDom()
     const targets = collectTourTargets(document, 150)

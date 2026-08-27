@@ -1,5 +1,6 @@
 import { useStore } from '@nanostores/react'
 
+import { useTourMarker } from '@/app/chat/tour-marker'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
@@ -69,6 +70,7 @@ export function ComposerControls({
   const { t } = useI18n()
   const c = t.composer
   const hudMode = useStore($hudMode)
+  const sendTourMarker = useTourMarker('composer-send')
 
   if (conversation.active) {
     return <ConversationPill {...conversation} disabled={disabled} />
@@ -157,6 +159,7 @@ export function ComposerControls({
           <Button
             aria-label={showStop ? c.stop : c.send}
             className={PRIMARY_ICON_BTN}
+            data-tour={sendTourMarker}
             disabled={disabled || !canSubmit}
             type="submit"
           >

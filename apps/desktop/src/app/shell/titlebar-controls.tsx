@@ -351,6 +351,9 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
         aria-label={tool.label}
         aria-pressed={tool.active ?? undefined}
         className={className}
+        // Every titlebar tool renders through this one component, so the handle
+        // names the one a tour actually asks for by id.
+        data-tour={tool.id === 'settings' ? 'settings' : undefined}
         disabled={tool.disabled}
         onClick={event => {
           if (tool.to) {
