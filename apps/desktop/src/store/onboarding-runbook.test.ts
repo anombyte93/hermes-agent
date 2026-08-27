@@ -72,8 +72,23 @@ describe('the onboarding runbook', () => {
       expect(runbook).toContain(option)
     }
 
+    // Lightest first: the three-line version has to be the one their eye lands
+    // on, so the full tour reads as a deliberate step up rather than the
+    // default. Nobody wants to open a new app into a click-through.
+    expect(runbook.indexOf('Just the basics')).toBeLessThan(runbook.indexOf('Show me around'))
+
     // Selectors come from the tool, not from the model's imagination.
     expect(runbook).toMatch(/action="targets" FIRST/)
+  })
+
+  // The tour is the flow's most reusable trick and the easiest to never
+  // discover, so the one turn that mentions it has to say it is always on
+  // offer — including to the user who just waved the tour off.
+  it('tells them the tour stays on offer, whichever way they answered', () => {
+    const runbook = buildChatOnboardingPrompt()
+
+    expect(runbook).toContain('Whichever they picked')
+    expect(runbook).toMatch(/any part of this, any time/)
   })
 
   // There is one place a first build can land: a session on the user's own

@@ -34,6 +34,7 @@ import {
   SETUP_CHAT_TITLE,
   SETUP_PROFILE
 } from '@/components/onboarding-chat/setup-profile'
+import { declinedLookAround, showProfileSignpost } from '@/components/onboarding-chat/signpost'
 import { setActiveTreePane } from '@/components/pane-shell/tree/store'
 import { requestGatewayForProfile } from '@/store/gateway'
 import { loadMachineProfile } from '@/store/machine'
@@ -42,6 +43,7 @@ import { $wizardAnswers, markGuideKickoffStarted } from '@/store/onboarding-wiza
 import { $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,
+  $messages,
   $selectedStoredSessionId,
   setAwaitingResponse,
   setBusy,
@@ -258,6 +260,10 @@ export function useOnboardingHandoff({
     void (async () => {
       const setupSession = $setupSession.get()
 
+      // Read the tour answer NOW: the guide transcript is what carries it, and
+      // in a few lines the switch replaces it with the build session's.
+      const signpost = !declinedLookAround($messages.get())
+
       // The guide chat lives on the setup profile's own backend; by whisper
       // time the ACTIVE gateway is the default profile's, so route explicitly.
       const whisperToSetup = (text: string) => {
@@ -344,6 +350,12 @@ export function useOnboardingHandoff({
         markSetupHandoffDone()
         $setupHandoff.set({ brief, phase: 'done', plan, sessionTitle: chatTitle, task })
         whisperToSetup(buildHandoffCompleteNote(task))
+
+        // Last: the rail lights up to say the guide chat is still there. Not
+        // awaited — it waits on a render, and the build is already running.
+        if (signpost) {
+          void showProfileSignpost()
+        }
       } catch {
         // Undo the half-swap so the user's chat context stays with the guide.
         $newChatProfile.set(previousNewChatProfile)

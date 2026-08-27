@@ -35,6 +35,7 @@ canonical chat.
 | The cards themselves | `cards/{setup,build,first-screen}.tsx` |
 | Check-in pacing, off real work done | `first-build.ts` |
 | Kickoff + handoff + check-in delivery | `../../app/contrib/onboarding-handoff.ts` |
+| The parting signpost (accent tour step) | `signpost.ts` |
 | The "Sign in to Hermes" pill | `../../store/suggestion-providers/hermes-account.ts` |
 
 ## Script (the model's runbook)
@@ -70,11 +71,16 @@ Do not reintroduce a per-beat save.
 4. **Layout** — `::onboarding{step="layout"}` (the app assembles around the
    chat).
 5. **The look around** — `::ask{question="Want a look around first?"
-   options="Show me around|Just the basics|I'll figure it out"}`. "Show me
-   around" runs the built-in `tour` tool: `action="targets"` first to see
-   what is actually on screen, then one `action="start"` with 4–6 steps built
-   from the stable targets. "Just the basics" is three plain lines and no
-   overlay; "I'll figure it out" is one line and on.
+   options="Just the basics|Show me around|I'll figure it out"}`. "Just the
+   basics" is three plain lines and no overlay; "Show me around" runs the
+   built-in `tour` tool (`action="targets"` first to see what is actually on
+   screen, then one `action="start"` with 4–6 steps built from the stable
+   targets); "I'll figure it out" is one line and on. Whichever they pick,
+   the turn closes by saying the tour is always on offer.
+
+    Lightest first, deliberately: the three-line version should be the one
+    their eye lands on, so the full tour reads as a step up rather than the
+    default. Nobody wants to open a new app into a click-through.
 
     This beat sits AFTER the layout pick on purpose. Before it the window is
     the conversation and nothing else, so a tour would highlight a chat pane
@@ -128,6 +134,14 @@ the box first.
 
 - The renderer whispers a hidden `[setup] handoff complete` note into the
   welcome chat, which says one short line and stops.
+- **The parting signpost** (`signpost.ts`). The handoff is the only moment in
+  the run where the ground moves under the user — they were talking to Hermes
+  on its own profile and they land mid-build in a session of their own — so the
+  profile rail lights up once to say the chat they just had is still there. One
+  accent-lit tour step, not a tour: the whole appeal of this flow is that it
+  happens in conversation, and a click-through at the last beat would spend
+  that. Skipped for the user who answered "I'll figure it out", read straight
+  off the guide transcript before the switch replaces it.
 - **The check-ins ride the build, not a clock** (`first-build.ts`). The guide used
   to schedule itself a daily cron here, which on a first run means a check-in
   that arrives tomorrow about a task that finished in four minutes. Instead the

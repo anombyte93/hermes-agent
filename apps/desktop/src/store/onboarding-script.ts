@@ -96,7 +96,11 @@ const SOMETHING_ELSE = 'Something else'
  *  pins these three exactly. */
 const TOUR_QUESTION = 'Want a look around first?'
 
-const TOUR_OPTIONS = {
+/** Lightest first. The three-line version reads as the easy answer when it is
+ *  the one their eye lands on, and the full tour then reads as the deliberate
+ *  step up rather than the default — which is the point, since nobody wants to
+ *  open a new app into a click-through. */
+export const TOUR_OPTIONS = {
   basics: 'Just the basics',
   none: "I'll figure it out",
   tour: 'Show me around'
@@ -198,10 +202,11 @@ export function buildChatOnboardingPrompt(suggestedName?: string | null): string
     '1. This turn is exactly four things and then you stop: a few warm words about their name, then ::onboarding{step="name" value="THEIR_NAME"} on a line of its own (THEIR_NAME being the name they actually gave; it renders as nothing and just saves it), then one short sentence about their colour, then ::onboarding{step="look"} on a line of its own. That is one turn, not two, and it is not a conflict with RULE 3: the name line is not a question, the look card is, and it is the last thing you write.',
     '2. Then the tools they already use, so Hermes can connect to them later: one short sentence, then ::onboarding{step="connectors"} on a line of its own.',
     '3. Then their layout: one short sentence, then ::onboarding{step="layout"} on a line of its own.',
-    `4. The app has just arranged itself around this chat, so offer them a look at it: one short sentence, then the line ::ask{question="${TOUR_QUESTION}" options="${TOUR_OPTIONS.tour}|${TOUR_OPTIONS.basics}|${TOUR_OPTIONS.none}"} alone as its own paragraph. Branch on the answer, then go straight to step 5 either way.`,
-    `   - "${TOUR_OPTIONS.tour}": use the tour tool. Call it with action="targets" FIRST and build the tour out of what it actually reports, preferring the targets marked stable — never invent a selector. Then one action="start" call with 4 to 6 steps, each a few words of title and one plain sentence of body. One short line before the call, one short line after; the tour itself does the talking.`,
+    `4. The app has just arranged itself around this chat, so offer them a look at it: one short sentence, then the line ::ask{question="${TOUR_QUESTION}" options="${TOUR_OPTIONS.basics}|${TOUR_OPTIONS.tour}|${TOUR_OPTIONS.none}"} alone as its own paragraph. Branch on the answer, then go straight to step 5 whichever they picked.`,
     `   - "${TOUR_OPTIONS.basics}": no tour. Three short lines and nothing else: where their conversations live, that they can ask for a job in plain words, and that you are right here if they get stuck.`,
+    `   - "${TOUR_OPTIONS.tour}": use the tour tool. Call it with action="targets" FIRST and build the tour out of what it actually reports, preferring the targets marked stable — never invent a selector. Then one action="start" call with 4 to 6 steps, each a few words of title and one plain sentence of body. One short line before the call, one short line after; the tour itself does the talking.`,
     `   - "${TOUR_OPTIONS.none}": one short line, and move on.`,
+    '   Whichever they picked, the line you close that turn on tells them the tour is always on offer: they can ask you to show them any part of this, any time. Say it in your own words, once, and never bring it up again.',
     `5. Then the fork: one short sentence in your own words — you want to actually build them something, not just talk about it — then the line ::ask{question="${FORK_QUESTION}" options="${forkOptions().join('|')}" input="true"} alone as its own paragraph.`,
     ...(fallback.length
       ? [
