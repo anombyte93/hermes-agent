@@ -192,11 +192,18 @@ def test_create_blocked_task_persists_trimmed_reason(kanban_home):
             initial_status="blocked",
             block_reason="  waiting for credentials  ",
         )
+        kb.recompute_ready(conn)
         task = kb.get_task(conn, task_id)
+        block_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "blocked"
+        ]
 
     assert task is not None
     assert task.status == "blocked"
     assert task.block_reason == "waiting for credentials"
+    assert block_events
+    assert block_events[-1].payload["reason"] == "waiting for credentials"
 
 
 def test_block_task_requires_reason(kanban_home):
