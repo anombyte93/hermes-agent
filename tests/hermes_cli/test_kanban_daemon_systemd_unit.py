@@ -15,7 +15,9 @@ def test_default_board_daemon_unit_uses_repo_runtime_and_default_board():
 
     assert "WorkingDirectory=/home/anombyte/.hermes/hermes-agent" in text
     assert (
-        "ExecStart=/home/anombyte/.hermes/hermes-agent/venv/bin/python "
+        "ExecStart=/usr/bin/flock --no-fork --nonblock "
+        "/home/anombyte/.hermes/kanban/.dispatcher.lock "
+        "/home/anombyte/.hermes/hermes-agent/venv/bin/python "
         "-m hermes_cli.main kanban --board default daemon"
     ) in text
     assert "Environment=HERMES_PROFILE=" not in text
@@ -24,6 +26,9 @@ def test_default_board_daemon_unit_uses_repo_runtime_and_default_board():
 def test_default_board_daemon_unit_has_standalone_singleton_runtime_controls():
     text = _unit_text()
 
+    assert "ExecStartPre=/usr/bin/mkdir -p /home/anombyte/.hermes/kanban" in text
+    assert "/usr/bin/flock --no-fork --nonblock" in text
+    assert "/home/anombyte/.hermes/kanban/.dispatcher.lock" in text
     assert "--force" in text
     assert "--interval 30" in text
     assert "--verbose" in text
@@ -44,6 +49,8 @@ def test_ops_note_documents_install_observe_and_reversible_rollback():
         "journalctl --user -u hermes-kanban-daemon.service",
         "systemctl --user disable --now hermes-kanban-daemon.service",
         "kanban.dispatch_in_gateway",
+        "machine-global",
+        "/home/anombyte/.hermes/kanban/.dispatcher.lock",
         "restore",
     ):
         assert required in text

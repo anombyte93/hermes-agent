@@ -2,7 +2,7 @@
 
 This user service keeps the Hermes **default** Kanban board moving when no long-lived default-profile gateway process owns the embedded dispatcher. It intentionally uses the repository virtual environment and does not set `HERMES_PROFILE`, so Hermes resolves the normal default home (`~/.hermes`).
 
-The daemon runs in standalone `--force` mode because `kanban.dispatch_in_gateway` defaults to enabled. The same daemon singleton lock used by embedded dispatch still prevents two dispatch loops from owning the board at once.
+The daemon runs in standalone `--force` mode because `kanban.dispatch_in_gateway` defaults to enabled. That legacy command does **not** acquire the embedded gateway lock itself, so the unit wraps it with `/usr/bin/flock --no-fork --nonblock /home/anombyte/.hermes/kanban/.dispatcher.lock`. This is the exact lock path used by the gateway and it is **machine-global across profiles**, not per database. A gateway with embedded dispatch accidentally re-enabled therefore contends instead of racing this service; conversely, an embedded dispatcher for any other profile also contends, so keep gateway dispatch disabled when this unit owns the machine-global lock.
 
 ## Install
 
@@ -29,6 +29,9 @@ systemctl --user enable --now hermes-kanban-daemon.service
 systemctl --user status hermes-kanban-daemon.service
 journalctl --user -u hermes-kanban-daemon.service -f
 hermes kanban --board default list --json
+# While the service is active this must exit non-zero: the shared lock is held.
+/usr/bin/flock --no-fork --nonblock \
+  /home/anombyte/.hermes/kanban/.dispatcher.lock /usr/bin/true
 ```
 
 A normal verbose tick reports promoted, spawned, skipped and running counts. A zero-spawn tick is not evidence by itself that the daemon is healthy; prove it with a reversible default-board task and read back the corresponding task/run records.
