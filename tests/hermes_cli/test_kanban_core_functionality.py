@@ -586,7 +586,8 @@ def test_unblock_invariant_recovery(kanban_home):
         leaked_run_id = kb.latest_run(conn, tid).id
         # Force the bad state.
         conn.execute(
-            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,),
+            "UPDATE tasks SET status = 'blocked', block_reason = ? WHERE id = ?",
+            ("test-injected leaked run", tid),
         )
         conn.commit()
         # current_run_id is still set; run is still open.

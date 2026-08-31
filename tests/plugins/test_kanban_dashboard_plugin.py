@@ -190,6 +190,19 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
     assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
 
 
+def test_dashboard_requires_and_renders_current_block_reason():
+    """The shipped Desktop bundle must collect and display the kernel field."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text(encoding="utf-8")
+
+    assert 'label: tx(i18n, "blockReason", "Block reason")' in js
+    assert "value: t.block_reason" in js
+    assert "block_reason: r.blockReason" in js
+    assert "A block reason is required before marking a task blocked." in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
@@ -594,6 +607,60 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Bulk actions
 # ---------------------------------------------------------------------------
+
+
+def test_status_blocked_requires_and_persists_reason(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "needs context"}
+    ).json()["task"]
+
+    missing = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked"},
+    )
+    assert missing.status_code == 400
+    assert "block reason is required" in missing.json()["detail"]
+
+    blocked = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "  Waiting for owner  "},
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["task"]["block_reason"] == "Waiting for owner"
+
+
+def test_bulk_status_blocked_requires_and_persists_reason(client):
+    tasks = [
+        client.post(
+            "/api/plugins/kanban/tasks", json={"title": title}
+        ).json()["task"]
+        for title in ("a", "b")
+    ]
+
+    missing = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task["id"] for task in tasks], "status": "blocked"},
+    )
+    assert missing.status_code == 200
+    assert all(not item["ok"] for item in missing.json()["results"])
+    assert all(
+        "block reason is required" in item["error"]
+        for item in missing.json()["results"]
+    )
+
+    blocked = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task["id"] for task in tasks],
+            "status": "blocked",
+            "block_reason": "  Shared dependency  ",
+        },
+    )
+    assert blocked.status_code == 200
+    assert all(item["ok"] for item in blocked.json()["results"])
+    for task in tasks:
+        detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+        assert detail["task"]["block_reason"] == "Shared dependency"
 
 
 def test_bulk_status_ready(client):
