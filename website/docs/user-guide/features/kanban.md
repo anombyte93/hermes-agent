@@ -787,18 +787,26 @@ All commands are also available as a slash command in the interactive CLI and in
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
+`hermes kanban dispatch --dry-run` runs the normal dependency-promotion,
+recovery, timeout, and candidate-selection logic against an in-memory SQLite
+snapshot. It reports what would be promoted or spawned but does not update task
+rows, append events, claim work, signal workers, call the spawn function, or
+checkpoint the source database. JSON output includes `"dry_run": true`.
+
 ### Concurrency, scheduling, and child promotion config
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.default_max_runtime` | `7200` (2 hours) | Finite backstop for tasks created without `--max-runtime`. The effective value is written to both the task and its run when claimed, so timeout evidence is explicit. A task's own `--max-runtime` always wins. Set `0` to disable default inheritance. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
   max_in_progress: 2
+  default_max_runtime: 7200
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```

@@ -2829,6 +2829,10 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Finite runtime backstop for tasks without an explicit
+        # max_runtime_seconds. The effective value is persisted on the task
+        # and run when claimed; a per-task cap always wins. Set 0 to disable.
+        "default_max_runtime": 2 * 60 * 60,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

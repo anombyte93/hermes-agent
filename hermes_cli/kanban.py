@@ -2770,6 +2770,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         print(json.dumps({
+            "dry_run": bool(args.dry_run),
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -2789,21 +2790,30 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
-    print(f"Reclaimed:    {res.reclaimed}")
-    print(f"Crashed:      {len(res.crashed)}")
+    if args.dry_run:
+        print(f"Would reclaim: {res.reclaimed}")
+        print(f"Would mark crashed: {len(res.crashed)}")
+        print(f"Would time out: {len(res.timed_out)}")
+        print(f"Would mark stale: {len(res.stale)}")
+        print(f"Would auto-block: {len(res.auto_blocked)}")
+        print(f"Would promote: {res.promoted}")
+        print(f"Would spawn:   {len(res.spawned)}")
+    else:
+        print(f"Reclaimed:    {res.reclaimed}")
+        print(f"Crashed:      {len(res.crashed)}")
+        print(f"Timed out:    {len(res.timed_out)}")
+        print(f"Stale:        {len(res.stale)}")
+        print(f"Auto-blocked: {len(res.auto_blocked)}")
+        print(f"Promoted:     {res.promoted}")
+        print(f"Spawned:      {len(res.spawned)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
-    print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
-    print(f"Stale:        {len(res.stale)}")
     if res.stale:
         print(f"  {', '.join(res.stale)}")
-    print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
-    print(f"Promoted:     {res.promoted}")
-    print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
