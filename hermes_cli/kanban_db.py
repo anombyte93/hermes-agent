@@ -366,6 +366,10 @@ def _fire_dispatch_tick_hook(
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Finite safety backstop for tasks that do not set a per-task runtime cap.
+# Operators can set kanban.default_max_runtime to 0 to disable inheritance.
+DEFAULT_MAX_RUNTIME_SECONDS = 2 * 60 * 60
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -4640,6 +4644,7 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    default_max_runtime = configured_default_max_runtime()
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4692,12 +4697,13 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   max_runtime_seconds = COALESCE(max_runtime_seconds, ?)
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, default_max_runtime, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4768,6 +4774,7 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    default_max_runtime = configured_default_max_runtime()
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -4792,12 +4799,13 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   max_runtime_seconds = COALESCE(max_runtime_seconds, ?)
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, default_max_runtime, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -9705,6 +9713,31 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
+def configured_default_max_runtime() -> Optional[int]:
+    """Return the effective ``kanban.default_max_runtime`` in seconds.
+
+    The shipped fallback is finite. A configured value of 0 explicitly
+    disables inheritance; malformed values fail safe to the shipped default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        kanban_cfg = (load_config_readonly() or {}).get("kanban", {})
+        raw = kanban_cfg.get(
+            "default_max_runtime",
+            DEFAULT_MAX_RUNTIME_SECONDS,
+        )
+    except Exception:
+        return DEFAULT_MAX_RUNTIME_SECONDS
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RUNTIME_SECONDS
+    if parsed == 0:
+        return None
+    return parsed if parsed > 0 else DEFAULT_MAX_RUNTIME_SECONDS
+
+
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
@@ -9816,6 +9849,31 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _preview_dispatch_once(
+    conn: sqlite3.Connection,
+    **kwargs,
+) -> DispatchResult:
+    """Run a dispatch tick against an in-memory snapshot of ``conn``.
+
+    Dry-run must exercise the same promotion, reclaim, timeout, and candidate
+    selection code as a real tick without writing the source database or
+    signalling worker processes. SQLite's backup API includes committed WAL
+    frames in the snapshot while leaving the source connection untouched.
+    """
+    preview = sqlite3.connect(":memory:", isolation_level=None)
+    preview.row_factory = sqlite3.Row
+    try:
+        conn.backup(preview)
+        return _dispatch_once_locked(
+            preview,
+            dry_run=True,
+            preview=True,
+            **kwargs,
+        )
+    finally:
+        preview.close()
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9846,50 +9904,43 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    def _run_tick() -> DispatchResult:
+        kwargs = {
+            "spawn_fn": spawn_fn,
+            "ttl_seconds": ttl_seconds,
+            "max_spawn": max_spawn,
+            "max_in_progress": max_in_progress,
+            "failure_limit": failure_limit,
+            "stale_timeout_seconds": stale_timeout_seconds,
+            "board": board,
+            "default_assignee": default_assignee,
+            "max_in_progress_per_profile": max_in_progress_per_profile,
+            "reconcile_orphans": reconcile_orphans,
+        }
+        if dry_run:
+            return _preview_dispatch_once(conn, **kwargs)
+        return _dispatch_once_locked(conn, dry_run=False, **kwargs)
+
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
+        result = _run_tick()
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                reconcile_orphans=reconcile_orphans,
-            )
+            result = _run_tick()
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
-            _maybe_checkpoint_wal(conn, db_path)
+            # A dry-run must leave the source SQLite files byte-for-byte alone.
+            if not dry_run:
+                _maybe_checkpoint_wal(conn, db_path)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
@@ -9912,6 +9963,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    preview: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9949,18 +10001,28 @@ def _dispatch_once_locked(
     board. When omitted, the current-board resolution chain is used.
     """
     # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    # reap_worker_zombies() for the full rationale. Preview runs against an
+    # in-memory snapshot and must not mutate process-lifecycle state.
+    if not preview:
+        reap_worker_zombies()
 
+    def _preview_signal(*_args) -> None:
+        # Simulate an already-gone worker so reclaim/timeout classification is
+        # accurate without signalling or waiting on a real process.
+        raise ProcessLookupError
+
+    signal_fn = _preview_signal if preview else None
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = release_stale_claims(conn, signal_fn=signal_fn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
+        conn,
+        stale_timeout_seconds=stale_timeout_seconds,
+        signal_fn=signal_fn,
     )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
@@ -9979,7 +10041,7 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, signal_fn=signal_fn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
