@@ -3141,7 +3141,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"(no runs yet for {args.task_id})")
         return 0
     print(f"{'#':3s}  {'OUTCOME':12s}  {'PROFILE':16s}  {'ELAPSED':>8s}  STARTED")
-    for i, r in enumerate(runs, 1):
+    for r in runs:
         end = r.ended_at or int(time.time())
         # Clamp to 0 so NTP backward-jumps don't print negative durations.
         elapsed = max(0, end - r.started_at)
@@ -3152,7 +3152,12 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         else:
             el = f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
-        print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        # Print the task_runs ROW ID, not a per-task ordinal: `kanban show`
+        # and its event stream already reference runs by row id ([run N],
+        # Runs #N), so a per-task ordinal here made one run look like several
+        # (troubleshooting#83, 2026-08-31: run 1 printed as "run 5" read as
+        # worker churn that never happened).
+        print(f"{r.id:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
         if r.summary:
             # Indent and truncate long summaries to keep the table readable.
             summary = r.summary.splitlines()[0][:100]
