@@ -36,6 +36,19 @@ hermes kanban --board default list --json
 
 A normal verbose tick reports promoted, spawned, skipped and running counts. A zero-spawn tick is not evidence by itself that the daemon is healthy; prove it with a reversible default-board task and read back the corresponding task/run records.
 
+## Maintenance safety
+
+**Do not stop or restart this unit while it owns active workers.** A live acceptance run showed that stopping the service can terminate a worker it spawned, which the next dispatcher tick correctly records as a crash and may turn into a retry or circuit-breaker block.
+
+There is not yet a first-class drain command. Before planned maintenance, check both running and ready work and wait for the board to quiesce:
+
+```bash
+hermes kanban --board default list --status running --json
+hermes kanban --board default list --status ready --json
+```
+
+If either list is non-empty, do not stop or restart the service. Merely seeing no running cards is not a durable drain barrier: another ready card can be claimed on the next tick.
+
 ## Roll back
 
 Stop and remove only this unit, then restore the `kanban.dispatch_in_gateway` value captured before installation:

@@ -51,6 +51,9 @@ def test_ops_note_documents_install_observe_and_reversible_rollback():
         "kanban.dispatch_in_gateway",
         "machine-global",
         "/home/anombyte/.hermes/kanban/.dispatcher.lock",
+        "Do not stop or restart",
+        "active workers",
+        "hermes kanban --board default list --status running --json",
         "restore",
     ):
         assert required in text
