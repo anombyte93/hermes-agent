@@ -60,6 +60,12 @@ def test_create_blocked_requires_and_surfaces_reason(tmp_path):
     assert payload["status"] == "blocked"
     assert payload["block_reason"] == "Waiting for access"
 
+    listed = _run_hermes(home, "kanban", "list", "--json")
+    assert listed.returncode == 0, listed.stderr
+    listed_task = next(task for task in json.loads(listed.stdout) if task["id"] == payload["id"])
+    assert listed_task["status"] == "blocked"
+    assert listed_task["block_reason"] == "Waiting for access"
+
     shown = _run_hermes(home, "kanban", "show", payload["id"])
     assert shown.returncode == 0, shown.stderr
     assert "blocked:   Waiting for access" in shown.stdout

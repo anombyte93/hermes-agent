@@ -3631,6 +3631,22 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # Initial blocked creation is an explicit operator handoff,
+                    # just like block_task().  Emit the canonical event so
+                    # _has_sticky_block() keeps it parked across list/dispatcher
+                    # recomputation until an explicit unblock.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": block_reason,
+                            "kind": None,
+                            "recurrences": 0,
+                            "source_status": "created",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
