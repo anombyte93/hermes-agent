@@ -13,22 +13,23 @@ def _unit_text() -> str:
 def test_default_board_daemon_unit_uses_repo_runtime_and_default_board():
     text = _unit_text()
 
-    assert "WorkingDirectory=/home/anombyte/.hermes/hermes-agent" in text
+    assert "WorkingDirectory=%h/.hermes/hermes-agent" in text
     assert (
         "ExecStart=/usr/bin/flock --no-fork --nonblock "
-        "/home/anombyte/.hermes/kanban/.dispatcher.lock "
-        "/home/anombyte/.hermes/hermes-agent/venv/bin/python "
+        "%h/.hermes/kanban/.dispatcher.lock "
+        "%h/.hermes/hermes-agent/venv/bin/python "
         "-m hermes_cli.main kanban --board default daemon"
     ) in text
+    assert "/home/anombyte" not in text
     assert "Environment=HERMES_PROFILE=" not in text
 
 
 def test_default_board_daemon_unit_has_standalone_singleton_runtime_controls():
     text = _unit_text()
 
-    assert "ExecStartPre=/usr/bin/mkdir -p /home/anombyte/.hermes/kanban" in text
+    assert "ExecStartPre=/usr/bin/mkdir -p %h/.hermes/kanban" in text
     assert "/usr/bin/flock --no-fork --nonblock" in text
-    assert "/home/anombyte/.hermes/kanban/.dispatcher.lock" in text
+    assert "%h/.hermes/kanban/.dispatcher.lock" in text
     assert "--force" in text
     assert "--interval 30" in text
     assert "--verbose" in text
@@ -50,7 +51,7 @@ def test_ops_note_documents_install_observe_and_reversible_rollback():
         "systemctl --user disable --now hermes-kanban-daemon.service",
         "kanban.dispatch_in_gateway",
         "machine-global",
-        "/home/anombyte/.hermes/kanban/.dispatcher.lock",
+        "$HOME/.hermes/kanban/.dispatcher.lock",
         "Do not stop or restart",
         "active workers",
         "hermes kanban --board default list --status running --json",
