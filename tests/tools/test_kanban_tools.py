@@ -416,6 +416,31 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_blocked_requires_and_returns_reason(worker_env):
+    from tools import kanban_tools as kt
+
+    missing = json.loads(kt._handle_create({
+        "title": "blocked child",
+        "assignee": "peer",
+        "initial_status": "blocked",
+    }))
+    assert "error" in missing
+    assert "block reason is required" in missing["error"]
+
+    created = json.loads(kt._handle_create({
+        "title": "blocked child",
+        "assignee": "peer",
+        "initial_status": "blocked",
+        "block_reason": "  Waiting for access  ",
+    }))
+    assert created["ok"] is True
+    assert created["status"] == "blocked"
+    assert created["block_reason"] == "Waiting for access"
+
+    shown = json.loads(kt._handle_show({"task_id": created["task_id"]}))
+    assert shown["task"]["block_reason"] == "Waiting for access"
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -469,7 +494,10 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     try:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
-        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_reason=? WHERE id=?",
+            ("waiting for parent", child),
+        )
         conn.commit()
     finally:
         conn.close()

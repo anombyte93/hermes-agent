@@ -63,6 +63,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "block_reason": t.block_reason,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -437,6 +438,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--block-reason", default=None,
+                          help="Required human-readable reason when "
+                               "--initial-status=blocked.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1662,6 +1666,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    initial_status = getattr(args, "initial_status", "running")
+    block_reason = getattr(args, "block_reason", None)
+    if initial_status == "blocked" and not (block_reason or "").strip():
+        print(
+            "kanban create: --block-reason is required when "
+            "--initial-status=blocked",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1685,7 +1698,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
+            block_reason=block_reason,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1850,6 +1864,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if task.status == "blocked" and task.block_reason:
+        print(f"  blocked:   {task.block_reason}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")

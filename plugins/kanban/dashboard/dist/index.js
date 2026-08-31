@@ -821,12 +821,16 @@
     // dialog via useKanbanDialogs now).
     //   taskId  — required when count <= 1 (single-task PATCH endpoint)
     //           — ignored when count >  1 (bulk endpoint uses selectedIds)
-    //   summary — completion summary string, or null/undefined to skip
-    const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
+    //   summary     — completion summary string, or null/undefined to skip
+    //   blockReason — required explanation when moving to blocked
+    const performMoveTask = useCallback(function (taskId, newStatus, count, summary, blockReason) {
       const patch = { status: newStatus };
-      const finalPatch = summary
-        ? Object.assign({}, patch, { result: summary, summary: summary })
-        : patch;
+      const finalPatch = Object.assign(
+        {},
+        patch,
+        summary ? { result: summary, summary: summary } : {},
+        blockReason ? { block_reason: blockReason } : {},
+      );
       if (count > 1) {
         // Bulk path: optimistic UI prepends all moved tasks to dest column.
         setBoardData(function (b) {
@@ -938,23 +942,47 @@
       return Promise.resolve({ confirmed: true, summary: summary });
     }, [t]);
 
-    // Single-task card move. Drives confirmation + completion summary
-    // dialogs via the hook, then dispatches via performMoveTask.
+    const requestBlockReason = useCallback(function (count) {
+      const label = dialogLabelForCount(count, t);
+      var reason = window.prompt(
+        tx(t, "blockReasonPrompt",
+          "Why is {label} blocked? This reason is shown on the card until it is unblocked.",
+          { label: label }),
+        "",
+      );
+      if (reason === null) return Promise.resolve({ confirmed: false });
+      reason = reason.trim();
+      if (!reason) {
+        window.alert(tx(t, "blockReasonRequired",
+          "A block reason is required before marking a task blocked."));
+        return Promise.resolve({ confirmed: false });
+      }
+      return Promise.resolve({ confirmed: true, blockReason: reason });
+    }, [t]);
+
+    // Single-task card move. Drives confirmation + required status details
+    // via the hook, then dispatches via performMoveTask.
     const moveTask = useCallback(function (taskId, newStatus) {
       requestMoveConfirm(newStatus, 1)
         .then(function (r1) {
           if (!r1.confirmed) return null;
+          if (newStatus === "blocked") {
+            return requestBlockReason(1).then(function (r2) {
+              if (!r2.confirmed) return null;
+              performMoveTask(taskId, newStatus, 1, null, r2.blockReason);
+            });
+          }
           if (newStatus !== "done") {
-            performMoveTask(taskId, newStatus, 1, null);
+            performMoveTask(taskId, newStatus, 1, null, null);
             return null;
           }
           return requestCompletionSummary(1).then(function (r2) {
             if (!r2.confirmed) return null;
-            performMoveTask(taskId, newStatus, 1, r2.summary || null);
+            performMoveTask(taskId, newStatus, 1, r2.summary || null, null);
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [requestMoveConfirm, requestCompletionSummary, requestBlockReason, performMoveTask]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -968,17 +996,23 @@
       requestMoveConfirm(newStatus, count)
         .then(function (r1) {
           if (!r1.confirmed) return null;
+          if (newStatus === "blocked") {
+            return requestBlockReason(count).then(function (r2) {
+              if (!r2.confirmed) return null;
+              performMoveTask(taskId, newStatus, count, null, r2.blockReason);
+            });
+          }
           if (newStatus !== "done") {
-            performMoveTask(taskId, newStatus, count, null);
+            performMoveTask(taskId, newStatus, count, null, null);
             return null;
           }
           return requestCompletionSummary(count).then(function (r2) {
             if (!r2.confirmed) return null;
-            performMoveTask(taskId, newStatus, count, r2.summary || null);
+            performMoveTask(taskId, newStatus, count, r2.summary || null, null);
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [selectedIds, requestMoveConfirm, requestCompletionSummary, requestBlockReason, performMoveTask]);
 
     const createTask = useCallback(function (body) {
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
@@ -1076,8 +1110,7 @@
     const applyBulk = useCallback(function (patch, confirmMsg) {
       if (selectedIds.size === 0) return;
       const count = selectedIds.size;
-      const run = function () {
-        const finalPatch = patch;
+      const run = function (finalPatch) {
         const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
         // Optimistic UI for status moves (same pattern as moveSelected).
         if (finalPatch.status) {
@@ -1122,8 +1155,18 @@
             loadBoard();
           });
       };
+      const runWithDetails = function () {
+        if (patch.status !== "blocked") {
+          run(patch);
+          return;
+        }
+        requestBlockReason(count).then(function (r) {
+          if (!r.confirmed) return;
+          run(Object.assign({}, patch, { block_reason: r.blockReason }));
+        });
+      };
       if (!confirmMsg) {
-        run();
+        runWithDetails();
         return;
       }
       kanbanDialogs.request({
@@ -1133,9 +1176,9 @@
         confirmLabel: tx(t, "apply", "Apply"),
         destructive: false,
       }).then(function (r) {
-        if (r.confirmed) run();
+        if (r.confirmed) runWithDetails();
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, loadBoard, board, t, kanbanDialogs]);
+    }, [selectedIds, loadBoard, board, t, kanbanDialogs, requestBlockReason]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -3894,6 +3937,10 @@
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
+        (t.status === "blocked" && t.block_reason) ? h(MetaRow, {
+          label: tx(i18n, "blockReason", "Block reason"),
+          value: t.block_reason,
+        }) : null,
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         h(ModelEditor, { task: t, onPatch: props.onPatch }),
@@ -4616,7 +4663,26 @@
     const [decomposeMsg, setDecomposeMsg] = useState(null);
     const b = function (label, patch, enabled, confirmMsg) {
       return h(Button, {
-        onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
+        onClick: function () {
+          if (enabled === false) return;
+          var finalPatch = patch;
+          if (patch.status === "blocked") {
+            var reason = window.prompt(
+              tx(t, "blockReasonPromptOne",
+                "Why is this task blocked? This reason is shown until it is unblocked."),
+              "",
+            );
+            if (reason === null) return;
+            reason = reason.trim();
+            if (!reason) {
+              window.alert(tx(t, "blockReasonRequired",
+                "A block reason is required before marking a task blocked."));
+              return;
+            }
+            finalPatch = Object.assign({}, patch, { block_reason: reason });
+          }
+          props.onPatch(finalPatch, { confirm: confirmMsg });
+        },
         disabled: enabled === false,
         size: "sm",
       }, label);

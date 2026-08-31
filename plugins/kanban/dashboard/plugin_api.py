@@ -905,7 +905,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                try:
+                    ok = kanban_db.block_task(
+                        conn, task_id, reason=payload.block_reason
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "review":
@@ -1302,6 +1307,7 @@ class BulkTaskBody(BaseModel):
     priority: Optional[int] = None
     archive: bool = False
     result: Optional[str] = None
+    block_reason: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
@@ -1349,7 +1355,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task(
+                            conn, tid, reason=payload.block_reason
+                        )
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(

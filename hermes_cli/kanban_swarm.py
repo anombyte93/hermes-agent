@@ -245,6 +245,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         idempotency_key=idempotency_key,
         initial_status="blocked",
+        block_reason="Swarm graph is being constructed atomically",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
     )
