@@ -42,8 +42,14 @@ def test_dispatch_dry_run_previews_promotion_and_spawn_without_writes(
             conn,
             title="eligible preview",
             assignee="alice",
-            initial_status="blocked",
         )
+        # Model a recoverable circuit-breaker block: it has a current reason
+        # but no explicit ``blocked`` event, so recompute may promote it.
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_reason=? WHERE id=?",
+            ("dry-run preview circuit breaker", task_id),
+        )
+        conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         before_task = dict(conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -232,12 +238,16 @@ def test_cli_dry_run_labels_preview_honestly(
     from hermes_cli import kanban as kanban_cli
 
     with kb.connect(db_path=kanban_home / "kanban.db") as conn:
-        kb.create_task(
+        task_id = kb.create_task(
             conn,
             title="CLI preview",
             assignee="alice",
-            initial_status="blocked",
         )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_reason=? WHERE id=?",
+            ("CLI dry-run circuit breaker", task_id),
+        )
+        conn.commit()
 
     args = argparse.Namespace(dry_run=True, max=1, failure_limit=2, json=False)
     assert kanban_cli._cmd_dispatch(args) == 0
