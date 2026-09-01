@@ -105,6 +105,45 @@ def _record_kanban_budget_exhausted(
         )
 
 
+def _preserve_kanban_budget_output(
+    kanban_task: str,
+    output: str,
+    api_call_count: int,
+    max_iterations: int,
+    logger: logging.Logger,
+) -> bool:
+    """Route a late terminal Kanban deliverable to review, best-effort."""
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        expected_run_id = int(raw_run_id) if raw_run_id else None
+        _conn = _kb.connect()
+        try:
+            return bool(
+                _kb.preserve_timeout_output_for_review(
+                    _conn,
+                    kanban_task,
+                    output=output,
+                    budget_used=api_call_count,
+                    budget_max=max_iterations,
+                    expected_run_id=expected_run_id,
+                )
+            )
+        finally:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.warning(
+            "Failed to preserve budget-exhausted output for task %s",
+            kanban_task,
+            exc_info=True,
+        )
+        return False
+
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -135,6 +174,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    _pending_verification_response_source=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -194,17 +234,24 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # A report composed immediately before the terminal Kanban nudge is a
+        # reviewable deliverable, not an empty timeout. Preserve only this
+        # explicit provenance; arbitrary non-empty summaries remain ordinary
+        # failures because tool noise is not evidence of completed work.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
+        preserved_for_review = bool(
+            _kanban_task
+            and preserved_verification_fallback
+            and _pending_verification_response_source == "kanban_stop"
+            and _preserve_kanban_budget_output(
+                _kanban_task,
+                str(final_response or ""),
+                api_call_count,
+                agent.max_iterations,
+                logger,
+            )
+        )
+        if _kanban_task and not preserved_for_review:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )

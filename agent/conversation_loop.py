@@ -1982,6 +1982,10 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    # Provenance is required before a late response can affect Kanban lifecycle.
+    # Only the terminal-board nudge may turn an exhausted run into review.
+    _pending_verification_response_source = None
+    _kanban_wrapup_nudge_issued = False
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -2051,6 +2055,33 @@ def run_conversation(
                     f"the review tool loop before the next provider call."
                 )
             break
+
+        # Kanban workers reserve the final two provider calls: one to compose a
+        # bounded terminal report, one to invoke the lifecycle tool. This is a
+        # one-shot user-tail nudge, so it neither mutates the system prompt nor
+        # invalidates the conversation's cached prefix.
+        try:
+            from agent.kanban_stop import build_kanban_wrapup_nudge
+
+            _wrapup_nudge = build_kanban_wrapup_nudge(
+                api_call_count=api_call_count,
+                max_iterations=agent.max_iterations,
+                already_issued=_kanban_wrapup_nudge_issued,
+            )
+        except Exception:
+            logger.debug("kanban wrap-up reserve check failed", exc_info=True)
+            _wrapup_nudge = None
+        if _wrapup_nudge:
+            _tail = messages[-1] if messages else None
+            if isinstance(_tail, dict) and _tail.get("role") == "user" and isinstance(_tail.get("content"), str):
+                _tail["content"] = f"{_tail['content']}\n\n{_wrapup_nudge}"
+            else:
+                append_message(messages, {"role": "user", "content": _wrapup_nudge})
+            agent._session_messages = messages
+            _kanban_wrapup_nudge_issued = True
+            agent._emit_status(
+                "⚠️ Kanban iteration reserve reached — finalising for board handoff"
+            )
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -8281,6 +8312,7 @@ def run_conversation(
                     # finalizer can mark the turn previewed only if the
                     # candidate is actually reused as the final response.
                     _pending_verification_response = final_response
+                    _pending_verification_response_source = "verify_on_stop"
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
@@ -8343,6 +8375,7 @@ def run_conversation(
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
                     _pending_verification_response = final_response
+                    _pending_verification_response_source = "pre_verify"
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
@@ -8393,6 +8426,7 @@ def run_conversation(
                     # exhaustion path does not treat the narrated stop as
                     # a completed answer.
                     _pending_verification_response = final_response
+                    _pending_verification_response_source = "kanban_stop"
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
@@ -8602,6 +8636,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        _pending_verification_response_source=_pending_verification_response_source,
     )
 
 

@@ -6,6 +6,7 @@ import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
+    build_kanban_wrapup_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
 )
@@ -72,6 +73,67 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_no_nudge_after_kanban_request_review(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_request_review",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": "review",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_wrapup_nudge_reserves_two_calls_for_report_and_lifecycle(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_late")
+
+    assert build_kanban_wrapup_nudge(
+        api_call_count=57, max_iterations=60, already_issued=False,
+    ) is None
+
+    nudge = build_kanban_wrapup_nudge(
+        api_call_count=58, max_iterations=60, already_issued=False,
+    )
+    assert nudge is not None
+    assert "2 calls remain" in nudge
+    assert "final report" in nudge.lower()
+    assert "kanban_complete" in nudge
+    assert "kanban_request_review" in nudge
+    assert "kanban_block" in nudge
+
+    assert build_kanban_wrapup_nudge(
+        api_call_count=58, max_iterations=60, already_issued=True,
+    ) is None
+
+
+def test_wrapup_nudge_skips_non_kanban_and_tiny_budgets(clear_kanban_env):
+    assert build_kanban_wrapup_nudge(
+        api_call_count=58, max_iterations=60, already_issued=False,
+    ) is None
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_tiny")
+    assert build_kanban_wrapup_nudge(
+        api_call_count=0, max_iterations=2, already_issued=False,
+    ) is None
 
 
 

@@ -263,7 +263,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "timed_out_with_output", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -628,6 +628,17 @@ class GatewayKanbanWatchersMixin:
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "timed_out_with_output":
+                            summary = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                summary = str(ev.payload["summary"])[:4300]
+                            wake_handoff = summary
+                            handoff = f"\n{summary}" if summary else ""
+                            msg = (
+                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} "
+                                "timed out with output; moved to review"
+                                f" — {title}{handoff}"
+                            )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
@@ -841,8 +852,8 @@ class GatewayKanbanWatchersMixin:
                         # ``unblocked`` stay out: bookkeeping.
                         _WAKE_KINDS = (
                             "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
+                            "timed_out_with_output", "blocked", "review_requested",
+                            "changes_requested", "block_loop_detected",
                         )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
@@ -879,6 +890,7 @@ class GatewayKanbanWatchersMixin:
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+                            if "timed_out_with_output" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
                             if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
