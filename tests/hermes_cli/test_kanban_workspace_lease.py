@@ -548,3 +548,240 @@ def test_canonical_key_is_none_for_empty_input(kb):
     assert kb._canonical_workspace_key(None) is None
     assert kb._canonical_workspace_key("") is None
     assert kb._canonical_workspace_key("   ") is None
+
+
+# --------------------------------------------------------------------------
+# Post-resolution CONFIRM branch (independent review, gate 4 finding).
+#
+# The lease has two halves. The PRE-CLAIM half predicts the key from the
+# stored row and leaves the loser genuinely unclaimed; the CONFIRM half
+# re-keys the REAL path returned by ``resolve_workspace`` after the claim,
+# because resolution can land somewhere the prediction could not see (a repo
+# ANCHOR materialising ``<repo>/.worktrees/<id>``, a board ``default_workdir``
+# fallback, an alias collapsing late).
+#
+# Review's sys.settrace line probe proved every seeded case in this file was
+# caught by the pre-check, so the confirm branch shipped UNTESTED. These two
+# controls execute it deliberately in each lane by making resolution — not
+# the stored row — be the thing that collides: two tasks whose prediction is
+# ``None`` (scratch, no path) are resolved into ONE directory.
+# --------------------------------------------------------------------------
+
+
+def _collide_on_resolution(kb, monkeypatch, target):
+    """Force ``resolve_workspace`` to land every task in ``target``.
+
+    Prediction for a pathless scratch task is ``None`` (unique by
+    construction), so the pre-check cannot fire and only the post-resolution
+    confirm can catch the collision. This is exactly the shape the pre-check
+    is blind to.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        kb, "resolve_workspace", lambda task, **kwargs: target,
+    )
+
+
+def test_confirm_branch_catches_ready_lane_collision(kb, tmp_path, monkeypatch):
+    """Ready lane: a collision visible ONLY after resolution is still caught."""
+    target = tmp_path / "late-resolved"
+    with kb.connect_closing() as conn:
+        a = _mk(kb, conn, "ready-a")
+        b = _mk(kb, conn, "ready-b")
+    assert kb._predicted_workspace_key(a, "scratch", None, None) is None, (
+        "control precondition: prediction must be None so the pre-check "
+        "cannot fire and the confirm branch is the thing under test"
+    )
+
+    _collide_on_resolution(kb, monkeypatch, target)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    assert len(res.spawned) == 1, (
+        f"confirm branch failed to serialise {target}: {res.spawned}"
+    )
+    assert len(res.skipped_workspace_busy) == 1
+    winner = res.spawned[0][0]
+    loser, holder, path = res.skipped_workspace_busy[0]
+    assert {winner, loser} == {a, b}
+    assert holder == winner
+    assert path == str(target.resolve())
+
+    with kb.connect_closing() as conn:
+        assert _status(conn, winner) == "running"
+        # Claimed then released: the loser returns to its OWN column with the
+        # claim dropped, and must not be charged a failure for losing a race.
+        assert _status(conn, loser) == "ready"
+        row = conn.execute(
+            "SELECT claim_lock, consecutive_failures FROM tasks WHERE id = ?",
+            (loser,),
+        ).fetchone()
+        assert row["claim_lock"] is None
+        assert row["consecutive_failures"] == 0
+        payloads = _events(kb, conn, loser, "workspace_busy")
+        assert len(payloads) == 1
+        assert payloads[0] == {
+            "holder": winner, "workspace": str(target.resolve()),
+        }
+
+
+def test_confirm_branch_catches_review_lane_collision(kb, tmp_path, monkeypatch):
+    """Review lane: the loser returns to ``review``, not to an impl retry.
+
+    The dangerous failure mode here is silent lane conversion — a deferred
+    reviewer coming back as a fresh implementation attempt.
+    """
+    target = tmp_path / "late-resolved-review"
+    with kb.connect_closing() as conn:
+        ready_id = _mk(kb, conn, "ready-worker")
+        review_id = _mk(kb, conn, "review-worker", status="review")
+
+    _collide_on_resolution(kb, monkeypatch, target)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    assert len(res.spawned) == 1
+    assert len(res.skipped_workspace_busy) == 1
+    winner = res.spawned[0][0]
+    loser, holder, path = res.skipped_workspace_busy[0]
+    assert winner == ready_id, "ready queue is walked first"
+    assert loser == review_id
+    assert holder == winner
+    assert path == str(target.resolve())
+
+    with kb.connect_closing() as conn:
+        assert _status(conn, loser) == "review", (
+            "a deferred review card must return to review, never be "
+            "converted into an implementation retry"
+        )
+        assert conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (loser,),
+        ).fetchone()["claim_lock"] is None
+
+
+# --------------------------------------------------------------------------
+# Bounded workspace_busy evidence (independent review, finding B).
+#
+# Review measured 31 dispatch ticks against one long-lived holder writing 31
+# workspace_busy rows onto the deferred card — ~1,440 rows/day per contended
+# card at the default 60s interval, for a fact whose content never changes.
+# --------------------------------------------------------------------------
+
+
+def test_repeated_ticks_do_not_write_unbounded_workspace_busy_events(
+    kb, tmp_path,
+):
+    """Many ticks, one unchanged holder -> exactly ONE durable event."""
+    shared = tmp_path / "contended"
+    shared.mkdir()
+    with kb.connect_closing() as conn:
+        _mk(kb, conn, "holder", workspace=shared)
+        loser = _mk(kb, conn, "deferred", workspace=shared)
+
+    for _ in range(12):
+        with kb.connect_closing() as conn:
+            res = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+            # Every tick still REPORTS the deferral on the in-memory
+            # surface; only the durable row is deduplicated.
+            if res.skipped_workspace_busy:
+                assert res.skipped_workspace_busy[0][0] == loser
+
+    with kb.connect_closing() as conn:
+        payloads = _events(kb, conn, loser, "workspace_busy")
+    assert len(payloads) == 1, (
+        f"expected the durable evidence to be bounded, got {len(payloads)} "
+        f"rows across 12 ticks"
+    )
+
+
+def test_workspace_busy_event_is_rewritten_when_the_holder_changes(
+    kb, tmp_path,
+):
+    """Dedup must not swallow NEW information.
+
+    A guard that suppresses a changed holder would make the diagnostic lie
+    about who currently owns the directory.
+    """
+    shared = tmp_path / "contended"
+    shared.mkdir()
+    with kb.connect_closing() as conn:
+        first = _mk(kb, conn, "holder-one", workspace=shared)
+        loser = _mk(kb, conn, "deferred", workspace=shared)
+
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, spawn_fn=_fake_spawn)  # suppressed duplicate
+        payloads = _events(kb, conn, loser, "workspace_busy")
+        assert len(payloads) == 1
+        assert payloads[0]["holder"] == first
+
+    # Retire the first holder and introduce a second one, so the deferred
+    # card is now blocked by a DIFFERENT task.
+    with kb.connect_closing() as conn:
+        kb.complete_task(conn, first, summary="done")
+        second = _mk(kb, conn, "holder-two", workspace=shared)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET priority = 50 WHERE id = ?", (second,),
+            )
+
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    with kb.connect_closing() as conn:
+        payloads = _events(kb, conn, loser, "workspace_busy")
+    holders = [p["holder"] for p in payloads]
+    assert second in holders, (
+        f"a changed holder must be recorded, not deduplicated away: {holders}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Scope limit, asserted rather than merely documented (review finding A).
+# --------------------------------------------------------------------------
+
+
+def test_lease_is_single_board_scoped_and_says_so(kb, tmp_path):
+    """Two boards, one directory: BOTH spawn — the documented limitation.
+
+    This is deliberately a characterisation test, not an aspiration. It
+    fails the day someone implements cross-board leasing, which is the
+    correct moment to revisit the scope wording and the follow-up issue.
+    """
+    shared = tmp_path / "cross-board-dir"
+    shared.mkdir()
+
+    kb.init_db(board="alpha-board")
+    kb.init_db(board="beta-board")
+    with kb.connect_closing(board="alpha-board") as conn:
+        kb.create_board(slug="alpha-board", name="Alpha")
+        a = _mk(kb, conn, "on-alpha", workspace=shared)
+    with kb.connect_closing(board="beta-board") as conn:
+        kb.create_board(slug="beta-board", name="Beta")
+        b = _mk(kb, conn, "on-beta", workspace=shared)
+
+    with kb.connect_closing(board="alpha-board") as conn:
+        res_a = kb.dispatch_once(conn, spawn_fn=_fake_spawn, board="alpha-board")
+    with kb.connect_closing(board="beta-board") as conn:
+        res_b = kb.dispatch_once(conn, spawn_fn=_fake_spawn, board="beta-board")
+
+    assert [t[0] for t in res_a.spawned] == [a]
+    assert [t[0] for t in res_b.spawned] == [b]
+    assert res_a.skipped_workspace_busy == []
+    assert res_b.skipped_workspace_busy == []
+
+    # The limitation must be documented where a reader of the guarantee
+    # looks, so nobody reads "across the board" as cross-board.
+    doc = kb._seed_workspace_leases.__doc__ or ""
+    assert "SINGLE-BOARD" in doc, (
+        "the per-board scope must be stated on the seeding helper"
+    )
+    import inspect
+
+    source = inspect.getsource(kb.DispatchResult)
+    assert "SCOPE — SINGLE BOARD" in source, (
+        "the per-board scope must be stated in the DispatchResult docstring, "
+        "which is what a caller reads to learn what the guarantee covers"
+    )
+
