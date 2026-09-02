@@ -7704,6 +7704,43 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     return git_dir != common_dir
 
 
+def _git_primary_worktree(path: Path) -> Optional[Path]:
+    """Return the primary checkout sharing ``path``'s Git common directory."""
+    common_dir = _git_common_dir(path)
+    if common_dir is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = Path(line.removeprefix("worktree ")).expanduser().resolve(strict=False)
+        if _git_dir(candidate) == common_dir:
+            return candidate
+    return None
+
+
+def _require_worktree_branch(path: Path, branch_name: str) -> None:
+    """Fail closed unless ``path`` is checked out on ``branch_name``."""
+    actual_branch = _git_current_branch(path)
+    if actual_branch != branch_name:
+        observed = actual_branch or "<detached>"
+        raise RuntimeError(
+            f"worktree branch mismatch for {path}: requested branch "
+            f"{branch_name!r}, observed {observed!r}"
+        )
+
+
 def _nearest_existing_path(path: Path) -> Path:
     current = path
     while not current.exists() and current != current.parent:
@@ -7729,6 +7766,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            _require_worktree_branch(target, branch_name)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -7750,6 +7788,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _require_worktree_branch(target, branch_name)
 
 
 def _resolve_worktree_workspace(
@@ -7814,16 +7853,19 @@ def _resolve_worktree_workspace(
         # branch — silent cross-task provenance corruption, and unsafe
         # when siblings run concurrently. Fall back to a fresh worktree
         # of our own under the same repo.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        fallback_root = _git_primary_worktree(requested)
+        if fallback_root is None:
+            fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        # The occupied checkout is already this task's canonical target, or
+        # Git exposed no primary checkout where a fresh task worktree can be
+        # anchored. Never rewrite the requested branch to match that checkout.
+        _require_worktree_branch(requested, branch_name)
+        return requested_resolved, branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
