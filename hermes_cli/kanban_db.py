@@ -5991,6 +5991,14 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
             return  # never remove the main checkout
+        managed = repo_root / ".worktrees" / task_id
+        if wp.resolve(strict=False) != managed.resolve(strict=False):
+            _log.warning(
+                "Refusing to remove worktree not owned by task %s: %s "
+                "(expected managed path %s)",
+                task_id, wp, managed,
+            )
+            return
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -7768,8 +7776,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             _require_worktree_branch(target, branch_name)
             return
+    target_preexisted = target.exists()
+    branch_preexisted = _git_branch_exists(repo_root, branch_name)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
+    if branch_preexisted:
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         cmd = [
@@ -7788,7 +7798,46 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
-    _require_worktree_branch(target, branch_name)
+    try:
+        _require_worktree_branch(target, branch_name)
+    except Exception as validation_error:
+        remove_result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "worktree", "remove", "--force",
+                str(target),
+            ],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+        )
+        rollback_errors = []
+        if remove_result.returncode != 0:
+            rollback_errors.append(
+                (remove_result.stderr or remove_result.stdout or "").strip()
+                or f"failed to remove {target}"
+            )
+        elif target_preexisted:
+            target.mkdir(parents=True, exist_ok=True)
+        if not branch_preexisted and not target.exists():
+            branch_result = subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "-D", branch_name],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=30,
+                check=False,
+            )
+            if branch_result.returncode != 0:
+                rollback_errors.append(
+                    (branch_result.stderr or branch_result.stdout or "").strip()
+                    or f"failed to delete branch {branch_name}"
+                )
+        if rollback_errors:
+            raise RuntimeError(
+                f"{validation_error}; worktree rollback failed: "
+                + "; ".join(rollback_errors)
+            ) from validation_error
+        raise
 
 
 def _resolve_worktree_workspace(
@@ -7843,27 +7892,23 @@ def _resolve_worktree_workspace(
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
-        actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
-            return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT
-        # task's branch. Decompose children inherit the root's
-        # workspace_path verbatim, so siblings all point here; reusing
-        # the checkout as-is would run this task on the other task's
-        # branch — silent cross-task provenance corruption, and unsafe
-        # when siblings run concurrently. Fall back to a fresh worktree
-        # of our own under the same repo.
+        # A linked checkout is reusable only when it is this task's canonical
+        # managed path. An external checkout remains owned by its creator even
+        # when it already has the requested branch; adopting it would let task
+        # completion delete someone else's checkout.
         fallback_root = _git_primary_worktree(requested)
         if fallback_root is None:
             fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
-            if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
-        # The occupied checkout is already this task's canonical target, or
+            if fallback.resolve(strict=False) == requested_resolved:
+                _require_worktree_branch(requested, branch_name)
+                return requested_resolved, branch_name
+            _ensure_git_worktree(fallback_root, fallback, branch_name)
+            return fallback.resolve(strict=False), branch_name
         # Git exposed no primary checkout where a fresh task worktree can be
-        # anchored. Never rewrite the requested branch to match that checkout.
+        # anchored. Never rewrite the requested branch to match the external
+        # checkout; fail closed instead.
         _require_worktree_branch(requested, branch_name)
         return requested_resolved, branch_name
 

@@ -265,9 +265,12 @@ def test_post_add_validation_failure_rolls_back_only_created_artifacts(
 
     monkeypatch.setattr(kb, "_require_worktree_branch", reject_created_worktree)
 
-    with pytest.raises(RuntimeError, match="forced post-add validation failure"):
+    with pytest.raises(
+        RuntimeError, match="forced post-add validation failure"
+    ) as exc_info:
         kb._ensure_git_worktree(repo, target, branch)
 
+    assert "worktree rollback failed" not in str(exc_info.value)
     assert not target.exists()
     assert _branch_exists(repo, branch) is branch_preexists
 
