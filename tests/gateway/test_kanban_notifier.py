@@ -692,6 +692,54 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
     )
 
 
+def test_timeout_with_output_notice_surfaces_bounded_redacted_tail(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "timeout-output.db"))
+    kb.init_db()
+    secret = "ghp_" + "Q" * 40
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="late report",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode="notify+wake",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.preserve_timeout_output_for_review(
+            conn,
+            tid,
+            output=("A" * 5000) + f"\ntoken: {secret}\nPASS: final report",
+            budget_used=60,
+            budget_max=60,
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    notice = adapter.sent[0]["text"]
+    assert "timed out with output" in notice.lower()
+    assert "PASS: final report" in notice
+    assert secret not in notice
+    assert len(notice) <= 4600
+    wake = _wake_text(adapter)
+    assert "PASS: final report" in wake
+    assert secret not in wake
+
+
 def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
     """A triage escalation wakes the origin so a decision gets made."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "triage-wake.db"))

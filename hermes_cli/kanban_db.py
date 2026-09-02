@@ -1462,7 +1462,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     profile             TEXT,
     step_key            TEXT,
     status              TEXT NOT NULL,
-    -- status: running | done | blocked | crashed | timed_out | failed | released
+    -- status: running | done | review | blocked | crashed | timed_out | failed | released
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
@@ -1471,8 +1471,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
-    -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    -- outcome: completed | blocked | crashed | timed_out | timed_out_with_output |
+    --          spawn_failed | gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -4346,7 +4346,7 @@ def _end_run(
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
     ``outcome`` is the semantic result (completed / blocked / crashed /
-    timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
+    timed_out / timed_out_with_output / spawn_failed / gave_up / reclaimed). ``status`` is the
     run-row status (usually just ``outcome``, but callers can pass it
     explicitly). Returns the closed run_id or ``None`` if no active run
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
@@ -4903,6 +4903,7 @@ def goal_run_status(
             {
                 "completed": "done",
                 "review_requested": "review",
+                "timed_out_with_output": "review",
                 "changes_requested": "changes_requested",
                 "blocked": "blocked",
                 "dependency_wait": "blocked",
@@ -6499,6 +6500,81 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def preserve_timeout_output_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    output: str,
+    budget_used: int,
+    budget_max: int,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Preserve a late Kanban deliverable and route it to review.
+
+    This is intentionally not a failure/retry transition. Only output captured
+    from the terminal Kanban wrap-up path may call it. The durable tail is
+    force-redacted and bounded before it reaches either the run row or event.
+    Existing task statuses and schema remain unchanged: ``review`` is the card
+    phase, while the free-form run outcome records ``timed_out_with_output``.
+    """
+    redacted = str(redact_review_value(output or "")).strip()
+    if not redacted:
+        return False
+    output_tail = redacted[-4000:]
+    summary = (
+        f"Iteration budget exhausted ({int(budget_used)}/{int(budget_max)}) "
+        "after a terminal deliverable was produced. Preserved for review; "
+        "automatic retry was not scheduled.\n\n"
+        "Final output tail (bounded, secret-redacted):\n"
+        f"{output_tail}"
+    )
+    metadata = {
+        "budget_used": int(budget_used),
+        "budget_max": int(budget_max),
+        "final_output_tail": output_tail,
+        "final_output_tail_chars": len(output_tail),
+    }
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] is None:
+            return False
+        run_id = int(row["current_run_id"])
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="timed_out_with_output",
+            status="review",
+            summary=summary,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "timed_out_with_output",
+            {
+                "summary": summary,
+                "implementer": row["assignee"],
+                "reviewer": None,
+                **metadata,
+            },
+            run_id=closed_run_id,
+        )
+    return True
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6671,10 +6747,10 @@ def request_changes(
     """Finish an active review run and route the task back for rework.
 
     The transition is valid only for a run claimed from ``review``.  It closes
-    that reviewer run, restores the implementer recorded by the latest
-    ``review_requested`` event, reapplies parent gating, and emits an auditable
-    ``changes_requested`` event.  The second tuple item is the implementer on
-    success or a diagnostic reason on failure.
+    that reviewer run, restores the implementer recorded by the latest review
+    handoff (``review_requested`` or ``timed_out_with_output``), reapplies parent
+    gating, and emits an auditable ``changes_requested`` event.  The second
+    tuple item is the implementer on success or a diagnostic reason on failure.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
@@ -6714,12 +6790,13 @@ def request_changes(
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_requested' "
+            "WHERE task_id = ? "
+            "AND kind IN ('review_requested', 'timed_out_with_output') "
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if requested_event is None:
-            return False, "no prior review_requested event"
+            return False, "no prior review handoff event"
         try:
             requested_payload = (
                 json.loads(requested_event["payload"])

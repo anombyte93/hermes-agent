@@ -17,9 +17,52 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_request_review",
+    "kanban_block",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+
+# Reserve one call for a bounded final report and one for the terminal board
+# tool. Smaller budgets keep their historical behaviour rather than spending
+# the whole turn wrapping up.
+_KANBAN_WRAPUP_RESERVE_CALLS = 2
+_KANBAN_WRAPUP_MIN_BUDGET = 4
+
+
+def build_kanban_wrapup_nudge(
+    *,
+    api_call_count: int,
+    max_iterations: int,
+    already_issued: bool,
+) -> Optional[str]:
+    """Return the one-shot Kanban wrap-up prompt before the hard ceiling.
+
+    The prompt is issued with two provider calls remaining: one to compose the
+    final deliverable and one to invoke the lifecycle tool. It is Kanban-only so
+    ordinary interactive turns retain the no-pressure-warning behaviour.
+    """
+    if already_issued or not kanban_stop_nudge_enabled():
+        return None
+    try:
+        used = int(api_call_count)
+        maximum = int(max_iterations)
+    except (TypeError, ValueError):
+        return None
+    if maximum < _KANBAN_WRAPUP_MIN_BUDGET:
+        return None
+    remaining = maximum - used
+    if remaining != _KANBAN_WRAPUP_RESERVE_CALLS:
+        return None
+    return (
+        "[System: Kanban iteration reserve reached. Exactly 2 calls remain. "
+        "Stop starting new work. Use this response to finish and state the "
+        "bounded final report, then use the remaining call to invoke exactly "
+        "one terminal board tool: `kanban_complete`, `kanban_request_review`, "
+        "or `kanban_block`. Do not end with narration or a promise.]"
+    )
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -95,7 +138,9 @@ def build_kanban_stop_nudge(
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, `kanban_request_review(summary=...)` if implementation is "
+        "finished but needs same-card review, OR `kanban_block(reason=...)` if "
+        "you are blocked.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
@@ -103,6 +148,7 @@ def build_kanban_stop_nudge(
 
 __all__ = [
     "build_kanban_stop_nudge",
+    "build_kanban_wrapup_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
 ]
