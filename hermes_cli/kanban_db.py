@@ -5983,6 +5983,12 @@ def _cleanup_worktree_workspace(
         return  # CLI safety predicates unavailable — preserve
     try:
         wp = Path(path).expanduser()
+        if wp.is_symlink():
+            _log.warning(
+                "Refusing to remove symlinked worktree for task %s: %s",
+                task_id, wp,
+            )
+            return
         if not wp.is_dir():
             return
         common = _git_common_dir(wp)
@@ -7770,6 +7776,8 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
+    if target.is_symlink():
+        raise RuntimeError(f"refusing symlinked worktree target: {target}")
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
@@ -7901,6 +7909,12 @@ def _resolve_worktree_workspace(
             fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
+            if requested.is_symlink() and os.path.abspath(requested) == os.path.abspath(
+                fallback
+            ):
+                raise RuntimeError(
+                    f"refusing symlinked canonical worktree path: {requested}"
+                )
             if fallback.resolve(strict=False) == requested_resolved:
                 _require_worktree_branch(requested, branch_name)
                 return requested_resolved, branch_name
