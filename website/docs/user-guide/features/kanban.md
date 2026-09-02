@@ -245,6 +245,49 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Releasing one exact card
+
+`--max N` caps **how many** cards a pass spawns, not **which**. To release
+one specific card, name it:
+
+```bash
+hermes kanban dispatch --task t_abcd            # spawn ONLY t_abcd
+hermes kanban dispatch --task t_abcd --dry-run  # ...or just ask about it
+```
+
+A targeted pass may spawn that id and no other, in either lane. Board-wide
+bookkeeping (reclaim, crash/timeout detection, ready promotion) still runs
+normally — those are integrity operations. The selector narrows selection
+only; it grants no permissions, so every existing gate (concurrency caps,
+respawn guard, workspace lease, the review gate below) applies identically.
+An unknown or non-spawnable id spawns nothing rather than falling back to
+another card.
+
+### Cards awaiting review are not re-entered by their implementer
+
+A card in `review` is a candidate awaiting audit. The dispatcher will not
+spawn it for the profile that produced the candidate — that would re-enter
+the implementer in the very workspace under review and move the audit
+target beneath the reviewer. Such a card is reported as:
+
+```
+Held (review not dispatchable): t_abcd — awaiting review; its assignee is
+the implementer that produced the candidate...
+```
+
+This is not a failure: no attempt is counted and no retry gate is touched.
+A review run must be an explicitly assigned reviewer transition, so the two
+ways forward are:
+
+```bash
+hermes kanban request-review t_abcd --reviewer some-reviewer  # name a reviewer
+hermes kanban complete t_abcd                                  # accept it
+```
+
+Cards moved into `review` by hand (no recorded `review_requested` handoff)
+and reviewer retries after a crash or timeout are unaffected and dispatch
+as before.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
@@ -765,7 +808,7 @@ hermes kanban heartbeat <id> [--note "..."]            # worker liveness signal 
 hermes kanban runs <id> [--json]                       # attempt history (one row per run)
 hermes kanban assignees [--json]                       # profiles on disk + per-assignee task counts
 hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
-        [--failure-limit N] [--json]
+        [--task TASK_ID] [--failure-limit N] [--json]  # --task: spawn ONLY that card
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
 hermes kanban stats [--json]                           # per-status + per-assignee counts

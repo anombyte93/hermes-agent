@@ -343,6 +343,7 @@ def _fire_dispatch_tick_hook(
             result.respawn_guarded,
             result.skipped_per_profile_capped,
             result.skipped_workspace_busy,
+            result.skipped_review_not_dispatchable,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -8100,8 +8101,27 @@ class DispatchResult:
     still spawn concurrently; that shape is a KNOWN LIMITATION, not a
     regression (issue #5's reproduction was single-board). Cross-board
     workspace ownership needs a walk over sibling board DBs — the pattern
-    ``count_running_tasks_other_boards`` already uses — and is tracked
     separately rather than smuggled into this slice."""
+    skipped_review_not_dispatchable: list[tuple[str, str]] = field(
+        default_factory=list
+    )
+    """Review-column cards this tick refused to dispatch, as
+    ``(task_id, reason)`` pairs (issue #5, identity half).
+
+    Reason ``"implementer_reentry"``: the card's assignee is the same
+    profile the latest ``review_requested`` event named as the implementer,
+    so spawning it would re-enter the author of the candidate into the very
+    workspace awaiting audit. See :func:`review_dispatch_refusal` for the
+    live reproduction and the full rule.
+
+    NOT a failure and NOT operator-actionable as an error — it is the
+    accepted-review transition working. The card is waiting for an
+    explicitly assigned reviewer or the manual completion ceremony; no
+    failure is counted and no retry gate is touched.
+
+    These cards are also excluded from the review-lane reservation: a card
+    the gate will refuse anyway is not genuine review work, so it must not
+    hold a spawn slot back from the ready lane."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9643,6 +9663,84 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def review_dispatch_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+) -> Optional[str]:
+    """Return a reason a ``review`` card must NOT be dispatched, else ``None``.
+
+    ACCEPTED-REVIEW TERMINALITY (issue #5, identity half). A card sitting in
+    ``review`` is a candidate awaiting an audit. The dispatcher used to treat
+    that column as "spawnable work" and would re-claim the card for whoever
+    its assignee happened to be — which, when no reviewer was ever named, is
+    the IMPLEMENTER that just produced the candidate.
+
+    Live reproduction (board ``atlas-launcher``, 2026-09-02 05:24 AWST): task
+    ``t_f334f81a`` finished implementation run 9 with outcome
+    ``review_requested`` and candidate commit ``47586555``. Source status was
+    ``review`` with no active worker. The next dispatcher pass re-claimed the
+    SAME implementation task as run 10 (its ``claimed`` event records
+    ``source_status: review``) into the SAME implementation workspace. The
+    accepted candidate was therefore not stable while awaiting review: the
+    implementer was re-entered in the accepted worktree and moved the audit
+    target beneath the reviewer.
+
+    The rule that fixes it, stated positively: **a review run must be an
+    explicitly assigned reviewer transition.** So we refuse when the card's
+    current assignee is the same profile the latest ``review_requested``
+    event named as the implementer.
+
+    Deliberate properties of keying off that event:
+
+    * **No provenance, no gate.** A card a human (or a control-plane lane)
+      moved into ``review`` by hand has no ``review_requested`` event, so we
+      cannot know it is being handed back to its own implementer. Those keep
+      the historical behaviour rather than silently freezing.
+    * **Spent reviews are covered by the same rule.** When a reviewer run
+      itself ends in ``review_requested``, that event names the reviewer as
+      the implementer of the new candidate — so the reviewer is likewise not
+      re-entered without a fresh, explicit assignment. This is the shape of
+      the other live reproduction (an already-PASS review card re-claimed as
+      a new run).
+    * **Retry gates are untouched.** A reviewer run that crashed or timed out
+      never wrote a newer ``review_requested`` event, so the latest one still
+      names the original implementer, the assignee is still the reviewer, and
+      the retry dispatches normally.
+
+    The operator's route out is the one that was missing: name a reviewer
+    (``kanban_request_review(reviewer=...)`` or reassign the card), or run
+    the manual completion ceremony. Re-spawning the implementer is not it.
+    """
+    who = (assignee or "").strip()
+    if not who:
+        # Unassigned cards are already bucketed as skipped_unassigned by the
+        # dispatch loop; nothing for this gate to add.
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        # An unparseable payload is not evidence of anything. Fail OPEN so a
+        # corrupt row can never freeze a board's review lane.
+        return None
+    if not isinstance(payload, dict):
+        return None
+    implementer = payload.get("implementer")
+    if not isinstance(implementer, str) or not implementer.strip():
+        return None
+    if _canonical_assignee(implementer) != _canonical_assignee(who):
+        return None
+    return "implementer_reentry"
+
+
 # ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
@@ -9997,6 +10095,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    only_task: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10012,6 +10111,9 @@ def dispatch_once(
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
+
+    ``only_task`` restricts SPAWN SELECTION to exactly that task id — see
+    :func:`_dispatch_once_locked` for the full contract.
     """
     try:
         db_path = kanban_db_path(board=board)
@@ -10032,6 +10134,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            only_task=only_task,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10052,6 +10155,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                only_task=only_task,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -10079,6 +10183,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    only_task: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10114,6 +10219,28 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+
+    ``only_task`` is the EXACT-CARD SELECTOR (issue #5, identity half).
+    When set, this tick may spawn that task id and no other, in either
+    lane. Board-wide bookkeeping — reclaim, orphan reconciliation, crash
+    and timeout detection, ready promotion — still runs unrestricted,
+    because those are integrity operations that must not silently stop
+    just because the operator asked about one card.
+
+    It exists because operators had NO route to release one specific card.
+    Live reproduction on board ``my-agents-overnight-20260902`` (2026-09-02
+    04:15 AWST): ``hermes kanban dispatch --max 1 --json`` did not claim
+    the sole ``ready`` integration card ``t_f023288c``; it selected an
+    already-PASS ``review`` card and spawned a worker into that review
+    worktree instead. ``--max 1`` bounds HOW MANY cards a pass spawns, and
+    was mistaken for a way to control WHICH — it never was.
+
+    The selector narrows selection only. It grants no permissions: every
+    existing gate (caps, respawn guard, workspace lease, the
+    accepted-review transition in :func:`review_dispatch_refusal`) applies
+    identically to a targeted card. An unknown or non-spawnable id simply
+    spawns nothing rather than falling back to another card — silently
+    picking a different card is the exact defect this closes.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -10211,11 +10338,21 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
+    # Exact-card selector (issue #5): narrow BOTH lanes' candidate sets to
+    # the requested id. Applied here — after all reclaim/promotion
+    # bookkeeping above and before any spawn decision — so a targeted pass
+    # keeps the board's integrity operations intact while spawning nothing
+    # but the card the operator named.
+    _only = (only_task or "").strip() or None
+    _only_clause = " AND id = ?" if _only else ""
+    _only_params: tuple[Any, ...] = (_only,) if _only else ()
+
     ready_rows = conn.execute(
         "SELECT id, assignee, workspace_kind, workspace_path, branch_name "
         "FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "WHERE status = 'ready' AND claim_lock IS NULL" + _only_clause
+        + " ORDER BY priority DESC, created_at ASC",
+        _only_params,
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
@@ -10224,9 +10361,33 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee, workspace_kind, workspace_path, branch_name "
             "FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
+            "WHERE status = 'review' AND claim_lock IS NULL" + _only_clause
+            + " ORDER BY priority DESC, created_at ASC",
+            _only_params,
         ).fetchall()
+    # Accepted-review terminality (issue #5, identity half): refuse review
+    # cards whose spawn would re-enter the implementer that produced the
+    # candidate. Resolved BEFORE the reservation below so a refused card
+    # cannot hold a spawn slot back from the ready lane — it is not genuine
+    # review work. See review_dispatch_refusal for the rule and evidence.
+    _review_refusals: dict[str, str] = {}
+    for row in review_rows:
+        try:
+            reason = review_dispatch_refusal(conn, row["id"], row["assignee"])
+        except Exception:
+            # A diagnostic query must never break dispatch; fail OPEN.
+            _log.debug(
+                "kanban dispatch: review gate check failed for %s",
+                row["id"], exc_info=True,
+            )
+            reason = None
+        if reason is not None:
+            _review_refusals[row["id"]] = reason
+            result.skipped_review_not_dispatchable.append((row["id"], reason))
+    if _review_refusals:
+        review_rows = [
+            row for row in review_rows if row["id"] not in _review_refusals
+        ]
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work

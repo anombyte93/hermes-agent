@@ -757,6 +757,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
+    p_disp.add_argument(
+        "--task", default=None, metavar="TASK_ID",
+        help="Spawn ONLY this task id, in either lane. Reclaim/promotion "
+             "bookkeeping still runs board-wide. Note --max caps HOW MANY "
+             "cards a pass spawns, not WHICH — use --task to release one "
+             "exact card.",
+    )
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -2667,6 +2674,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            only_task=getattr(args, "task", None),
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2689,6 +2697,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_workspace_busy": [
                 {"task_id": tid, "holder": holder, "workspace": ws}
                 for (tid, holder, ws) in res.skipped_workspace_busy
+            ],
+            "skipped_review_not_dispatchable": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.skipped_review_not_dispatchable
             ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
@@ -2728,6 +2740,19 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred (workspace busy, held by {holder}): {tid} @ {ws}"
             )
+    if res.skipped_review_not_dispatchable:
+        for tid, reason in res.skipped_review_not_dispatchable:
+            if reason == "implementer_reentry":
+                detail = (
+                    "awaiting review; its assignee is the implementer that "
+                    "produced the candidate. Assign a reviewer "
+                    "(kanban request-review --reviewer / assign) or complete "
+                    "it — re-spawning the implementer would move the audit "
+                    "target"
+                )
+            else:
+                detail = reason
+            print(f"Held (review not dispatchable): {tid} — {detail}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
