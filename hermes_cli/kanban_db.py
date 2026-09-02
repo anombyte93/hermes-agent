@@ -5983,12 +5983,6 @@ def _cleanup_worktree_workspace(
         return  # CLI safety predicates unavailable — preserve
     try:
         wp = Path(path).expanduser()
-        if wp.is_symlink():
-            _log.warning(
-                "Refusing to remove symlinked worktree for task %s: %s",
-                task_id, wp,
-            )
-            return
         if not wp.is_dir():
             return
         common = _git_common_dir(wp)
@@ -5998,11 +5992,23 @@ def _cleanup_worktree_workspace(
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
             return  # never remove the main checkout
         managed = repo_root / ".worktrees" / task_id
-        if wp.resolve(strict=False) != managed.resolve(strict=False):
+        if (
+            os.path.abspath(wp) != os.path.abspath(managed)
+            or _worktree_path_has_symlink_component(repo_root, managed)
+        ):
             _log.warning(
                 "Refusing to remove worktree not owned by task %s: %s "
-                "(expected managed path %s)",
+                "(expected unaliased managed path %s)",
                 task_id, wp, managed,
+            )
+            return
+        expected_branch = (branch_name or "").strip() or f"wt/{task_id}"
+        actual_branch = _git_current_branch(wp)
+        if actual_branch != expected_branch:
+            _log.warning(
+                "Refusing to remove worktree for task %s with branch mismatch: "
+                "expected %r, observed %r at %s",
+                task_id, expected_branch, actual_branch or "<detached>", wp,
             )
             return
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
@@ -6029,10 +6035,10 @@ def _cleanup_worktree_workspace(
             )
             return
         _log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
+        auto_branch = f"wt/{task_id}"
+        if actual_branch == auto_branch:
             subprocess.run(
-                ["git", "-C", str(repo_root), "branch", "-D", branch],
+                ["git", "-C", str(repo_root), "branch", "-D", auto_branch],
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 timeout=30,
@@ -7773,10 +7779,26 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _worktree_path_has_symlink_component(repo_root: Path, target: Path) -> bool:
+    """Return whether ``target`` is outside ``repo_root`` or aliases through a symlink."""
+    root = Path(os.path.abspath(repo_root.expanduser()))
+    path = Path(os.path.abspath(target.expanduser()))
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
-    if target.is_symlink():
+    if _worktree_path_has_symlink_component(repo_root, target):
         raise RuntimeError(f"refusing symlinked worktree target: {target}")
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -7909,8 +7931,9 @@ def _resolve_worktree_workspace(
             fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
-            if requested.is_symlink() and os.path.abspath(requested) == os.path.abspath(
-                fallback
+            if (
+                os.path.abspath(requested) == os.path.abspath(fallback)
+                and _worktree_path_has_symlink_component(fallback_root, requested)
             ):
                 raise RuntimeError(
                     f"refusing symlinked canonical worktree path: {requested}"
