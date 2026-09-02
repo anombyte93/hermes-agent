@@ -315,6 +315,61 @@ def test_persisted_canonical_symlink_is_not_adopted_or_cleaned(
     assert _branch_exists(repo, "feature/requested")
 
 
+def test_repo_root_rejects_symlinked_canonical_worktrees_parent(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    external_parent = tmp_path / "external worktrees"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="must not follow canonical parent symlink",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/requested",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    linked = _add_worktree(repo, external_parent / tid, "feature/requested")
+    before = _checkout_snapshot(linked)
+    (repo / ".worktrees").symlink_to(external_parent, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        kb._resolve_worktree_workspace(task)
+
+    assert linked.is_dir()
+    assert _checkout_snapshot(linked) == before
+
+
+def test_cleanup_preserves_checkout_behind_symlinked_canonical_parent(
+    kanban_home, tmp_path
+):
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    repo = _make_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-u", "origin", "main")
+    external_parent = tmp_path / "external worktrees"
+    tid = "t_parent_alias"
+    linked = _add_worktree(repo, external_parent / tid, "feature/requested")
+    _git(linked, "push", "-u", "origin", "feature/requested")
+    before = _checkout_snapshot(linked)
+    (repo / ".worktrees").symlink_to(external_parent, target_is_directory=True)
+
+    kb._cleanup_worktree_workspace(
+        tid, str(repo / ".worktrees" / tid), "feature/requested"
+    )
+
+    assert linked.is_dir()
+    assert _checkout_snapshot(linked) == before
+    assert _branch_exists(repo, "feature/requested")
+
+
 @pytest.mark.parametrize("branch_preexists", [False, True], ids=["created", "pre-existing"])
 def test_post_add_validation_failure_rolls_back_only_created_artifacts(
     kanban_home, tmp_path, monkeypatch, branch_preexists
@@ -402,6 +457,34 @@ def test_branch_mismatch_fails_before_spawn_and_preserves_linked_checkout(
     assert "requested branch 'feature/requested'" in task.last_failure_error
     assert "observed 'feature/observed'" in task.last_failure_error
     assert _checkout_snapshot(occupied) == before
+
+
+def test_cleanup_preserves_clean_canonical_checkout_on_branch_mismatch(
+    kanban_home, tmp_path
+):
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    repo = _make_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-u", "origin", "main")
+    tid = "t_branch_mismatch"
+    stored_branch = f"wt/{tid}"
+    _git(repo, "branch", stored_branch)
+    occupied = _add_worktree(
+        repo, repo / ".worktrees" / tid, "feature/observed"
+    )
+    _git(occupied, "push", "-u", "origin", "feature/observed")
+    before = _checkout_snapshot(occupied)
+
+    kb._cleanup_worktree_workspace(tid, str(occupied), stored_branch)
+
+    assert occupied.is_dir()
+    assert _checkout_snapshot(occupied) == before
+    assert _branch_exists(repo, "feature/observed")
+    assert _branch_exists(repo, stored_branch)
 
 
 
