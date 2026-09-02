@@ -73,6 +73,14 @@ def _current_branch(worktree: Path) -> str:
     ).stdout.strip()
 
 
+def _branch_exists(repo: Path, branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", branch],
+        check=True, capture_output=True, text=True,
+    )
+    return bool(result.stdout.strip())
+
+
 def _checkout_snapshot(worktree: Path) -> tuple[str, bytes, dict[str, bytes]]:
     status = subprocess.run(
         ["git", "-C", str(worktree), "status", "--porcelain=v1", "-z"],
@@ -194,6 +202,74 @@ def test_linked_checkout_with_different_requested_branch_is_not_reused(
     assert branch == "feature/requested"
     assert _current_branch(workspace) == "feature/requested"
     assert _checkout_snapshot(linked) == before
+
+
+def test_external_linked_checkout_on_requested_branch_is_not_adopted(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    linked = _add_worktree(repo, tmp_path / "external checkout", "feature/requested")
+    before = _checkout_snapshot(linked)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="must own workspace",
+            workspace_kind="worktree",
+            workspace_path=str(linked),
+            branch_name="feature/requested",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(RuntimeError, match="git worktree add failed"):
+        kb._resolve_worktree_workspace(task)
+
+    assert _checkout_snapshot(linked) == before
+    assert not (repo / ".worktrees" / tid).exists()
+
+
+def test_cleanup_preserves_external_same_branch_checkout(kanban_home, tmp_path):
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    repo = _make_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-u", "origin", "main")
+    linked = _add_worktree(repo, tmp_path / "external checkout", "feature/requested")
+    before = _checkout_snapshot(linked)
+
+    kb._cleanup_worktree_workspace("t_not_owner", str(linked), "feature/requested")
+
+    assert linked.is_dir()
+    assert _checkout_snapshot(linked) == before
+    assert _branch_exists(repo, "feature/requested")
+
+
+@pytest.mark.parametrize("branch_preexists", [False, True], ids=["created", "pre-existing"])
+def test_post_add_validation_failure_rolls_back_only_created_artifacts(
+    kanban_home, tmp_path, monkeypatch, branch_preexists
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "t_rollback"
+    branch = "feature/rollback"
+    if branch_preexists:
+        _git(repo, "branch", branch)
+
+    def reject_created_worktree(path: Path, requested_branch: str) -> None:
+        assert path == target
+        assert requested_branch == branch
+        raise RuntimeError("forced post-add validation failure")
+
+    monkeypatch.setattr(kb, "_require_worktree_branch", reject_created_worktree)
+
+    with pytest.raises(RuntimeError, match="forced post-add validation failure"):
+        kb._ensure_git_worktree(repo, target, branch)
+
+    assert not target.exists()
+    assert _branch_exists(repo, branch) is branch_preexists
 
 
 def test_dir_workspace_reuses_existing_path_without_branch(kanban_home, tmp_path):
