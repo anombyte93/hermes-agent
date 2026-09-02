@@ -344,6 +344,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.rejected_skills,
         )):
             outcome = "idle"
         invoke_hook(
@@ -8052,6 +8053,9 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    rejected_skills: list[tuple[str, list[str]]] = field(default_factory=list)
+    """Ready tasks rejected before claim/workspace/spawn because one or more
+    force-loaded skill identifiers could not be resolved for the assignee."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9898,6 +9902,46 @@ def dispatch_once(
     return result
 
 
+def _missing_worker_skills(
+    skill_identifiers: Optional[list[str]], assignee: str
+) -> list[str]:
+    """Resolve forced skills in the assignee profile without mutating process env."""
+    if not skill_identifiers:
+        return []
+
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        profile_home = resolve_profile_env(assignee)
+    except FileNotFoundError:
+        return list(dict.fromkeys(skill_identifiers))
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        import json
+
+        from agent.skill_utils import get_disabled_skill_names
+        from tools.skills_tool import skill_view
+
+        disabled = get_disabled_skill_names()
+        missing: list[str] = []
+        for identifier in dict.fromkeys(skill_identifiers):
+            name = (identifier or "").strip()
+            if not name:
+                continue
+            try:
+                loaded = json.loads(skill_view(name, preprocess=False))
+            except Exception:
+                loaded = {}
+            loaded_name = str(loaded.get("name") or name)
+            if not loaded.get("success") or name in disabled or loaded_name in disabled:
+                missing.append(name)
+        return missing
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -10191,6 +10235,13 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        candidate = get_task(conn, row["id"])
+        missing_skills = _missing_worker_skills(
+            candidate.skills if candidate is not None else [], row_assignee
+        )
+        if missing_skills:
+            result.rejected_skills.append((row["id"], missing_skills))
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
