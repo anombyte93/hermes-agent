@@ -248,6 +248,73 @@ def test_cleanup_preserves_external_same_branch_checkout(kanban_home, tmp_path):
     assert _branch_exists(repo, "feature/requested")
 
 
+def test_repo_root_rejects_canonical_symlink_to_external_checkout(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    linked = _add_worktree(repo, tmp_path / "external checkout", "feature/requested")
+    before = _checkout_snapshot(linked)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="must not follow canonical symlink",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/requested",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    managed = repo / ".worktrees" / tid
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    managed.symlink_to(linked, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        kb._resolve_worktree_workspace(task)
+
+    assert managed.is_symlink()
+    assert linked.is_dir()
+    assert _checkout_snapshot(linked) == before
+
+
+def test_persisted_canonical_symlink_is_not_adopted_or_cleaned(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    linked = _add_worktree(repo, tmp_path / "external checkout", "feature/requested")
+    before = _checkout_snapshot(linked)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="retry must not adopt symlink target",
+            workspace_kind="worktree",
+            workspace_path=str(repo / ".worktrees" / "placeholder"),
+            branch_name="feature/requested",
+        )
+        managed = repo / ".worktrees" / tid
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        managed.symlink_to(linked, target_is_directory=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(managed), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(RuntimeError, match="symlink"):
+        kb._resolve_worktree_workspace(task)
+
+    kb._cleanup_worktree_workspace(tid, str(managed), "feature/requested")
+
+    assert managed.is_symlink()
+    assert linked.is_dir()
+    assert _checkout_snapshot(linked) == before
+    assert _branch_exists(repo, "feature/requested")
+
+
 @pytest.mark.parametrize("branch_preexists", [False, True], ids=["created", "pre-existing"])
 def test_post_add_validation_failure_rolls_back_only_created_artifacts(
     kanban_home, tmp_path, monkeypatch, branch_preexists
