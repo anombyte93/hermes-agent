@@ -66,6 +66,26 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
+def _current_branch(worktree: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(worktree), "branch", "--show-current"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _checkout_snapshot(worktree: Path) -> tuple[str, bytes, dict[str, bytes]]:
+    status = subprocess.run(
+        ["git", "-C", str(worktree), "status", "--porcelain=v1", "-z"],
+        check=True, capture_output=True,
+    ).stdout
+    files = {
+        str(path.relative_to(worktree)): path.read_bytes()
+        for path in sorted(worktree.rglob("*"))
+        if path.is_file()
+    }
+    return _current_branch(worktree), status, files
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
@@ -124,6 +144,118 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
+
+
+def test_repo_root_materializes_requested_branch(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="requested branch",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/requested",
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == repo / ".worktrees" / tid
+    assert branch == "feature/requested"
+    assert _current_branch(workspace) == "feature/requested"
+
+
+@pytest.mark.parametrize("dirty", [False, True], ids=["clean", "dirty"])
+def test_linked_checkout_with_different_requested_branch_is_not_reused(
+    kanban_home, tmp_path, dirty
+):
+    repo = _make_repo(tmp_path)
+    linked = _add_worktree(repo, tmp_path / "linked-source", "feature/occupied")
+    if dirty:
+        (linked / "README.md").write_text("dirty tracked file\n", encoding="utf-8")
+        (linked / "untracked.txt").write_bytes(b"dirty untracked file\n")
+    before = _checkout_snapshot(linked)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="must isolate branch",
+            workspace_kind="worktree",
+            workspace_path=str(linked),
+            branch_name="feature/requested",
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == (repo / ".worktrees" / tid).resolve()
+    assert workspace != linked.resolve()
+    assert branch == "feature/requested"
+    assert _current_branch(workspace) == "feature/requested"
+    assert _checkout_snapshot(linked) == before
+
+
+def test_dir_workspace_reuses_existing_path_without_branch(kanban_home, tmp_path):
+    workspace = tmp_path / "shared-dir"
+    workspace.mkdir()
+    sentinel = workspace / "keep.txt"
+    sentinel.write_bytes(b"untouched\n")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="explicit reuse",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task.branch_name is None
+    assert kb.resolve_workspace(task) == workspace
+    assert sentinel.read_bytes() == b"untouched\n"
+
+
+def test_branch_mismatch_fails_before_spawn_and_preserves_linked_checkout(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="fail closed",
+            assignee="default",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/requested",
+        )
+        occupied = _add_worktree(
+            repo, repo / ".worktrees" / tid, "feature/observed"
+        )
+        (occupied / "README.md").write_text("dirty tracked file\n", encoding="utf-8")
+        (occupied / "untracked.txt").write_bytes(b"dirty untracked file\n")
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(occupied), tid),
+        )
+        conn.commit()
+        before = _checkout_snapshot(occupied)
+        spawn_calls = []
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+            reconcile_orphans=False,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned == []
+    assert spawn_calls == []
+    assert task.branch_name == "feature/requested"
+    assert "requested branch 'feature/requested'" in task.last_failure_error
+    assert "observed 'feature/observed'" in task.last_failure_error
+    assert _checkout_snapshot(occupied) == before
 
 
 
