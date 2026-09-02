@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway import dispatcher_heartbeat as _hb
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -1790,6 +1791,8 @@ class GatewayKanbanWatchersMixin:
                 if not _kanban_dispatch_allowed():
                     ready_pending = False
                     bad_ticks = 0
+                    results = []
+                    spawned_count = 0
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
                     # flipping kanban.auto_decompose=false to STOP runaway fan-out
@@ -1799,9 +1802,11 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
+                    spawned_count = 0
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
+                            spawned_count += len(res.spawned)
                             # Quiet by default — only log when something actually
                             # happened, so an idle gateway stays silent.
                             logger.info(
@@ -1821,6 +1826,21 @@ class GatewayKanbanWatchersMixin:
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
+                # Positive dispatcher liveness (issue #9): stamp EVERY tick,
+                # idle or not, so `hermes gateway status` can distinguish "the
+                # dispatcher ticked and the board was idle" from "no
+                # dispatcher is running" — the ambiguity that let ready cards
+                # sit undispatched beside a live but unmanaged gateway while
+                # everything still looked healthy. Best-effort: a diagnostics
+                # field must never be able to break the loop it observes.
+                try:
+                    _hb.record_dispatcher_tick(
+                        boards=[slug for slug, _ in (results or [])],
+                        spawned=spawned_count,
+                    )
+                except Exception:
+                    logger.debug("kanban dispatcher: heartbeat write failed",
+                                 exc_info=True)
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:

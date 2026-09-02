@@ -293,9 +293,10 @@ class TestPortOwner:
         assert "1206662" in text
         assert "astra" in text
         # No argv, no environment, no secret material — the description is
-        # built from the value-safe fields only.
+        # built from the value-safe fields only. (`--profile` in the remedy is
+        # the suggested CLI command, not the owner's own command line.)
         lowered = text.lower()
-        for banned in ("token", "secret", "api_key", "--", "env["):
+        for banned in ("token", "secret", "api_key", "password", "environ", "argv"):
             assert banned not in lowered
 
     def test_owner_record_exposes_no_argv_or_environment_fields(self):
