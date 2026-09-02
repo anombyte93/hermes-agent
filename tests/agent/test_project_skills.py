@@ -30,6 +30,7 @@ def project_env(tmp_path, monkeypatch):
     )
 
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.chdir(repo)
     su._external_dirs_cache_clear()
     yield {"home": home, "repo": repo, "config": config}
@@ -126,13 +127,12 @@ class TestPrecedence:
         p = project_env["repo"] / ".hermes" / "skills" / "repo-skill" / "SKILL.md"
         assert su.is_external_skill_path(p) is True
 
-    def test_get_all_skills_dirs_unchanged(self, project_env):
-        # Backward-compat contract: local first, no project tier here.
+    def test_get_all_skills_dirs_excludes_project_tier(self, project_env):
+        # Local stays first; trusted project roots remain scan-order-only.
         _trust(project_env["config"], project_env["repo"])
         dirs = su.get_all_skills_dirs()
         assert dirs[0] == su.get_skills_dir()
-        for d in dirs:
-            assert ".agents" not in str(d)
+        assert project_env["repo"] / ".agents" / "skills" not in dirs
 
 
 class TestNonInteractiveInheritance:
