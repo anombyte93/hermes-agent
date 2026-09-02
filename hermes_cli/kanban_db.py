@@ -8092,7 +8092,16 @@ class DispatchResult:
     (or the two can clobber each other's commits). NOT operator-actionable —
     the deferred task is picked up on a later tick once the holder finishes,
     is reclaimed, or is completed. No task-body content is recorded, only
-    ids and the path."""
+    ids and the path.
+
+    SCOPE — SINGLE BOARD. This lease is seeded from the *current board's*
+    ``tasks`` table only, and the dispatch lock it runs under is keyed per
+    board DB path. Two cards on DIFFERENT boards naming one directory can
+    still spawn concurrently; that shape is a KNOWN LIMITATION, not a
+    regression (issue #5's reproduction was single-board). Cross-board
+    workspace ownership needs a walk over sibling board DBs — the pattern
+    ``count_running_tasks_other_boards`` already uses — and is tracked
+    separately rather than smuggled into this slice."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9853,6 +9862,18 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 # serialises ticks, so a tick-local map is sufficient to make one pass unable
 # to race itself. Completion, reclaim and TTL release the workspace naturally,
 # because the holder leaves ``running`` and the next tick reseeds the map.
+#
+# SCOPE LIMIT — SINGLE BOARD. Both halves of that boundary are per-board: the
+# lease map is seeded from THIS board's ``tasks`` table, and
+# ``_dispatch_tick_lock`` is keyed on the board's DB path. Two cards living on
+# DIFFERENT boards that name one directory therefore both spawn — each tick is
+# individually correct and neither can see the other's claim. Issue #5's
+# reproduction was single-board, so this is a documented KNOWN LIMITATION of
+# this slice, not a regression; it is deliberately NOT fixed here because a
+# cross-board guard needs a walk over sibling board DBs (the pattern
+# ``count_running_tasks_other_boards`` uses) plus a cross-board lock ordering
+# decision, which is a different risk surface. Do not read the phrase "across
+# the board" below as a cross-board guarantee.
 
 
 def _canonical_workspace_key(path: Optional[str]) -> Optional[str]:
@@ -9884,6 +9905,10 @@ def _seed_workspace_leases(conn: sqlite3.Connection) -> dict[str, str]:
     worker spawned by an EARLIER tick still holds its workspace against this
     one. Reclaim/completion move the task out of ``running`` and therefore
     release the lease on the next tick with no extra bookkeeping.
+
+    SINGLE-BOARD: ``conn`` is this board's DB, so holders on other boards are
+    invisible here by construction. See the scope-limit note above
+    ``_canonical_workspace_key``.
     """
     leases: dict[str, str] = {}
     for row in conn.execute(
@@ -10251,10 +10276,11 @@ def _dispatch_once_locked(
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Workspace lease (issue #5): at most one active claim per canonical
-    # workspace, spanning BOTH the ready and review queues so one pass can
-    # never race itself. Seeded from tasks already running (an earlier
-    # tick's worker still holds its directory), then extended by this
-    # tick's own spawns.
+    # workspace, spanning BOTH the ready and review queues of THIS board so
+    # one pass can never race itself. Seeded from tasks already running (an
+    # earlier tick's worker still holds its directory), then extended by
+    # this tick's own spawns. Single-board scope — see the scope-limit note
+    # on the lease helpers above; a holder on another board is not visible.
     _workspace_leases = _seed_workspace_leases(conn)
 
     def _workspace_busy_holder(
@@ -10275,16 +10301,44 @@ def _dispatch_once_locked(
 
         The event payload carries ids and the canonical path only — never
         task-body content, per the issue's diagnostic contract.
+
+        BOUNDED (review follow-up). The in-memory ``result`` bucket is
+        per-tick and always appended, so the operator surface still reports
+        every deferral on the tick they ask about. The DURABLE event is
+        written only when the situation CHANGES: a contended card facing one
+        long-lived holder would otherwise accrue one row per tick — at the
+        default 60s dispatch interval, ~1,440 rows/day per contended card,
+        for a fact whose information content is constant. We therefore write
+        the row only when the task's most recent event is not already an
+        identical ``workspace_busy`` (same holder, same workspace). Keying
+        the check on the LAST event of any kind rather than the last
+        ``workspace_busy`` is deliberate: any intervening lifecycle activity
+        (claim, reclaim, comment, status change) means the card's story moved
+        on, and the next deferral is genuinely new information worth a row.
         """
         result.skipped_workspace_busy.append((task_id, holder, key))
         if dry_run:
             return
+        payload = {"holder": holder, "workspace": key}
         try:
+            last = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if last is not None and last["kind"] == "workspace_busy":
+                try:
+                    if json.loads(last["payload"] or "{}") == payload:
+                        # Unchanged holder and path since the last event on
+                        # this card: the durable record already says exactly
+                        # this. Suppress the duplicate row.
+                        return
+                except (TypeError, ValueError):
+                    # Unparseable prior payload — fall through and write, so
+                    # a corrupt row can never silence the diagnostic.
+                    pass
             with write_txn(conn):
-                _append_event(
-                    conn, task_id, "workspace_busy",
-                    {"holder": holder, "workspace": key},
-                )
+                _append_event(conn, task_id, "workspace_busy", payload)
         except Exception:
             _log.debug(
                 "kanban dispatch: failed to record workspace_busy for %s",
