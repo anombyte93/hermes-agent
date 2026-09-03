@@ -7,14 +7,16 @@ on:
 jobs:
   check:
     name: JS & TS checks
-    # One 32-core job replaces a 14-leg matrix. The matrix spread about 612s
-    # of check payload over 4-core runners. It paid about 371s of repeated
+    # One job replaces a 14-leg matrix. The matrix spread about 612s of check
+    # payload across runners and paid about 371s of repeated
     # setup to do it: 14 checkouts, 14 node installs, 14 node_modules
     # restores.
     #
-    # One larger runner installs one time. vitest, tsc and eslint each size
-    # their own worker pool from the core count.
-    runs-on: ubuntu-latest-32-core
+    # The standard hosted runner installs one time. Run one outer check at a
+    # time so its vitest, tsc, eslint, Vite and esbuild children share the same
+    # four-core runner budget instead of each sizing an inner pool while four
+    # peer checks compete for those cores.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,7 +64,20 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
+      # Temporary diagnostic for issue #15 follow-up. This commit is pushed
+      # only to obtain repeated constrained-runner evidence, then removed.
+      - name: Repeat ui-tui offset-cache timing control on one CPU
+        run: |
+          set -euo pipefail
+          npm run --prefix ui-tui build:ink
+          for attempt in $(seq 1 20); do
+            echo "control attempt ${attempt}/20"
+            taskset --cpu-list 0 npm run --prefix ui-tui test -- \
+              src/__tests__/virtualHistoryOffsetCache.test.ts \
+              -t 'corrects and compensates a same-layout row measured at unmount'
+          done
+
+      # Every check runs, one at a time, and the step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
@@ -80,4 +95,4 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1
