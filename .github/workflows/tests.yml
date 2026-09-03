@@ -91,32 +91,12 @@ jobs:
         #
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
+        # Limit concurrent test-file processes to the runner's actual CPU count
+        # so the same command scales without oversubscribing smaller hosts.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          HERMES_TEST_WORKERS="$(nproc)" scripts/run_tests.sh
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess for each file
-          # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # The 96-worker threshold below is intentionally preserved by this
-          # runner-routing fix; changing test parallelism is a separate concern.
-          #
-          # Originally measured on a 96-core EPYC 7763 runner. Whole suite,
-          # two repetitions for each value. See run 32549672063:
-          #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
