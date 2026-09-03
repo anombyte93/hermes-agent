@@ -342,6 +342,7 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.skipped_workspace_busy,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
             result.rejected_skills,
@@ -8208,6 +8209,27 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_workspace_busy: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks left unclaimed this tick because another active task already
+    holds their canonical workspace (issue #5). Each entry is
+    ``(task_id, holder_task_id, canonical_workspace_path)``.
+
+    The lease spans BOTH the ready and review queues and is exclusive: two
+    workers must never run concurrently in one resolved directory, because a
+    reviewer can otherwise observe a tree the implementer is still mutating
+    (or the two can clobber each other's commits). NOT operator-actionable —
+    the deferred task is picked up on a later tick once the holder finishes,
+    is reclaimed, or is completed. No task-body content is recorded, only
+    ids and the path.
+
+    SCOPE — SINGLE BOARD. This lease is seeded from the *current board's*
+    ``tasks`` table only, and the dispatch lock it runs under is keyed per
+    board DB path. Two cards on DIFFERENT boards naming one directory can
+    still spawn concurrently; that shape is a KNOWN LIMITATION, not a
+    regression (issue #5's reproduction was single-board). Cross-board
+    workspace ownership needs a walk over sibling board DBs — the pattern
+    ``count_running_tasks_other_boards`` already uses — and is tracked
+    separately rather than smuggled into this slice."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9944,6 +9966,151 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Workspace lease (issue #5)
+#
+# One dispatcher pass independently walks the ready queue and the review
+# queue. Both queues can name the SAME directory — the canonical shape is an
+# implementation card sitting in ``review`` beside a separate reviewer card
+# pointed at the implementer's worktree. Before this guard the tick claimed
+# and spawned both, so two agents edited, committed, cleaned or tested in one
+# checkout concurrently; a reviewer could then attribute the implementer's
+# in-flight writes to the candidate, or corrupt the evidence it exists to
+# verify.
+#
+# The lease is keyed on the CANONICAL (symlink-resolved, normalised)
+# workspace path, so ``/repo/wt``, ``/repo/./wt`` and a symlink pointing at
+# either are one workspace, and it is EXCLUSIVE: there is deliberately no
+# multi-reader exception in this slice, because ``sdlc-review`` is not a
+# structural read-only boundary.
+#
+# Scope: a single dispatcher tick, seeded from the tasks already ``running``
+# when the tick starts. It is a scheduling guard, not a filesystem lock — the
+# board-scoped single-writer dispatch lock (``_dispatch_tick_lock``) already
+# serialises ticks, so a tick-local map is sufficient to make one pass unable
+# to race itself. Completion, reclaim and TTL release the workspace naturally,
+# because the holder leaves ``running`` and the next tick reseeds the map.
+#
+# SCOPE LIMIT — SINGLE BOARD. Both halves of that boundary are per-board: the
+# lease map is seeded from THIS board's ``tasks`` table, and
+# ``_dispatch_tick_lock`` is keyed on the board's DB path. Two cards living on
+# DIFFERENT boards that name one directory therefore both spawn — each tick is
+# individually correct and neither can see the other's claim. Issue #5's
+# reproduction was single-board, so this is a documented KNOWN LIMITATION of
+# this slice, not a regression; it is deliberately NOT fixed here because a
+# cross-board guard needs a walk over sibling board DBs (the pattern
+# ``count_running_tasks_other_boards`` uses) plus a cross-board lock ordering
+# decision, which is a different risk surface. Do not read the phrase "across
+# the board" below as a cross-board guarantee.
+
+
+def _canonical_workspace_key(path: Optional[str]) -> Optional[str]:
+    """Return the canonical lease key for ``path``, or None when unkeyable.
+
+    Aliases of one directory (``..`` segments, ``.`` segments, trailing
+    slashes, symlinks, ``~``) must collapse to a single key or the lease can
+    be trivially bypassed by how a task happened to spell its workspace.
+    ``strict=False`` so a workspace that has not been materialised yet still
+    keys consistently.
+    """
+    if not path:
+        return None
+    text = str(path).strip()
+    if not text:
+        return None
+    try:
+        return os.path.normcase(str(Path(text).expanduser().resolve(strict=False)))
+    except (OSError, ValueError, RuntimeError):
+        # Never let an exotic path break dispatch; an unkeyable workspace
+        # simply gets no lease (the pre-#5 behaviour) rather than a crash.
+        return None
+
+
+def _seed_workspace_leases(conn: sqlite3.Connection) -> dict[str, str]:
+    """Map canonical workspace path -> holding task id for live claims.
+
+    Seeded from tasks already ``running`` at the top of the tick, so a
+    worker spawned by an EARLIER tick still holds its workspace against this
+    one. Reclaim/completion move the task out of ``running`` and therefore
+    release the lease on the next tick with no extra bookkeeping.
+
+    SINGLE-BOARD: ``conn`` is this board's DB, so holders on other boards are
+    invisible here by construction. See the scope-limit note above
+    ``_canonical_workspace_key``.
+    """
+    leases: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT id, workspace_path FROM tasks "
+        "WHERE status = 'running' AND workspace_path IS NOT NULL"
+    ):
+        key = _canonical_workspace_key(row["workspace_path"])
+        if key is not None:
+            leases.setdefault(key, row["id"])
+    return leases
+
+
+def _predicted_workspace_key(
+    task_id: str,
+    workspace_kind: Optional[str],
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+) -> Optional[str]:
+    """Predict a task's canonical workspace key WITHOUT materialising it.
+
+    Used for the pre-claim half of the lease so a contended task is left
+    genuinely unclaimed (issue #5 requirement 3) rather than claimed and
+    rolled back. Read-only: it inspects git state but never creates a
+    worktree or a directory.
+
+    Returns ``None`` when the task is guaranteed to resolve to a path unique
+    to itself (a scratch dir under the board root, or a worktree anchored on
+    a repo root which materialises at ``<repo>/.worktrees/<task-id>``). A
+    ``None`` prediction is not "no lease" — the post-resolution confirm in
+    the dispatch loop still checks the REAL resolved path before spawning.
+    """
+    kind = (workspace_kind or "scratch").strip() or "scratch"
+    raw = (workspace_path or "").strip()
+    if kind in ("scratch", "dir"):
+        # Scratch with no explicit path lands under <board>/workspaces/<id>,
+        # which is unique per task by construction.
+        return _canonical_workspace_key(raw) if raw else None
+    if kind != "worktree":
+        return None
+    if not raw:
+        # Anchored on the board default_workdir -> <repo>/.worktrees/<id>.
+        return None
+    try:
+        requested = Path(raw).expanduser()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not requested.is_absolute():
+        return None
+    branch = (branch_name or "").strip() or f"wt/{task_id}"
+    try:
+        if requested.exists() and _is_linked_worktree_checkout(requested):
+            if _git_current_branch(requested) == branch:
+                return _canonical_workspace_key(str(requested))
+            # The path is an existing checkout of a DIFFERENT branch. The
+            # resolver falls back to this task's own
+            # <repo>/.worktrees/<task-id> when a repo anchor exists — this
+            # is how decompose siblings (which inherit workspace_path
+            # verbatim) legitimately run concurrently, so predicting a
+            # shared key here would wrongly serialise them.
+            fallback_root = _repo_root_for_worktree_target(requested.parent)
+            if fallback_root is not None:
+                fallback = fallback_root / ".worktrees" / task_id
+                if fallback.resolve(strict=False) != requested.resolve(strict=False):
+                    return None
+            return _canonical_workspace_key(str(requested))
+        repo_root = _git_toplevel(requested)
+        if repo_root is not None and requested.resolve(strict=False) == repo_root:
+            # Repo root is an ANCHOR: materialises <repo>/.worktrees/<id>.
+            return None
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return _canonical_workspace_key(str(requested))
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10213,7 +10380,8 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, workspace_kind, workspace_path, branch_name "
+        "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10222,7 +10390,8 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, workspace_kind, workspace_path, branch_name "
+            "FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10274,6 +10443,76 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Workspace lease (issue #5): at most one active claim per canonical
+    # workspace, spanning BOTH the ready and review queues of THIS board so
+    # one pass can never race itself. Seeded from tasks already running (an
+    # earlier tick's worker still holds its directory), then extended by
+    # this tick's own spawns. Single-board scope — see the scope-limit note
+    # on the lease helpers above; a holder on another board is not visible.
+    _workspace_leases = _seed_workspace_leases(conn)
+
+    def _workspace_busy_holder(
+        task_id: str, key: Optional[str],
+    ) -> Optional[str]:
+        """Return the holding task id when ``key`` is leased by someone else."""
+        if key is None:
+            return None
+        holder = _workspace_leases.get(key)
+        if holder is None or holder == task_id:
+            return None
+        return holder
+
+    def _record_workspace_busy(
+        task_id: str, holder: str, key: str,
+    ) -> None:
+        """Defer ``task_id`` this tick and record an auditable diagnostic.
+
+        The event payload carries ids and the canonical path only — never
+        task-body content, per the issue's diagnostic contract.
+
+        BOUNDED (review follow-up). The in-memory ``result`` bucket is
+        per-tick and always appended, so the operator surface still reports
+        every deferral on the tick they ask about. The DURABLE event is
+        written only when the situation CHANGES: a contended card facing one
+        long-lived holder would otherwise accrue one row per tick — at the
+        default 60s dispatch interval, ~1,440 rows/day per contended card,
+        for a fact whose information content is constant. We therefore write
+        the row only when the task's most recent event is not already an
+        identical ``workspace_busy`` (same holder, same workspace). Keying
+        the check on the LAST event of any kind rather than the last
+        ``workspace_busy`` is deliberate: any intervening lifecycle activity
+        (claim, reclaim, comment, status change) means the card's story moved
+        on, and the next deferral is genuinely new information worth a row.
+        """
+        result.skipped_workspace_busy.append((task_id, holder, key))
+        if dry_run:
+            return
+        payload = {"holder": holder, "workspace": key}
+        try:
+            last = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if last is not None and last["kind"] == "workspace_busy":
+                try:
+                    if json.loads(last["payload"] or "{}") == payload:
+                        # Unchanged holder and path since the last event on
+                        # this card: the durable record already says exactly
+                        # this. Suppress the duplicate row.
+                        return
+                except (TypeError, ValueError):
+                    # Unparseable prior payload — fall through and write, so
+                    # a corrupt row can never silence the diagnostic.
+                    pass
+            with write_txn(conn):
+                _append_event(conn, task_id, "workspace_busy", payload)
+        except Exception:
+            _log.debug(
+                "kanban dispatch: failed to record workspace_busy for %s",
+                task_id, exc_info=True,
+            )
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10401,9 +10640,22 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Workspace lease pre-check (issue #5): predicted from the stored
+        # row, so a contended task is left genuinely UNCLAIMED rather than
+        # claimed and rolled back.
+        predicted_key = _predicted_workspace_key(
+            row["id"], row["workspace_kind"], row["workspace_path"],
+            row["branch_name"],
+        )
+        holder = _workspace_busy_holder(row["id"], predicted_key)
+        if holder is not None:
+            _record_workspace_busy(row["id"], holder, predicted_key or "")
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
+            if predicted_key is not None:
+                _workspace_leases.setdefault(predicted_key, row["id"])
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -10432,6 +10684,22 @@ def _dispatch_once_locked(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        # Workspace lease confirm (issue #5): the pre-check works from the
+        # STORED row; resolution can land somewhere else (anchor -> per-task
+        # worktree, alias collapse, board default_workdir). Re-check the
+        # REAL canonical path and release the claim rather than spawn a
+        # second worker into an occupied directory.
+        resolved_key = _canonical_workspace_key(str(workspace))
+        holder = _workspace_busy_holder(claimed.id, resolved_key)
+        if holder is not None:
+            _record_workspace_busy(claimed.id, holder, resolved_key or "")
+            reclaim_task(
+                conn, claimed.id, reason="workspace_busy",
+                signal_fn=lambda *_a, **_k: None,
+            )
+            continue
+        if resolved_key is not None:
+            _workspace_leases.setdefault(resolved_key, claimed.id)
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -10532,9 +10800,19 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        predicted_key = _predicted_workspace_key(
+            row["id"], row["workspace_kind"], row["workspace_path"],
+            row["branch_name"],
+        )
+        holder = _workspace_busy_holder(row["id"], predicted_key)
+        if holder is not None:
+            _record_workspace_busy(row["id"], holder, predicted_key or "")
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
+            if predicted_key is not None:
+                _workspace_leases.setdefault(predicted_key, row["id"])
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
@@ -10559,6 +10837,18 @@ def _dispatch_once_locked(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        # Workspace lease confirm (issue #5) — see the ready-lane comment.
+        resolved_key = _canonical_workspace_key(str(workspace))
+        holder = _workspace_busy_holder(claimed.id, resolved_key)
+        if holder is not None:
+            _record_workspace_busy(claimed.id, holder, resolved_key or "")
+            reclaim_task(
+                conn, claimed.id, reason="workspace_busy",
+                signal_fn=lambda *_a, **_k: None,
+            )
+            continue
+        if resolved_key is not None:
+            _workspace_leases.setdefault(resolved_key, claimed.id)
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
