@@ -14,14 +14,10 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
-    #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
-    runs-on: ubuntu-latest-96-core
+    # Keep the suite in one job to avoid the matrix, duration cache, per-slice
+    # artifacts and merge job that slicing requires. Use the standard hosted
+    # runner label so public-repository workflows can schedule it.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -102,9 +98,10 @@ jobs:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
+          # The 96-worker threshold below is intentionally preserved by this
+          # runner-routing fix; changing test parallelism is a separate concern.
           #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
+          # Originally measured on a 96-core EPYC 7763 runner. Whole suite,
           # two repetitions for each value. See run 32549672063:
           #
           #     workers   x cores   mean
