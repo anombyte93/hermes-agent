@@ -2,6 +2,11 @@ name: Tests
 
 on:
   workflow_call:
+    inputs:
+      slice_count:
+        description: Number of parallel duration-balanced test slices
+        type: number
+        default: 8
 
 permissions:
   contents: read
@@ -12,13 +17,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  generate:
+    name: Generate test slices
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations
+          restore-keys: |
+            test-durations-
+
+      - name: Generate duration-balanced matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          MATRIX=$(python3 scripts/run_tests_parallel.py --generate-slices ${{ inputs.slice_count }})
+          test -n "$MATRIX"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
   test:
-    name: Run tests
-    # Keep the suite in one job to avoid the matrix, duration cache, per-slice
-    # artifacts and merge job that slicing requires. Use the standard hosted
-    # runner label so public-repository workflows can schedule it.
+    name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
+    needs: generate
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -83,24 +115,81 @@ jobs:
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
-      - name: Run tests
+      - name: Run tests (slice ${{ matrix.slice.index }}/${{ inputs.slice_count }})
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
-        #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
-        # Limit concurrent test-file processes to the runner's actual CPU count
-        # so the same command scales without oversubscribing smaller hosts.
+        # The generator discovers the complete suite once, then assigns every
+        # file to exactly one LPT slice. Each standard four-core runner keeps
+        # one test-file process per core instead of oversubscribing itself.
         run: |
           source .venv/bin/activate
-          HERMES_TEST_WORKERS="$(nproc)" scripts/run_tests.sh
+          HERMES_TEST_WORKERS="$(nproc)" scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Upload per-slice durations
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-durations-slice-${{ matrix.slice.index }}
+          path: test_durations.json
+          if-no-files-found: error
+          retention-days: 1
+
+  test-result:
+    name: Require every test slice
+    needs: [generate, test]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every slice
+        env:
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          test "$GENERATE_RESULT" = success
+          test "$TEST_RESULT" = success
+
+  save-durations:
+    name: Save merged test durations
+    needs: [test, test-result]
+    if: ${{ needs.test.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all slice durations
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: test-durations-slice-*
+          path: durations
+
+      - name: Merge into single durations file
+        run: |
+          python3 -c "
+          import glob, json
+          merged = {}
+          for filename in glob.glob('durations/*/test_durations.json'):
+              with open(filename) as handle:
+                  merged.update(json.load(handle))
+          if not merged:
+              raise SystemExit('no per-slice durations found')
+          with open('test_durations.json', 'w') as handle:
+              json.dump(merged, handle, indent=2, sort_keys=True)
+          print(f'Merged {len(merged)} file durations')
+          "
+
+      - name: Save merged duration cache
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-${{ github.run_id }}
 
   e2e:
     runs-on: ubuntu-latest

@@ -12,8 +12,10 @@ jobs:
     # setup to do it: 14 checkouts, 14 node installs, 14 node_modules
     # restores.
     #
-    # The standard hosted runner installs one time. vitest, tsc and eslint each
-    # size their own worker pool from the available core count.
+    # The standard hosted runner installs one time. Run one outer check at a
+    # time so its vitest, tsc, eslint, Vite and esbuild children share the same
+    # four-core runner budget instead of each sizing an inner pool while four
+    # peer checks compete for those cores.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -62,7 +64,7 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
+      # Every check runs, one at a time, and the step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
@@ -80,4 +82,4 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1

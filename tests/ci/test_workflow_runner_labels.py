@@ -16,7 +16,8 @@ STANDARD_PUBLIC_RUNNER_LABELS = {
     "windows-latest",
 }
 RUNNER_EXPRESSION = re.compile(
-    r"^\$\{\{\s*(matrix|inputs)\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}$"
+    r"^\$\{\{\s*(matrix|inputs)\."
+    r"([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)\s*\}\}$"
 )
 
 
@@ -27,6 +28,14 @@ class _MarkedString(str):
         instance = super().__new__(cls, value)
         instance.line = line
         return instance
+
+
+class _MarkedList(list[Any]):
+    line: int
+
+
+class _MarkedMapping(dict[Any, Any]):
+    line: int
 
 
 class _WorkflowLoader(yaml.SafeLoader):
@@ -42,7 +51,8 @@ def _construct_marked_string(
 def _construct_unique_mapping(
     loader: _WorkflowLoader, node: yaml.nodes.MappingNode, deep: bool = False
 ) -> dict[Any, Any]:
-    mapping: dict[Any, Any] = {}
+    mapping = _MarkedMapping()
+    mapping.line = node.start_mark.line + 1
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
         if key in mapping:
@@ -56,11 +66,22 @@ def _construct_unique_mapping(
     return mapping
 
 
+def _construct_marked_sequence(
+    loader: _WorkflowLoader, node: yaml.nodes.SequenceNode, deep: bool = False
+) -> _MarkedList:
+    sequence = _MarkedList(loader.construct_sequence(node, deep=deep))
+    sequence.line = node.start_mark.line + 1
+    return sequence
+
+
 _WorkflowLoader.add_constructor(
     "tag:yaml.org,2002:str", _construct_marked_string
 )
 _WorkflowLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+_WorkflowLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_SEQUENCE_TAG, _construct_marked_sequence
 )
 
 
@@ -84,6 +105,11 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
         if finding not in unsupported:
             unsupported.append(finding)
 
+    def key_source(mapping: Any, name: str, fallback: Any) -> Any:
+        if isinstance(mapping, dict):
+            return next((key for key in mapping if key == name), fallback)
+        return fallback
+
     documents: dict[Path, Any] = {}
     for workflow in workflows:
         try:
@@ -101,6 +127,9 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
 
     def check_literal(workflow: Path, value: Any, source: Any) -> None:
         if isinstance(value, list):
+            if not value:
+                report(workflow, value, "unresolved runner source: empty list")
+                return
             for item in value:
                 check_literal(workflow, item, item)
             return
@@ -111,6 +140,36 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
             report(workflow, source, f"unresolved runner source: {value}")
         elif value not in STANDARD_PUBLIC_RUNNER_LABELS:
             report(workflow, value, str(value))
+
+    def resolve_path(
+        workflow: Path,
+        values: list[Any],
+        path: list[str],
+        display_name: str,
+    ) -> list[Any]:
+        current = values
+        for segment in path:
+            resolved: list[Any] = []
+            for value in current:
+                candidates = value if isinstance(value, list) else [value]
+                if isinstance(value, list) and not value:
+                    report(
+                        workflow,
+                        value,
+                        f"unresolved runner source: {display_name} is missing",
+                    )
+                    continue
+                for candidate in candidates:
+                    if isinstance(candidate, dict) and segment in candidate:
+                        resolved.append(candidate[segment])
+                    else:
+                        report(
+                            workflow,
+                            candidate,
+                            f"unresolved runner source: {display_name} is missing",
+                        )
+            current = resolved
+        return current
 
     def check_runs_on(
         workflow: Path,
@@ -127,27 +186,48 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
             check_literal(workflow, value, value)
             return
 
-        namespace, name = expression.groups()
+        namespace, dotted_name = expression.groups()
+        path = dotted_name.split(".")
+        name = path[0]
+        display_name = f"{namespace}.{dotted_name}"
         sources: list[Any] = []
         resolved_from_caller = False
         if namespace == "matrix":
-            matrix = job.get("strategy", {}).get("matrix", {})
-            if isinstance(matrix, dict):
-                has_direct_axis = name in matrix
-                if has_direct_axis:
-                    sources.append(matrix[name])
-                include = matrix.get("include", [])
-                if isinstance(include, list):
-                    for entry in include:
-                        if isinstance(entry, dict) and name in entry:
-                            sources.append(entry[name])
-                        elif isinstance(entry, dict) and not has_direct_axis:
-                            location = next(iter(entry.values()), value)
-                            report(
-                                workflow,
-                                location,
-                                f"unresolved runner source: matrix.{name} is missing",
-                            )
+            strategy = job.get("strategy")
+            if not isinstance(strategy, dict):
+                report(
+                    workflow,
+                    key_source(job, "strategy", value),
+                    "malformed strategy: expected mapping",
+                )
+                return
+            matrix = strategy.get("matrix")
+            if not isinstance(matrix, dict):
+                if isinstance(matrix, str) and "${{" in matrix:
+                    report(workflow, value, f"unresolved runner source: {value}")
+                else:
+                    report(
+                        workflow,
+                        key_source(strategy, "matrix", strategy),
+                        "malformed matrix: expected mapping or expression",
+                    )
+                return
+
+            has_direct_axis = name in matrix
+            if has_direct_axis:
+                sources.extend(
+                    resolve_path(
+                        workflow,
+                        [matrix[name]],
+                        path[1:],
+                        display_name,
+                    )
+                )
+            include = matrix.get("include", [])
+            if isinstance(include, list) and not has_direct_axis:
+                sources.extend(
+                    resolve_path(workflow, include, path, display_name)
+                )
         else:
             has_default = False
             trigger = document.get("on", document.get(True, {}))
@@ -158,7 +238,14 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
                     declaration = inputs.get(name, {}) if isinstance(inputs, dict) else {}
                     if isinstance(declaration, dict) and "default" in declaration:
                         has_default = True
-                        sources.append(declaration["default"])
+                        sources.extend(
+                            resolve_path(
+                                workflow,
+                                [declaration["default"]],
+                                path[1:],
+                                display_name,
+                            )
+                        )
 
             for caller_workflow, caller_document in documents.items():
                 if not isinstance(caller_document, dict):
@@ -175,18 +262,25 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
                     supplied = caller_job.get("with", {})
                     if isinstance(supplied, dict) and name in supplied:
                         resolved_from_caller = True
-                        check_runs_on(
+                        resolved = resolve_path(
                             caller_workflow,
-                            caller_document,
-                            caller_job,
-                            supplied[name],
+                            [supplied[name]],
+                            path[1:],
+                            display_name,
                         )
+                        for source in resolved:
+                            check_runs_on(
+                                caller_workflow,
+                                caller_document,
+                                caller_job,
+                                source,
+                            )
                     elif not has_default:
                         resolved_from_caller = True
                         report(
                             caller_workflow,
                             uses,
-                            f"unresolved runner source: input {name} is not supplied",
+                            f"unresolved runner source: input {dotted_name} is not supplied",
                         )
 
         if not sources and not resolved_from_caller:
@@ -195,22 +289,28 @@ def _unsupported_runner_labels(workflows: list[Path]) -> list[str]:
         for source in sources:
             check_literal(workflow, source, source)
 
-    def walk(workflow: Path, document: dict[str, Any], value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key == "runs-on":
-                    check_runs_on(workflow, document, value, child)
-                else:
-                    walk(workflow, document, child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(workflow, document, child)
-
     for workflow, document in documents.items():
         if not isinstance(document, dict):
             report(workflow, "", "unresolved workflow document")
             continue
-        walk(workflow, document, document)
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            report(
+                workflow,
+                key_source(document, "jobs", document),
+                "malformed jobs: expected mapping",
+            )
+            continue
+        for job_name, job in jobs.items():
+            if not isinstance(job, dict):
+                report(
+                    workflow,
+                    job_name,
+                    f"malformed job {job_name}: expected mapping",
+                )
+                continue
+            if "runs-on" in job:
+                check_runs_on(workflow, document, job, job["runs-on"])
     return unsupported
 
 
@@ -230,10 +330,13 @@ def test_checker_accepts_standard_public_runner_labels(tmp_path: Path) -> None:
 
 def test_checker_rejects_unavailable_private_size_label(tmp_path: Path) -> None:
     workflow = tmp_path / "known-bad.yml"
-    workflow.write_text("runs-on: ubuntu-latest-32-core\n", encoding="utf-8")
+    workflow.write_text(
+        "jobs:\n  test:\n    runs-on: ubuntu-latest-32-core\n",
+        encoding="utf-8",
+    )
 
     assert _unsupported_runner_labels([workflow]) == [
-        "known-bad.yml:1: ubuntu-latest-32-core"
+        "known-bad.yml:3: ubuntu-latest-32-core"
     ]
 
 
@@ -398,20 +501,172 @@ def test_checker_reports_unresolved_runner_expression(tmp_path: Path) -> None:
     )
 
 
-def test_python_suite_derives_worker_count_from_runner_cpu() -> None:
+def test_checker_ignores_nested_non_job_runs_on_keys(tmp_path: Path) -> None:
+    workflow = _write_workflow(
+        tmp_path,
+        "action-input.yml",
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - uses: example/action@v1\n"
+        "        with:\n          runs-on: arbitrary-action-input\n",
+    )
+
+    assert _unsupported_runner_labels([workflow]) == []
+
+
+def test_checker_resolves_nested_matrix_runner_literals(tmp_path: Path) -> None:
+    workflow = _write_workflow(
+        tmp_path,
+        "nested-matrix.yml",
+        "jobs:\n  test:\n    runs-on: ${{ matrix.config.runner }}\n"
+        "    strategy:\n      matrix:\n        config:\n"
+        "          - runner: ubuntu-latest\n"
+        "          - runner: windows-latest\n",
+    )
+
+    assert _unsupported_runner_labels([workflow]) == []
+
+
+def test_checker_rejects_nested_matrix_private_runner_literal(tmp_path: Path) -> None:
+    workflow = _write_workflow(
+        tmp_path,
+        "nested-matrix-private.yml",
+        "jobs:\n  test:\n    runs-on: ${{ matrix.config.runner }}\n"
+        "    strategy:\n      matrix:\n        config:\n"
+        "          - runner: ubuntu-latest\n"
+        "          - runner: ubuntu-latest-32-core\n",
+    )
+
+    assert any(
+        finding.startswith("nested-matrix-private.yml:8:")
+        and "ubuntu-latest-32-core" in finding
+        for finding in _unsupported_runner_labels([workflow])
+    )
+
+
+def test_checker_reports_missing_nested_matrix_runner(tmp_path: Path) -> None:
+    workflow = _write_workflow(
+        tmp_path,
+        "nested-matrix-missing.yml",
+        "jobs:\n  test:\n    runs-on: ${{ matrix.config.runner }}\n"
+        "    strategy:\n      matrix:\n        config:\n"
+        "          - runner: ubuntu-latest\n"
+        "          - image: windows\n",
+    )
+
+    assert any(
+        finding.startswith("nested-matrix-missing.yml:8:")
+        and "matrix.config.runner is missing" in finding
+        for finding in _unsupported_runner_labels([workflow])
+    )
+
+
+def test_checker_rejects_empty_and_recursively_empty_runner_lists(
+    tmp_path: Path,
+) -> None:
+    empty = _write_workflow(
+        tmp_path,
+        "empty.yml",
+        "jobs:\n  test:\n    runs-on: []\n",
+    )
+    nested = _write_workflow(
+        tmp_path,
+        "nested-empty.yml",
+        "jobs:\n  test:\n    runs-on:\n      - []\n",
+    )
+
+    assert _unsupported_runner_labels([empty]) == [
+        "empty.yml:3: unresolved runner source: empty list"
+    ]
+    assert _unsupported_runner_labels([nested]) == [
+        "nested-empty.yml:4: unresolved runner source: empty list"
+    ]
+
+
+def test_checker_reports_malformed_strategy_with_source_line(tmp_path: Path) -> None:
+    for value in ("null", "[]", "invalid"):
+        workflow = _write_workflow(
+            tmp_path,
+            f"strategy-{value}.yml",
+            "jobs:\n  test:\n    runs-on: ${{ matrix.runner }}\n"
+            f"    strategy: {value}\n",
+        )
+
+        assert _unsupported_runner_labels([workflow]) == [
+            f"strategy-{value}.yml:4: malformed strategy: expected mapping"
+        ]
+
+
+def test_checker_reports_malformed_matrix_with_source_line(tmp_path: Path) -> None:
+    for value in ("null", "[]", "invalid"):
+        workflow = _write_workflow(
+            tmp_path,
+            f"matrix-{value}.yml",
+            "jobs:\n  test:\n    runs-on: ${{ matrix.runner }}\n"
+            f"    strategy:\n      matrix: {value}\n",
+        )
+
+        assert _unsupported_runner_labels([workflow]) == [
+            f"matrix-{value}.yml:5: malformed matrix: expected mapping or expression"
+        ]
+
+
+def test_python_suite_uses_fail_closed_duration_balanced_slices() -> None:
     document = yaml.safe_load(
         (WORKFLOWS_DIR / "tests.yml").read_text(encoding="utf-8")
     )
-    run_tests_step = next(
-        step for step in document["jobs"]["test"]["steps"] if step.get("name") == "Run tests"
-    )
+    trigger = document.get("on", document.get(True))
+    assert trigger["workflow_call"]["inputs"]["slice_count"]["default"] == 8
 
-    commands = [line.strip() for line in run_tests_step["run"].splitlines() if line.strip()]
+    generate = document["jobs"]["generate"]
+    assert generate["outputs"]["matrix"] == "${{ steps.matrix.outputs.matrix }}"
+    generate_step = next(
+        step for step in generate["steps"] if step.get("id") == "matrix"
+    )
+    assert "--generate-slices ${{ inputs.slice_count }}" in generate_step["run"]
+
+    test_job = document["jobs"]["test"]
+    assert test_job["needs"] == "generate"
+    assert test_job["strategy"]["fail-fast"] is False
+    assert test_job["strategy"]["matrix"] == "${{ fromJSON(needs.generate.outputs.matrix) }}"
+    assert test_job["timeout-minutes"] == 30
+    run_tests_step = next(
+        step for step in test_job["steps"] if step.get("name", "").startswith("Run tests")
+    )
+    commands = [
+        line.strip() for line in run_tests_step["run"].splitlines() if line.strip()
+    ]
     assert commands == [
         "source .venv/bin/activate",
-        'HERMES_TEST_WORKERS="$(nproc)" scripts/run_tests.sh',
+        "HERMES_TEST_WORKERS=\"$(nproc)\" scripts/run_tests.sh --files '${{ matrix.slice.files }}'",
     ]
-    assert "HERMES_TEST_WORKERS" not in run_tests_step.get("env", {})
+
+    aggregate = document["jobs"]["test-result"]
+    assert aggregate["if"] == "${{ always() }}"
+    assert aggregate["needs"] == ["generate", "test"]
+    result_step = next(
+        step for step in aggregate["steps"] if step.get("name") == "Require every slice"
+    )
+    assert result_step["env"] == {
+        "GENERATE_RESULT": "${{ needs.generate.result }}",
+        "TEST_RESULT": "${{ needs.test.result }}",
+    }
+    assert 'test "$GENERATE_RESULT" = success' in result_step["run"]
+    assert 'test "$TEST_RESULT" = success' in result_step["run"]
+
+
+def test_js_workspace_checks_use_one_shared_cpu_budget() -> None:
+    document = yaml.safe_load(
+        (WORKFLOWS_DIR / "js-tests.yml").read_text(encoding="utf-8")
+    )
+    run_step = next(
+        step
+        for step in document["jobs"]["check"]["steps"]
+        if step.get("name") == "Run all workspace checks"
+    )
+
+    assert run_step["run"] == (
+        "node .github/scripts/run-workspace-checks.mjs --concurrency 1"
+    )
 
 
 def test_repository_workflows_use_standard_public_runner_labels() -> None:
