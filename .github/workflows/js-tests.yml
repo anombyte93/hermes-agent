@@ -64,6 +64,18 @@ jobs:
         with:
           command: npm ci
 
+      # Temporary diagnostic for issue #15 follow-up. This commit is pushed
+      # only to obtain repeated constrained-runner evidence, then removed.
+      - name: Repeat ui-tui offset-cache timing control on one CPU
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            echo "control attempt ${attempt}/20"
+            taskset --cpu-list 0 npm run --prefix ui-tui test -- \
+              src/__tests__/virtualHistoryOffsetCache.test.ts \
+              -t 'corrects and compensates a same-layout row measured at unmount'
+          done
+
       # Every check runs, one at a time, and the step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
