@@ -218,6 +218,106 @@ def test_operator_retry_with_judge_still_down_completes(monkeypatch, goal_env):
         conn.close()
 
 
+def test_park_is_sticky_across_recompute_ready(monkeypatch, goal_env):
+    """A judge-unavailable park must survive recompute_ready / the
+    dispatcher tick. Before the fix the park emitted only a
+    ``completion_judge_unavailable`` event, so ``_has_sticky_block`` saw no
+    ``blocked`` event and recompute_ready silently re-promoted the task to
+    ``ready`` — the dispatcher then respawned a worker on already-finished
+    work."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid, _child = goal_env
+    _force_judge_reachable(monkeypatch)
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *a, **k: (_ for _ in ()).throw(
+            PermissionDeniedError("org disabled subscription access")
+        ),
+    )
+    out = json.loads(kt._handle_complete(dict(SUBMISSION)))
+    assert "error" in out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+        promoted = kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"judge-unavailable park must be sticky across recompute_ready; "
+            f"got status={task.status!r} (promoted={promoted})"
+        )
+        # The preserved submission must still be retrievable after the tick.
+        assert kb.get_preserved_completion_submission(conn, tid) is not None
+    finally:
+        conn.close()
+
+
+def test_park_event_visible_to_terminal_notification_path(
+    monkeypatch, goal_env
+):
+    """The park must surface on the existing terminal notification path.
+
+    The gateway notifier claims events via ``claim_unseen_events_for_sub``
+    filtered to its TERMINAL_KINDS (which include ``blocked`` but not any
+    bespoke kind). Before the fix the park emitted only
+    ``completion_judge_unavailable`` — never claimed, never delivered — so
+    a subscribed watcher received zero notification for a stranded task."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Mirror of gateway/kanban_watchers.py TERMINAL_KINDS.
+    TERMINAL_KINDS = (
+        "completed", "blocked", "gave_up", "crashed", "timed_out",
+        "status", "archived", "unblocked", "block_loop_detected",
+        "review_requested", "changes_requested",
+    )
+
+    tid, _child = goal_env
+    _force_judge_reachable(monkeypatch)
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *a, **k: (_ for _ in ()).throw(
+            PermissionDeniedError("org disabled subscription access")
+        ),
+    )
+
+    # Subscribe BEFORE the park (new subs snap their cursor to the current
+    # MAX event id, so only events after subscription are unseen).
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_complete(dict(SUBMISSION)))
+    assert "error" in out
+
+    conn = kb.connect()
+    try:
+        old, new, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=TERMINAL_KINDS,
+        )
+        kinds = [ev.kind for ev in events]
+        assert "blocked" in kinds, (
+            f"judge-unavailable park must emit a terminal-visible 'blocked' "
+            f"event; watcher claimed kinds={kinds}"
+        )
+        blocked = [ev for ev in events if ev.kind == "blocked"][0]
+        payload = blocked.payload or {}
+        # The notifier renders payload['reason'] into the user-facing ping.
+        assert "judge" in str(payload.get("reason", "")).lower()
+    finally:
+        conn.close()
+
+
 def test_negative_judge_verdict_still_rejects_without_parking(
     monkeypatch, goal_env
 ):
