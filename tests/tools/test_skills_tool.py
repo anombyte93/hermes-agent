@@ -946,3 +946,50 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+    def test_internal_package_doc_does_not_collide_with_real_skill(
+        self, tmp_path
+    ):
+        """Markdown nested inside another skill's package is not a skill.
+
+        Live regression (2026-09-04): Kanban dispatch rejected a card
+        force-loading ``deep-research`` because
+        ``atlas-report/subskills/deep-research.md`` — internal package
+        content, but under a NON-support dir name (``subskills``) —
+        collided with the real ``deep-research/SKILL.md`` package.
+        Anything under a directory containing SKILL.md is package
+        internals and must not be discoverable as a standalone skill.
+        """
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+
+        _make_skill(local_dir, "deep-research", body="REAL DEEP RESEARCH")
+        _make_skill(local_dir, "atlas-report")
+        subskill = local_dir / "atlas-report" / "subskills" / "deep-research.md"
+        subskill.parent.mkdir(parents=True, exist_ok=True)
+        subskill.write_text("# Deep Research subskill chapter\n")
+
+        p1, p2 = self._patch_dirs(local_dir, [])
+        with p1, p2:
+            raw = skill_view("deep-research")
+
+        result = json.loads(raw)
+        assert result["success"] is True, result.get("error")
+        assert "REAL DEEP RESEARCH" in result["content"]
+
+    def test_top_level_legacy_flat_md_still_discoverable(self, tmp_path):
+        """Non-collision control: a legacy flat <name>.md NOT nested in any
+        skill package remains discoverable as a standalone skill."""
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        (local_dir / "loose-notes.md").write_text(
+            "# Loose legacy skill\nLEGACY FLAT BODY\n"
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, [])
+        with p1, p2:
+            raw = skill_view("loose-notes")
+
+        result = json.loads(raw)
+        assert result["success"] is True, result.get("error")
+        assert "LEGACY FLAT BODY" in result["content"]
