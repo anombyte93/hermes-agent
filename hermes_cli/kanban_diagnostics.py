@@ -955,6 +955,76 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A READY card cannot dispatch because its assignee cannot load one or
+    more force-requested skills.
+
+    Dispatch deliberately remains fail-closed: the operator must install the
+    skills, fix their identifiers, or reassign to a profile that can load them.
+    The event is durable and this rule stays active for as long as the card is
+    READY. Once a successful dispatch changes status, it auto-clears.
+    """
+    if _task_field(task, "status") != "ready":
+        return []
+
+    latest = None
+    # A refusal is active only until the task contract/owner changes or a
+    # later dispatch succeeds. This also prevents stale historical events
+    # from diagnosing a card that was subsequently reclaimed back to READY.
+    for ev in events:
+        kind = _event_kind(ev)
+        if kind == "skill_rejected":
+            latest = ev
+        elif kind in {
+            "assigned", "edited", "claimed", "spawned", "reclaimed",
+            "unblocked", "promoted",
+        }:
+            latest = None
+    if latest is None:
+        return []
+    rejected = [
+        ev for ev in events
+        if _event_kind(ev) == "skill_rejected" and _event_ts(ev) == _event_ts(latest)
+    ]
+    payload = _parse_payload(latest)
+    assignee = str(payload.get("assignee") or _task_field(task, "assignee") or "")
+    missing = payload.get("missing_skills") or []
+    if not isinstance(missing, list) or not missing:
+        return []
+    missing = [str(name) for name in missing]
+    ts = _event_ts(latest)
+
+    return [Diagnostic(
+        kind="skill_rejected",
+        severity="error",
+        title="Forced skills unavailable",
+        detail=(
+            f"This task remains ready because assignee {assignee!r} cannot "
+            f"load the forced skill(s): {', '.join(missing)}. Install or fix "
+            "the requested skills, or reassign the task to a profile that "
+            "can load them. The dispatcher will not silently weaken the "
+            "requested skill contract."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="reassign",
+                label="Reassign to a profile with these skills",
+                payload={"current_assignee": assignee},
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Inspect installed skills",
+                payload={"command": f"hermes -p {assignee} skills list"},
+                suggested=True,
+            ),
+        ],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        count=len(rejected),
+        data={"assignee": assignee, "missing_skills": missing},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
     claiming it.
@@ -1089,6 +1159,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_skill_rejected,
     _rule_stranded_in_ready,
 ]
 
@@ -1104,6 +1175,7 @@ DIAGNOSTIC_KINDS = (
     "review_dependency_deadlock",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "skill_rejected",
     "stranded_in_ready",
 )
 
