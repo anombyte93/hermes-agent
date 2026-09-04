@@ -83,6 +83,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    is_inside_skill_package as _is_inside_skill_package,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -1330,9 +1331,15 @@ def skill_view(
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
+            # Likewise exclude ANY markdown nested inside another skill's
+            # package (e.g. atlas-report/subskills/deep-research.md): package
+            # internals are documentation for that skill, not standalone
+            # skills, and must never collide with a real same-named package.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
+                if (
+                    found_md.name != "SKILL.md"
+                    and not _is_skill_support_path(found_md)
+                    and not _is_inside_skill_package(found_md, stop=search_dir)
                 ):
                     _record(None, found_md)
 

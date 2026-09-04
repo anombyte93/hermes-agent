@@ -149,6 +149,42 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     return False
 
 
+def is_inside_skill_package(path, *, stop: Optional[Path] = None) -> bool:
+    """True if *path* sits inside another skill's package directory.
+
+    A markdown file nested anywhere under a directory that contains
+    ``SKILL.md`` is internal package content (subskills, mechanism notes,
+    agent briefs, ...), not a standalone legacy skill — regardless of
+    whether its containing directory is one of the canonical
+    :data:`SKILL_SUPPORT_DIRS`. Discovered live 2026-09-04: dispatch
+    rejected a card force-loading ``deep-research`` because
+    ``atlas-report/subskills/deep-research.md`` collided with the real
+    ``deep-research/SKILL.md`` package.
+
+    ``stop`` bounds the ancestor walk (exclusive): pass the skills
+    directory being scanned so an unrelated ``SKILL.md`` higher up the
+    filesystem cannot influence the verdict. The check starts from the
+    file's parent directory, so a skill package's own ``SKILL.md`` never
+    marks the package itself as nested.
+    """
+    path_obj = path if isinstance(path, Path) else Path(str(path))
+    try:
+        stop_resolved = stop.resolve() if stop is not None else None
+        current = path_obj.resolve().parent
+    except OSError:
+        stop_resolved = stop
+        current = path_obj.parent
+    while True:
+        if stop_resolved is not None and current == stop_resolved:
+            return False
+        if (current / "SKILL.md").exists():
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
 
 _yaml_load_fn = None
