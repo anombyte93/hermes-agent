@@ -10026,6 +10026,49 @@ def dispatch_once(
     return result
 
 
+def _append_skill_rejected_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    missing_skills: list[str],
+) -> None:
+    """Record a forced-skill refusal as a durable ``skill_rejected`` event,
+    rate-limited to one event per unchanged refusal streak (#20).
+
+    A dispatch tick that rejects the same task for the same assignee and the
+    same missing skill set appends nothing — the first event already says
+    everything, and the default 60s dispatcher loop would otherwise spam an
+    unbounded stream of identical rows. A changed assignee or skill set, or a
+    fresh refusal after an intervening claim/spawn, IS a new refusal and is
+    recorded again. The payload is deliberately minimal — assignee and missing
+    skill names only; the task id is the event row's own identity.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["kind"] == "skill_rejected":
+        try:
+            prev = json.loads(row["payload"] or "{}")
+        except Exception:
+            prev = {}
+        if (
+            isinstance(prev, dict)
+            and prev.get("assignee") == assignee
+            and sorted(prev.get("missing_skills") or []) == sorted(missing_skills)
+        ):
+            return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "skill_rejected",
+            {"assignee": assignee, "missing_skills": sorted(missing_skills)},
+        )
+
+
 def _missing_worker_skills(
     skill_identifiers: Optional[list[str]], assignee: str
 ) -> list[str]:
@@ -10366,6 +10409,16 @@ def _dispatch_once_locked(
         )
         if missing_skills:
             result.rejected_skills.append((row["id"], missing_skills))
+            # Durable, rate-limited event so `show` / `tail` / diagnostics
+            # can explain why the card stayed READY (#20) — previously the
+            # refusal existed only in this in-memory result and every
+            # operator surface rendered an unexplained no-op. Fail-closed
+            # loading is unchanged: the card is never spawned, edited or
+            # auto-blocked here.
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row_assignee, missing_skills
+                )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
