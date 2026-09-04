@@ -2227,25 +2227,36 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task], evidence: str,
+) -> "tuple[Optional[str], Optional[str]]":
+    """Apply the goal judge to every terminal worker handoff, including review.
+
+    Returns ``(rejection, judge_error)`` — mirrors
+    ``tools.kanban_tools._goal_mode_handoff_rejection``:
+
+    * ``(None, None)`` — allowed;
+    * ``(reason, None)`` — a reachable judge returned a genuine negative
+      verdict;
+    * ``(None, error)`` — the judge call failed (raised or transport
+      failure, e.g. ``PermissionDeniedError``). Infrastructure failure,
+      not a judgement (Issue #37).
+    """
     if task is None or not task.goal_mode:
-        return None
+        return None, None
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
 
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
-        return None
+        return None, None
     if client is None or not model:
-        return None
+        return None, None
 
     from hermes_cli.goals import judge_goal
 
-    verdict = "done"
-    reason = ""
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
         )
@@ -2253,11 +2264,15 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
         import logging as _logging
 
         _logging.getLogger(__name__).warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
+            "goal judge call raised — treating as judge unavailability, "
+            "not a verdict: %s",
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+        return None, f"{type(judge_exc).__name__}: {judge_exc}"
+    if transport_failed:
+        return None, reason or "judge transport failure"
+    return (reason if verdict != "done" else None), None
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -2295,11 +2310,48 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+
+            # Operator recovery route (Issue #37): a task parked by
+            # park_completion_for_judge_failure carries its worker's
+            # preserved submission. When the operator retries without an
+            # explicit handoff, reuse it verbatim.
+            tid_summary = summary
+            tid_result = args.result
+            tid_metadata = metadata
+            preserved = None
+            if (
+                task is not None
+                and getattr(task, "status", None) == "blocked"
+                and not (summary or args.result or metadata)
+            ):
+                preserved = kb.get_preserved_completion_submission(conn, tid)
+                if preserved:
+                    tid_summary = preserved.get("summary")
+                    tid_result = preserved.get("result")
+                    md = preserved.get("metadata")
+                    tid_metadata = md if isinstance(md, dict) else None
+                    print(
+                        f"kanban: {tid} — reusing preserved completion "
+                        f"submission from the judge-failure park "
+                        f"(judge error was: "
+                        f"{preserved.get('error') or 'unknown'})"
+                    )
+
+            rejection, judge_error = _goal_mode_handoff_rejection(
                 task,
-                (summary or args.result or "").strip(),
+                (tid_summary or tid_result or "").strip(),
             )
-            if rejection is not None:
+            if judge_error is not None:
+                # An explicit `hermes kanban complete` is a human decision.
+                # If the judge is STILL unreachable, warn and accept rather
+                # than re-stranding the task (Issue #37).
+                print(
+                    f"kanban: warning — completion judge unavailable for "
+                    f"{tid} ({judge_error}); accepting on operator "
+                    f"authority.",
+                    file=sys.stderr,
+                )
+            elif rejection is not None:
                 print(
                     f"kanban: goal completion of {tid} rejected by judge: {rejection}. "
                     f"Provide evidence matching the task's acceptance criteria.",
@@ -2310,9 +2362,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
             if not kb.complete_task(
                 conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
+                result=tid_result,
+                summary=tid_summary,
+                metadata=tid_metadata,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
@@ -2448,11 +2500,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
+        rejection, judge_error = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
         )
-        if rejection is not None:
+        if judge_error is not None:
+            # Judge infrastructure failure (Issue #37): review hands the
+            # task to a human anyway, so warn and proceed.
+            print(
+                f"kanban: warning — goal judge unavailable for {tid} "
+                f"({judge_error}); proceeding with review handoff.",
+                file=sys.stderr,
+            )
+        elif rejection is not None:
             print(
                 f"kanban: goal review handoff of {tid} rejected by judge: "
                 f"{rejection}. Provide acceptance evidence matching the task.",

@@ -6590,6 +6590,166 @@ def block_task(
 
 
 
+def park_completion_for_judge_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    error: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a goal-mode task whose completion judge was UNREACHABLE.
+
+    Issue #37: a judge infrastructure/permission failure (e.g. the provider
+    raising ``PermissionDeniedError``) is NOT a negative judgement. The
+    worker's submitted handoff is complete evidence; throwing it away and
+    letting the goal loop escalate to ``triage`` strands finished work in an
+    unrecoverable state.
+
+    Instead we:
+
+    * transition ``running``/``ready`` → ``blocked`` with
+      ``block_kind='transient'`` — a LOUD, human-visible, retryable state
+      that ``hermes kanban unblock`` / ``complete`` can recover, unlike
+      ``triage``;
+    * preserve the submitted ``summary``/``result``/``metadata`` on the
+      closing run row (so attempt history shows the real handoff); and
+    * append a ``blocked`` event (with ``judge_unavailable: true`` and the
+      full submission + judge error in its payload). Using the standard
+      ``blocked`` kind — rather than a bespoke one — is load-bearing twice
+      over:
+
+      - :func:`_has_sticky_block` keys on the newest ``blocked``/
+        ``unblocked`` event, so the park survives :func:`recompute_ready`
+        and the dispatcher tick instead of being silently re-promoted to
+        ``ready`` (which would respawn a worker on already-finished work);
+      - the gateway notifier's TERMINAL_KINDS claim includes ``blocked``,
+        so a subscribed watcher actually receives a terminal notification
+        for the park (a bespoke kind was never claimed → zero pings).
+
+      :func:`get_preserved_completion_submission` reads the payload back so
+      an operator retry (``hermes kanban complete <id>``) can re-submit it
+      verbatim.
+
+    Deliberately does NOT touch ``block_recurrences`` — a judge outage is
+    not a worker block loop, so it must never auto-escalate to ``triage``.
+    The event payload carries ``recurrences: 0`` explicitly so the
+    notifier's re-block counter rendering never inflates.
+
+    Returns True on success, False when the task wasn't in a parkable state
+    (or ``expected_run_id`` didn't match the live run).
+    """
+    with write_txn(conn):
+        guard = "" if expected_run_id is None else " AND current_run_id = ?"
+        params: tuple = (
+            (task_id,) if expected_run_id is None
+            else (task_id, int(expected_run_id))
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'blocked',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = 'transient'
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="blocked", status="blocked",
+            summary=summary if summary is not None else result,
+            error=error,
+            metadata=metadata,
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="blocked",
+                summary=summary if summary is not None else result,
+                error=error,
+                metadata=metadata,
+            )
+        _append_event(
+            conn, task_id, "blocked",
+            {
+                # Standard blocked-event fields the notifier / sticky-block
+                # predicate / resume logic already understand.
+                "reason": (
+                    f"completion judge unavailable: "
+                    f"{error or 'unknown error'} — submitted result "
+                    f"preserved; retry `hermes kanban complete {task_id}` "
+                    f"once the judge is restored"
+                ),
+                "kind": "transient",
+                "recurrences": 0,
+                # Park-specific fields: marker + the preserved submission
+                # that get_preserved_completion_submission reads back.
+                "judge_unavailable": True,
+                "summary": summary,
+                "result": result,
+                "metadata": metadata,
+                "error": error,
+            },
+            run_id=run_id,
+        )
+        _parked_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=_parked_task.assignee if _parked_task else None,
+        run_id=run_id,
+        reason=f"completion judge unavailable: {error or 'unknown error'}",
+    )
+    return True
+
+
+def get_preserved_completion_submission(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Return the latest judge-failure-preserved completion submission.
+
+    Reads the newest park event written by
+    :func:`park_completion_for_judge_failure` — a ``blocked`` event marked
+    ``judge_unavailable: true`` (or a legacy ``completion_judge_unavailable``
+    event from earlier builds). Returns a dict with ``summary`` / ``result``
+    / ``metadata`` / ``error`` keys, or ``None`` when no submission was ever
+    parked for this task.
+
+    A plain worker/operator ``blocked`` event is never treated as a
+    preserved submission, and any ``blocked`` event written *after* the
+    park supersedes it (the newest ``blocked``-family row wins), so a
+    later genuine block cannot leak a stale submission into an operator
+    retry.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? "
+        "AND kind IN ('blocked', 'completion_judge_unavailable') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if row["kind"] == "blocked" and not payload.get("judge_unavailable"):
+        return None
+    return payload
+
+
 def redact_review_value(value: Any) -> Any:
     """Redact secrets at the domain boundary for durable review handoffs."""
     if isinstance(value, str):
