@@ -1078,6 +1078,45 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A READY task cannot spawn because its forced skill contract is unmet."""
+    if _task_field(task, "status") != "ready":
+        return []
+    hits = [ev for ev in events if _event_kind(ev) == "skill_rejected"]
+    if not hits:
+        return []
+    latest = hits[-1]
+    payload = _parse_payload(latest)
+    assignee = str(payload.get("assignee") or _task_field(task, "assignee") or "")
+    missing = [str(name) for name in payload.get("missing_skills", []) if name]
+    if not missing:
+        return []
+    task_id = _task_field(task, "id")
+    actions = [DiagnosticAction(
+        kind="cli_hint",
+        label="Inspect the assignee's installed skills",
+        payload={"command": f"hermes -p {assignee} skills list"},
+        suggested=True,
+    )]
+    actions.extend(_generic_recovery_actions(task, running=False))
+    return [Diagnostic(
+        kind="skill_rejected",
+        severity="error",
+        title="Forced skills unavailable for assigned profile",
+        detail=(
+            f"Task {task_id} stayed ready because profile {assignee!r} cannot "
+            f"load these required skills: {', '.join(missing)}. Install or "
+            "repair those skills, or explicitly reassign the task; the "
+            "dispatcher will not weaken the requested worker contract."
+        ),
+        actions=actions,
+        first_seen_at=_event_ts(hits[0]),
+        last_seen_at=_event_ts(latest),
+        count=len(hits),
+        data={"assignee": assignee, "missing_skills": missing},
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1089,6 +1128,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_skill_rejected,
     _rule_stranded_in_ready,
 ]
 
@@ -1104,6 +1144,7 @@ DIAGNOSTIC_KINDS = (
     "review_dependency_deadlock",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "skill_rejected",
     "stranded_in_ready",
 )
 

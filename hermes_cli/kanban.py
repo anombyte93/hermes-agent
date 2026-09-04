@@ -2682,6 +2682,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "rejected_skills": [
+                {"task_id": tid, "missing_skills": missing}
+                for (tid, missing) in res.rejected_skills
+            ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2724,6 +2732,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, missing in res.rejected_skills:
+        print(f"Rejected (missing forced skills: {', '.join(missing)}): {tid}")
+    for tid, reason in res.respawn_guarded:
+        print(f"Deferred (respawn guard: {reason}): {tid}")
     return 0
 
 

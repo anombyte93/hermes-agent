@@ -8139,6 +8139,10 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Missing forced skills are checked on every dispatcher tick while a task stays
+# ready. Keep the durable explanation without flooding task history.
+_SKILL_REJECTION_EVENT_WINDOW_SECONDS = 300
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -8221,6 +8225,36 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+
+
+def _record_skill_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    missing_skills: list[str],
+) -> None:
+    """Persist one bounded explanation for an unchanged skill rejection."""
+    now = int(time.time())
+    latest = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'skill_rejected' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    expected = {"assignee": assignee, "missing_skills": list(missing_skills)}
+    if latest is not None:
+        try:
+            prior = json.loads(latest["payload"]) if latest["payload"] else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            prior = {}
+        if (
+            prior == expected
+            and now - int(latest["created_at"] or 0)
+            < _SKILL_REJECTION_EVENT_WINDOW_SECONDS
+        ):
+            return
+    with write_txn(conn):
+        _append_event(conn, task_id, "skill_rejected", expected)
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -10366,6 +10400,10 @@ def _dispatch_once_locked(
         )
         if missing_skills:
             result.rejected_skills.append((row["id"], missing_skills))
+            if not dry_run:
+                _record_skill_rejection(
+                    conn, row["id"], row_assignee, missing_skills,
+                )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
