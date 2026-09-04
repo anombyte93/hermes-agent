@@ -10043,24 +10043,24 @@ def _append_skill_rejected_event(
     recorded again. The payload is deliberately minimal — assignee and missing
     skill names only; the task id is the event row's own identity.
     """
-    row = conn.execute(
-        "SELECT kind, payload FROM task_events "
-        "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if row is not None and row["kind"] == "skill_rejected":
-        try:
-            prev = json.loads(row["payload"] or "{}")
-        except Exception:
-            prev = {}
-        if (
-            isinstance(prev, dict)
-            and prev.get("assignee") == assignee
-            and sorted(prev.get("missing_skills") or []) == sorted(missing_skills)
-        ):
-            return
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None and row["kind"] == "skill_rejected":
+            try:
+                prev = json.loads(row["payload"] or "{}")
+            except Exception:
+                prev = {}
+            if (
+                isinstance(prev, dict)
+                and prev.get("assignee") == assignee
+                and sorted(prev.get("missing_skills") or []) == sorted(missing_skills)
+            ):
+                return
         _append_event(
             conn,
             task_id,
