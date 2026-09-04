@@ -251,26 +251,47 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+def _goal_mode_handoff_rejection(task, evidence: str) -> "tuple[Optional[str], Optional[str]]":
+    """Judge a goal-mode terminal handoff.
+
+    Returns ``(rejection, judge_error)``:
+
+    * ``(None, None)`` — allowed (not goal-mode, judge unavailable, or the
+      judge affirmatively said DONE).
+    * ``(reason, None)`` — a REACHABLE judge returned a genuine negative
+      verdict; the handoff must be rejected.
+    * ``(None, error)`` — the judge was reachable per the availability
+      probe but the actual call failed (raised, or transport-failed
+      internally — e.g. ``PermissionDeniedError``). This is an
+      infrastructure failure, NOT a judgement; callers must not treat it
+      as a rejection (Issue #37: doing so stranded completed tasks in
+      triage with their evidence thrown away).
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
-        return None
-    verdict = "done"
-    reason = ""
+        return None, None
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
-        # Keep the existing fail-open semantics: an unavailable/broken
-        # auxiliary judge must not permanently wedge goal-mode work.
+        # A raised provider error (PermissionDeniedError, auth failures,
+        # etc.) is an infrastructure failure — surface it as such so the
+        # caller can preserve the submission instead of rejecting it.
         logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
+            "goal judge call raised — treating as judge unavailability, "
+            "not a verdict: %s",
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+        return None, f"{type(judge_exc).__name__}: {judge_exc}"
+    if transport_failed:
+        # judge_goal swallowed an API/transport error internally and
+        # returned its fail-open 'continue'. That is indistinguishable
+        # from a real negative verdict unless we check this flag — the
+        # exact confusion behind Issue #37.
+        return None, reason or "judge transport failure"
+    return (reason if verdict != "done" else None), None
 
 
 # ---------------------------------------------------------------------------
@@ -752,10 +773,38 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            rejection, judge_error = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
             )
+            if judge_error is not None:
+                # Issue #37: the judge was UNREACHABLE (infra/permission
+                # failure), not negative. Preserve the submitted handoff
+                # and park the task in a loud retryable blocked state so
+                # an operator can recover it once the judge is restored.
+                parked = kb.park_completion_for_judge_failure(
+                    conn, tid,
+                    summary=summary,
+                    result=result,
+                    metadata=metadata,
+                    error=judge_error,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if parked:
+                    return tool_error(
+                        f"Completion judge unavailable ({judge_error}). "
+                        f"Your submitted result was preserved and the task "
+                        f"was parked in a retryable blocked state — it is "
+                        f"NOT rejected and NOT lost. An operator can retry "
+                        f"with `hermes kanban complete {tid}` once the "
+                        f"judge is restored; the preserved submission will "
+                        f"be reused."
+                    )
+                return tool_error(
+                    f"Completion judge unavailable ({judge_error}) and the "
+                    f"task could not be parked (unexpected state). Retry "
+                    f"kanban_complete with the same handoff."
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal completion rejected by judge: {rejection}. "
@@ -937,7 +986,16 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection, judge_error = _goal_mode_handoff_rejection(task, summary)
+            if judge_error is not None:
+                # Judge infrastructure failure (Issue #37). Review hands the
+                # task to a human reviewer anyway, so fail open: proceed
+                # with the handoff rather than stranding finished work.
+                logger.warning(
+                    "goal judge unavailable during review handoff of %s "
+                    "(%s); proceeding — a human reviews this task anyway",
+                    tid, judge_error,
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
