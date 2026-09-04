@@ -123,6 +123,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+LEGACY_UNKNOWN_BLOCK_REASON = "Legacy block reason unknown"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1135,6 +1136,9 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Current human-readable reason for a task in ``blocked``. Cleared when the
+    # task leaves blocked; immutable events and run summaries retain history.
+    block_reason: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1227,6 +1231,11 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            block_reason=(
+                row["block_reason"]
+                if "block_reason" in keys and row["block_reason"]
+                else None
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1411,6 +1420,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Authoritative current human-readable reason while the task is blocked.
+    -- Immutable events and run summaries retain historical reasons after this
+    -- field is cleared on exit from ``blocked``.
+    block_reason         TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2675,6 +2688,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "block_reason" not in cols:
+        # Additive current-reason field. Legacy blocked rows have no trustworthy
+        # cause, so persist an explicit unknown label rather than guessing from
+        # comments or historical events.
+        _add_column_if_missing(conn, "tasks", "block_reason", "block_reason TEXT")
+    if "status" in cols:
+        conn.execute(
+            "UPDATE tasks SET block_reason = ? "
+            "WHERE status = 'blocked' AND TRIM(COALESCE(block_reason, '')) = ''",
+            (LEGACY_UNKNOWN_BLOCK_REASON,),
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2690,6 +2715,40 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    # Kernel-level invariant: no writer, including direct SQL used by plugins or
+    # future integrations, may create a reasonless blocked row. The companion
+    # trigger clears only the mutable current reason when a card leaves blocked;
+    # events and run summaries remain immutable history.
+    if "status" in cols:
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_insert
+            BEFORE INSERT ON tasks
+            WHEN NEW.status = 'blocked'
+             AND TRIM(COALESCE(NEW.block_reason, '')) = ''
+            BEGIN
+                SELECT RAISE(ABORT, 'block reason is required');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_update
+            BEFORE UPDATE ON tasks
+            WHEN NEW.status = 'blocked'
+             AND TRIM(COALESCE(NEW.block_reason, '')) = ''
+            BEGIN
+                SELECT RAISE(ABORT, 'block reason is required');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_clear
+            AFTER UPDATE OF status ON tasks
+            WHEN OLD.status = 'blocked'
+             AND NEW.status != 'blocked'
+             AND NEW.block_reason IS NOT NULL
+            BEGIN
+                UPDATE tasks SET block_reason = NULL WHERE id = NEW.id;
+            END
+        """)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3191,6 +3250,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    block_reason: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3247,6 +3307,9 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    block_reason = (block_reason or "").strip() or None
+    if initial_status == "blocked" and block_reason is None:
+        raise ValueError("block reason is required when initial_status='blocked'")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -3509,8 +3572,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, block_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3536,6 +3599,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        block_reason if task_status == "blocked" else None,
                     ),
                 )
                 for pid in parents:
@@ -3554,6 +3618,7 @@ def create_task(
                     {
                         "assignee": assignee,
                         "status": task_status,
+                        "block_reason": block_reason if task_status == "blocked" else None,
                         "parents": list(parents),
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
@@ -3566,6 +3631,22 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # Initial blocked creation is an explicit operator handoff,
+                    # just like block_task().  Emit the canonical event so
+                    # _has_sticky_block() keeps it parked across list/dispatcher
+                    # recomputation until an explicit unblock.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": block_reason,
+                            "kind": None,
+                            "recurrences": 0,
+                            "source_status": "created",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -6314,6 +6395,9 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    reason = (reason or "").strip() or None
+    if reason is None:
+        raise ValueError("block reason is required")
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6443,12 +6527,13 @@ def block_task(
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
+                           block_reason  = ?,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (reason, kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -6458,13 +6543,14 @@ def block_task(
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
+                           block_reason  = ?,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (reason, kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -9374,24 +9460,28 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            block_reason = (
+                f"Circuit breaker tripped after {failures} consecutive "
+                f"{outcome} failure(s): {error[:500]}"
+            ).strip()
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, block_reason = ?, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (block_reason, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
                 # cleared; just flip to blocked + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = 'blocked', block_reason = ?, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (block_reason, failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:
