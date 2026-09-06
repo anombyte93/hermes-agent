@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -20,11 +21,12 @@ def external_skills_dir(tmp_path):
 
 
 @pytest.fixture
-def hermes_home(tmp_path):
+def hermes_home(tmp_path, monkeypatch):
     """Create a minimal HERMES_HOME with config."""
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "skills").mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     return home
 
 
@@ -61,7 +63,7 @@ class TestGetAllSkillsDirs:
             from agent.skill_utils import get_all_skills_dirs
             result = get_all_skills_dirs()
         assert result[0] == hermes_home / "skills"
-        assert result[1] == external_skills_dir.resolve()
+        assert external_skills_dir.resolve() in result
 
 
 class TestExternalSkillsInFindAll:

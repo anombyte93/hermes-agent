@@ -83,6 +83,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    is_inside_skill_package as _is_inside_skill_package,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -700,8 +701,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import (
-        get_external_skills_dirs,
         get_project_skills_dirs,
+        get_scan_ordered_skills_dirs,
         iter_project_skill_files,
         iter_skill_index_files,
     )
@@ -717,12 +718,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
     # dirs come FIRST: first-wins dedup below gives them precedence over
     # same-named local/external skills.
-    project_dirs = list(get_project_skills_dirs())
-    dirs_to_scan: list = list(project_dirs)
     active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    project_dirs = list(get_project_skills_dirs())
+    dirs_to_scan = get_scan_ordered_skills_dirs(active_skills_dir)
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -1223,7 +1221,7 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import get_project_skills_dirs, get_scan_ordered_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1242,12 +1240,9 @@ def skill_view(
         # Build list of all skill directories to search. Project dirs first —
         # they're the highest-precedence tier and the collision resolver
         # below uses this ordering.
-        project_dirs = get_project_skills_dirs()
-        all_dirs = list(project_dirs)
         active_skills_dir = _skills_dir()
-        if active_skills_dir.exists():
-            all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        project_dirs = get_project_skills_dirs()
+        all_dirs = get_scan_ordered_skills_dirs(active_skills_dir)
 
         if not all_dirs:
             return json.dumps(
@@ -1336,9 +1331,15 @@ def skill_view(
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
+            # Likewise exclude ANY markdown nested inside another skill's
+            # package (e.g. atlas-report/subskills/deep-research.md): package
+            # internals are documentation for that skill, not standalone
+            # skills, and must never collide with a real same-named package.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
+                if (
+                    found_md.name != "SKILL.md"
+                    and not _is_skill_support_path(found_md)
+                    and not _is_inside_skill_package(found_md, stop=search_dir)
                 ):
                     _record(None, found_md)
 
