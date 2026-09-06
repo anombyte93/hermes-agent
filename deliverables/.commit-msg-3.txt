@@ -1,0 +1,22 @@
+fix(codex): distinguish host identity from boot identity in thread ownership
+
+Comparing boot id alone made every cold reboot of the SAME host look foreign,
+so a rebooted Evo service would be refused its own conversation forever —
+contradicting approved reboot persistence.
+
+- Record now carries owner_host_id (/etc/machine-id, hostname fallback)
+  alongside owner_boot_id.
+- Same host + different boot => predecessor_died_at_reboot(): the reboot
+  provably killed that process, so the exact thread resumes, and the takeover
+  is written into the record's note rather than happening silently.
+- Different host without an explicit release => still refused outright; a
+  foreign pid cannot be probed.
+- Same host + same boot + live pid => still refused, unchanged.
+- Stores without lock_path now log that durable exclusive ownership is
+  UNSUPPORTED for them, so the test-only fallback cannot be mistaken for a
+  production guarantee.
+
+Controls added: positive same-host-new-boot resume (with a pid that is alive,
+proving the boot change drives it), negative different-host refusal, and
+same-boot live-pid refusal. With the old boot-only comparison restored, the
+reboot control fails — recorded in evidence/reboot-gate-falsification.txt.
