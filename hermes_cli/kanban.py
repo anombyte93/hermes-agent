@@ -3016,7 +3016,15 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         if args.kinds else None
     )
     cursor = 0
-    print("Watching kanban events. Ctrl-C to stop.", flush=True)
+    _db = kb.kanban_db_path(None)
+    _board_name = (
+        "default" if _db.parent.name == "kanban" or _db.parent.name == "boards"
+        else _db.parent.name
+    )
+    print(
+        f"Watching kanban events on board '{_board_name}'. Ctrl-C to stop.",
+        flush=True,
+    )
     # Seed cursor at the latest id so we don't replay history.
     with kb.connect_closing() as conn:
         row = conn.execute(
