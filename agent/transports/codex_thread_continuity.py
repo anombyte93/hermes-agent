@@ -29,9 +29,13 @@ Design rules this implements (all of them are behaviour the tests lock in):
    the bug invisible in the first place.
 2. **A fresh Hermes session gets a fresh thread.** Continuity is keyed by the
    Hermes session id; no record means ``thread/start``.
-3. **One owner at a time.** A record carries the owning pid/boot id. A *live*
-   owner on the same host means :class:`CodexThreadOwnershipError`; a dead owner
-   (crash) or a released record is a legitimate takeover and is allowed.
+3. **One owner at a time.** A record carries the owning pid, boot id and host
+   id. A *live* owner on the same host+boot means
+   :class:`CodexThreadOwnershipError`. Same host with a *different* boot means
+   the predecessor was killed by a reboot — a legitimate takeover, so an Evo
+   service that comes back after a cold reboot reaches its own conversation.
+   A *different host* with no explicit release is refused outright: its pid
+   cannot be probed, so we cannot prove that owner is gone.
 4. **Runtime identity must match.** cwd / permission profile are part of the
    record. A resume request under a different cwd or profile is refused
    explicitly (:class:`CodexThreadIdentityMismatch`) rather than silently
@@ -44,9 +48,10 @@ Design rules this implements (all of them are behaviour the tests lock in):
 6. **Reservation before decision.** A per-session ``flock`` is taken before the
    record is even read and held for the object's lifetime, so two processes
    racing on the same session cannot both conclude "no owner, start fresh".
-7. **Foreign hosts fail closed.** A pid from another boot cannot be probed, so
-   an unreleased record from another host/boot is refused outright rather than
-   assumed dead.
+7. **Host vs boot are distinct.** A different *boot* on the same host proves the
+   predecessor died and permits an exact resume; a different *host* without an
+   explicit release is refused. Comparing boot alone would lock a rebooted Evo
+   host out of its own conversation forever.
 
 Nothing here talks to codex. The RPC is issued by the session, which owns the
 client; this module owns *what may be resumed and by whom*.
@@ -93,17 +98,42 @@ class CodexThreadPersistenceError(CodexThreadContinuityError):
 
 def _boot_id() -> str:
     """Identify this machine boot, so a pid recycled after a reboot cannot be
-    mistaken for the original live owner."""
+    mistaken for the original live owner.
+
+    Boot identity alone must NOT be used to decide ownership across machines —
+    a reboot of the SAME host changes it, and treating that as "foreign" would
+    strand the thread forever. Pair it with :func:`_host_id`.
+    """
     try:
         with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as fh:
             return fh.read().strip()
     except OSError:
-        # Non-Linux / restricted: fall back to hostname. Coarser but still
-        # prevents cross-host pid confusion, which is the important case.
+        # Non-Linux / restricted: no boot identity available. Return empty so
+        # callers fall back to pid liveness rather than inventing a value that
+        # would look like a different boot on every call.
+        return ""
+
+
+def _host_id() -> str:
+    """Stable identity of THIS machine, surviving reboots.
+
+    Prefers /etc/machine-id (systemd, stable for the life of the install),
+    falling back to the hostname. Used to distinguish "same host, new boot"
+    (predecessor is provably dead → resume allowed) from "different host"
+    (predecessor unknowable → refuse).
+    """
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         try:
-            return os.uname().nodename
-        except Exception:  # pragma: no cover - defensive
-            return ""
+            with open(path, "r", encoding="utf-8") as fh:
+                value = fh.read().strip()
+            if value:
+                return value
+        except OSError:
+            continue
+    try:
+        return os.uname().nodename
+    except Exception:  # pragma: no cover - defensive
+        return ""
 
 
 def _pid_alive(pid: int) -> bool:
@@ -131,6 +161,7 @@ class CodexThreadRecord:
     permission_profile: str = ""
     owner_pid: int = 0
     owner_boot_id: str = ""
+    owner_host_id: str = ""
     claimed_at: float = 0.0
     released_at: float = 0.0
     version: int = RECORD_VERSION
@@ -172,6 +203,7 @@ class CodexThreadRecord:
             permission_profile=_s("permission_profile"),
             owner_pid=owner_pid if isinstance(owner_pid, int) else 0,
             owner_boot_id=_s("owner_boot_id"),
+            owner_host_id=_s("owner_host_id"),
             claimed_at=_f("claimed_at"),
             released_at=_f("released_at"),
             version=version,
@@ -184,15 +216,17 @@ class CodexThreadRecord:
         return bool(self.released_at) and self.released_at >= self.claimed_at
 
     def owner_is_live(self) -> bool:
-        """True only when the recorded owner is a live process on this boot.
+        """True only when the recorded owner is a live process on THIS boot.
 
-        Same-boot liveness ONLY. A record from another host/boot cannot be
-        judged here at all — see :meth:`owner_is_foreign`, which fails closed
-        instead of guessing.
+        Requires same host AND same boot: only then is the recorded pid a
+        meaningful handle in this namespace. Anything else is judged by
+        :meth:`owner_is_foreign` / :meth:`predecessor_died_at_reboot`.
         """
         if self.is_released():
             return False
         if not self.owner_pid:
+            return False
+        if self.owner_host_id and self.owner_host_id != _host_id():
             return False
         if self.owner_boot_id and self.owner_boot_id != _boot_id():
             return False
@@ -200,23 +234,40 @@ class CodexThreadRecord:
             return False
         return _pid_alive(self.owner_pid)
 
-    def owner_is_foreign(self) -> bool:
-        """True when the owner is on a different host/boot and never released.
+    def predecessor_died_at_reboot(self) -> bool:
+        """True for "same host, different boot" — a legitimate takeover.
 
-        A pid from another boot is meaningless in this namespace, so we cannot
-        prove the owner is dead. Same-host liveness checks must NOT be used to
-        declare a remote owner released — that would let two hosts drive one
-        codex thread. This fails closed: the only way past it is an explicit
-        release (``released_at``) written by that owner, or an operator
-        calling :meth:`CodexThreadContinuity.invalidate`.
+        A reboot of this machine provably killed the recorded process, so its
+        claim is stale and the exact thread may be resumed. This is the
+        approved reboot-persistence case: an Evo service that comes back after
+        a cold reboot must reach its own conversation, not be locked out of it.
         """
         if self.is_released():
             return False
-        if not self.owner_boot_id:
-            # No boot id recorded (pre-boot-id record or restricted host):
-            # fall back to same-boot pid liveness, which is all we have.
+        if not self.owner_host_id or not self.owner_boot_id:
+            return False
+        if self.owner_host_id != _host_id():
             return False
         return self.owner_boot_id != _boot_id()
+
+    def owner_is_foreign(self) -> bool:
+        """True when the owner is on a DIFFERENT host and never released.
+
+        A pid on another machine cannot be probed, so we cannot prove that
+        owner is gone; refusing is the only safe answer. Note this is a host
+        comparison, deliberately NOT a boot comparison: a reboot of the same
+        host is :meth:`predecessor_died_at_reboot`, which is allowed.
+
+        The only ways past this are an explicit release written by that owner
+        or an operator calling :meth:`CodexThreadContinuity.invalidate`.
+        """
+        if self.is_released():
+            return False
+        if not self.owner_host_id:
+            # No host identity recorded (older record or restricted host):
+            # fall back to same-boot pid liveness, which is all we have.
+            return False
+        return self.owner_host_id != _host_id()
 
 
 class CodexThreadStore(Protocol):
@@ -336,14 +387,25 @@ class CodexThreadContinuity:
     def reserve(self) -> None:
         """Take the exclusive per-session reservation, or raise.
 
-        Idempotent within one object. No-op when the store cannot supply a
-        lock path (custom/in-memory stores in tests): those callers get the
-        record-level checks only, which is stated rather than hidden.
+        Idempotent within one object.
+
+        **A store without ``lock_path`` is NOT production-safe.** Such a store
+        gets record-level checks only, which cannot stop two processes that
+        both start before either has saved. It is supported for tests and
+        in-memory experiments; it is logged as unsupported for durable
+        exclusive ownership so the gap can never be mistaken for a guarantee.
         """
         if self._reserved:
             return
         lock_path_fn = getattr(self._store, "lock_path", None)
         if lock_path_fn is None:
+            logger.warning(
+                "codex continuity: store %s provides no lock_path; durable "
+                "exclusive thread ownership is UNSUPPORTED for this store "
+                "(record-level checks only, concurrent starts are possible). "
+                "Do not use in production.",
+                type(self._store).__name__,
+            )
             self._reserved = True
             return
         try:
@@ -411,9 +473,11 @@ class CodexThreadContinuity:
         if record.owner_is_foreign():
             raise CodexThreadOwnershipError(
                 f"codex thread {record.thread_id} is claimed by a process on "
-                f"another host/boot ({record.owner_boot_id[:8]}, pid "
+                f"another host ({record.owner_host_id[:12]}, pid "
                 f"{record.owner_pid}) and was never released. Refusing: this "
-                f"host cannot prove that owner is gone."
+                f"host cannot prove that owner is gone. (A reboot of THIS "
+                f"host would be a legitimate takeover; a different host is "
+                f"not.)"
             )
         if record.owner_is_live():
             raise CodexThreadOwnershipError(
@@ -452,6 +516,7 @@ class CodexThreadContinuity:
             permission_profile=self._permission_profile,
             owner_pid=os.getpid(),
             owner_boot_id=_boot_id(),
+            owner_host_id=_host_id(),
             claimed_at=self._now(),
             released_at=0.0,
         )
@@ -462,7 +527,18 @@ class CodexThreadContinuity:
     def record_resumed(
         self, record: CodexThreadRecord, *, model: str = "", note: str = ""
     ) -> CodexThreadRecord:
-        """Re-claim an existing thread after a successful ``thread/resume``."""
+        """Re-claim an existing thread after a successful ``thread/resume``.
+
+        Records a continuity note when the previous claim was invalidated by a
+        reboot of this same host, so the takeover is auditable rather than
+        silent.
+        """
+        takeover_note = note or record.note
+        if record.predecessor_died_at_reboot():
+            takeover_note = (
+                f"recovered after host reboot (previous owner pid "
+                f"{record.owner_pid} on boot {record.owner_boot_id[:8]})"
+            )
         claimed = CodexThreadRecord(
             thread_id=record.thread_id,
             cwd=record.cwd or self._cwd,
@@ -472,9 +548,10 @@ class CodexThreadContinuity:
             ),
             owner_pid=os.getpid(),
             owner_boot_id=_boot_id(),
+            owner_host_id=_host_id(),
             claimed_at=self._now(),
             released_at=0.0,
-            note=note or record.note,
+            note=takeover_note,
         )
         self._store.save(claimed)
         self._record = claimed

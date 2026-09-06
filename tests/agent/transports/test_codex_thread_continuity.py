@@ -257,6 +257,7 @@ class TestNegativeControls:
                 permission_profile="workspace-write",
                 owner_pid=os.getppid(),  # a real, live, different process
                 owner_boot_id=_current_boot_id(),
+                owner_host_id=_current_host_id(),
                 claimed_at=1.0,
                 version=1,
             ).to_dict()
@@ -278,6 +279,7 @@ class TestNegativeControls:
                 permission_profile="workspace-write",
                 owner_pid=_dead_pid(),
                 owner_boot_id=_current_boot_id(),
+                owner_host_id=_current_host_id(),
                 claimed_at=1.0,
                 version=1,
             ).to_dict()
@@ -353,7 +355,7 @@ class TestNegativeControls:
         )
 
     def test_foreign_host_owner_fails_closed(self, db):
-        """A pid from another boot cannot be probed — refuse, don't assume."""
+        """A pid on ANOTHER machine cannot be probed — refuse, don't assume."""
         sid = _session_row(db, "sess-foreign")
         db.patch_session_model_config(sid, {
             THREAD_RECORD_KEY: CodexThreadRecord(
@@ -362,6 +364,7 @@ class TestNegativeControls:
                 permission_profile="workspace-write",
                 owner_pid=999999,
                 owner_boot_id="00000000-0000-0000-0000-ffffffffffff",
+                owner_host_id="some-other-machine-id",
                 claimed_at=1.0,
                 version=1,
             ).to_dict()
@@ -371,6 +374,63 @@ class TestNegativeControls:
         with pytest.raises(CodexThreadOwnershipError) as exc:
             s.ensure_started()
         assert "another host" in str(exc.value)
+        assert client.requests == []
+
+    def test_same_host_new_boot_resumes(self, db):
+        """Cold reboot of THIS host: the predecessor is provably dead.
+
+        This is the approved reboot-persistence case. Comparing boot id alone
+        would refuse forever and lock the service out of its conversation.
+        """
+        sid = _session_row(db, "sess-reboot")
+        db.patch_session_model_config(sid, {
+            THREAD_RECORD_KEY: CodexThreadRecord(
+                thread_id="thread-survives-reboot",
+                cwd=CWD,
+                permission_profile="workspace-write",
+                # A pid that IS alive right now — proving the takeover is
+                # driven by the boot-id change, not by pid liveness.
+                owner_pid=os.getppid(),
+                owner_boot_id="00000000-0000-0000-0000-aaaaaaaaaaaa",
+                owner_host_id=_current_host_id(),
+                claimed_at=1.0,
+                version=1,
+            ).to_dict()
+        })
+        client = FakeClient(known_threads={"thread-survives-reboot"})
+        s = make_session(client, continuity=make_continuity(db, sid))
+
+        assert s.ensure_started() == "thread-survives-reboot"
+        assert client.methods() == ["thread/resume"]
+
+        record = CodexThreadRecord.from_dict(
+            db.get_session_model_config_value(sid, THREAD_RECORD_KEY)
+        )
+        assert record.owner_pid == os.getpid()
+        assert record.owner_host_id == _current_host_id()
+        assert "reboot" in record.note, (
+            "a reboot takeover must be recorded, not silent"
+        )
+
+    def test_same_host_same_boot_live_pid_still_refused(self, db):
+        """The reboot allowance must not weaken same-boot exclusion."""
+        sid = _session_row(db, "sess-same-boot-live")
+        db.patch_session_model_config(sid, {
+            THREAD_RECORD_KEY: CodexThreadRecord(
+                thread_id="thread-busy",
+                cwd=CWD,
+                permission_profile="workspace-write",
+                owner_pid=os.getppid(),
+                owner_boot_id=_current_boot_id(),
+                owner_host_id=_current_host_id(),
+                claimed_at=1.0,
+                version=1,
+            ).to_dict()
+        })
+        client = FakeClient(known_threads={"thread-busy"})
+        s = make_session(client, continuity=make_continuity(db, sid))
+        with pytest.raises(CodexThreadOwnershipError):
+            s.ensure_started()
         assert client.requests == []
 
     def test_foreign_host_release_is_honoured(self, db):
@@ -383,6 +443,7 @@ class TestNegativeControls:
                 permission_profile="workspace-write",
                 owner_pid=999999,
                 owner_boot_id="00000000-0000-0000-0000-ffffffffffff",
+                owner_host_id="some-other-machine-id",
                 claimed_at=1.0,
                 released_at=2.0,
                 version=1,
@@ -620,6 +681,12 @@ def _current_boot_id() -> str:
     from agent.transports.codex_thread_continuity import _boot_id
 
     return _boot_id()
+
+
+def _current_host_id() -> str:
+    from agent.transports.codex_thread_continuity import _host_id
+
+    return _host_id()
 
 
 def _dead_pid() -> int:
