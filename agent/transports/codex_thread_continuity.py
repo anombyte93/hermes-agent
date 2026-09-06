@@ -75,6 +75,12 @@ THREAD_RECORD_KEY = "codex_thread"
 # mis-parsed into a resume attempt with missing fields.
 RECORD_VERSION = 1
 
+# Marker written by an explicit clear. A tombstone is the ONLY present payload
+# that legitimately means "no prior conversation" — it records that a human or
+# an explicit code path decided to abandon the thread, which is a different
+# fact from a corrupt blob that merely cannot be read.
+TOMBSTONE_KEY = "cleared"
+
 
 class CodexThreadContinuityError(RuntimeError):
     """Base for every explicit continuity refusal."""
@@ -94,6 +100,32 @@ class CodexThreadIdentityMismatch(CodexThreadContinuityError):
 
 class CodexThreadPersistenceError(CodexThreadContinuityError):
     """The continuity store could not be read or written."""
+
+
+class CodexThreadRecordUnusable(CodexThreadContinuityError):
+    """A record IS present but this build cannot understand it.
+
+    This is deliberately NOT ``None``. "No record" and "a record I cannot
+    parse" are different facts with opposite safe answers: the first may
+    legitimately start a fresh thread, the second must refuse before any
+    codex RPC, because starting fresh would silently abandon a conversation
+    that exists. The offending payload is carried on ``raw`` and is never
+    rewritten by the refusal path.
+    """
+
+    def __init__(self, message: str, *, raw: Any = None) -> None:
+        super().__init__(message)
+        self.raw = raw
+
+
+class CodexThreadRuntimeFidelityError(CodexThreadContinuityError):
+    """Codex did not confirm the model / permissions we asked it to run under.
+
+    Raised when the app-server's own ``thread/start`` or ``thread/resume``
+    response reports a model or sandbox/approval policy other than the one
+    requested. A label in our record is not proof; this is the check that
+    turns it into proof.
+    """
 
 
 def _boot_id() -> str:
@@ -167,26 +199,63 @@ class CodexThreadRecord:
     version: int = RECORD_VERSION
     # Free-form continuity notes (e.g. "recovered from crashed pid 123").
     note: str = ""
+    # ---- runtime fidelity (what codex ITSELF confirmed, not what we asked) ----
+    # These are only populated from an app-server response. An empty value
+    # means "not applied / not confirmed" and must never be read as proof
+    # that the thread ran under that model or those permissions.
+    model_applied: bool = False
+    permissions_applied: bool = False
+    sandbox: str = ""
+    approval_policy: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, raw: Any) -> Optional["CodexThreadRecord"]:
+        """Parse a stored payload.
+
+        Returns ``None`` for exactly two states, both of which legitimately
+        mean "no prior conversation": the key is **absent** (``raw is None``)
+        or it holds an **explicit tombstone** written by :meth:`clear`.
+
+        Anything else that is *present* but not understandable raises
+        :class:`CodexThreadRecordUnusable`. Returning ``None`` there — the
+        behaviour before this change — made a corrupt or future-versioned
+        record indistinguishable from no record at all, so the runtime would
+        silently start a brand new thread and abandon a live conversation.
+        """
+        if raw is None:
+            return None
         if not isinstance(raw, dict):
+            raise CodexThreadRecordUnusable(
+                "codex continuity: stored thread record is a "
+                f"{type(raw).__name__}, not an object; refusing to treat a "
+                "present-but-unreadable record as 'no conversation'",
+                raw=raw,
+            )
+        if raw.get(TOMBSTONE_KEY) is True:
+            # Explicitly cleared by an operator/caller: a fresh thread is the
+            # intended outcome, and the clearing is auditable in the payload.
             return None
         thread_id = raw.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id.strip():
-            return None
+            raise CodexThreadRecordUnusable(
+                "codex continuity: stored thread record has no usable "
+                f"thread_id (keys: {sorted(raw)}); refusing to start a fresh "
+                "thread over it",
+                raw=raw,
+            )
         version = raw.get("version")
         if not isinstance(version, int) or version > RECORD_VERSION:
-            logger.warning(
-                "codex continuity: ignoring thread record with unsupported "
-                "version %r (this build understands <= %d)",
-                version,
-                RECORD_VERSION,
+            raise CodexThreadRecordUnusable(
+                f"codex continuity: stored thread record {thread_id} has "
+                f"unsupported version {version!r} (this build understands "
+                f"<= {RECORD_VERSION}); refusing rather than starting a new "
+                "thread and losing that conversation",
+                raw=raw,
             )
-            return None
+
         def _s(key: str) -> str:
             value = raw.get(key)
             return value if isinstance(value, str) else ""
@@ -194,6 +263,9 @@ class CodexThreadRecord:
         def _f(key: str) -> float:
             value = raw.get(key)
             return float(value) if isinstance(value, (int, float)) else 0.0
+
+        def _b(key: str) -> bool:
+            return raw.get(key) is True
 
         owner_pid = raw.get("owner_pid")
         return cls(
@@ -208,6 +280,10 @@ class CodexThreadRecord:
             released_at=_f("released_at"),
             version=version,
             note=_s("note"),
+            model_applied=_b("model_applied"),
+            permissions_applied=_b("permissions_applied"),
+            sandbox=_s("sandbox"),
+            approval_policy=_s("approval_policy"),
         )
 
     # ---- ownership ----
@@ -277,7 +353,7 @@ class CodexThreadStore(Protocol):
 
     def save(self, record: CodexThreadRecord) -> None: ...
 
-    def clear(self) -> None: ...
+    def clear(self, *, reason: str = "") -> None: ...
 
 
 class SessionModelConfigThreadStore:
@@ -322,7 +398,25 @@ class SessionModelConfigThreadStore:
                 f"could not read codex thread record for session "
                 f"{self._session_id}: {exc}"
             ) from exc
+        # from_dict raises CodexThreadRecordUnusable for a present-but-
+        # unreadable payload. It is deliberately NOT caught here: swallowing
+        # it would restore the exact ambiguity this store is meant to remove.
         return CodexThreadRecord.from_dict(raw)
+
+    def load_raw(self) -> Any:
+        """Return the stored payload verbatim, for evidence on a refusal.
+
+        Never parsed, never normalised, never written back.
+        """
+        try:
+            return self._db.get_session_model_config_value(
+                self._session_id, THREAD_RECORD_KEY
+            )
+        except Exception as exc:
+            raise CodexThreadPersistenceError(
+                f"could not read codex thread record for session "
+                f"{self._session_id}: {exc}"
+            ) from exc
 
     def save(self, record: CodexThreadRecord) -> None:
         try:
@@ -335,10 +429,30 @@ class SessionModelConfigThreadStore:
                 f"{self._session_id}: {exc}"
             ) from exc
 
-    def clear(self) -> None:
+    def clear(self, *, reason: str = "") -> None:
+        """Write an explicit tombstone (not a delete).
+
+        A tombstone is what makes "explicitly cleared" distinguishable from
+        "corrupt" on the next read: the next process sees a payload that
+        says, in so many words, *a human decided this thread is finished*,
+        rather than having to guess from an absent key. The superseded
+        payload is preserved inside it so a mistaken clear is still
+        recoverable evidence.
+        """
+        superseded: Any = None
+        try:
+            superseded = self.load_raw()
+        except CodexThreadPersistenceError:
+            superseded = None
+        tombstone = {
+            TOMBSTONE_KEY: True,
+            "cleared_at": time.time(),
+            "cleared_reason": reason,
+            "superseded": superseded,
+        }
         try:
             self._db.patch_session_model_config(
-                self._session_id, {THREAD_RECORD_KEY: None}
+                self._session_id, {THREAD_RECORD_KEY: tombstone}
             )
         except Exception as exc:
             raise CodexThreadPersistenceError(
@@ -507,8 +621,21 @@ class CodexThreadContinuity:
 
     # ---- write side ----
 
-    def record_started(self, thread_id: str, *, model: str = "") -> CodexThreadRecord:
-        """Persist a newly started thread and claim ownership."""
+    def record_started(
+        self,
+        thread_id: str,
+        *,
+        model: str = "",
+        runtime: Optional[Dict[str, Any]] = None,
+    ) -> CodexThreadRecord:
+        """Persist a newly started thread and claim ownership.
+
+        ``runtime`` carries what codex CONFIRMED (see
+        ``codex_app_server_session._verify_runtime_fidelity``). Absent it, the
+        applied-flags stay False and the record cannot later be read as proof
+        that the model/permissions took effect.
+        """
+        runtime = runtime or {}
         record = CodexThreadRecord(
             thread_id=thread_id,
             cwd=self._cwd,
@@ -519,13 +646,22 @@ class CodexThreadContinuity:
             owner_host_id=_host_id(),
             claimed_at=self._now(),
             released_at=0.0,
+            model_applied=bool(runtime.get("model_applied")),
+            permissions_applied=bool(runtime.get("permissions_applied")),
+            sandbox=str(runtime.get("sandbox") or ""),
+            approval_policy=str(runtime.get("approval_policy") or ""),
         )
         self._store.save(record)
         self._record = record
         return record
 
     def record_resumed(
-        self, record: CodexThreadRecord, *, model: str = "", note: str = ""
+        self,
+        record: CodexThreadRecord,
+        *,
+        model: str = "",
+        note: str = "",
+        runtime: Optional[Dict[str, Any]] = None,
     ) -> CodexThreadRecord:
         """Re-claim an existing thread after a successful ``thread/resume``.
 
@@ -533,6 +669,7 @@ class CodexThreadContinuity:
         reboot of this same host, so the takeover is auditable rather than
         silent.
         """
+        runtime = runtime or {}
         takeover_note = note or record.note
         if record.predecessor_died_at_reboot():
             takeover_note = (
@@ -552,6 +689,12 @@ class CodexThreadContinuity:
             claimed_at=self._now(),
             released_at=0.0,
             note=takeover_note,
+            # Fidelity is re-proved on every attach; a previous run's
+            # confirmation is not evidence about this one.
+            model_applied=bool(runtime.get("model_applied")),
+            permissions_applied=bool(runtime.get("permissions_applied")),
+            sandbox=str(runtime.get("sandbox") or ""),
+            approval_policy=str(runtime.get("approval_policy") or ""),
         )
         self._store.save(claimed)
         self._record = claimed
@@ -592,13 +735,19 @@ class CodexThreadContinuity:
             self._release_reservation()
 
     def invalidate(self, reason: str) -> None:
-        """Drop an unusable record so the next start is a clean fresh thread.
+        """Write an explicit tombstone so the next start is a clean fresh thread.
 
         Only called after an explicit, surfaced refusal — never as a silent
-        fallback inside the resume path.
+        fallback inside the resume path, and never automatically on an
+        unusable record (that refusal must reach a human with the original
+        bytes intact).
         """
         try:
-            self._store.clear()
+            try:
+                self._store.clear(reason=reason)
+            except TypeError:
+                # Store predates the reason kwarg.
+                self._store.clear()
         except Exception:
             logger.warning(
                 "codex continuity: could not clear unusable thread record (%s)",
