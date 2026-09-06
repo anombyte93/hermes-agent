@@ -38,8 +38,34 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.codex_thread_continuity import (
+    CodexThreadContinuity,
+    CodexThreadContinuityError,
+    CodexThreadRecord,
+    CodexThreadResumeError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_thread_id(result: Any) -> Optional[str]:
+    """Pull the thread id out of a thread/start or thread/resume result.
+
+    Cross-fills thread.id / sessionId — different codex versions have
+    serialized this under either key. Mirrors openclaw beta.8's tolerance fix
+    so future codex drops/renames don't KeyError us at handshake time.
+    """
+    if not isinstance(result, dict):
+        return None
+    thread_obj = result.get("thread") or {}
+    if not isinstance(thread_obj, dict):
+        thread_obj = {}
+    return (
+        thread_obj.get("id")
+        or thread_obj.get("sessionId")
+        or result.get("sessionId")
+        or result.get("threadId")
+    )
 
 
 # How many tailing stderr lines from the codex subprocess to attach to a
@@ -282,6 +308,8 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        continuity: Optional["CodexThreadContinuity"] = None,
+        model: str = "",
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -296,6 +324,12 @@ class CodexAppServerSession:
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        # Durable thread continuity. None = today's behaviour (a fresh thread
+        # every process), which is correct for ephemeral agents with no
+        # session DB. When present it is consulted before every thread/start.
+        self._continuity = continuity
+        self._model = model
+        self._resumed = False
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
@@ -313,11 +347,28 @@ class CodexAppServerSession:
     # ---------- lifecycle ----------
 
     def ensure_started(self) -> str:
-        """Spawn the subprocess, do the initialize handshake, and start a
+        """Spawn the subprocess, do the initialize handshake, and attach to a
         thread. Returns the codex thread id. Idempotent — repeated calls
-        return the same thread id."""
+        return the same thread id.
+
+        Attachment is *resume-first* when durable continuity is configured:
+        a saved record for this Hermes session is resumed by its exact id, so
+        a service restart keeps the model's own context. There is deliberately
+        no silent fallback to ``thread/start`` when a record exists but cannot
+        be used — that fallback is what made the continuity bug invisible.
+        Refusals raise (``CodexThreadResumeError``,
+        ``CodexThreadOwnershipError``, ``CodexThreadIdentityMismatch``,
+        ``CodexThreadPersistenceError``) and the caller decides.
+        """
         if self._thread_id is not None:
             return self._thread_id
+
+        # Continuity is consulted BEFORE spawning codex, so an ownership or
+        # identity refusal costs no subprocess and no codex-side state.
+        record = None
+        if self._continuity is not None:
+            record = self._continuity.load_resumable()
+
         if self._client is None:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
@@ -327,6 +378,11 @@ class CodexAppServerSession:
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
+
+        if record is not None:
+            self._thread_id = self._resume_recorded_thread(record)
+            return self._thread_id
+
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi
@@ -344,17 +400,7 @@ class CodexAppServerSession:
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
         result = self._client.request("thread/start", params, timeout=15)
-        # Cross-fill thread.id/sessionId — different codex versions have
-        # serialized this under either key. Mirrors openclaw beta.8's
-        # tolerance fix so future codex drops/renames don't KeyError us
-        # at handshake time.
-        thread_obj = result.get("thread") or {}
-        thread_id = (
-            thread_obj.get("id")
-            or thread_obj.get("sessionId")
-            or result.get("sessionId")
-            or result.get("threadId")
-        )
+        thread_id = _extract_thread_id(result)
         if not thread_id:
             raise CodexAppServerError(
                 code=-32603,
@@ -370,7 +416,52 @@ class CodexAppServerSession:
             self._permission_profile,
             self._cwd,
         )
+        if self._continuity is not None:
+            # A start we cannot persist is a thread the next restart will
+            # lose. Abort the turn rather than let the user build a
+            # conversation on top of it believing it is durable. Drop our
+            # local attachment too, so a retry re-decides from scratch.
+            try:
+                self._continuity.record_started(thread_id, model=self._model)
+            except CodexThreadContinuityError:
+                self._thread_id = None
+                raise
         return self._thread_id
+
+    def _resume_recorded_thread(self, record: "CodexThreadRecord") -> str:
+        """Resume the exact saved thread, or raise. Never falls back."""
+        assert self._client is not None
+        try:
+            result = self._client.request(
+                "thread/resume", {"threadId": record.thread_id}, timeout=30
+            )
+        except (CodexAppServerError, TimeoutError) as exc:
+            raise CodexThreadResumeError(
+                f"codex refused to resume saved thread {record.thread_id}: "
+                f"{exc}. The conversation's codex context is unavailable; "
+                f"not silently starting a different thread."
+            ) from exc
+        resumed_id = _extract_thread_id(result) or record.thread_id
+        if resumed_id != record.thread_id:
+            raise CodexThreadResumeError(
+                f"codex resumed thread {resumed_id} but {record.thread_id} "
+                f"was requested"
+            )
+        self._resumed = True
+        logger.info(
+            "codex app-server thread resumed: id=%s profile=%s cwd=%s",
+            resumed_id[:8],
+            record.permission_profile or self._permission_profile,
+            record.cwd or self._cwd,
+        )
+        if self._continuity is not None:
+            self._continuity.record_resumed(record, model=self._model)
+        return resumed_id
+
+    @property
+    def resumed(self) -> bool:
+        """True when this session attached to a pre-existing codex thread."""
+        return self._resumed
 
     def close(self) -> None:
         if self._closed:
@@ -378,6 +469,14 @@ class CodexAppServerSession:
         self._closed = True
         with self._active_turn_lock:
             self._active_turn_id = None
+        # Graceful ownership hand-back before the client goes away, so a
+        # clean restart is not mistaken for a concurrent owner. Best-effort
+        # by design (see CodexThreadContinuity.release).
+        if self._continuity is not None:
+            try:
+                self._continuity.release()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("codex continuity release failed", exc_info=True)
         if self._client is not None:
             try:
                 self._client.close()
@@ -493,6 +592,15 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
+        except CodexThreadContinuityError as exc:
+            # Explicit continuity refusal (fabricated/unavailable thread, live
+            # concurrent owner, identity mismatch, unreadable store). Surface
+            # verbatim: silently starting a *different* thread here is exactly
+            # the bug this path exists to prevent.
+            result.error = f"Codex conversation continuity refused: {exc}"
+            result.should_retire = True
+            self._interrupt_event.clear()
+            return result
         except (CodexAppServerError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
@@ -804,6 +912,10 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
+        except CodexThreadContinuityError as exc:
+            result.error = f"Codex conversation continuity refused: {exc}"
+            result.should_retire = True
+            return result
         except (CodexAppServerError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
