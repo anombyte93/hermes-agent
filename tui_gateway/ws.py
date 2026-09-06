@@ -530,6 +530,17 @@ async def handle_ws(
         if transport is not None:
             server.unregister_live_transport(transport)
 
+            # Shared-conversation attachments are client-side only: dropping
+            # them releases this socket's poller and its service connection.
+            # The owner, the lease and the conversation are untouched — a
+            # disconnect must never be able to end the shared service.
+            try:
+                from tui_gateway import shared_conversation
+
+                shared_conversation.detach_transport(transport)
+            except Exception:
+                _log.debug("shared_conversation detach on disconnect failed", exc_info=True)
+
             # Owner-safely park browser controllers this transport registered.
             # A reconnect with the same stable identity may deliver a terminal
             # result for work already in flight; no new dispatch is admitted
