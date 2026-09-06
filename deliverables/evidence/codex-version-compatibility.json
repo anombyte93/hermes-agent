@@ -1,0 +1,47 @@
+{
+ "captured_at": "2026-09-06T21:10Z (AWST 2026-09-07 05:10)",
+ "why": "Two hosts run different codex builds. The integration card must stage a deliberate compatible version, not assume Archie's build is what Evo will run.",
+ "hosts": {
+  "Archie": {
+   "codex_version": "codex-cli 0.153.4",
+   "codex_bin": "/home/anombyte/.npm-global/bin/codex",
+   "status": "LIVE-PROVEN — every live probe in this card ran here"
+  },
+  "Evo": {
+   "codex_version": "codex-cli 0.149.0",
+   "codex_bin": "/home/hayden/.local/bin/codex",
+   "vendor": "/home/hayden/.codex-vendor/x86_64-unknown-linux-musl/bin/codex",
+   "status": "SCHEMA-COMPATIBLE ONLY — no live turn was run here from this card"
+  }
+ },
+ "minimum_tested_version": "0.153.4 (live). 0.149.0 verified by schema inspection only.",
+ "schema_fields_this_change_depends_on": {
+  "method": "codex app-server generate-json-schema --out <dir>, run on BOTH hosts",
+  "ThreadStartParams": {
+   "0.153.4": ["model", "sandbox", "approvalPolicy", "cwd"],
+   "0.149.0": ["model", "sandbox", "approvalPolicy", "cwd"],
+   "verdict": "identical"
+  },
+  "ThreadResumeParams": {
+   "0.153.4": ["model", "sandbox", "approvalPolicy", "cwd"],
+   "0.149.0": ["model", "sandbox", "approvalPolicy", "cwd"],
+   "verdict": "identical"
+  },
+  "ThreadStartResponse": {
+   "0.153.4": ["model", "sandbox", "approvalPolicy", "cwd"],
+   "0.149.0": ["model", "sandbox", "approvalPolicy", "cwd"],
+   "verdict": "identical - the readback the fidelity check depends on exists on both"
+  },
+  "TurnStartParams.UserInput variants": {
+   "0.153.4": ["audio", "image", "localAudio", "localImage", "mention", "skill", "text"],
+   "0.149.0": ["audio", "image", "localAudio", "localImage", "mention", "skill", "text"],
+   "verdict": "identical - text / image / localImage all present on both"
+  }
+ },
+ "what_this_does_NOT_prove": [
+  "That codex 0.149.0 BEHAVES the same as 0.153.4. Only the request/response SHAPES were compared. No thread was started, no turn was run, and no image was sent on Evo from this card.",
+  "That the Evo host has usable codex auth. Not probed; out of scope (no auth, no browser, no device flow).",
+  "Anything about codex versions other than these two."
+ ],
+ "integration_requirement": "t_dda40b50 must stage an explicit, matching codex version rather than inheriting whatever is installed. If Evo stays on 0.149.0, run the two live probes there before the rehearsal is called proven; a schema match is a necessary condition, not a sufficient one."
+}
