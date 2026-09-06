@@ -1,0 +1,144 @@
+..F....FF..........FF..........FF.                                       [100%]
+=================================== FAILURES ===================================
+________ TestParserKnownAnswers.test_unsupported_version_refuses_loudly ________
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestParserKnownAnswers object at 0x7f43d10e4770>
+
+    def test_unsupported_version_refuses_loudly(self):
+        """Was: returns None → silent thread/start on a live conversation."""
+        raw = {"thread_id": "abc", "version": 999}
+>       with pytest.raises(CodexThreadRecordUnusable) as exc:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'agent.transports.codex_thread_continuity.CodexThreadRecordUnusable'>
+
+tests/agent/transports/test_codex_runtime_fidelity.py:181: Failed
+____ TestStoreBoundary.test_unsupported_record_refuses_before_any_codex_rpc ____
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestStoreBoundary object at 0x7f43d10a5810>
+db = <hermes_state.SessionDB object at 0x7f43d0ece900>
+
+    def test_unsupported_record_refuses_before_any_codex_rpc(self, db):
+        """The refusal must land BEFORE thread/start, or the damage is done."""
+        continuity = make_continuity(db, "s-unsupported")
+        db.patch_session_model_config(
+            "s-unsupported",
+            {THREAD_RECORD_KEY: {"thread_id": "live-thread", "version": 999}},
+        )
+        client = FidelityClient()
+        session = make_session(client, continuity)
+>       with pytest.raises(CodexThreadRecordUnusable):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'agent.transports.codex_thread_continuity.CodexThreadRecordUnusable'>
+
+tests/agent/transports/test_codex_runtime_fidelity.py:213: Failed
+_________ TestStoreBoundary.test_refusal_preserves_the_original_bytes __________
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestStoreBoundary object at 0x7f43d10a5bd0>
+db = <hermes_state.SessionDB object at 0x7f43d0f06850>
+
+    def test_refusal_preserves_the_original_bytes(self, db):
+        continuity = make_continuity(db, "s-preserve")
+        payload = {"thread_id": "live-thread", "version": 999, "cwd": CWD}
+        db.patch_session_model_config("s-preserve", {THREAD_RECORD_KEY: payload})
+>       with pytest.raises(CodexThreadRecordUnusable):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'agent.transports.codex_thread_continuity.CodexThreadRecordUnusable'>
+
+tests/agent/transports/test_codex_runtime_fidelity.py:223: Failed
+__ TestRuntimeFidelityVerification.test_wrong_sandbox_in_response_is_refused ___
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestRuntimeFidelityVerification object at 0x7f43d10e55b0>
+db = <hermes_state.SessionDB object at 0x7f43d0f07610>
+
+    def test_wrong_sandbox_in_response_is_refused(self, db):
+        """The hermes-agent#41 observation, reproduced as a gate.
+    
+        Requested read-only, codex answers workspace-write / on-request —
+        exactly what the saved rollout showed. Before this change nothing
+        looked, and the record kept claiming read-only.
+        """
+        client = FidelityClient(reply_overrides={
+            "sandbox": {"type": "workspaceWrite"},
+            "approvalPolicy": "on-request",
+        })
+        session = make_session(client, make_continuity(db, "s-mismatch"))
+>       with pytest.raises(CodexThreadRuntimeFidelityError) as exc:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'agent.transports.codex_thread_continuity.CodexThreadRuntimeFidelityError'>
+
+tests/agent/transports/test_codex_runtime_fidelity.py:339: Failed
+___ TestRuntimeFidelityVerification.test_wrong_model_in_response_is_refused ____
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestRuntimeFidelityVerification object at 0x7f43d1150170>
+db = <hermes_state.SessionDB object at 0x7f43d30dc050>
+
+    def test_wrong_model_in_response_is_refused(self, db):
+        client = FidelityClient(reply_overrides={"model": "gpt-5-codex"})
+        session = make_session(client, make_continuity(db, "s-model-mismatch"))
+>       with pytest.raises(CodexThreadRuntimeFidelityError) as exc:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'agent.transports.codex_thread_continuity.CodexThreadRuntimeFidelityError'>
+
+tests/agent/transports/test_codex_runtime_fidelity.py:346: Failed
+_ TestCloseOrdering.test_ownership_is_retained_when_the_subprocess_survives_close _
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestCloseOrdering object at 0x7f43d10a6850>
+db = <hermes_state.SessionDB object at 0x7f43d30dc190>
+
+    def test_ownership_is_retained_when_the_subprocess_survives_close(self, db):
+        """A close that does not reap codex must NOT hand the thread away."""
+        continuity = make_continuity(db, "s-survivor")
+        client = FidelityClient()
+        client.alive_after_close = True  # ignored terminate/kill
+        session = make_session(client, continuity)
+        session.ensure_started()
+        session.close()
+    
+        record = CodexThreadRecord.from_dict(
+            db.get_session_model_config_value("s-survivor", THREAD_RECORD_KEY)
+        )
+>       assert record.released_at == 0.0, (
+            "ownership was released while the codex subprocess was still alive"
+        )
+E       AssertionError: ownership was released while the codex subprocess was still alive
+E       assert 1788699296.5605035 == 0.0
+E        +  where 1788699296.5605035 = CodexThreadRecord(thread_id='thread-fid-001', cwd='/tmp', model='gpt-6-astra', permission_profile='read-only', owner_p...5605035, version=1, note='', model_applied=True, permissions_applied=True, sandbox='readOnly', approval_policy='never').released_at
+
+tests/agent/transports/test_codex_runtime_fidelity.py:479: AssertionError
+________ TestCloseOrdering.test_ownership_is_retained_when_close_raises ________
+
+self = <tests.agent.transports.test_codex_runtime_fidelity.TestCloseOrdering object at 0x7f43d10e5940>
+db = <hermes_state.SessionDB object at 0x7f43d30dc690>
+
+    def test_ownership_is_retained_when_close_raises(self, db):
+        continuity = make_continuity(db, "s-raiser")
+        client = FidelityClient()
+    
+        def boom():
+            client.closed = True
+            raise RuntimeError("close timed out")
+    
+        session = make_session(client, continuity)
+        session.ensure_started()
+        client.close = boom
+        client.alive_after_close = True
+        session.close()
+    
+        record = CodexThreadRecord.from_dict(
+            db.get_session_model_config_value("s-raiser", THREAD_RECORD_KEY)
+        )
+>       assert record.released_at == 0.0
+E       AssertionError: assert 1788699296.9683607 == 0.0
+E        +  where 1788699296.9683607 = CodexThreadRecord(thread_id='thread-fid-001', cwd='/tmp', model='gpt-6-astra', permission_profile='read-only', owner_p...9683607, version=1, note='', model_applied=True, permissions_applied=True, sandbox='readOnly', approval_policy='never').released_at
+
+tests/agent/transports/test_codex_runtime_fidelity.py:500: AssertionError
+=========================== short test summary info ============================
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestParserKnownAnswers::test_unsupported_version_refuses_loudly
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestStoreBoundary::test_unsupported_record_refuses_before_any_codex_rpc
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestStoreBoundary::test_refusal_preserves_the_original_bytes
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestRuntimeFidelityVerification::test_wrong_sandbox_in_response_is_refused
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestRuntimeFidelityVerification::test_wrong_model_in_response_is_refused
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestCloseOrdering::test_ownership_is_retained_when_the_subprocess_survives_close
+FAILED tests/agent/transports/test_codex_runtime_fidelity.py::TestCloseOrdering::test_ownership_is_retained_when_close_raises
+7 failed, 27 passed in 7.56s
+exit=1
