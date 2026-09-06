@@ -121,10 +121,13 @@ in the URL, in `localStorage`, or in a repo.
 
 * A frontend that **supplies** it gets true retry semantics: resending the same
   key returns `duplicate: true` and queues no second turn.
-* A frontend that **omits** it (today: the stock TUI/Desktop composer, which
-  has no such field) gets a fresh UUID per RPC, so a resend is treated as a
-  genuinely new message. That is correct for new text and is the only safe
-  default for text we cannot prove is a retry.
+* A frontend that **omits** it (today: the stock TUI and Desktop composers,
+  which have no such field) gets a fresh UUID per RPC, so a resend is treated
+  as a genuinely new message. That is correct for new text and is the only
+  safe default for text we cannot prove is a retry — but it is a **fallback,
+  not stable-retry acceptance**. Making the real frontends carry a stable key
+  across an interrupted reply is frontend work owned by the integration card;
+  the bridge honours such a key today and is tested for it.
 
 **This bridge never auto-retries a submit.** If a submit's outcome is uncertain
 (socket error after the frame went out), the error is surfaced and the resend

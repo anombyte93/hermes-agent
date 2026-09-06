@@ -30,9 +30,13 @@ Before the shared service may take ownership:
    service's lease refuses to evict a *live* holder by timeout, so an
    un-stopped old owner will block the new one rather than duplicate it —
    that refusal is the safety net, not the plan.
-5. **The Discord token is provisioned to exactly one holder.** The service
-   resolves it per API call from `~/.config/astra-evo/secrets.env`; the old
-   owner must no longer hold a usable copy.
+5. **Astra ingestion is exclusively the new owner's.** What must be true is
+   that exactly one process ingests and answers for this Astra conversation —
+   not that any credential is destroyed. The Discord bot credential is shared
+   with other routes and stays valid for them; deleting or invalidating it is
+   out of scope here and would break unrelated surfaces. The check is
+   exclusivity of *ingestion and ownership*, evidenced by the lease and by the
+   old owner no longer processing this conversation.
 
 ## 2. Transcript migration with loss-free tail capture
 
@@ -102,13 +106,39 @@ explicit continuity event must be recorded linking old thread → new thread wit
 the reason. A silent replacement would make the conversation look continuous
 while its history was severed.
 
-## 6. What is still UNKNOWN from this side
+## 6. Open items — parent resolves these, on evidence and authority
 
-* Whether the installed Evo Hermes build exposes `continuity=` (decides
-  §5 outcome). Read from the service's `describe()` at install time.
-* The real service socket path/token location on Evo — the template ships a
-  placeholder, deliberately.
-* Whether the Workbench's own auth can reach the `serve` port; the bridge
-  provides the URL, not the tunnel.
-* Whether Hayden's Desktop build's remote-connection UI is on a version that
-  accepts a bare `ws://host:port/api/ws`; the path is correct for this tree.
+These are unresolved **from this card's position**, not questions requiring a
+human gate. The parent resolves each from delivery evidence and its own
+authority; none of them blocks anything by itself.
+
+* Whether the installed Evo Hermes build exposes `continuity=` — decides the
+  §5 outcome. Read from the service's `describe()` at install time.
+* The real service socket path / token location on Evo. The template ships
+  placeholders deliberately.
+* Whether the Workbench's auth/tunnel can reach the `serve` port. This bridge
+  supplies the URL; the tunnel is not its to build.
+* Whether Hayden's Desktop build's remote-connection UI accepts a bare
+  `ws://host:port/api/ws`. The path is correct for this tree.
+
+## 7. What this card does NOT prove
+
+Stated plainly so no downstream reader mistakes component proof for user
+proof:
+
+* **No rendered-UI proof exists.** Nothing here has been exercised through a
+  real TUI render, a real Desktop window, or a real browser Chat tab. Every
+  test drives the transport and dispatch layers with a deterministic service
+  fixture. Rendered-frontend proof is still outstanding and follows the staged
+  Evo install.
+* **No live-model proof exists.** No test in this repository involves Codex or
+  any real model.
+* **Stable retry keys are not delivered, only documented.** The stock TUI and
+  Desktop composers do not send `client_message_id`, so today a resend is a
+  new message. The bridge honours a stable key when one is supplied and is
+  tested for it, but *making the real frontends supply one* is frontend work
+  owned by the integration card — documentation of the fresh-UUID fallback
+  does not satisfy a stable-retry acceptance criterion.
+* **The attachment seam is owned by the integration card.** This bridge
+  refuses attachment-bearing submits with an exact `missing_seam` and will
+  carry them unchanged the moment the service `submit` grows the parameter.
