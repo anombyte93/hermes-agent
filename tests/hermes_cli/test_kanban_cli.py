@@ -179,3 +179,89 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# create --goal TEXT / --parent validation (issue #42)
+# ---------------------------------------------------------------------------
+
+
+def _build_hermes_like_parser():
+    """A throwaway root parser with the kanban subtree attached the same way
+    hermes_cli.main attaches it (build_parser over a subparsers action)."""
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    return parser
+
+
+def test_create_goal_text_appends_goal_heading_and_bare_flag_unchanged(kanban_home):
+    """Issue #42 bug 1: ``--goal "<sentence>"`` used to die with exit 2
+    "unrecognized arguments" raised by the TOP-LEVEL parser (because --goal
+    was store_true), creating nothing. The sentence must instead be accepted
+    and appended to the body under a ``## Goal`` heading, while a bare
+    ``--goal`` keeps enabling goal mode without touching the body."""
+    parser = _build_hermes_like_parser()
+
+    goal_text = (
+        "Ownership resolves when the bag stamp is within the scan's own "
+        "duration; state and age ledgered; red test first"
+    )
+
+    args = parser.parse_args(
+        ["kanban", "create", "stamp ownership", "--body", "seed brief",
+         "--goal", goal_text, "--json"]
+    )
+    rc = kc.kanban_command(args)
+    assert rc == 0, f"create --goal '<text>' must succeed, got exit {rc}"
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, kb.list_tasks(conn, limit=1)[0].id)
+    assert task is not None
+    assert task.goal_mode is True
+    assert "## Goal" in (task.body or "")
+    assert goal_text in (task.body or "")
+    # The original body is preserved ahead of the appended heading.
+    assert (task.body or "").startswith("seed brief")
+
+    # Bare --goal: unchanged — goal mode on, no heading injected.
+    args_bare = parser.parse_args(
+        ["kanban", "create", "bare goal card", "--body", "plain", "--goal", "--json"]
+    )
+    assert kc.kanban_command(args_bare) == 0
+    with kb.connect_closing() as conn:
+        rows = [t for t in kb.list_tasks(conn, limit=10) if t.title == "bare goal card"]
+        assert len(rows) == 1
+        assert rows[0].goal_mode is True
+        assert "## Goal" not in (rows[0].body or "")
+        assert rows[0].body == "plain"
+
+
+def test_create_rejects_empty_parent_values(kanban_home, capsys):
+    """Issue #42 bug 2: ``--parent ""`` (an unset shell variable) used to be
+    silently dropped and the card created parentless in ready — ahead of the
+    card it depended on. Empty/whitespace --parent values must be rejected at
+    create time with exit 2, the message must name --parent, and no card may
+    be created."""
+    parser = _build_hermes_like_parser()
+
+    for bad in ("", "   "):
+        args = parser.parse_args(
+            ["kanban", "create", "orphan risk", "--parent", bad, "--json"]
+        )
+        rc = kc.kanban_command(args)
+        captured = capsys.readouterr()
+        assert rc == 2, f"--parent {bad!r} must exit 2, got {rc}"
+        assert "--parent" in captured.err, captured.err
+
+    with kb.connect_closing() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert count == 0, "no card may be created from a rejected --parent"
+
+    # The DB layer must not silently drop empty parents either — it is the
+    # durable trust boundary (children can import kanban_db directly).
+    import pytest
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="parent"):
+            kb.create_task(conn, title="db api orphan risk", parents=[""])
+
+
