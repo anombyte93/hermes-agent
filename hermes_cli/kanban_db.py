@@ -10301,6 +10301,14 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # Reject wrong-host dispatch before claiming cards or changing run state.
+    # A max=0 maintenance tick may still retire already-existing local runs.
+    if spawn_fn is None and max_spawn != 0 and not preview:
+        from hermes_cli.config import load_config
+        from hermes_cli.kanban_host import require_execution_host
+
+        require_execution_host(load_config())
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale. Preview runs against an
     # in-memory snapshot and must not mutate process-lifecycle state.
@@ -11115,6 +11123,12 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
+    # A remote model endpoint does not move this process or its tools off-box.
+    # Validate placement before opening logs or starting any worker process.
+    from hermes_cli.config import load_config
+    from hermes_cli.kanban_host import require_execution_host
+
+    require_execution_host(load_config())
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
