@@ -2615,6 +2615,43 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
                 )
+                # Schedule-KIND transition: the job must adopt the repeat
+                # semantics of its NEW schedule kind, unless the caller set
+                # repeat explicitly in this same update (issue #45).
+                # create_job auto-sets repeat.times=1 for one-shot schedules;
+                # an update from a one-shot schedule to a recurring one used
+                # to keep that auto limit, and mark_job_run retires on
+                # completed >= times for ANY kind — so the "recurring" job
+                # silently fired once and retired. Symmetrically, moving TO a
+                # one-shot schedule without an explicit repeat adopts the
+                # create-time default (times=1) so the readback can't claim
+                # 'forever' for a job that fires once.
+                if "repeat" not in updates:
+                    old_schedule = job.get("schedule")
+                    old_kind = (
+                        old_schedule.get("kind")
+                        if isinstance(old_schedule, dict)
+                        else None
+                    )
+                    new_kind = updated_schedule.get("kind")
+                    if old_kind != new_kind:
+                        prior_repeat = dict(job.get("repeat") or {})
+                        prior_completed = prior_repeat.get("completed", 0)
+                        if new_kind == "once":
+                            if prior_repeat.get("times") is None:
+                                updated["repeat"] = {
+                                    "times": 1,
+                                    "completed": prior_completed,
+                                }
+                        elif old_kind == "once" and new_kind in ("interval", "cron"):
+                            # Clear only the one-shot auto-default (times=1);
+                            # an explicit finite limit (>1) survives the
+                            # transition — the caller asked for that budget.
+                            if prior_repeat.get("times") == 1:
+                                updated["repeat"] = {
+                                    "times": None,
+                                    "completed": prior_completed,
+                                }
                 if updated.get("state") != "paused":
                     updated_next_run = compute_next_run(updated_schedule)
                     # Same guard as create_job: an UPDATE that sets a one-shot
