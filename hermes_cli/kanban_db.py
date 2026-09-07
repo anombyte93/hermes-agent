@@ -10251,7 +10251,7 @@ def _dispatch_once_locked(
     """
     # Reject wrong-host dispatch before claiming cards or changing run state.
     # A max=0 maintenance tick may still retire already-existing local runs.
-    if spawn_fn is None and max_spawn != 0 and not preview:
+    if spawn_fn is None and max_spawn != 0 and not dry_run:
         from hermes_cli.config import load_config
         from hermes_cli.kanban_host import require_execution_host
 
