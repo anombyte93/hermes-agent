@@ -332,6 +332,9 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # Optional physical hostname for workers. Run the board and dispatcher there.
+  # Choosing a remote model provider alone still executes tools on this machine.
+  # execution_host: "evo"
 
 # =============================================================================
 # Terminal Tool Configuration
