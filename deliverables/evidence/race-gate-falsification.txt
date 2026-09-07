@@ -1,0 +1,71 @@
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+_______ TestConcurrentStartRace.test_in_process_second_holder_is_refused _______
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestConcurrentStartRace object at 0x7fbb113e42d0>
+db = <hermes_state.SessionDB object at 0x7fbb101c1d30>
+
+    def test_in_process_second_holder_is_refused(self, db):
+        """Two live continuity objects, same session, no record yet.
+    
+        Without a reservation both would see "no owner" and both would call
+        thread/start. The flock makes the second one lose explicitly.
+        """
+        sid = _session_row(db, "sess-race-inproc")
+        first = make_continuity(db, sid)
+        first.load_resumable()  # takes and holds the reservation
+    
+        second = make_continuity(db, sid)
+>       with pytest.raises(CodexThreadOwnershipError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'agent.transports.codex_thread_continuity.CodexThreadOwnershipError'>
+
+tests/agent/transports/test_codex_thread_continuity.py:413: Failed
+______ TestConcurrentStartRace.test_two_real_processes_cannot_both_start _______
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestConcurrentStartRace object at 0x7fbb105a7750>
+db = <hermes_state.SessionDB object at 0x7fbb101db110>
+
+    def test_two_real_processes_cannot_both_start(self, db):
+        """Real subprocess race: N processes, one winner, no double-start.
+    
+        This is the control the parent asked for — actual concurrent OS
+        processes contending on the same session, not sequential fakes.
+        """
+        import json
+        import subprocess
+        import sys
+    
+        sid = _session_row(db, "sess-race-subproc")
+        repo = _repo_root()
+        script = os.path.join(repo, "tests", "agent", "transports",
+                              "_continuity_race_child.py")
+        procs = [
+            subprocess.Popen(
+                [sys.executable, script, str(db.db_path), sid, CWD],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=repo, env={**os.environ, "PYTHONPATH": repo},
+            )
+            for _ in range(6)
+        ]
+        outcomes = []
+        for p in procs:
+            out, err = p.communicate(timeout=180)
+            line = (out or "").strip().splitlines()
+            assert line, f"child produced no output; stderr={err[-1500:]}"
+            outcomes.append(json.loads(line[-1]))
+    
+        winners = [o for o in outcomes if o["outcome"] == "reserved"]
+        losers = [o for o in outcomes if o["outcome"] == "refused"]
+>       assert len(winners) == 1, (
+            f"exactly one process may start the thread; got {outcomes}"
+        )
+E       AssertionError: exactly one process may start the thread; got [{'pid': 3118672, 'outcome': 'reserved', 'record': None}, {'pid': 3118673, 'outcome': 'reserved', 'record': None}, {'pid': 3118674, 'outcome': 'reserved', 'record': None}, {'pid': 3118676, 'outcome': 'reserved', 'record': None}, {'pid': 3118678, 'outcome': 'reserved', 'record': None}, {'pid': 3118679, 'outcome': 'reserved', 'record': None}]
+E       assert 6 == 1
+E        +  where 6 = len([{'outcome': 'reserved', 'pid': 3118672, 'record': None}, {'outcome': 'reserved', 'pid': 3118673, 'record': None}, {'o...one}, {'outcome': 'reserved', 'pid': 3118678, 'record': None}, {'outcome': 'reserved', 'pid': 3118679, 'record': None}])
+
+tests/agent/transports/test_codex_thread_continuity.py:453: AssertionError
+=========================== short test summary info ============================
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestConcurrentStartRace::test_in_process_second_holder_is_refused
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestConcurrentStartRace::test_two_real_processes_cannot_both_start
+2 failed in 3.09s

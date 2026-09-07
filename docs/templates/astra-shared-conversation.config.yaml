@@ -1,0 +1,58 @@
+# Astra shared-conversation profile template.
+#
+# Copy to ~/.hermes/profiles/astra-shared/config.yaml (see
+# docs/shared-conversation.md for the exact install and rollback commands).
+# NOTHING is installed by the bridge card — this file is a template.
+#
+# What the shared_conversation block does: it makes THIS profile a client of
+# the Astra Evo shared-conversation service instead of a model runner. Every
+# entrance opened under this profile (terminal TUI, Hermes Desktop, the
+# dashboard Chat tab / Workbench) attaches to the one owner and continues the
+# same conversation. Remove the block, or set enabled: false, and the profile
+# is an ordinary Hermes profile again.
+#
+# Ownership rules this encodes:
+#   * this process runs NO model and holds NO lease;
+#   * closing a client never stops the service;
+#   * receipts record queueing, never execution or delivery.
+
+shared_conversation:
+  enabled: true
+
+  # --- where the service is -------------------------------------------
+  # Use ONE of socket_path or tcp_host/tcp_port.
+  #
+  # Same host as the service (the normal case on Evo). The service creates
+  # this socket 0600, so it is loopback-by-construction and needs no token.
+  socket_path: ~/.local/state/astra-evo/control.sock
+  #
+  # Remote/tunnelled: point the Desktop's SSH tunnel at the service's TCP
+  # control port. A NON-loopback tcp_host is REFUSED without token_ref — both
+  # here and by the service at bind.
+  # tcp_host: 127.0.0.1
+  # tcp_port: 8791
+
+  # --- credentials ----------------------------------------------------
+  # Secrets are references only: "env:NAME" or "file:/path". An inline literal
+  # is refused so a token can never be committed in config.yaml. A file:
+  # secret must not be group/world readable (chmod 600).
+  # token_ref: file:~/.config/astra-evo/control.token
+  # token_ref: env:ASTRA_EVO_CONTROL_TOKEN
+
+  # --- behaviour ------------------------------------------------------
+  # Protocol v1 has no server push: the client polls `transcript` with a
+  # cursor. 0.5–2s is the documented live-view range.
+  poll_interval: 0.75
+  connect_timeout: 10
+  # Transcript page size. The service caps this at 500.
+  transcript_limit: 200
+  # Entrance label recorded on everything this profile submits. Leave unset to
+  # auto-detect (terminal for stdio, desktop for a WebSocket client); set it
+  # explicitly for a dedicated surface such as the Workbench.
+  # entrance: workbench
+  label: "Astra (shared)"
+
+# The rest of the profile is deliberately minimal: in shared mode this process
+# never builds an agent, so model/tool/skill settings here are inert. They are
+# left unset rather than set to plausible-looking values that would imply this
+# profile runs something.

@@ -38,8 +38,35 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.codex_thread_continuity import (
+    CodexThreadContinuity,
+    CodexThreadContinuityError,
+    CodexThreadRecord,
+    CodexThreadResumeError,
+    CodexThreadRuntimeFidelityError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_thread_id(result: Any) -> Optional[str]:
+    """Pull the thread id out of a thread/start or thread/resume result.
+
+    Cross-fills thread.id / sessionId — different codex versions have
+    serialized this under either key. Mirrors openclaw beta.8's tolerance fix
+    so future codex drops/renames don't KeyError us at handshake time.
+    """
+    if not isinstance(result, dict):
+        return None
+    thread_obj = result.get("thread") or {}
+    if not isinstance(thread_obj, dict):
+        thread_obj = {}
+    return (
+        thread_obj.get("id")
+        or thread_obj.get("sessionId")
+        or result.get("sessionId")
+        or result.get("threadId")
+    )
 
 
 # How many tailing stderr lines from the codex subprocess to attach to a
@@ -59,6 +86,196 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+
+# Hermes permission-profile id → the ACTUAL app-server protocol fields that
+# enforce it. This is the repair for hermes-agent#41: a profile name recorded
+# in our own metadata is a label, and codex ran the thread under its own
+# defaults (observed: sandbox_type=workspace-write, approval_policy=on-request
+# on a thread whose record said "read-only").
+#
+# The fields below are the real ones on this codex build, read from
+# `codex app-server generate-json-schema` (ThreadStartParams / ThreadResumeParams):
+#   sandbox:         SandboxMode enum — "read-only" | "workspace-write"
+#                    | "danger-full-access"
+#   approvalPolicy:  AskForApproval  — "untrusted" | "on-request" | "never"
+# The historical omission (codex 0.130's experimentalApi-gated
+# `permissions: {type: profile, id: ...}`, which additionally required a
+# `[permissions]` table in config.toml) is NOT simply removed: that surface
+# no longer exists on this schema, and these two stable fields express the
+# same intent without a config.toml prerequisite.
+_CODEX_PERMISSION_PROFILE_PROTOCOL: dict[str, dict[str, str]] = {
+    # Read-only, nothing may escalate.
+    "read-only": {"sandbox": "read-only", "approvalPolicy": "never"},
+    # Read-only, but codex may ask the user to escalate a specific action.
+    "read-only-with-approval": {
+        "sandbox": "read-only",
+        "approvalPolicy": "on-request",
+    },
+    "workspace-write": {
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+    },
+    "full-access": {
+        "sandbox": "danger-full-access",
+        "approvalPolicy": "never",
+    },
+}
+
+# SandboxMode (request) → SandboxPolicy.type (response). Codex answers with the
+# policy object, not the mode string, so the readback has to be translated
+# before it can be compared. Anything unmapped is a mismatch, not a pass.
+_SANDBOX_MODE_TO_POLICY_TYPE = {
+    "read-only": "readOnly",
+    "workspace-write": "workspaceWrite",
+    "danger-full-access": "dangerFullAccess",
+}
+
+
+class CodexUnsupportedPermissionProfile(CodexThreadContinuityError):
+    """An explicitly requested permission profile has no protocol expression.
+
+    Loud by design: silently falling back to codex's defaults is exactly the
+    label/runtime mismatch this refusal exists to prevent.
+    """
+
+
+def _permission_params(profile: str) -> dict[str, str]:
+    """Translate a Hermes permission profile into real app-server params.
+
+    An empty profile means "caller expressed no preference" → no override,
+    codex uses its configured default. A non-empty profile we don't know is a
+    refusal, never a silent default.
+    """
+    if not profile:
+        return {}
+    params = _CODEX_PERMISSION_PROFILE_PROTOCOL.get(profile)
+    if params is None:
+        raise CodexUnsupportedPermissionProfile(
+            f"codex permission profile {profile!r} has no supported "
+            f"app-server expression on this build (known: "
+            f"{sorted(_CODEX_PERMISSION_PROFILE_PROTOCOL)}). Refusing to "
+            f"start a thread that would silently run under codex's defaults."
+        )
+    return dict(params)
+
+
+def _observed_sandbox_type(result: Any) -> Optional[str]:
+    """Read SandboxPolicy.type out of a thread/start|resume response."""
+    if not isinstance(result, dict):
+        return None
+    sandbox = result.get("sandbox")
+    if isinstance(sandbox, dict):
+        value = sandbox.get("type")
+        return str(value) if value else None
+    if isinstance(sandbox, str):
+        # Tolerate a build that answers with the mode string.
+        return _SANDBOX_MODE_TO_POLICY_TYPE.get(sandbox, sandbox)
+    return None
+
+
+def _observed_approval_policy(result: Any) -> Optional[str]:
+    if not isinstance(result, dict):
+        return None
+    value = result.get("approvalPolicy")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        # GranularAskForApproval — not one of the plain modes we request.
+        return "granular"
+    return None
+
+
+def _verify_runtime_fidelity(
+    result: Any,
+    *,
+    requested_model: str,
+    requested_permissions: dict[str, str],
+    op: str,
+) -> dict[str, Any]:
+    """Assert codex is actually running what we asked for, from ITS response.
+
+    Two distinct outcomes, deliberately not merged:
+
+    * **Contradiction** — codex reports a model/sandbox/approval policy other
+      than the one requested. That is the hermes-agent#41 defect and it
+      raises :class:`CodexThreadRuntimeFidelityError`. The turn does not run.
+    * **Silence** — the response does not carry the field at all. We cannot
+      prove anything, so the corresponding ``*_applied`` flag stays ``False``
+      and a warning is logged. The record then says "not confirmed", which is
+      the honest answer; nothing downstream may read it as proof. On this
+      codex build ``model`` and ``sandbox`` are *required* fields of
+      ThreadStartResponse/ThreadResumeResponse, so silence means a fake, an
+      older server, or a protocol change — never a satisfied request.
+
+    Returns the observed runtime facts.
+    """
+    observed_model = (
+        str(result.get("model") or "") if isinstance(result, dict) else ""
+    )
+    observed_sandbox = _observed_sandbox_type(result)
+    observed_approval = _observed_approval_policy(result)
+
+    problems: list[str] = []
+    unconfirmed: list[str] = []
+
+    if requested_model:
+        if not observed_model:
+            unconfirmed.append("model")
+        elif observed_model != requested_model:
+            problems.append(
+                f"model: requested {requested_model!r}, codex reports "
+                f"{observed_model!r}"
+            )
+
+    want_sandbox = requested_permissions.get("sandbox")
+    if want_sandbox:
+        expected_type = _SANDBOX_MODE_TO_POLICY_TYPE.get(want_sandbox)
+        if observed_sandbox is None:
+            unconfirmed.append("sandbox")
+        elif expected_type and observed_sandbox != expected_type:
+            problems.append(
+                f"sandbox: requested {want_sandbox!r} "
+                f"({expected_type}), codex reports {observed_sandbox!r}"
+            )
+    want_approval = requested_permissions.get("approvalPolicy")
+    if want_approval:
+        if observed_approval is None:
+            unconfirmed.append("approvalPolicy")
+        elif observed_approval != want_approval:
+            problems.append(
+                f"approvalPolicy: requested {want_approval!r}, codex reports "
+                f"{observed_approval!r}"
+            )
+
+    if problems:
+        raise CodexThreadRuntimeFidelityError(
+            f"codex {op} did not apply the requested runtime: "
+            + "; ".join(problems)
+            + ". Refusing to run a turn whose recorded model/permissions "
+            "would be a label rather than the truth."
+        )
+    if unconfirmed:
+        logger.warning(
+            "codex %s did not report %s; recording them as UNCONFIRMED. Do "
+            "not read this thread's record as proof of its model or "
+            "permissions.",
+            op,
+            ", ".join(unconfirmed),
+        )
+
+    model_confirmed = bool(requested_model) and observed_model == requested_model
+    permissions_confirmed = bool(requested_permissions) and not any(
+        field in unconfirmed for field in ("sandbox", "approvalPolicy")
+    )
+    return {
+        "model": observed_model,
+        "model_applied": model_confirmed,
+        "sandbox": observed_sandbox or "",
+        "approval_policy": observed_approval or "",
+        "permissions_applied": permissions_confirmed,
+        "unconfirmed": unconfirmed,
+    }
 
 
 @dataclass
@@ -168,10 +385,10 @@ def _notification_belongs_to_turn(
 def _coerce_turn_input_text(user_input: Any) -> str:
     """Collapse Hermes/OpenAI rich content into app-server text input.
 
-    The current `turn/start` path sends text items only. TUI image attachment
-    can hand us OpenAI-style content parts, so keep the text/path hints and
-    replace opaque image payloads with a small marker instead of putting a
-    Python list into the `text` field.
+    Retained for callers that genuinely want a flat string (logging, the
+    text-only compatibility path, existing tests). The live turn path now
+    uses :func:`_build_turn_input`, which carries images through instead of
+    marking them.
     """
     if isinstance(user_input, str):
         return user_input
@@ -196,6 +413,80 @@ def _coerce_turn_input_text(user_input: Any) -> str:
         text = "\n\n".join(p for p in parts if p).strip()
         return text or "What do you see in this image?"
     return "" if user_input is None else str(user_input)
+
+
+def _image_url_of(item: dict) -> str:
+    """Pull the URL out of the several image shapes Hermes produces."""
+    raw = item.get("image_url")
+    if isinstance(raw, dict):
+        raw = raw.get("url")
+    if not raw:
+        raw = item.get("url") or item.get("image") or item.get("source")
+    return str(raw) if raw else ""
+
+
+def _build_turn_input(user_input: Any) -> list[dict[str, Any]]:
+    """Build real ``TurnStartParams.input`` items, images included.
+
+    The app-server ``UserInput`` union on this codex build (read from
+    `generate-json-schema`) accepts, among others:
+
+        {"type": "text",       "text": "..."}
+        {"type": "image",      "url": "<http(s) or data: URL>"}
+        {"type": "localImage", "path": "<absolute path>"}
+
+    Previously every image collapsed to the literal string
+    ``"[image attached]"``, so the model never saw the picture at all. A
+    ``file://`` or bare filesystem path becomes ``localImage`` (codex reads
+    it itself, so no bytes are copied through Hermes); anything else stays a
+    URL. Text callers are unaffected: a plain string still produces exactly
+    one text item, byte-identical to before.
+    """
+    if isinstance(user_input, str):
+        return [{"type": "text", "text": user_input}]
+    if not isinstance(user_input, list):
+        text = "" if user_input is None else str(user_input)
+        return [{"type": "text", "text": text}]
+
+    items: list[dict[str, Any]] = []
+    for part in user_input:
+        if isinstance(part, str):
+            if part.strip():
+                items.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            if part is not None:
+                items.append({"type": "text", "text": str(part)})
+            continue
+        kind = part.get("type")
+        if kind in {"text", "input_text"}:
+            text = part.get("text") or part.get("content") or ""
+            if text:
+                items.append({"type": "text", "text": str(text)})
+        elif kind in {"image", "image_url", "input_image"}:
+            url = _image_url_of(part)
+            if not url:
+                # Never silently drop an image we cannot address: say so.
+                items.append(
+                    {"type": "text", "text": "[image attached, no usable URL]"}
+                )
+                continue
+            if url.startswith("file://"):
+                items.append({"type": "localImage", "path": url[7:]})
+            elif url.startswith(("http://", "https://", "data:")):
+                items.append({"type": "image", "url": url})
+            elif os.path.isabs(url):
+                items.append({"type": "localImage", "path": url})
+            else:
+                items.append({"type": "image", "url": url})
+        elif kind in {"localImage", "local_image"}:
+            path = part.get("path") or ""
+            if path:
+                items.append({"type": "localImage", "path": str(path)})
+
+    if not items:
+        items.append({"type": "text", "text": ""})
+    return items
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -282,6 +573,8 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        continuity: Optional["CodexThreadContinuity"] = None,
+        model: str = "",
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -296,6 +589,15 @@ class CodexAppServerSession:
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        # Durable thread continuity. None = today's behaviour (a fresh thread
+        # every process), which is correct for ephemeral agents with no
+        # session DB. When present it is consulted before every thread/start.
+        self._continuity = continuity
+        self._model = model
+        self._resumed = False
+        # Runtime facts confirmed by codex's own thread/start|resume response.
+        # Empty until a thread is attached; never populated from our request.
+        self._runtime: dict[str, Any] = {}
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
@@ -313,11 +615,28 @@ class CodexAppServerSession:
     # ---------- lifecycle ----------
 
     def ensure_started(self) -> str:
-        """Spawn the subprocess, do the initialize handshake, and start a
+        """Spawn the subprocess, do the initialize handshake, and attach to a
         thread. Returns the codex thread id. Idempotent — repeated calls
-        return the same thread id."""
+        return the same thread id.
+
+        Attachment is *resume-first* when durable continuity is configured:
+        a saved record for this Hermes session is resumed by its exact id, so
+        a service restart keeps the model's own context. There is deliberately
+        no silent fallback to ``thread/start`` when a record exists but cannot
+        be used — that fallback is what made the continuity bug invisible.
+        Refusals raise (``CodexThreadResumeError``,
+        ``CodexThreadOwnershipError``, ``CodexThreadIdentityMismatch``,
+        ``CodexThreadPersistenceError``) and the caller decides.
+        """
         if self._thread_id is not None:
             return self._thread_id
+
+        # Continuity is consulted BEFORE spawning codex, so an ownership or
+        # identity refusal costs no subprocess and no codex-side state.
+        record = None
+        if self._continuity is not None:
+            record = self._continuity.load_resumable()
+
         if self._client is None:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
@@ -327,34 +646,32 @@ class CodexAppServerSession:
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
-        # Permission selection is intentionally NOT sent on thread/start.
-        # Two reasons (live-tested against codex 0.130.0):
-        #   1. `thread/start.permissions` is gated behind the experimentalApi
-        #      capability on this codex version — we'd have to opt in during
-        #      initialize and accept the unstable surface.
-        #   2. Even with experimentalApi declared and the correct shape
-        #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
-        #      codex requires a matching `[permissions]` table in
-        #      ~/.codex/config.toml or it fails the request with
-        #      'default_permissions requires a [permissions] table'.
-        # Letting codex pick its default (`:read-only` unless the user has
-        # configured otherwise in their codex config.toml) is the standard
-        # codex CLI workflow and avoids fighting codex's own validation.
-        # Users who want a write-capable profile configure it in their
-        # ~/.codex/config.toml the same way they would for any codex usage.
+
+        if record is not None:
+            self._thread_id = self._resume_recorded_thread(record)
+            return self._thread_id
+
+        # Permissions ARE sent now, by the real supported protocol fields.
+        #
+        # History (kept deliberately, do not re-delete): on codex 0.130 the
+        # only expression was `thread/start.permissions = {type: profile,
+        # id: ...}`, gated behind the experimentalApi capability AND requiring
+        # a matching `[permissions]` table in ~/.codex/config.toml, so it was
+        # omitted on purpose. That omission then became a real defect
+        # (hermes-agent#41): a thread recorded as "read-only" actually ran
+        # sandbox_type=workspace-write / approval_policy=on-request, because
+        # codex applied its own defaults and nothing checked.
+        # This build's schema exposes stable, non-experimental `sandbox`
+        # (SandboxMode) and `approvalPolicy` (AskForApproval) fields on
+        # ThreadStartParams/ThreadResumeParams with no config.toml
+        # prerequisite, so the requested profile is expressed through those
+        # and then VERIFIED against codex's own response.
         params: dict[str, Any] = {"cwd": self._cwd}
+        params.update(_permission_params(self._permission_profile))
+        if self._model:
+            params["model"] = self._model
         result = self._client.request("thread/start", params, timeout=15)
-        # Cross-fill thread.id/sessionId — different codex versions have
-        # serialized this under either key. Mirrors openclaw beta.8's
-        # tolerance fix so future codex drops/renames don't KeyError us
-        # at handshake time.
-        thread_obj = result.get("thread") or {}
-        thread_id = (
-            thread_obj.get("id")
-            or thread_obj.get("sessionId")
-            or result.get("sessionId")
-            or result.get("threadId")
-        )
+        thread_id = _extract_thread_id(result)
         if not thread_id:
             raise CodexAppServerError(
                 code=-32603,
@@ -363,28 +680,155 @@ class CodexAppServerSession:
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
+        # Proof, not a label: codex's own response must confirm the model and
+        # permissions before we treat this thread as running under them.
+        self._runtime = _verify_runtime_fidelity(
+            result,
+            requested_model=self._model,
+            requested_permissions=_permission_params(self._permission_profile),
+            op="thread/start",
+        )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread started: id=%s profile=%s cwd=%s "
+            "model=%s sandbox=%s approval=%s",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
+            self._runtime.get("model") or "(codex default)",
+            self._runtime.get("sandbox") or "(unreported)",
+            self._runtime.get("approval_policy") or "(unreported)",
         )
+        if self._continuity is not None:
+            # A start we cannot persist is a thread the next restart will
+            # lose. Abort the turn rather than let the user build a
+            # conversation on top of it believing it is durable. Drop our
+            # local attachment too, so a retry re-decides from scratch.
+            try:
+                self._continuity.record_started(
+                    thread_id,
+                    model=self._runtime.get("model") or self._model,
+                    runtime=self._runtime,
+                )
+            except CodexThreadContinuityError:
+                self._thread_id = None
+                raise
         return self._thread_id
 
+    def _resume_recorded_thread(self, record: "CodexThreadRecord") -> str:
+        """Resume the exact saved thread, or raise. Never falls back."""
+        assert self._client is not None
+        requested_permissions = _permission_params(
+            self._permission_profile or record.permission_profile
+        )
+        requested_model = self._model or record.model
+        params: dict[str, Any] = {"threadId": record.thread_id}
+        params.update(requested_permissions)
+        if requested_model:
+            params["model"] = requested_model
+        try:
+            result = self._client.request("thread/resume", params, timeout=30)
+        except (CodexAppServerError, TimeoutError) as exc:
+            raise CodexThreadResumeError(
+                f"codex refused to resume saved thread {record.thread_id}: "
+                f"{exc}. The conversation's codex context is unavailable; "
+                f"not silently starting a different thread."
+            ) from exc
+        resumed_id = _extract_thread_id(result) or record.thread_id
+        if resumed_id != record.thread_id:
+            raise CodexThreadResumeError(
+                f"codex resumed thread {resumed_id} but {record.thread_id} "
+                f"was requested"
+            )
+        self._runtime = _verify_runtime_fidelity(
+            result,
+            requested_model=requested_model,
+            requested_permissions=requested_permissions,
+            op="thread/resume",
+        )
+        self._resumed = True
+        logger.info(
+            "codex app-server thread resumed: id=%s profile=%s cwd=%s "
+            "model=%s sandbox=%s approval=%s",
+            resumed_id[:8],
+            record.permission_profile or self._permission_profile,
+            record.cwd or self._cwd,
+            self._runtime.get("model") or "(codex default)",
+            self._runtime.get("sandbox") or "(unreported)",
+            self._runtime.get("approval_policy") or "(unreported)",
+        )
+        if self._continuity is not None:
+            self._continuity.record_resumed(
+                record,
+                model=self._runtime.get("model") or requested_model,
+                runtime=self._runtime,
+            )
+        return resumed_id
+
+    @property
+    def runtime(self) -> dict[str, Any]:
+        """Runtime facts codex CONFIRMED for this thread (empty before start)."""
+        return dict(self._runtime)
+
+    @property
+    def resumed(self) -> bool:
+        """True when this session attached to a pre-existing codex thread."""
+        return self._resumed
+
     def close(self) -> None:
+        """Tear down codex FIRST, release ownership only once it is reaped.
+
+        Ordering is load-bearing (mirrors the same one-owner defect found on
+        the Evo service side): releasing the continuity claim on *requested*
+        close means a successor can acquire the thread while this process's
+        codex subprocess is still alive and still attached to it — two owners
+        driving one thread, which is precisely what the reservation exists to
+        prevent. So:
+
+        1. close the client and WAIT for the subprocess to actually exit;
+        2. only after it is provably gone (``is_alive()`` is False) release
+           the record claim and the flock.
+
+        If the subprocess cannot be confirmed dead — ``close()`` raised, timed
+        out, or the process ignored terminate/kill — ownership is **retained**
+        and the refusal is logged. The OS drops the flock when this process
+        finally exits, and until then the live-owner check keeps a successor
+        out. A held lock is recoverable; two writers on one thread is not.
+        """
         if self._closed:
             return
         self._closed = True
         with self._active_turn_lock:
             self._active_turn_id = None
+
+        subprocess_reaped = True  # No client ⇒ nothing to outlive us.
         if self._client is not None:
+            client = self._client
             try:
-                self._client.close()
+                client.close()
             except Exception:  # pragma: no cover - best-effort cleanup
-                pass
+                logger.debug("codex app-server client close failed", exc_info=True)
+            try:
+                subprocess_reaped = not client.is_alive()
+            except Exception:  # pragma: no cover - defensive
+                subprocess_reaped = False
             self._client = None
         self._thread_id = None
+
+        if self._continuity is None:
+            return
+        if not subprocess_reaped:
+            logger.warning(
+                "codex continuity: NOT releasing thread ownership — the codex "
+                "subprocess did not exit on close, so it may still be attached "
+                "to this thread. The claim is held until this process exits; a "
+                "successor must not acquire a thread with a live owner."
+            )
+            return
+        try:
+            self._continuity.release()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("codex continuity release failed", exc_info=True)
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -493,6 +937,15 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
+        except CodexThreadContinuityError as exc:
+            # Explicit continuity refusal (fabricated/unavailable thread, live
+            # concurrent owner, identity mismatch, unreadable store). Surface
+            # verbatim: silently starting a *different* thread here is exactly
+            # the bug this path exists to prevent.
+            result.error = f"Codex conversation continuity refused: {exc}"
+            result.should_retire = True
+            self._interrupt_event.clear()
+            return result
         except (CodexAppServerError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
@@ -514,16 +967,17 @@ class CodexAppServerSession:
             return result
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        # Carry the real input items through: text stays text, images become
+        # the app-server's own image/localImage UserInput variants instead of
+        # collapsing to "[image attached]".
+        turn_input = _build_turn_input(user_input)
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
         try:
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": turn_input,
                 },
                 timeout=10,
             )
@@ -804,6 +1258,10 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
+        except CodexThreadContinuityError as exc:
+            result.error = f"Codex conversation continuity refused: {exc}"
+            result.should_retire = True
+            return result
         except (CodexAppServerError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
