@@ -419,7 +419,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
-    p_create.add_argument("--goal", action="store_true", dest="goal_mode",
+    p_create.add_argument("--goal", nargs="?", const=True, default=None,
+                          metavar="TEXT", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
                                "card title/body and, if not done, the worker "
@@ -427,7 +428,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "judge agrees it's complete (or the turn "
                                "budget runs out, which blocks the card for "
                                "review). Best for open-ended cards one shot "
-                               "rarely finishes.")
+                               "rarely finishes. Optional TEXT is appended to "
+                               "the card body under a '## Goal' heading so "
+                               "the judge (and humans) can see the stated "
+                               "goal; bare --goal enables the loop only.")
     p_create.add_argument("--goal-max-turns", type=int, default=None,
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
@@ -1644,6 +1648,36 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    # --goal is nargs='?' (issue #42): None = flag absent, True = bare flag,
+    # str = goal text to pin under a '## Goal' heading in the card body.
+    goal_raw = getattr(args, "goal_mode", None)
+    goal_mode = goal_raw is not None
+    goal_text = goal_raw.strip() if isinstance(goal_raw, str) else ""
+    if goal_text:
+        goal_section = f"## Goal\n\n{goal_text}"
+        body = getattr(args, "body", None)
+        args.body = (
+            f"{body.rstrip()}\n\n{goal_section}"
+            if body and body.strip()
+            else goal_section
+        )
+
+    # Empty --parent values (typically an unset shell variable) used to be
+    # silently dropped deep in kanban_db, creating a parentless 'ready' card
+    # that could dispatch ahead of the card it depended on (issue #42).
+    # Reject at the CLI boundary with a message naming the flag.
+    blank_parents = [
+        p for p in (getattr(args, "parent", None) or ())
+        if not str(p).strip()
+    ]
+    if blank_parents:
+        shown = ", ".join(repr(p) for p in blank_parents)
+        print(
+            f"kanban: --parent requires a task id; got empty value(s) {shown} "
+            "(an unset shell variable?) — pass a real task id or drop --parent",
+            file=sys.stderr,
+        )
+        return 2
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1696,7 +1730,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
+            goal_mode=goal_mode,
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=initial_status,
             block_reason=block_reason,
