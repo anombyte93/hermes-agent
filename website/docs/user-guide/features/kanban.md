@@ -10,6 +10,19 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+### Worker execution host
+
+Set `kanban.execution_host` to the physical hostname that should run workers.
+The dispatcher refuses to spawn on a different host, regardless of the selected
+model or provider. Start the dispatcher on the required host with a locally
+provisioned board, profile and workspace. This setting does not transfer boards,
+files or running workers. There is no automatic local fallback. Leave it unset
+to preserve the default same-host execution behaviour.
+
+A `dispatch --max 0` maintenance tick can still inspect and retire existing
+local runs without starting new workers. Treat model selection and execution
+placement as separate facts in status reports.
+
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
