@@ -4036,6 +4036,17 @@ def _workflow_write_guard(board: str) -> Optional[dict]:
     return None
 
 
+def _workflow_unresolved_remedy(tool: str, cause: str) -> str:
+    """Remedy for a UNKNOWN that must not invite a blind retry.
+
+    A write whose outcome is unresolved is a possible double mutation, so the
+    remedy is always "inspect before retry". A read may simply be retried.
+    """
+    if tool in WORKFLOW_WRITE_TOOLS:
+        return f"Inspect the board and helper state before retrying; {cause}."
+    return f"Retry; if it persists, {cause}."
+
+
 def _aligned_local_task(board: str, card: str):
     """Read the task from the ALIGNED local board DB (never the evidence host).
 
@@ -4046,6 +4057,32 @@ def _aligned_local_task(board: str, card: str):
         return kanban_db.get_task(conn, card)
     finally:
         conn.close()
+
+
+# A card with more direct parents than this is a pathological dependency
+# graph; readiness must say UNKNOWN rather than feed it through blindly.
+_WORKFLOW_MAX_PARENTS = 128
+
+
+def _aligned_parent_ids(board: str, card: str):
+    """Return the card's direct parent ids from the ALIGNED local board DB, or
+    None when the dependency graph cannot be read or exceeds the safe bound.
+
+    One bounded query (no recursive traversal). A card with no links returns an
+    honest empty list; an unreadable or overbound graph returns None so the
+    caller can say UNKNOWN instead of silently treating an absent read as "no
+    dependencies" (K2 dependency readiness must reflect the real graph).
+    """
+    conn = kanban_db.connect(board=board)
+    try:
+        parents = kanban_db.parent_ids(conn, card)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if len(parents) > _WORKFLOW_MAX_PARENTS:
+        return None
+    return parents
 
 
 def _git_head(workspace: str) -> Optional[str]:
@@ -4093,22 +4130,61 @@ def _workflow_shape_error(
 
     Readiness and continuation receipts are root results, not data-wrapped
     projections, so they are validated here rather than through the
-    /evidence/* shape table.
+    /evidence/* shape table. A contradictory or malformed receipt is a hard
+    UNKNOWN; nothing here repairs a wrong type.
     """
     board = args.get("board")
     card = args.get("card")
     if tool == "kanban_readiness":
-        if isinstance(receipt.get("requested"), dict):
-            if receipt["requested"].get("board") != board:
-                return "readiness requested identity board mismatch"
+        requested = receipt.get("requested")
+        if not isinstance(requested, dict):
+            return "readiness requested identity is missing"
+        for field in (
+            "board", "profile", "provider", "model", "workspace",
+            "expected_revision", "python", "check_model",
+        ):
+            if requested.get(field) != args.get(field):
+                return f"readiness requested identity {field} mismatch"
+        requested_parents = requested.get("parents")
+        parents = args.get("parents") or []
+        if (
+            not isinstance(requested_parents, list)
+            or not all(isinstance(p, str) for p in requested_parents)
+            or sorted(requested_parents) != sorted(parents)
+        ):
+            return "readiness requested identity parents mismatch"
         checks = receipt.get("checks")
         if not isinstance(checks, list) or not checks:
             return "readiness receipt checks are missing or empty"
+        names: list[str] = []
         for entry in checks:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 return "a readiness check is not a well-formed object"
+            if entry.get("state") not in ("PASS", "FAIL", "UNKNOWN"):
+                return "a readiness check has an invalid state"
+            names.append(entry["name"])
+        if len(names) != len(set(names)):
+            return "readiness check names are duplicated"
         if not isinstance(receipt.get("ready_to_release"), bool):
             return "readiness receipt ready_to_release is not a boolean"
+        freshness = receipt.get("freshness")
+        if not isinstance(freshness, dict):
+            return "readiness receipt freshness is missing"
+        checked_at = freshness.get("checked_at")
+        stale_after = freshness.get("stale_after")
+        if not (
+            _evidence_finite_number(checked_at) and _evidence_finite_number(stale_after)
+        ):
+            return "readiness receipt freshness is not finite"
+        # Both are finite numbers here (the guard above returned otherwise);
+        # the cast is only to satisfy the type checker.
+        if float(stale_after) <= float(checked_at):  # type: ignore[arg-type]
+            return "readiness receipt freshness horizon is inverted or empty"
+        states = {entry.get("state") for entry in checks}
+        if receipt["ready_to_release"] and states != {"PASS"}:
+            return "readiness ready_to_release is true with a failed or missing check"
+        if receipt["ready_to_release"] and not args.get("check_model"):
+            return "readiness ready_to_release is true but the model proof was skipped"
     elif tool == "kanban_continuation_draft":
         if receipt.get("board") != board:
             return "continuation-draft receipt board mismatch"
@@ -4124,6 +4200,8 @@ def _workflow_shape_error(
         for field in ("passed_checks", "remaining_checks"):
             if not isinstance(receipt.get(field), list):
                 return f"continuation-draft receipt {field} is missing"
+        if not isinstance(receipt.get("commission"), dict):
+            return "continuation-draft receipt commission is missing or malformed"
     elif tool == "kanban_continue":
         if receipt.get("board") != board:
             return "continue receipt board mismatch"
@@ -4134,16 +4212,21 @@ def _workflow_shape_error(
             return "continue receipt new_card is not a valid card id"
         if receipt.get("held") is not True:
             return "continue receipt is not held"
+        if receipt.get("no_original_mutation") is not True:
+            return "continue receipt claims the original card was mutated"
+        if receipt.get("new_card_status") not in ("blocked", "triage"):
+            return "continue receipt new_card_status is not a held state"
     elif tool == "kanban_hold":
         read_back = receipt.get("read_back")
         if not isinstance(read_back, dict):
             return "hold receipt read_back is missing"
-        rb_state = read_back.get("state")
-        if rb_state is not None and rb_state != "PASS":
+        if read_back.get("state") != "PASS":
             return "hold receipt read_back is not PASS"
         rb_data = read_back.get("data")
-        if isinstance(rb_data, dict) and rb_data.get("id") != card:
-            return "hold receipt read_back card identity mismatch"
+        if not isinstance(rb_data, dict) or rb_data.get("id") != card:
+            return "hold receipt read_back card identity is missing or mismatched"
+        if rb_data.get("status") not in ("blocked", "triage"):
+            return "hold receipt read_back status is not a durable hold"
     return None
 
 
@@ -4188,7 +4271,7 @@ def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
             return _evidence_envelope(
                 state="UNKNOWN",
                 reason=f"{_WAND}helper timed out after {_WORKFLOW_TIMEOUT_SECONDS:.0f}s",
-                remedy="Retry; if it persists the EVO host's remote query cap may be exceeded.",
+                remedy=_workflow_unresolved_remedy(tool, "the EVO host's remote query cap may be exceeded"),
             )
         except OSError as exc:
             return _evidence_envelope(
@@ -4228,19 +4311,16 @@ def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                 reason=f"{_WAND}helper receipt state {state!r} is not PASS/FAIL/UNKNOWN",
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
             )
-        if proc.returncode != 0:
-            if state == "PASS":
-                return _evidence_envelope(
-                    state="UNKNOWN",
-                    reason=f"{_WAND}helper exited {proc.returncode} while claiming PASS",
-                    remedy="Retry; if it persists inspect the helper installation (its stderr is not surfaced here).",
-                    evidence=None,
-                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
-                )
-            reason = str(receipt.get("reason") or f"helper reported {state}")
+        if proc.returncode != 0 and state == "PASS":
+            # A nonzero exit can never claim PASS: the helper's own success
+            # convention was contradicted by its process status.
             return _evidence_envelope(
-                state=state,
-                reason=f"{reason} (helper exited {proc.returncode})",
+                state="UNKNOWN",
+                reason=f"{_WAND}helper exited {proc.returncode} while claiming PASS",
+                remedy=_workflow_unresolved_remedy(
+                    tool, "inspect the helper installation (its stderr is not surfaced here)"
+                ),
+                evidence=None,
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
             )
         if state == "PASS":
@@ -4263,6 +4343,7 @@ def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                 return _evidence_envelope(
                     state="UNKNOWN",
                     reason=f"{_WAND}{shape_error}",
+                    remedy=_workflow_unresolved_remedy(tool, "the helper receipt is inconsistent"),
                     timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
                 )
             envelope = _evidence_envelope(
@@ -4276,7 +4357,11 @@ def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                 host if host == _EVIDENCE_EXECUTION_HOST else None
             )
             return envelope
-        # FAIL / UNKNOWN.
+        # FAIL / UNKNOWN. A valid structured receipt is still evidence even
+        # when the helper exits nonzero: the released helper exits 1 for a
+        # legitimate structured FAIL (e.g. a denied board), so the exit code
+        # alone must not strip readiness checks. PASS+nonzero is rejected above.
+        exit_note = f" (helper exited {proc.returncode})" if proc.returncode != 0 else ""
         if tool == "kanban_readiness":
             # A structured readiness receipt (e.g. board_permission FAIL) still
             # carries its checks; forward them so the UI shows why. Malformed
@@ -4286,12 +4371,13 @@ def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                 return _evidence_envelope(
                     state="UNKNOWN",
                     reason=f"{_WAND}{shape_error}",
+                    remedy=_workflow_unresolved_remedy(tool, "the helper readiness receipt is inconsistent"),
                     timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
                 )
             return _evidence_envelope(
                 state=state,
                 evidence=receipt,
-                reason=str(receipt.get("reason") or f"helper reported {state}"),
+                reason=str(receipt.get("reason") or f"helper reported {state}") + exit_note,
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
                 observed_at=(
                     receipt.get("observed_at")
@@ -4301,7 +4387,7 @@ def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
             )
         return _evidence_envelope(
             state=state,
-            reason=str(receipt.get("reason") or f"helper reported {state}"),
+            reason=str(receipt.get("reason") or f"helper reported {state}") + exit_note,
             timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
         )
     finally:
@@ -4432,6 +4518,16 @@ async def workflow_readiness(
             ),
             board=slug, card=card, tool="kanban_readiness", request_echo=echo,
         )
+    parents = _aligned_parent_ids(slug, card)
+    if parents is None:
+        return _workflow_respond(
+            _evidence_envelope(
+                state="UNKNOWN",
+                reason="could not derive the card's dependency graph from the aligned board",
+                remedy="Inspect the card's task_links on this board; readiness needs its real parent ids to judge dependency completion.",
+            ),
+            board=slug, card=card, tool="kanban_readiness", request_echo=echo,
+        )
     args: dict[str, Any] = {
         "board": slug,
         "profile": profile,
@@ -4440,7 +4536,7 @@ async def workflow_readiness(
         "workspace": workspace,
         "expected_revision": head,
         "python": os.path.join(workspace, ".venv", "bin", "python"),
-        "parents": [],
+        "parents": parents,
         "check_model": bool(payload.check_model),
     }
     return await _workflow_call(
