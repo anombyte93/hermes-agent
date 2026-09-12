@@ -38,7 +38,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -3022,3 +3027,416 @@ async def stream_events(ws: WebSocket):
                 log.warning("Kanban event stream connection cleanup failed: %s", exc)
             finally:
                 event_executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ---------------------------------------------------------------------------
+# Read-only shared-evidence bridge (GET /evidence/*)
+# ---------------------------------------------------------------------------
+#
+# These routes serve the two Kanban UI consumers read-only evidence from the
+# SHARED board owned by the EVO kanban host, proxied through the RELEASED
+# ``atlas-kanban-call`` helper executable. Design constraints (verified
+# dependency decision, recorded on the parent card):
+#
+#   * Hermes runs MCP 2.0.0; AtlasKanban is an MCP 1.x runtime. The helper
+#     is therefore NEVER imported into this process — it owns its isolated
+#     runtime and is invoked without a shell as
+#     ``[<absolute helper>, <fixed tool>, "-"]`` with a bounded JSON payload
+#     on stdin. Resolved once per invocation with ``shutil.which``; the
+#     request can never select the executable, argv or tool name.
+#   * The selected board belongs to EVO and NEED NOT EXIST in the local
+#     Hermes DB. Board params are validated with PURE slug validation
+#     (``kanban_db._normalize_board_slug``) — never ``_resolve_board``,
+#     which 404s on boards missing from the local DB and would touch the
+#     local DB. No route here opens a local kanban connection at all; there
+#     is no SQL fallback for unknown routes or incomplete evidence.
+#   * Every outcome other than a fully validated helper PASS receipt is
+#     returned as an HTTP 200 envelope with ``state`` PASS / FAIL / UNKNOWN
+#     — missing helper, timeout, invalid JSON, malformed receipt, wrong
+#     execution host and nonzero-exit-with-PASS all map to UNKNOWN with a
+#     short reason and remedy. The helper's own stderr/argv/environment are
+#     never echoed into responses or logs.
+#   * One HTTP request causes exactly ONE helper invocation (never
+#     per-card subprocesses). Helper round-trip timing and local
+#     collection time are surfaced as separate fields.
+#
+# Auth note: these are plain GET routes on the plugin router, so in the
+# production dashboard they sit behind the same session-token
+# ``auth_middleware`` as every other ``/api/`` path (the plugin-bypass does
+# not exempt them — see the module docstring and the tests).
+
+_EAND = "evidence bridge: "
+
+# Fixed allowlist of read tools the bridge may ever invoke. The tool name is
+# a literal at each call site; there is no request parameter that can select
+# a different one, and no write tool name appears anywhere in this module.
+EVIDENCE_READ_TOOLS = frozenset(
+    {"kanban_snapshot", "kanban_page", "kanban_worker", "kanban_card"}
+)
+
+# Card ids are ``t_`` + 8..32 lowercase hex chars (kanban_db._new_task_id
+# mints ``t_`` + token_hex(4) today; the range admits deeper ids).
+_EVIDENCE_CARD_RE = re.compile(r"^t_[0-9a-f]{8,32}$")
+
+# Subprocess budget: helper remote-side cap is 60s; local wall clock is
+# bounded above it. stdout is captured to disk with a 1 MiB cap; stderr with
+# a 16 KiB cap (never surfaced — only its size may appear).
+EVIDENCE_HELPER_TIMEOUT_SECONDS = 75.0
+_EVIDENCE_STDOUT_CAP = 1 * 1024 * 1024
+_EVIDENCE_STDERR_CAP = 16 * 1024
+_EVIDENCE_CURSOR_MAX_CHARS = 512
+
+# Expected execution host stamped in every valid receipt.
+_EVIDENCE_EXECUTION_HOST = "evo"
+
+
+class _EvidenceError(Exception):
+    """Internal control-flow: carry a terminal envelope to the route."""
+
+    def __init__(self, state: str, reason: str, remedy: Optional[str] = None):
+        super().__init__(reason)
+        self.state = state
+        self.reason = reason
+        self.remedy = remedy
+
+
+def _evidence_board_slug(board: str) -> str:
+    """PURE slug validation for evidence boards.
+
+    Unlike ``_resolve_board`` this NEVER checks the local DB: the shared
+    evidence boards belong to the EVO kanban host and need not exist
+    locally. Malformed slugs are a client 400.
+    """
+    try:
+        normed = kanban_db._normalize_board_slug(board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed:
+        raise HTTPException(status_code=400, detail="board is required for evidence routes")
+    return normed
+
+
+def _evidence_card_id(card: str) -> str:
+    if not _EVIDENCE_CARD_RE.match(card):
+        raise HTTPException(
+            status_code=422,
+            detail="card must match t_[0-9a-f]{8,32}",
+        )
+    return card
+
+
+def _evidence_cursor(cursor: Optional[str]) -> Optional[str]:
+    if cursor is None:
+        return None
+    if len(cursor) > _EVIDENCE_CURSOR_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"cursor must be at most {_EVIDENCE_CURSOR_MAX_CHARS} chars",
+        )
+    return cursor
+
+
+def _evidence_env(child_record_path: Optional[Path] = None) -> dict[str, str]:
+    """Child environment: normal inherited runtime env minus write authority.
+
+    ``ATLAS_KANBAN_WRITE_BOARDS`` is forced EMPTY so the helper's child can
+    never write boards regardless of what this process was granted. Nothing
+    here is printed or logged.
+    """
+    env = dict(os.environ)
+    env["ATLAS_KANBAN_WRITE_BOARDS"] = ""
+    return env
+
+
+def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Invoke the released helper ONCE and normalise its receipt.
+
+    Returns the route envelope dict (``state`` / ``evidence`` / ``reason`` /
+    ``remedy`` / ``timing`` / ``helper``). Never raises past a subprocess
+    failure — every failure mode maps to an UNKNOWN envelope with a short
+    reason. stdout is disk-backed and capped; stderr is capped and discarded
+    (only its truncated size may be referenced, never its content).
+    """
+    if tool not in EVIDENCE_READ_TOOLS:
+        # Defensive: unreachable via the routes (literals only), but a
+        # future call site must not be able to smuggle a write tool.
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_EAND}internal tool {tool!r} not in read allowlist",
+        )
+
+    helper = shutil.which("atlas-kanban-call")
+    if not helper:
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_EAND}atlas-kanban-call is not installed on this host",
+            remedy="The parent integration installs the released helper on the "
+                   "EVO UI host; evidence reads stay UNKNOWN until then.",
+        )
+
+    stdin_bytes = json.dumps(
+        {"tool": tool, "args": args}, separators=(",", ":")
+    ).encode("utf-8")
+
+    out_tmp = tempfile.TemporaryFile()
+    err_tmp = tempfile.TemporaryFile()
+    try:
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                [helper, tool, "-"],
+                input=stdin_bytes,
+                stdout=out_tmp,
+                stderr=err_tmp,
+                stdin=None,
+                env=_evidence_env(),
+                timeout=EVIDENCE_HELPER_TIMEOUT_SECONDS,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper timed out after "
+                       f"{EVIDENCE_HELPER_TIMEOUT_SECONDS:.0f}s",
+                remedy="Retry; if it persists the EVO host's remote query cap "
+                       "(60s) may be exceeded — narrow the page size.",
+            )
+        except OSError as exc:
+            # Exec-level failure (permissions, ENOENT raced). No argv/env echo.
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper could not be executed ({exc.__class__.__name__})",
+            )
+        helper_ms = (time.monotonic() - started) * 1000.0
+
+        out_tmp.seek(0)
+        raw_stdout = out_tmp.read(_EVIDENCE_STDOUT_CAP + 1)
+        if len(raw_stdout) > _EVIDENCE_STDOUT_CAP:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper stdout exceeded {_EVIDENCE_STDOUT_CAP} bytes",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        try:
+            receipt = json.loads(raw_stdout.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper stdout was not valid JSON",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if not isinstance(receipt, dict):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper receipt was not a JSON object",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+
+        state = receipt.get("state")
+        if state not in ("PASS", "FAIL", "UNKNOWN"):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper receipt state {state!r} is not PASS/FAIL/UNKNOWN",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if proc.returncode != 0:
+            # A nonzero exit must never be read as success even when the
+            # receipt claims PASS; and a claimed FAIL/UNKNOWN from a process
+            # that itself errored loses its reason's authority — keep it
+            # short but preserve the claimed state's class.
+            claimed = state
+            return _evidence_envelope(
+                state="UNKNOWN" if claimed == "PASS" else claimed,
+                reason=f"{_EAND}helper exited {proc.returncode} while claiming {claimed}",
+                remedy="Retry; if it persists, inspect the helper installation "
+                       "on the EVO host (its stderr is not surfaced here).",
+                evidence=None,
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if state == "PASS":
+            host = receipt.get("execution_host")
+            if host != _EVIDENCE_EXECUTION_HOST:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}receipt execution_host {host!r} is not "
+                           f"{_EVIDENCE_EXECUTION_HOST!r}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            return _evidence_envelope(
+                state="PASS",
+                evidence=receipt.get("data"),
+                reason=receipt.get("reason"),
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        # FAIL / UNKNOWN receipts pass through with their reason.
+        return _evidence_envelope(
+            state=state,
+            reason=str(receipt.get("reason") or f"helper reported {state}"),
+            timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+        )
+    finally:
+        for fh in (out_tmp, err_tmp):
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _evidence_envelope(
+    *,
+    state: str,
+    evidence: Optional[Any] = None,
+    reason: Optional[str] = None,
+    remedy: Optional[str] = None,
+    timing: Optional[dict[str, float]] = None,
+) -> dict[str, Any]:
+    envelope: dict[str, Any] = {"state": state, "evidence": evidence}
+    if reason:
+        envelope["reason"] = reason
+    if remedy:
+        envelope["remedy"] = remedy
+    envelope["timing"] = timing or {"helper_roundtrip_ms": None, "collection_ms": None}
+    return envelope
+
+
+def _evidence_respond(
+    envelope: dict[str, Any],
+    *,
+    board: str,
+    tool: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    """Wrap an envelope with board binding, fixed helper identity and the
+    validated request echo (for auditability). Exactly one HTTP response;
+    timing fields already populated by the runner."""
+    collection_started = time.monotonic()
+    wrapper = dict(envelope)
+    wrapper["board"] = board
+    wrapper["helper"] = {"tool": tool, "execution_host": _EVIDENCE_EXECUTION_HOST}
+    wrapper["request"] = request_echo
+    timing = wrapper.get("timing") or {}
+    timing.setdefault("helper_roundtrip_ms", None)
+    timing.setdefault("collection_ms", None)
+    if timing.get("collection_ms") is None:
+        timing["collection_ms"] = (time.monotonic() - collection_started) * 1000.0
+    wrapper["timing"] = timing
+    return wrapper
+
+
+async def _evidence_call(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    board: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the helper off the event loop and wrap the envelope.
+
+    One HTTP request -> exactly one helper invocation. The subprocess runs
+    in a worker thread (``asyncio.to_thread``) so a 75s helper round trip
+    never blocks the dashboard event loop.
+    """
+    envelope = await asyncio.to_thread(_evidence_run_helper, tool, args)
+    return _evidence_respond(
+        envelope, board=board, tool=tool, request_echo=request_echo
+    )
+
+
+@router.get("/evidence/snapshot")
+async def evidence_snapshot(
+    board: str = Query(..., description="Shared board slug (EVO-owned; need not exist locally)"),
+    status: str = Query("all", description="'all' or a valid status"),
+    card_limit: int = Query(100, ge=1, le=200, description="Cards per page"),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only board snapshot from the shared evidence service."""
+    board = _evidence_board_slug(board)
+    if status != "all" and status not in kanban_db.VALID_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be 'all' or one of {sorted(kanban_db.VALID_STATUSES)}")
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {
+        "board": board,
+        "status": status,
+        "card_limit": card_limit,
+    }
+    if cursor is not None:
+        args["cursor"] = cursor
+    return await _evidence_call(
+        "kanban_snapshot",
+        args,
+        board=board,
+        request_echo={"board": board, "status": status, "card_limit": card_limit, **({"cursor": cursor} if cursor else {})},
+    )
+
+
+@router.get("/evidence/page")
+async def evidence_page(
+    board: str = Query(...),
+    resource: str = Query(..., description="cards | runs | events | attachments"),
+    card: Optional[str] = Query(None, description="Required unless resource=cards"),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only page of a board resource from the shared evidence service."""
+    board = _evidence_board_slug(board)
+    if resource not in ("cards", "runs", "events", "attachments"):
+        raise HTTPException(status_code=422, detail="resource must be cards|runs|events|attachments")
+    if resource != "cards" and not card:
+        raise HTTPException(status_code=422, detail=f"card is required for resource={resource}")
+    if card:
+        card = _evidence_card_id(card)
+    if status is not None and status not in kanban_db.VALID_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(kanban_db.VALID_STATUSES)}")
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {"board": board, "resource": resource}
+    if card is not None:
+        args["card"] = card
+    if status is not None:
+        args["status"] = status
+    args["limit"] = limit
+    if cursor is not None:
+        args["cursor"] = cursor
+    echo: dict[str, Any] = {"board": board, "resource": resource, "limit": limit}
+    if card is not None:
+        echo["card"] = card
+    return await _evidence_call(
+        "kanban_page",
+        args,
+        board=board,
+        request_echo=echo,
+    )
+
+
+@router.get("/evidence/worker")
+async def evidence_worker(
+    board: str = Query(...),
+    card: str = Query(...),
+):
+    """Read-only worker evidence for one card from the shared service."""
+    board = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    return await _evidence_call(
+        "kanban_worker",
+        {"board": board, "card": card},
+        board=board,
+        request_echo={"board": board, "card": card},
+    )
+
+
+@router.get("/evidence/card")
+async def evidence_card(
+    board: str = Query(...),
+    card: str = Query(...),
+):
+    """Read-only single-card evidence; include_body=False and
+    recent_items=10 are FIXED, not request-selectable."""
+    board = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    return await _evidence_call(
+        "kanban_card",
+        {"board": board, "card": card, "include_body": False, "recent_items": 10},
+        board=board,
+        request_echo={"board": board, "card": card},
+    )
