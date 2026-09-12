@@ -351,6 +351,9 @@
   const EVIDENCE_STALE_RED_S = 300;
   const EVIDENCE_POLL_MS = 15000;
   const EVIDENCE_PAGE_CARD_LIMIT = 100;
+  // Per-resource page size for the drawer's bounded RUNS/EVENTS/ATTACHMENTS
+  // reads through /evidence/page (K10). Kept well under the 200 max.
+  const EVIDENCE_PAGE_RESOURCE_LIMIT = 50;
 
   // Build a query string from an object, skipping null/undefined/empty values.
   function evQuery(params) {
@@ -668,6 +671,154 @@
     };
   }
 
+  // -------------------------------------------------------------------------
+  // useEvidenceResourcePage — one bounded /evidence/page cursor per drawer
+  // resource (runs | events | attachments), K10.
+  //
+  // Each resource owns its own stable cursor, omissions rollup and Load-more
+  // affordance. Load more APPENDS visible rows (deduped by id) instead of
+  // only flipping a flag, so the drawer grows real details. Generation is
+  // bumped on board/card/resource change so a slow page for the previous card
+  // can never leak into the current one. When ``enabled`` is false (board not
+  // aligned) the hook clears itself and callers fall back to the legacy
+  // canonical detail read (runs/events/attachments off /tasks/:id).
+  // -------------------------------------------------------------------------
+  function useEvidenceResourcePage(boardSlug, cardId, resource, enabled) {
+    const [items, setItems] = useState([]);
+    const [envelope, setEnvelope] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [hasMore, setHasMore] = useState(false);
+    const [cursor, setCursor] = useState(null);
+    const [omitted, setOmitted] = useState(null);
+    const [total, setTotal] = useState(null);
+    const [returned, setReturned] = useState(null);
+    const [error, setError] = useState(null);
+    const genRef = useRef(0);
+    const itemsRef = useRef([]);
+
+    const loadFirst = useCallback(function () {
+      genRef.current += 1;
+      const gen = genRef.current;
+      setLoading(true);
+      setError(null);
+      setHasMore(false);
+      setCursor(null);
+      setOmitted(null);
+      setTotal(null);
+      setReturned(null);
+      return fetchEvidencePage(boardSlug, resource, cardId, null, EVIDENCE_PAGE_RESOURCE_LIMIT, null).then(function (env) {
+        if (gen !== genRef.current) return;
+        setEnvelope(env);
+        setLoading(false);
+        if (!env || env.state !== "PASS") {
+          itemsRef.current = [];
+          setItems([]);
+          setError((env && env.reason) || "evidence unavailable");
+          return;
+        }
+        const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        const pageItems = Array.isArray(data.items) ? data.items : [];
+        itemsRef.current = pageItems;
+        setItems(pageItems);
+        setHasMore(data.has_more === true);
+        setCursor(data.next_cursor != null ? data.next_cursor : null);
+        setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+        setTotal(typeof data.total === "number" ? data.total : null);
+        setReturned(typeof data.returned === "number" ? data.returned : null);
+      }).catch(function (e) {
+        if (gen !== genRef.current) return;
+        setLoading(false);
+        setError(String((e && e.message) || e));
+      });
+    }, [boardSlug, cardId, resource]);
+
+    const loadMore = useCallback(function () {
+      if (loadingMore || !hasMore || !cursor) return Promise.resolve();
+      setLoadingMore(true);
+      const gen = genRef.current;
+      return fetchEvidencePage(boardSlug, resource, cardId, null, EVIDENCE_PAGE_RESOURCE_LIMIT, cursor).then(function (env) {
+        if (gen !== genRef.current) return; // late page: card/board switched
+        setLoadingMore(false);
+        setEnvelope(env);
+        if (!env || env.state !== "PASS") {
+          setError((env && env.reason) || "evidence unavailable");
+          return;
+        }
+        const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        const pageItems = Array.isArray(data.items) ? data.items : [];
+        const seen = {};
+        const merged = itemsRef.current.concat(pageItems).filter(function (it) {
+          if (!it || it.id == null) return false;
+          if (seen[it.id]) return false;
+          seen[it.id] = true;
+          return true;
+        });
+        itemsRef.current = merged;
+        setItems(merged);
+        setHasMore(data.has_more === true);
+        if (data.next_cursor != null) setCursor(data.next_cursor);
+        else if (!data.has_more) setCursor(null);
+        setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+        setTotal(typeof data.total === "number" ? data.total : null);
+        setReturned(typeof data.returned === "number" ? data.returned : null);
+      }).catch(function (e) {
+        if (gen !== genRef.current) return;
+        setLoadingMore(false);
+        setError(String((e && e.message) || e));
+      });
+    }, [loadingMore, hasMore, cursor, boardSlug, cardId, resource]);
+
+    useEffect(function () {
+      if (!enabled) {
+        itemsRef.current = [];
+        setItems([]);
+        setEnvelope(null);
+        setLoading(false);
+        setLoadingMore(false);
+        setHasMore(false);
+        setCursor(null);
+        setOmitted(null);
+        setTotal(null);
+        setReturned(null);
+        setError(null);
+        return undefined;
+      }
+      loadFirst();
+      return undefined;
+    }, [enabled, boardSlug, cardId, resource, loadFirst]);
+
+    return {
+      items: items,
+      envelope: envelope,
+      loading: loading,
+      loadingMore: loadingMore,
+      hasMore: hasMore,
+      cursor: cursor,
+      omitted: omitted,
+      total: total,
+      returned: returned,
+      error: error,
+      loadMore: loadMore,
+    };
+  }
+
+  // Shared Load-more affordance for the drawer's bounded evidence pages
+  // (RUNS / EVENTS / ATTACHMENTS). Shows the omissions rollup from the
+  // helper so a partial page is never silently presented as complete.
+  function EvidenceLoadMoreButton(props) {
+    if (!props.hasMore) return null;
+    return h("button", {
+      type: "button",
+      className: "hermes-kanban-edit-link",
+      disabled: !!props.loadingMore,
+      style: { marginTop: "4px" },
+      onClick: props.onLoadMore,
+    }, props.loadingMore
+      ? "Loading…"
+      : "Load more" + (props.omitted != null ? " (" + props.omitted + " omitted)" : ""));
+  }
+
   // Compact per-card worker-evidence badge (K3). ``state`` is one of the
   // four EVIDENCE_STATE_LABEL keys; tone rendered inline so no stylesheet
   // change is required.
@@ -863,90 +1014,6 @@
             " \u00b7 unknown " + (agg.unknown != null ? agg.unknown : "?") +
             " \u00b7 complete " + (agg.complete === true ? "yes" : "no"))
         : null);
-  }
-
-  // Drawer evidence-attachment list (K9). Reads /evidence/page
-  // resource=attachments for the open card (gated on alignment) and offers a
-  // download through the authenticated /attachments/<id>?board route only.
-  // Never a stored_path URL. A missing file is surfaced separately from the
-  // metadata, and no content proof is claimed for an unopened attachment.
-  function EvidenceAttachmentsSection(props) {
-    const [envelope, setEnvelope] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [dlErr, setDlErr] = useState(null);
-    useEffect(function () {
-      let alive = true;
-      setLoading(true);
-      fetchEvidencePage(props.boardSlug, "attachments", props.cardId, null, null, null).then(function (env) {
-        if (!alive) return;
-        setEnvelope(env);
-        setLoading(false);
-      });
-      return function () { alive = false; };
-    }, [props.boardSlug, props.cardId]);
-
-    const head = "Evidence attachments";
-
-    if (loading) {
-      return h("div", { className: "hermes-kanban-section" },
-        h("div", { className: "hermes-kanban-section-head" }, head),
-        h("div", { className: "text-xs text-muted-foreground" }, "Loading\u2026"));
-    }
-
-    if (!envelope || envelope.state !== "PASS") {
-      return h("div", { className: "hermes-kanban-section" },
-        h("div", { className: "hermes-kanban-section-head" }, head),
-        h("div", { className: "text-xs text-muted-foreground" },
-          (envelope && envelope.reason) || "Attachment metadata is unavailable."));
-    }
-
-    const items = (envelope.evidence && envelope.evidence.items) || [];
-    if (items.length === 0) {
-      return h("div", { className: "hermes-kanban-section" },
-        h("div", { className: "hermes-kanban-section-head" }, head),
-        h("div", { className: "text-xs text-muted-foreground" }, "\u2014 no evidence attachments \u2014"));
-    }
-
-    function openAttachment(a) {
-      // Authenticated GET /attachments/<id>?board streams the file. A 404 is
-      // a missing file (distinct from the metadata row) and is reported, not
-      // hidden.
-      const url = withBoard(`${API}/attachments/${a.id}`, props.boardSlug);
-      setDlErr(null);
-      SDK.authedFetch(url).then(function (resp) {
-        if (!resp.ok) {
-          return resp.text().then(function (txt) {
-            throw new Error((resp.status === 404 ? "missing file: " : "") +
-              parseApiErrorMessage(new Error(resp.status + ": " + txt)));
-          });
-        }
-        return resp.blob();
-      }).then(function (blob) {
-        const objUrl = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = objUrl;
-        link.download = a.filename || "attachment";
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(function () { URL.revokeObjectURL(objUrl); }, 10000);
-      }).catch(function (e) { setDlErr(String(e.message || e)); });
-    }
-
-    return h("div", { className: "hermes-kanban-section" },
-      h("div", { className: "hermes-kanban-section-head" }, `${head} (${items.length})`),
-      dlErr ? h("div", { className: "text-xs text-destructive mb-1" }, dlErr) : null,
-      items.map(function (a) {
-        return h("div", { key: a.id, className: "flex items-center justify-between gap-2 py-1 text-sm" },
-          h("button", {
-            type: "button",
-            className: "hermes-kanban-attachment-link truncate",
-            title: a.filename,
-            onClick: function () { openAttachment(a); },
-          }, a.filename || ("attachment " + a.id)),
-          h("span", { className: "text-xs text-muted-foreground whitespace-nowrap" },
-            a.size != null ? _fmtBytes(a.size) : ""));
-      }));
   }
 
   // The SDK's Select component fires ``onValueChange(value)`` directly
@@ -2453,10 +2520,20 @@
     useEffect(function () {
       if (hasOpenDiags) setOpen(true);
     }, [hasOpenDiags]);
-    if (!hasOpenDiags && !props.alwaysVisible) {
+    if (!hasOpenDiags && !props.alwaysVisible && !props.diagnosticsUnknown) {
       // Nothing active. Collapse the section entirely rather than showing
       // an empty "Recovery" header — keeps clean tasks visually clean.
       return null;
+    }
+    if (!hasOpenDiags && props.diagnosticsUnknown) {
+      // K10: the legacy detail read was told NOT to materialise diagnostics
+      // (include_history=false on an EVO-aligned board). Surface that honestly
+      // instead of collapsing to an implicit "no diagnostics".
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" },
+          tx(t, "diagnostics", "Diagnostics")),
+        h("div", { className: "text-xs text-muted-foreground" },
+          "Not loaded: diagnostics are unavailable on an evidence read."));
     }
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head-row" },
@@ -4170,11 +4247,20 @@
     const boardSlug = props.boardSlug;
 
     const load = useCallback(function () {
-      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
+      // K10: on an EVO-aligned board, ask the detail route NOT to materialise
+      // runs/events/attachments (and derived diagnostics) — those are paged
+      // through /evidence/page instead. include_history=false is a supported
+      // read option on the detail route (parent-owned); non-aligned boards and
+      // all other callers keep the default include_history=true.
+      const detailPath = `${API}/tasks/${encodeURIComponent(props.taskId)}`;
+      const detailUrl = props.evidenceAligned
+        ? withBoard(`${detailPath}?include_history=false`, boardSlug)
+        : withBoard(detailPath, boardSlug);
+      return SDK.fetchJSON(detailUrl)
         .then(function (d) { setData(d); setErr(null); setPatchErr(null); })
         .catch(function (e) { setErr(String(e.message || e)); })
         .finally(function () { setLoading(false); });
-    }, [props.taskId, boardSlug]);
+    }, [props.taskId, boardSlug, props.evidenceAligned]);
 
     const loadHomeChannels = useCallback(function () {
       const qs = new URLSearchParams({ task_id: props.taskId });
@@ -4534,7 +4620,11 @@
         .then(function (resp) {
           if (!resp.ok) {
             return resp.text().then(function (txt) {
-              throw new Error(parseApiErrorMessage(new Error(resp.status + ": " + txt)));
+              // A 404 is a missing file, surfaced distinctly from the metadata
+              // row (never a silent content claim). In evidence mode the
+              // metadata came from the helper, so mark the 404 explicitly.
+              throw new Error((props.evidenceMode && resp.status === 404 ? "missing file: " : "") +
+                parseApiErrorMessage(new Error(resp.status + ": " + txt)));
             });
           }
           return resp.blob();
@@ -4553,7 +4643,7 @@
     }
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head" },
-        `${tx(i18n, "attachments", "Attachments")} (${atts.length})`),
+        `${props.evidenceMode ? "Evidence attachments" : tx(i18n, "attachments", "Attachments")} (${atts.length})`),
       h("input", {
         ref: fileRef,
         type: "file",
@@ -4618,6 +4708,14 @@
               }, "×"),
             );
           }),
+      props.evidenceMode
+        ? h(EvidenceLoadMoreButton, {
+            hasMore: props.hasMore,
+            omitted: props.omitted,
+            loadingMore: props.loadingMore,
+            onLoadMore: props.onLoadMore,
+          })
+        : null,
     );
   }
 
@@ -4625,10 +4723,23 @@
     const { t: i18n } = useI18n();
     const t = props.data.task;
     const comments = props.data.comments || [];
-    const events = props.data.events || [];
-    const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
     const childResults = props.data.child_results || [];
+
+    // K10: on an EVO-aligned board, runs/events/attachments are NOT
+    // materialised by the legacy detail read (TaskDrawer sends
+    // include_history=false) and are instead paged through /evidence/page with
+    // one stable cursor per resource. When not aligned, the legacy canonical
+    // read (props.data.runs/events/attachments) is used unchanged.
+    const evidenceAligned = !!props.evidenceAligned;
+    const runsPage = useEvidenceResourcePage(props.boardSlug, t.id, "runs", evidenceAligned);
+    const eventsPage = useEvidenceResourcePage(props.boardSlug, t.id, "events", evidenceAligned);
+    const attachmentsPage = useEvidenceResourcePage(props.boardSlug, t.id, "attachments", evidenceAligned);
+
+    const runs = evidenceAligned ? runsPage.items : (props.data.runs || []);
+    const events = evidenceAligned ? eventsPage.items : (props.data.events || []);
+    const attachments = evidenceAligned ? attachmentsPage.items : (props.data.attachments || []);
+    const diagnosticsUnknown = props.data.diagnostics_state === "UNKNOWN";
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
@@ -4684,6 +4795,7 @@
         boardSlug: props.boardSlug,
         assignees: props.assignees,
         diagnostics: t.diagnostics || [],
+        diagnosticsUnknown: diagnosticsUnknown,
         onRefresh: props.onRefresh,
       }),
       h(HomeSubsSection, {
@@ -4769,6 +4881,11 @@
         uploadErr: props.uploadErr,
         i18n: i18n,
         requestDialog: props.requestDialog,
+        evidenceMode: evidenceAligned,
+        hasMore: evidenceAligned ? attachmentsPage.hasMore : false,
+        omitted: evidenceAligned ? attachmentsPage.omitted : null,
+        loadingMore: evidenceAligned ? attachmentsPage.loadingMore : false,
+        onLoadMore: evidenceAligned ? attachmentsPage.loadMore : null,
       }),
       h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" },
@@ -4790,7 +4907,7 @@
       h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" },
           `${tx(i18n, "events", "Events")} (${events.length})`),
-        events.slice().reverse().slice(0, 20).map(function (e) {
+        (evidenceAligned ? events.slice().reverse() : events.slice().reverse().slice(0, 20)).map(function (e) {
           const isDiag = isDiagnosticEvent(e.kind);
           const phantoms = isDiag ? phantomIdsFromEvent(e) : [];
           return h("div", {
@@ -4831,15 +4948,28 @@
               : null,
           );
         }),
+        evidenceAligned
+          ? h(EvidenceLoadMoreButton, {
+              hasMore: eventsPage.hasMore,
+              omitted: eventsPage.omitted,
+              loadingMore: eventsPage.loadingMore,
+              onLoadMore: eventsPage.loadMore,
+            })
+          : null,
       ),
       h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
       props.evidenceAligned
         ? h(WorkerEvidenceSection, { boardSlug: props.boardSlug, cardId: t.id })
         : null,
-      props.evidenceAligned
-        ? h(EvidenceAttachmentsSection, { boardSlug: props.boardSlug, cardId: t.id })
-        : null,
-      h(RunHistorySection, { runs: props.data.runs || [] }),
+      h(RunHistorySection, {
+        runs: runs,
+        paged: evidenceAligned,
+        total: evidenceAligned ? runsPage.total : null,
+        hasMore: evidenceAligned ? runsPage.hasMore : false,
+        omitted: evidenceAligned ? runsPage.omitted : null,
+        loadingMore: evidenceAligned ? runsPage.loadingMore : false,
+        onLoadMore: evidenceAligned ? runsPage.loadMore : null,
+      }),
     );
   }
 
@@ -4850,9 +4980,14 @@
     const { t } = useI18n();
     const runs = props.runs || [];
     const [expanded, setExpanded] = useState(false);
-    if (runs.length === 0) return null;
-    const showAll = expanded || runs.length <= 3;
+    const paged = !!props.paged;
+    const hasLoadMore = paged && !!props.hasMore;
+    if (runs.length === 0 && !hasLoadMore) return null;
+    // Paged (bounded evidence) shows every loaded row plus a Load-more; the
+    // "+N earlier" collapse only applies to a fully-loaded unbounded list.
+    const showAll = paged ? true : (expanded || runs.length <= 3);
     const visible = showAll ? runs : runs.slice(-3);
+    const countLabel = paged && props.total != null ? props.total : runs.length;
 
     const fmtElapsed = function (run) {
       if (!run || !run.started_at) return "";
@@ -4866,7 +5001,7 @@
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head-row" },
         h("span", { className: "hermes-kanban-section-head" },
-          `${tx(t, "runHistory", "Run history")} (${runs.length})`),
+          `${tx(t, "runHistory", "Run history")} (${countLabel})`),
         !showAll
           ? h("button", {
               type: "button",
@@ -4911,6 +5046,14 @@
             : null,
         );
       }),
+      hasLoadMore
+        ? h(EvidenceLoadMoreButton, {
+            hasMore: props.hasMore,
+            omitted: props.omitted,
+            loadingMore: props.loadingMore,
+            onLoadMore: props.onLoadMore,
+          })
+        : null,
     );
   }
 
