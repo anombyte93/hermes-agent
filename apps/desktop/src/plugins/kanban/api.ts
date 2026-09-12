@@ -23,6 +23,10 @@ import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from 
 import type {
   BoardMeta,
   BoardsResponse,
+  EvidenceCardData,
+  EvidenceContext,
+  EvidenceEnvelope,
+  EvidenceSnapshotData,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
@@ -30,6 +34,7 @@ import type {
   KanbanTaskDetail,
   OrchestrationSettings,
   TaskEstimate,
+  WorkerEvidenceData,
   WorkerLog
 } from './types'
 
@@ -158,6 +163,15 @@ export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
 
+// Read-only /evidence/* bridge keys (board-scoped so a switch is a clean miss).
+export const evidenceContextKey = (slug: string) => ['kanban', 'evidence', 'context', slug] as const
+export const evidenceSnapshotKey = (slug: string, status: string, cursor: null | string) =>
+  ['kanban', 'evidence', 'snapshot', slug, status, cursor] as const
+export const evidenceWorkerKey = (slug: string, id: string) => ['kanban', 'evidence', 'worker', slug, id] as const
+export const evidenceCardKey = (slug: string, id: string) => ['kanban', 'evidence', 'card', slug, id] as const
+export const evidencePageKey = (slug: string, resource: string, card: null | string, cursor: null | string) =>
+  ['kanban', 'evidence', 'page', slug, resource, card, cursor] as const
+
 // ── reads ─────────────────────────────────────────────────────────────────────
 
 export const fetchBoard = (archived: boolean) =>
@@ -176,6 +190,46 @@ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profile
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
+
+// ── read-only /evidence/* bridge (physical EVO host) ──────────────────────────
+// These never touch the local /board or /tasks data; they read the shared
+// EVO evidence bridge. `withBoard` appends `?board=<slug>` so the evidence
+// read is pinned to the selected board, never the server's current pointer.
+
+/** Identity alignment: is the selected board's local DB the same EVO DB? */
+export const fetchEvidenceContext = () => call<EvidenceContext>(withBoard('/evidence/context'))
+
+/** Bounded board snapshot with running/stopped/unknown worker evidence. */
+export const fetchEvidenceSnapshot = (status: string, cursor: null | string, cardLimit = 100) =>
+  call<EvidenceEnvelope<EvidenceSnapshotData>>(
+    withBoard('/evidence/snapshot', { status, card_limit: String(cardLimit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Full worker aggregate for one card (complete/unknown/running + observations). */
+export const fetchEvidenceWorker = (id: string) =>
+  call<EvidenceEnvelope<WorkerEvidenceData>>(withBoard('/evidence/worker', { card: id }))
+
+/** Bounded single-card evidence (include_body/recent_items are server-fixed). */
+export const fetchEvidenceCard = (id: string) =>
+  call<EvidenceEnvelope<EvidenceCardData>>(withBoard('/evidence/card', { card: id }))
+
+/** Bounded page of a card resource (cards|runs|events|attachments). */
+export const fetchEvidencePage = (
+  resource: string,
+  card: null | string,
+  cursor: null | string,
+  limit = 50,
+  status?: string
+) =>
+  call<EvidenceEnvelope<{ items: Array<Record<string, unknown>>; returned: number; has_more: boolean; next_cursor?: null | string }>>(
+    withBoard('/evidence/page', {
+      resource,
+      limit: String(limit),
+      ...(card ? { card } : {}),
+      ...(status ? { status } : {}),
+      ...(cursor ? { cursor } : {})
+    })
+  )
 
 // ── writes ────────────────────────────────────────────────────────────────────
 
