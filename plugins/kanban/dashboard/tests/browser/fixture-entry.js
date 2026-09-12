@@ -53,7 +53,22 @@ function fetchJSON(url, opts) {
   });
 }
 function authedFetch(url, opts) { return fetch(url, opts); }
-function buildWsUrl() { return Promise.resolve(undefined); }
+// buildWsUrl resolves to a real ws:// URL on the fixture server so the IIFE
+// opens a genuine WebSocket and the fixture can drive frames over the wire
+// (network-boundary mock only, never a source-grep or a callback invoked by
+// hand). It mirrors the real SDK: the API path plus since/board query params.
+function buildWsUrl(path, params) {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const qs = new URLSearchParams();
+  if (params) {
+    Object.keys(params).forEach(function (k) {
+      if (params[k] != null) qs.set(k, String(params[k]));
+    });
+  }
+  const sep = path.indexOf("?") >= 0 ? "&" : "?";
+  const suffix = qs.toString() ? sep + qs.toString() : "";
+  return Promise.resolve(proto + "//" + window.location.host + path + suffix);
+}
 
 window.__HERMES_PLUGIN_SDK__ = {
   React: React,

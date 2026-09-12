@@ -41,6 +41,7 @@ const state = {
   continueUnknown: false, // when true, /workflow/continue returns UNKNOWN
   timelineDelayMs: 0, // delay the NEXT /evidence/timeline for timelineDelayCard
   timelineDelayCard: null,
+  eventsBaseline: null, // null | "fail" | "unknown" | "malformed" | "wrongboard"
 };
 
 function resetState() {
@@ -52,6 +53,7 @@ function resetState() {
   state.continueUnknown = false;
   state.timelineDelayMs = 0;
   state.timelineDelayCard = null;
+  state.eventsBaseline = null;
 }
 
 function json(res, code, obj) {
@@ -289,6 +291,17 @@ function changesData(board, cursor) {
     return Object.assign({}, base, { events: [changeEvent(875, "blocked", "t_attn1", now - 10), changeEvent(876, "claimed", "t_run1", now - 5)], returned: 2, has_more: true, next_cursor: "chg:p3", high_water_rowid: 876, anchor_state: "poll" });
   }
   return Object.assign({}, base, { events: [], returned: 0, has_more: true, next_cursor: "chg:p2", high_water_rowid: 874, anchor_state: "baseline" });
+}
+
+// GET /events/baseline — the notification baseline for the existing /events
+// WebSocket stream. Reads the current MAX(id) from the SAME selected-server
+// DB as /events (works local and EVO alike). Evidence is {board, baseline_id}.
+function eventsBaseline(board) {
+  if (board === "evo") return { board: "evo", baseline_id: 874 };
+  if (board === "other") return { board: "other", baseline_id: 150 };
+  if (board === "denied") return { board: "denied", baseline_id: 874 };
+  // local/broken/stale have no event table in the fixture: UNKNOWN.
+  return null;
 }
 
 function interval(kind, start, end, runIds, evIds) {
@@ -609,6 +622,32 @@ function handleRoutes(req, res, reqBody) {
     state.hits.push("changes:" + board + (q.get("cursor") ? ":cursor" : ""));
     return json(res, 200, wfEnvelope("PASS", board, null, changesData(board, q.get("cursor")), null, null, "kanban_changes"));
   }
+  if (p === `${API}/events/baseline`) {
+    state.hits.push("events-baseline:" + board);
+    if (state.eventsBaseline === "fail") {
+      return json(res, 200, wfEnvelope("FAIL", board, null, null,
+        "event baseline unavailable", "retry the baseline read", "kanban_events_baseline"));
+    }
+    if (state.eventsBaseline === "unknown") {
+      return json(res, 200, wfEnvelope("UNKNOWN", board, null, null,
+        "event baseline could not be resolved", "retry the baseline read", "kanban_events_baseline"));
+    }
+    if (state.eventsBaseline === "malformed") {
+      // PASS but the baseline id is not a nonnegative integer: unknown.
+      return json(res, 200, wfEnvelope("PASS", board, null, { board: board, baseline_id: -5 }, null, null, "kanban_events_baseline"));
+    }
+    if (state.eventsBaseline === "wrongboard") {
+      // PASS but the evidence names a different board: exact-board gate fails.
+      return json(res, 200, wfEnvelope("PASS", board, null, { board: "some-other-board", baseline_id: 874 }, null, null, "kanban_events_baseline"));
+    }
+    const base = eventsBaseline(board);
+    if (!base) {
+      // Absent/unreadable event table: UNKNOWN, never a synthetic baseline.
+      return json(res, 200, wfEnvelope("UNKNOWN", board, null, null,
+        "no event table for this board", "retry the baseline read", "kanban_events_baseline"));
+    }
+    return json(res, 200, wfEnvelope("PASS", board, null, base, null, null, "kanban_events_baseline"));
+  }
   if (p === `${API}/evidence/timeline`) {
     const card = q.get("card") || "";
     state.hits.push("timeline:" + card);
@@ -656,6 +695,110 @@ function handleRoutes(req, res, reqBody) {
   json(res, 404, { detail: "not found: " + p });
 }
 
+// --- WebSocket fixture server (real upgrade + frames, no `ws` dependency) ---
+// The IIFE opens a genuine WebSocket to /api/plugins/kanban/events via the
+// SDK buildWsUrl shim; this server accepts that upgrade over the same HTTP
+// server and lets scenarios push REAL frames over the wire. No source-grep,
+// no callback invoked by hand. Server->client frames are unmasked text frames
+// carrying the same {"events": [...], "cursor": N} shape the Python stream
+// sends.
+
+const wsConns = []; // { socket, board, since }
+
+function wsAccept(key) {
+  return crypto.createHash("sha1")
+    .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    .digest("base64");
+}
+
+function wsFrame(text) {
+  const payload = Buffer.from(text, "utf8");
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x81, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function registerWsUpgrade(server) {
+  server.on("upgrade", function (req, socket) {
+    const u = new URL(req.url, "http://localhost");
+    if (u.pathname !== `${API}/events`) {
+      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const key = req.headers["sec-websocket-key"];
+    if (!key) { socket.destroy(); return; }
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      "Sec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"
+    );
+    const conn = {
+      socket: socket,
+      board: u.searchParams.get("board") || "",
+      since: u.searchParams.get("since") || "0",
+    };
+    wsConns.push(conn);
+    socket.on("close", function () {
+      const i = wsConns.indexOf(conn);
+      if (i >= 0) wsConns.splice(i, 1);
+    });
+    socket.on("error", function () {
+      const i = wsConns.indexOf(conn);
+      if (i >= 0) wsConns.splice(i, 1);
+    });
+    // Ignore incoming (masked) client frames; the browser sends only a close
+    // frame on shutdown and the TCP close handler above does the cleanup.
+    socket.on("data", function () { /* ignore */ });
+  });
+}
+
+function wsEvent(id, kind, taskId) {
+  return { id: id, task_id: taskId, run_id: null, kind: kind, payload: {}, created_at: now - 1 };
+}
+
+// Push a real frame to every live connection for `board`. Returns the number
+// of sockets that accepted the write. A closed socket (board switched) cannot
+// receive it, which is the late-previous-board behavior under test.
+function sendWsFrame(board, events) {
+  const frame = wsFrame(JSON.stringify({
+    events: events,
+    cursor: events.length ? events[events.length - 1].id : 0,
+  }));
+  let sent = 0;
+  for (const conn of wsConns) {
+    if (conn.board !== board) continue;
+    try {
+      conn.socket.write(frame);
+      sent += 1;
+    } catch (_e) { /* socket already closed */ }
+  }
+  return sent;
+}
+
+async function waitForWs(board, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 3000);
+  while (Date.now() < deadline) {
+    if (wsConns.some(function (c) { return c.board === board; })) return;
+    await new Promise(function (r) { setTimeout(r, 25); });
+  }
+  throw new Error("timed out waiting for WS connection on board " + board);
+}
+
 // --- build the bundle -------------------------------------------------------
 let bundlePath;
 let server;
@@ -680,6 +823,7 @@ async function main() {
   });
 
   server = http.createServer(handle);
+  registerWsUpgrade(server);
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const port = server.address().port;
   const base = "http://127.0.0.1:" + port;
@@ -704,6 +848,10 @@ async function main() {
     await scenarioWorkflowDenied(base);
     await scenarioWorkflowLateCard(base);
     await scenarioWorkflowPhone(base);
+    await scenarioWorkflowNotices(base);
+    await scenarioWorkflowNoticeBaselineUnknown(base);
+    await scenarioWorkflowNoticeBoardSwitch(base);
+    await scenarioWorkflowNoticePhone(base);
   } finally {
     await browser.close();
     server.close();
@@ -1148,6 +1296,189 @@ async function scenarioWorkflowPhone(base) {
   check("phone-workflow: readiness check button visible", await page.locator("[data-workflow-readiness-check]").count() === 1);
   check("phone-workflow: timeline section visible", await page.locator("[data-workflow-timeline='true']").count() > 0);
 
+  await page.close();
+}
+
+// K7 notification region: baseline/replay zero alerts, newly arrived review
+// and changes open the exact card, duplicate frames collapse, no dispatch.
+// Frames are REAL WebSocket frames driven by the fixture server, never a
+// callback invoked by hand.
+async function scenarioWorkflowNotices(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice='true']", { timeout: 5000 });
+  await page.waitForSelector("[data-workflow-notice-baseline='ready']", { timeout: 5000 });
+  await page.waitForSelector("[data-workflow-notice-baseline-id='874']", { timeout: 5000 });
+  check("notices: bounded /events/baseline established", state.hits.some((h) => h.startsWith("events-baseline:evo")), state.hits.join(","));
+
+  await waitForWs("evo", 5000);
+
+  // Historical / replay events (id <= baseline 874) must produce zero alerts.
+  sendWsFrame("evo", [
+    wsEvent(100, "review_requested", "t_old1"),
+    wsEvent(200, "completed", "t_old2"),
+  ]);
+  await page.waitForTimeout(400);
+  check("notices: historical replay suppressed (zero alerts)",
+    await page.locator("[data-workflow-notice-item]").count() === 0);
+
+  // Newly arrived review_requested + changes_requested surface exact cards.
+  sendWsFrame("evo", [
+    wsEvent(900, "review_requested", "t_run1"),
+    wsEvent(901, "changes_requested", "t_run2"),
+  ]);
+  await page.waitForSelector("[data-workflow-notice-item='t_run1']", { timeout: 5000 });
+  await page.waitForSelector("[data-workflow-notice-item='t_run2']", { timeout: 5000 });
+  check("notices: review_requested surfaced for exact card",
+    await page.locator("[data-workflow-notice-kind='review_requested']").count() === 1);
+  check("notices: changes_requested surfaced for exact card",
+    await page.locator("[data-workflow-notice-kind='changes_requested']").count() === 1);
+
+  // A duplicate frame (same event ids) must not add a second row.
+  sendWsFrame("evo", [
+    wsEvent(900, "review_requested", "t_run1"),
+    wsEvent(901, "changes_requested", "t_run2"),
+  ]);
+  await page.waitForTimeout(400);
+  check("notices: duplicate frame collapsed to one row each",
+    await page.locator("[data-workflow-notice-item]").count() === 2);
+
+  // Clicking the review_requested row opens the exact drawer.
+  await page.click("[data-workflow-notice-open-item='t_run1']");
+  await page.waitForSelector(".hermes-kanban-drawer-head", { timeout: 5000 });
+  check("notices: click opens exact card drawer",
+    await page.locator(".hermes-kanban-drawer-head").locator("text=t_run1").count() > 0);
+
+  check("notices: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
+  await page.close();
+}
+
+// K7: FAIL/UNKNOWN/malformed baseline suppresses historical notifications and
+// offers a retry; a retry against a now-valid baseline recovers and new events
+// flow. No historical replay in any of the failure shapes.
+async function scenarioWorkflowNoticeBaselineUnknown(base) {
+  // FAIL shape
+  resetState();
+  state.eventsBaseline = "fail";
+  let page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='unknown']", { timeout: 5000 });
+  check("notices-fail: baseline FAIL becomes unknown, retry offered",
+    await page.locator("[data-workflow-notice-retry]").count() === 1);
+  await waitForWs("evo", 5000);
+  sendWsFrame("evo", [wsEvent(950, "completed", "t_run1")]);
+  await page.waitForTimeout(400);
+  check("notices-fail: historical notifications suppressed",
+    await page.locator("[data-workflow-notice-item]").count() === 0);
+  await page.close();
+
+  // UNKNOWN shape
+  resetState();
+  state.eventsBaseline = "unknown";
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='unknown']", { timeout: 5000 });
+  check("notices-unknown: baseline UNKNOWN -> unknown + retry",
+    await page.locator("[data-workflow-notice-retry]").count() === 1);
+  await page.close();
+
+  // malformed shape (negative baseline id)
+  resetState();
+  state.eventsBaseline = "malformed";
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='unknown']", { timeout: 5000 });
+  check("notices-malformed: non-integer/negative baseline treated unknown",
+    await page.locator("[data-workflow-notice-retry]").count() === 1);
+  await page.close();
+
+  // wrong-board shape (exact-board gate fails)
+  resetState();
+  state.eventsBaseline = "wrongboard";
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='unknown']", { timeout: 5000 });
+  check("notices-wrongboard: board mismatch treated unknown",
+    await page.locator("[data-workflow-notice-retry]").count() === 1);
+  await page.close();
+
+  // Retry recovery: baseline fails once, then a retry (with the failure mode
+  // cleared) establishes a valid baseline and new events flow.
+  resetState();
+  state.eventsBaseline = "fail";
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='unknown']", { timeout: 5000 });
+  state.eventsBaseline = null; // recovery: next read is a valid baseline
+  await page.click("[data-workflow-notice-retry]");
+  await page.waitForSelector("[data-workflow-notice-baseline='ready']", { timeout: 5000 });
+  await waitForWs("evo", 5000);
+  sendWsFrame("evo", [wsEvent(960, "review_requested", "t_run2")]);
+  await page.waitForSelector("[data-workflow-notice-item='t_run2']", { timeout: 5000 });
+  check("notices-retry: retry establishes baseline and new events flow",
+    await page.locator("[data-workflow-notice-item='t_run2']").count() === 1);
+  check("notices-retry: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
+  await page.close();
+}
+
+// K7: per-board isolation. Switching boards clears notices and re-establishes
+// a per-board baseline; a frame on the new board flows, a late frame on the
+// OLD board's (now-closed) connection is ignored.
+async function scenarioWorkflowNoticeBoardSwitch(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='ready']", { timeout: 5000 });
+  await waitForWs("evo", 5000);
+
+  // A valid evo event surfaces.
+  sendWsFrame("evo", [wsEvent(900, "review_requested", "t_run1")]);
+  await page.waitForSelector("[data-workflow-notice-item='t_run1']", { timeout: 5000 });
+
+  // Switch to "other": its own baseline (150), fresh notice set.
+  await page.selectOption('select[aria-label="Switch kanban board"]', "other");
+  await page.waitForSelector("[data-workflow-notice-baseline-id='150']", { timeout: 5000 });
+  await waitForWs("other", 5000);
+
+  // A late frame on the OLD evo connection must not surface (the IIFE closed
+  // that socket on board switch, and the board guard drops it regardless).
+  sendWsFrame("evo", [wsEvent(905, "changes_requested", "t_run2")]);
+  await page.waitForTimeout(400);
+  check("notices-switch: late previous-board frame ignored",
+    await page.locator("[data-workflow-notice-item='t_run2']").count() === 0);
+  check("notices-switch: prior board notices cleared",
+    await page.locator("[data-workflow-notice-item='t_run1']").count() === 0);
+
+  // A new-board event surfaces on its own board.
+  sendWsFrame("other", [wsEvent(300, "completed", "t_other1")]);
+  await page.waitForSelector("[data-workflow-notice-item='t_other1']", { timeout: 5000 });
+  check("notices-switch: new board isolated and receives its own event",
+    await page.locator("[data-workflow-notice-item='t_other1']").count() === 1);
+
+  check("notices-switch: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
+  await page.close();
+}
+
+// 390px phone: the in-page notification region renders and its click target
+// opens the exact drawer.
+async function scenarioWorkflowNoticePhone(base) {
+  resetState();
+  const page = await (await newPage(base, "evo", { width: 390, height: 844 }));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-notice-baseline='ready']", { timeout: 5000 });
+  await waitForWs("evo", 5000);
+
+  sendWsFrame("evo", [wsEvent(900, "review_requested", "t_run1")]);
+  await page.waitForSelector("[data-workflow-notice-item='t_run1']", { timeout: 5000 });
+  check("phone-notices: notification row visible at 390px",
+    await page.locator("[data-workflow-notice-item='t_run1']").count() === 1);
+
+  await page.click("[data-workflow-notice-open-item='t_run1']");
+  await page.waitForSelector(".hermes-kanban-drawer-head", { timeout: 5000 });
+  check("phone-notices: click opens exact card drawer",
+    await page.locator(".hermes-kanban-drawer-head").locator("text=t_run1").count() > 0);
+  check("phone-notices: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
   await page.close();
 }
 
