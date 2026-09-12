@@ -23,6 +23,10 @@ import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from 
 import type {
   BoardMeta,
   BoardsResponse,
+  EvidenceCardData,
+  EvidenceContext,
+  EvidenceEnvelope,
+  EvidenceSnapshotData,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
@@ -30,8 +34,19 @@ import type {
   KanbanTaskDetail,
   OrchestrationSettings,
   TaskEstimate,
+  WorkerEvidenceData,
   WorkerLog
 } from './types'
+import type {
+  AttentionData,
+  ChangesData,
+  ContinuationDraft,
+  ContinueReceipt,
+  HoldReceipt,
+  ReadinessReceipt,
+  RemainingCheck,
+  TimelineData
+} from './workflow-api'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
@@ -70,6 +85,10 @@ function onEventsFrame(slug: string, data: unknown): void {
   void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
   // Any event can change a board's card count — keep the switcher badge honest.
   void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
+  // A task event can also change worker evidence (a claim, stop, or completion),
+  // so the aligned snapshot/context refresh through the SAME callback — no
+  // second poller or notifier.
+  void queryClient.invalidateQueries({ queryKey: ['kanban', 'evidence'] })
 
   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
     void queryClient.invalidateQueries({ queryKey: taskKey(slug, taskId!) })
@@ -148,6 +167,23 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
   return qs ? `${path}?${qs}` : path
 }
 
+/** Append an EXPLICIT board slug to a path. The evidence fetchers take the
+ *  slug as a parameter and capture it in their closure, so an in-flight
+ *  request can never read a board that changed after it was issued — the
+ *  global atom is not consulted. A blank slug is omitted (the server resolves
+ *  the current board); callers resolve '' to the real slug before asking. */
+function withBoardSlug(path: string, slug: string, params: Record<string, string> = {}): string {
+  const search = new URLSearchParams(params)
+
+  if (slug) {
+    search.set('board', slug)
+  }
+
+  const qs = search.toString()
+
+  return qs ? `${path}?${qs}` : path
+}
+
 // ── query keys (all board-scoped so switching boards is a clean cache miss) ──
 
 export const boardKey = (slug: string, archived: boolean) => ['kanban', 'board', slug, archived] as const
@@ -158,12 +194,31 @@ export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
 
+// Read-only /evidence/* bridge keys (board-scoped so a switch is a clean miss).
+export const evidenceContextKey = (slug: string) => ['kanban', 'evidence', 'context', slug] as const
+export const evidenceSnapshotKey = (slug: string, status: string, cursor: null | string) =>
+  ['kanban', 'evidence', 'snapshot', slug, status, cursor] as const
+export const evidenceWorkerKey = (slug: string, id: string) => ['kanban', 'evidence', 'worker', slug, id] as const
+export const evidenceCardKey = (slug: string, id: string) => ['kanban', 'evidence', 'card', slug, id] as const
+export const evidencePageKey = (slug: string, resource: string, card: null | string, cursor: null | string) =>
+  ['kanban', 'evidence', 'page', slug, resource, card, cursor] as const
+
 // ── reads ─────────────────────────────────────────────────────────────────────
 
 export const fetchBoard = (archived: boolean) =>
   call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
 
 export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
+
+/** Resolve detail without materialising legacy history; pages supply that history. */
+export const fetchTaskWithoutHistory = (slug: string, id: string) =>
+  call<KanbanTaskDetail>(withBoardSlug(`/tasks/${id}`, slug, { include_history: 'false' }))
+
+/** JSON uses the existing authenticated desktop REST transport, including SSH. */
+export const fetchAttachmentDownload = (slug: string, id: number | string) =>
+  call<{ id: number; filename: string; content_type: string; size: number; content_base64: string }>(
+    withBoardSlug(`/attachments/${id}`, slug, { format: 'json' })
+  )
 
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
 export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
@@ -176,6 +231,48 @@ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profile
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
+
+// ── read-only /evidence/* bridge (physical EVO host) ──────────────────────────
+// These never touch the local /board or /tasks data; they read the shared
+// EVO evidence bridge. Each takes an EXPLICIT slug captured at call time (not
+// the global atom) so a late response from a previous board can never land
+// under a new board's query key.
+
+/** Identity alignment: is the selected board's local DB the same EVO DB? */
+export const fetchEvidenceContext = (slug: string) => call<EvidenceContext>(withBoardSlug('/evidence/context', slug))
+
+/** Bounded board snapshot with running/stopped/unknown worker evidence. */
+export const fetchEvidenceSnapshot = (slug: string, status: string, cursor: null | string, cardLimit = 100) =>
+  call<EvidenceEnvelope<EvidenceSnapshotData>>(
+    withBoardSlug('/evidence/snapshot', slug, { status, card_limit: String(cardLimit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Full worker aggregate for one card (complete/unknown/running + observations). */
+export const fetchEvidenceWorker = (slug: string, id: string) =>
+  call<EvidenceEnvelope<WorkerEvidenceData>>(withBoardSlug('/evidence/worker', slug, { card: id }))
+
+/** Bounded single-card evidence (include_body/recent_items are server-fixed). */
+export const fetchEvidenceCard = (slug: string, id: string) =>
+  call<EvidenceEnvelope<EvidenceCardData>>(withBoardSlug('/evidence/card', slug, { card: id }))
+
+/** Bounded page of a card resource (cards|runs|events|attachments). */
+export const fetchEvidencePage = (
+  slug: string,
+  resource: string,
+  card: null | string,
+  cursor: null | string,
+  limit = 50,
+  status?: string
+) =>
+  call<EvidenceEnvelope<{ items: Array<Record<string, unknown>>; returned: number; has_more: boolean; next_cursor?: null | string }>>(
+    withBoardSlug('/evidence/page', slug, {
+      resource,
+      limit: String(limit),
+      ...(card ? { card } : {}),
+      ...(status ? { status } : {}),
+      ...(cursor ? { cursor } : {})
+    })
+  )
 
 // ── writes ────────────────────────────────────────────────────────────────────
 
@@ -237,6 +334,15 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
+/**
+ * Authenticated attachment download route for one card. `id` is the integer
+ * attachment id; the download goes through the SAME identity the REST door
+ * uses (`/attachments/<id>?board=<slug>`), never a raw `stored_path` URL.
+ * Returns the namespaced path for the caller to open/download.
+ */
+export const attachmentDownloadPath = (slug: string, id: number | string) =>
+  withBoardSlug(`/attachments/${id}`, slug)
+
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
     method: 'POST',
@@ -270,3 +376,72 @@ export const autoDescribeProfile = (name: string) =>
     `/profiles/${encodeURIComponent(name)}/describe-auto`,
     { method: 'POST', body: { overwrite: true } }
   )
+
+// ── workflow REST (read-only evidence reads + explicit-action writes) ────────
+// The three reads are board-scoped bounded pages of the read-only /evidence/*
+// bridge. The three writes are EXPLICIT-ACTION routes: readiness never fires
+// unless the user clicks, and none of them dispatches, unblocks or grants
+// mutation authority. Each takes the board slug explicitly (never the global
+// atom) so a late response from a previous board cannot land under the new one.
+
+/** Bounded attention queue: cards needing operator attention, capped page. */
+export const fetchAttentionQueue = (slug: string, limit = 50, cursor: null | string = null) =>
+  call<EvidenceEnvelope<AttentionData>>(
+    withBoardSlug('/evidence/attention', slug, { limit: String(limit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Bounded changes page. First call is baseline-now (no historical flood). */
+export const fetchChanges = (slug: string, limit = 50, cursor: null | string = null) =>
+  call<EvidenceEnvelope<ChangesData>>(
+    withBoardSlug('/evidence/changes', slug, { limit: String(limit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Bounded timeline intervals for one card (execution/blocked/review/unknown). */
+export const fetchTimeline = (slug: string, card: string, limit = 50, cursor: null | string = null) =>
+  call<EvidenceEnvelope<TimelineData>>(
+    withBoardSlug('/evidence/timeline', slug, { card, limit: String(limit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Explicit-action readiness check. check_model gates the exact provider/model
+ *  proof; never invoked automatically by the UI. Returns the standard envelope;
+ *  the root helper readiness receipt is forwarded as `evidence`. */
+export const runReadiness = (slug: string, card: string, checkModel: boolean) =>
+  call<EvidenceEnvelope<ReadinessReceipt>>(withBoardSlug('/workflow/readiness', slug), {
+    method: 'POST',
+    body: { card, check_model: checkModel }
+  })
+
+export interface ContinuationInput {
+  card: string
+  passed_checks?: string[]
+  remaining_checks?: RemainingCheck[]
+  verification_note: string
+  workspace?: string
+  profile?: string
+  provider?: string
+  model?: string
+  max_runtime_minutes?: number
+  creator?: string
+  title?: string
+}
+
+/** Read-only continuation draft. Parent-supplied checks stay labelled; the
+ *  original source excerpt is returned marked unverified. No mutation. Returns
+ *  the standard envelope with the root draft receipt as `evidence`. */
+export const draftContinuation = (slug: string, input: ContinuationInput) =>
+  call<EvidenceEnvelope<ContinuationDraft>>(withBoardSlug('/workflow/continuation-draft', slug), {
+    method: 'POST',
+    body: input
+  })
+
+/** Separate user click after reviewing the draft: creates ONE held card, never
+ *  dispatches or unblocks. A stale fingerprint rejects; UNKNOWN asks to inspect. */
+export const continueCard = (slug: string, input: ContinuationInput & { fingerprint: string }) =>
+  call<EvidenceEnvelope<ContinueReceipt>>(withBoardSlug('/workflow/continue', slug), {
+    method: 'POST',
+    body: input
+  })
+
+/** Separate explicit review hold. Preserves history; never stops a live worker. */
+export const holdCard = (slug: string, card: string, reason: string) =>
+  call<EvidenceEnvelope<HoldReceipt>>(withBoardSlug('/workflow/hold', slug), { method: 'POST', body: { card, reason } })

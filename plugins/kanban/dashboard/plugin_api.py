@@ -36,18 +36,26 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import math
+import os
+import re
+import shutil
+import socket
 import sqlite3
+import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -521,6 +529,7 @@ def get_board(
 def get_task(
     task_id: str,
     board: Optional[str] = Query(None),
+    include_history: bool = Query(True, description="Include legacy runs/events/attachments and diagnostics; false lets evidence pages supply them"),
     run_state_type: Optional[str] = Query(
         None, description="With run_state_name: filter runs by column 'status' or 'outcome'",
     ),
@@ -566,16 +575,18 @@ def get_task(
             })
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
-        diags = _compute_task_diagnostics(conn, task_ids=[task_id])
+        diags = _compute_task_diagnostics(conn, task_ids=[task_id]) if include_history else {}
         diag_list = diags.get(task_id) or []
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
             "task": task_d,
+            "history_included": include_history,
+            "diagnostics_state": "PASS" if include_history else "UNKNOWN",
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
-            "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
-            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
+            "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)] if include_history else [],
+            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)] if include_history else [],
             "links": links,
             "child_results": child_results,
             "runs": [
@@ -586,7 +597,7 @@ def get_task(
                     state_type=run_state_type,
                     state_name=run_state_name,
                 )
-            ],
+            ] if include_history else [],
         }
     finally:
         conn.close()
@@ -783,7 +794,11 @@ async def upload_task_attachment(
 
 
 @router.get("/attachments/{attachment_id}")
-def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+def download_attachment(
+    attachment_id: int,
+    board: Optional[str] = Query(None),
+    response_format: Literal["binary", "json"] = Query("binary", alias="format"),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -800,6 +815,25 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
             raise HTTPException(status_code=404, detail="attachment file unavailable")
         if not stored.is_file():
             raise HTTPException(status_code=404, detail="attachment file missing on disk")
+        if response_format == "json":
+            # Desktop plugin REST already owns connection-scoped token/OAuth
+            # authentication but transports JSON only. Keep file bytes on that
+            # same door, with the existing attachment cap, rather than exposing
+            # tokens in a renderer URL or relaxing CORS.
+            try:
+                with stored.open("rb") as source:
+                    content = source.read(KANBAN_ATTACHMENT_MAX_BYTES + 1)
+            except OSError:
+                raise HTTPException(status_code=404, detail="attachment file unavailable")
+            if len(content) > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="attachment exceeds the supported download size")
+            return {
+                "id": att.id,
+                "filename": att.filename,
+                "content_type": att.content_type or "application/octet-stream",
+                "size": len(content),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
         return FileResponse(
             path=str(stored),
             filename=att.filename,
@@ -3022,3 +3056,1634 @@ async def stream_events(ws: WebSocket):
                 log.warning("Kanban event stream connection cleanup failed: %s", exc)
             finally:
                 event_executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ---------------------------------------------------------------------------
+# Read-only shared-evidence bridge (GET /evidence/*)
+# ---------------------------------------------------------------------------
+#
+# These routes serve the two Kanban UI consumers read-only evidence from the
+# SHARED board owned by the EVO kanban host, proxied through the RELEASED
+# ``atlas-kanban-call`` helper executable. Design constraints (verified
+# dependency decision, recorded on the parent card):
+#
+#   * Hermes runs MCP 2.0.0; AtlasKanban is an MCP 1.x runtime. The helper
+#     is therefore NEVER imported into this process — it owns its isolated
+#     runtime and is invoked without a shell as
+#     ``[<absolute helper>, <fixed tool>, "-"]`` with the flat JSON args
+#     object on stdin — the tool name arrives ONLY in argv; the released
+#     helper rejects the nested ``{"tool": ..., "args": ...}`` envelope
+#     (verified against candidate source 27ef127, 2026-09-12). Resolved
+#     once per invocation with ``shutil.which``; the request can never
+#     select the executable, argv or tool name.
+#   * The selected board belongs to EVO and NEED NOT EXIST in the local
+#     Hermes DB. Board params are validated with PURE slug validation
+#     (``kanban_db._normalize_board_slug``) — never ``_resolve_board``,
+#     which 404s on boards missing from the local DB and would touch the
+#     local DB. No route here opens a local kanban connection at all; there
+#     is no SQL fallback for unknown routes or incomplete evidence.
+#   * Every outcome other than a fully validated helper PASS receipt is
+#     returned as an HTTP 200 envelope with ``state`` PASS / FAIL / UNKNOWN
+#     — missing helper, timeout, invalid JSON, malformed receipt, wrong
+#     execution host and nonzero-exit-with-PASS all map to UNKNOWN with a
+#     short reason and remedy. The helper's own stderr/argv/environment are
+#     never echoed into responses or logs.
+#   * One HTTP request causes exactly ONE helper invocation (never
+#     per-card subprocesses). Helper round-trip timing and local
+#     collection time are surfaced as separate fields.
+#
+# Auth note: these are plain GET routes on the plugin router, so in the
+# production dashboard they sit behind the same session-token
+# ``auth_middleware`` as every other ``/api/`` path (the plugin-bypass does
+# not exempt them — see the module docstring and the tests).
+
+_EAND = "evidence bridge: "
+
+# Fixed allowlist of read tools the bridge may ever invoke. The tool name is
+# a literal at each call site; there is no request parameter that can select
+# a different one, and no write tool name appears anywhere in this module.
+EVIDENCE_READ_TOOLS = frozenset(
+    {"kanban_snapshot", "kanban_page", "kanban_worker", "kanban_card"}
+)
+# Bounded board projections (K6/K7/K8) added later. Kept in a SEPARATE fixed
+# set so the base read allowlist constant stays byte-stable (existing tests
+# assert it) while the runner still only ever invokes these exact literals.
+EVIDENCE_PROJECTION_TOOLS = frozenset(
+    {"kanban_attention", "kanban_changes", "kanban_timeline"}
+)
+
+# Card ids are ``t_`` + 8..32 lowercase hex chars (kanban_db._new_task_id
+# mints ``t_`` + token_hex(4) today; the range admits deeper ids).
+_EVIDENCE_CARD_RE = re.compile(r"^t_[0-9a-f]{8,32}$")
+
+# Subprocess budget: helper remote-side cap is 60s; local wall clock is
+# bounded above it. Output bounds are READ/PARSE bounds, not disk-write
+# caps: while the child runs it may write unbounded temporary files, and
+# only after exit does the bridge read back at most _EVIDENCE_STDOUT_CAP
+# bytes of stdout (over-cap → UNKNOWN) and truncate its captured stderr
+# copy to _EVIDENCE_STDERR_CAP (content never surfaced). Both temporary
+# files are closed — and so unlinked — in ``finally``.
+EVIDENCE_HELPER_TIMEOUT_SECONDS = 75.0
+_EVIDENCE_STDOUT_CAP = 1 * 1024 * 1024
+_EVIDENCE_STDERR_CAP = 16 * 1024
+_EVIDENCE_CURSOR_MAX_CHARS = 512
+
+# Expected execution host stamped in every valid receipt.
+_EVIDENCE_EXECUTION_HOST = "evo"
+
+
+class _EvidenceError(Exception):
+    """Internal control-flow: carry a terminal envelope to the route."""
+
+    def __init__(self, state: str, reason: str, remedy: Optional[str] = None):
+        super().__init__(reason)
+        self.state = state
+        self.reason = reason
+        self.remedy = remedy
+
+
+def _evidence_board_slug(board: str) -> str:
+    """PURE slug validation for evidence boards.
+
+    Unlike ``_resolve_board`` this NEVER checks the local DB: the shared
+    evidence boards belong to the EVO kanban host and need not exist
+    locally. Malformed slugs are a client 400.
+    """
+    try:
+        normed = kanban_db._normalize_board_slug(board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed:
+        raise HTTPException(status_code=400, detail="board is required for evidence routes")
+    return normed
+
+
+def _evidence_card_id(card: str) -> str:
+    if not _EVIDENCE_CARD_RE.match(card):
+        raise HTTPException(
+            status_code=422,
+            detail="card must match t_[0-9a-f]{8,32}",
+        )
+    return card
+
+
+def _evidence_cursor(cursor: Optional[str]) -> Optional[str]:
+    if cursor is None:
+        return None
+    if len(cursor) > _EVIDENCE_CURSOR_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"cursor must be at most {_EVIDENCE_CURSOR_MAX_CHARS} chars",
+        )
+    return cursor
+
+
+def _evidence_env(child_record_path: Optional[Path] = None) -> dict[str, str]:
+    """Child environment: normal inherited runtime env minus write authority.
+
+    ``ATLAS_KANBAN_WRITE_BOARDS`` is forced EMPTY so the helper's child can
+    never write boards regardless of what this process was granted. Nothing
+    here is printed or logged.
+    """
+    env = dict(os.environ)
+    env["ATLAS_KANBAN_WRITE_BOARDS"] = ""
+    return env
+
+
+# Minimal REQUIRED structure of a PASS receipt's ``data`` per tool — only
+# keys actually emitted by the released helper (observed against candidate
+# source 27ef127 on board relay-vault-build-20260912, 2026-09-12). A PASS
+# receipt with missing or malformed data is UNKNOWN, never a green light.
+_EVIDENCE_PASS_SHAPES: dict[str, tuple[str, ...]] = {
+    "kanban_snapshot": ("board", "cards", "counts", "observed_at", "status_filter"),
+    "kanban_page": ("items", "returned", "has_more"),
+    "kanban_worker": ("task_id", "observations"),
+    "kanban_card": ("task", "runs", "comments", "events"),
+    "kanban_attention": ("board", "cards", "observed_at", "returned", "has_more"),
+    "kanban_changes": ("board", "events", "observed_at", "returned", "has_more"),
+    "kanban_timeline": ("board", "card", "intervals", "observed_at", "returned", "has_more"),
+}
+
+
+def _evidence_list_of_dicts(value: Any) -> bool:
+    """True when *value* is a list whose entries are all dicts."""
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
+def _evidence_finite_number(value: Any) -> bool:
+    """True when *value* is a finite numeric (int/float), never a bool.
+
+    NaN and +/-Infinity are rejected here so a bad timestamp never reaches
+    FastAPI's JSON serialiser (which would emit non-standard ``NaN`` /
+    ``Infinity`` tokens).
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _evidence_pass_type_error(tool: str, data: dict[str, Any]) -> Optional[str]:
+    """Validate the CONSUMED field types of PASS ``data`` per tool.
+
+    Never coerces: a wrong type is a hard UNKNOWN, not a repair. Optional
+    forward-compatible fields are ignored — their presence is preserved and
+    their types are not second-guessed.
+    """
+    def bad(field: str, expected: str) -> str:
+        return f"PASS receipt for {tool} field {field!r} is not {expected}"
+
+    if tool == "kanban_snapshot":
+        if not _evidence_list_of_dicts(data["cards"]):
+            return bad("cards", "a list of objects")
+        if not isinstance(data["counts"], dict):
+            return bad("counts", "an object of per-status counts")
+        if not _evidence_finite_number(data["observed_at"]):
+            return bad("observed_at", "a finite number (never a boolean)")
+    elif tool == "kanban_page":
+        if not _evidence_list_of_dicts(data["items"]):
+            return bad("items", "a list of objects")
+        returned = data["returned"]
+        if isinstance(returned, bool) or not isinstance(returned, int) or returned < 0:
+            return bad("returned", "a non-negative integer")
+        if returned != len(data["items"]):
+            return (
+                f"PASS receipt for {tool} returned {returned!r} but carried "
+                f"{len(data['items'])} items"
+            )
+        if not isinstance(data["has_more"], bool):
+            return bad("has_more", "a boolean")
+        for cursor_key in ("cursor", "next_cursor"):
+            cursor = data.get(cursor_key)
+            if cursor is not None and not isinstance(cursor, str):
+                return bad(cursor_key, "absent, null, or a string")
+    elif tool == "kanban_worker":
+        if not _evidence_list_of_dicts(data["observations"]):
+            return bad("observations", "a list of objects")
+    elif tool == "kanban_card":
+        for field in ("runs", "comments", "events"):
+            if not _evidence_list_of_dicts(data[field]):
+                return bad(field, "a list of objects")
+        task = data.get("task")
+        if not isinstance(task, dict) or task.get("id") is None:
+            return bad("task", "an object carrying its id")
+    elif tool == "kanban_attention":
+        if not _evidence_list_of_dicts(data["cards"]):
+            return bad("cards", "a list of objects")
+        if not _evidence_finite_number(data["observed_at"]):
+            return bad("observed_at", "a finite number (never a boolean)")
+        returned = data["returned"]
+        if isinstance(returned, bool) or not isinstance(returned, int) or returned < 0:
+            return bad("returned", "a non-negative integer")
+        if returned != len(data["cards"]):
+            return f"PASS receipt for {tool} returned {returned!r} but carried {len(data['cards'])} cards"
+        if not isinstance(data["has_more"], bool):
+            return bad("has_more", "a boolean")
+    elif tool == "kanban_changes":
+        if not _evidence_list_of_dicts(data["events"]):
+            return bad("events", "a list of objects")
+        if not _evidence_finite_number(data["observed_at"]):
+            return bad("observed_at", "a finite number (never a boolean)")
+        returned = data["returned"]
+        if isinstance(returned, bool) or not isinstance(returned, int) or returned < 0:
+            return bad("returned", "a non-negative integer")
+        if returned != len(data["events"]):
+            return f"PASS receipt for {tool} returned {returned!r} but carried {len(data['events'])} events"
+        if not isinstance(data["has_more"], bool):
+            return bad("has_more", "a boolean")
+    elif tool == "kanban_timeline":
+        if not _evidence_list_of_dicts(data["intervals"]):
+            return bad("intervals", "a list of objects")
+        if not _evidence_finite_number(data["observed_at"]):
+            return bad("observed_at", "a finite number (never a boolean)")
+        returned = data["returned"]
+        if isinstance(returned, bool) or not isinstance(returned, int) or returned < 0:
+            return bad("returned", "a non-negative integer")
+        if returned != len(data["intervals"]):
+            return f"PASS receipt for {tool} returned {returned!r} but carried {len(data['intervals'])} intervals"
+        if not isinstance(data["has_more"], bool):
+            return bad("has_more", "a boolean")
+    return None
+
+
+def _evidence_pass_shape_error(tool: str, data: Any) -> Optional[str]:
+    """Validate the required per-tool structure AND consumed field types of
+    PASS ``data``.
+
+    Returns None when the shape and types are acceptable, else a short
+    reason. No fields are required that the adapter does not emit, and no
+    consumed value is ever coerced — a wrong type is a hard UNKNOWN.
+    """
+    if not isinstance(data, dict) or not data:
+        return f"PASS receipt for {tool} carried no data object"
+    missing = [k for k in _EVIDENCE_PASS_SHAPES.get(tool, ()) if k not in data]
+    if missing:
+        return (
+            f"PASS receipt for {tool} was missing data fields "
+            f"{sorted(missing)} required by the helper contract"
+        )
+    return _evidence_pass_type_error(tool, data)
+
+
+def _evidence_scope_error(
+    tool: str, receipt: dict[str, Any], args: dict[str, Any]
+) -> Optional[str]:
+    """Wherever a PASS receipt echoes the requested board/card scope, verify
+    it matches the request; a mismatched receipt is UNKNOWN.
+
+    Scope echoes observed in real receipts: ``kanban_snapshot`` →
+    ``data.board`` (and ``data.status_filter`` when present),
+    ``kanban_card`` → ``data.task.id``, ``kanban_worker`` →
+    ``data.task_id``. ``kanban_page`` emits no board/card echo (its data
+    carries evolving-view pagination keys only), so a page receipt's scope
+    is not independently verifiable and is not claimed to be.
+    """
+    data = receipt.get("data")
+    if not isinstance(data, dict):
+        return None  # shape validation reports this first
+    board = args.get("board")
+    if tool == "kanban_snapshot":
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not match "
+                f"requested board {board!r}"
+            )
+        status_filter = data.get("status_filter")
+        requested = str(args.get("status", "all"))
+        if status_filter is not None and str(status_filter) != requested:
+            return (
+                f"PASS receipt status_filter {status_filter!r} does not "
+                f"match requested status {requested!r}"
+            )
+    elif tool == "kanban_card":
+        task = data.get("task")
+        card = args.get("card")
+        if not isinstance(task, dict) or task.get("id") != card:
+            return f"PASS receipt card id does not match requested card {card!r}"
+    elif tool == "kanban_worker":
+        if data.get("task_id") != args.get("card"):
+            return (
+                f"PASS receipt task_id {data.get('task_id')!r} does not "
+                f"match requested card {args.get('card')!r}"
+            )
+    elif tool in ("kanban_attention", "kanban_changes"):
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not "
+                f"match requested board {board!r}"
+            )
+    elif tool == "kanban_timeline":
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not "
+                f"match requested board {board!r}"
+            )
+        if data.get("card") != args.get("card"):
+            return (
+                f"PASS receipt card {data.get('card')!r} does not "
+                f"match requested card {args.get('card')!r}"
+            )
+    return None
+
+
+def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Invoke the released helper ONCE and normalise its receipt.
+
+    Returns the route envelope dict (``state`` / ``evidence`` / ``reason`` /
+    ``remedy`` / ``timing`` / ``helper``). Never raises past a subprocess
+    failure — every failure mode maps to an UNKNOWN envelope with a short
+    reason. stdout is disk-backed and capped; stderr is capped and discarded
+    (only its truncated size may be referenced, never its content).
+    """
+    if tool not in (EVIDENCE_READ_TOOLS | EVIDENCE_PROJECTION_TOOLS):
+        # Defensive: unreachable via the routes (literals only), but a
+        # future call site must not be able to smuggle a write tool.
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_EAND}internal tool {tool!r} not in read allowlist",
+        )
+
+    helper = shutil.which("atlas-kanban-call")
+    if not helper:
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_EAND}atlas-kanban-call is not installed on this host",
+            remedy="The parent integration installs the released helper on the "
+                   "EVO UI host; evidence reads stay UNKNOWN until then.",
+        )
+
+    # Released helper contract: TOOL arrives in argv; stdin carries ONLY the
+    # flat JSON args object. The nested {"tool": ..., "args": ...} envelope
+    # this bridge used to send is rejected by the real helper (the original
+    # fake accepted it — that divergence is what this repair fixed).
+    stdin_bytes = json.dumps(args, separators=(",", ":")).encode("utf-8")
+
+    out_tmp = tempfile.TemporaryFile()
+    err_tmp = tempfile.TemporaryFile()
+    try:
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                [helper, tool, "-"],
+                input=stdin_bytes,
+                stdout=out_tmp,
+                stderr=err_tmp,
+                stdin=None,
+                env=_evidence_env(),
+                timeout=EVIDENCE_HELPER_TIMEOUT_SECONDS,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper timed out after "
+                       f"{EVIDENCE_HELPER_TIMEOUT_SECONDS:.0f}s",
+                remedy="Retry; if it persists the EVO host's remote query cap "
+                       "(60s) may be exceeded — narrow the page size.",
+            )
+        except OSError as exc:
+            # Exec-level failure (permissions, ENOENT raced). No argv/env echo.
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper could not be executed ({exc.__class__.__name__})",
+            )
+        helper_ms = (time.monotonic() - started) * 1000.0
+
+        out_tmp.seek(0)
+        raw_stdout = out_tmp.read(_EVIDENCE_STDOUT_CAP + 1)
+        # Honest bound-keeping: the stderr temp file may hold more than the
+        # cap while the child ran; truncate the retained copy now (content
+        # is never surfaced either way).
+        err_tmp.seek(0)
+        err_tmp.read(_EVIDENCE_STDERR_CAP)
+        err_tmp.truncate(_EVIDENCE_STDERR_CAP)
+        if len(raw_stdout) > _EVIDENCE_STDOUT_CAP:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper stdout exceeded {_EVIDENCE_STDOUT_CAP} bytes",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        try:
+            receipt = json.loads(raw_stdout.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper stdout was not valid JSON",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if not isinstance(receipt, dict):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper receipt was not a JSON object",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+
+        state = receipt.get("state")
+        if state not in ("PASS", "FAIL", "UNKNOWN"):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_EAND}helper receipt state {state!r} is not PASS/FAIL/UNKNOWN",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if proc.returncode != 0:
+            # The released helper exits 1 on ORDINARY FAIL outcomes (a
+            # missing board, a missing card), so a nonzero exit is not an
+            # error class of its own: the receipt's claimed state keeps its
+            # authority AND its safe reason, so "board absent" stays
+            # distinguishable from "helper unavailable". Only a claimed
+            # PASS from a nonzero-exit process is untrustworthy (→ UNKNOWN).
+            if state == "PASS":
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}helper exited {proc.returncode} while claiming PASS",
+                    remedy="Retry; if it persists, inspect the helper installation "
+                           "on the EVO host (its stderr is not surfaced here).",
+                    evidence=None,
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            reason = str(receipt.get("reason") or f"helper reported {state}")
+            return _evidence_envelope(
+                state=state,
+                reason=f"{reason} (helper exited {proc.returncode})",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if state == "PASS":
+            host = receipt.get("execution_host")
+            if host != _EVIDENCE_EXECUTION_HOST:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}receipt execution_host {host!r} is not "
+                           f"{_EVIDENCE_EXECUTION_HOST!r}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            observed_at = receipt.get("observed_at")
+            if not _evidence_finite_number(observed_at):
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}PASS receipt is missing a finite numeric observed_at",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            data = receipt.get("data")
+            shape_error = _evidence_pass_shape_error(tool, data)
+            if shape_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}{shape_error}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            scope_error = _evidence_scope_error(tool, receipt, args)
+            if scope_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}{scope_error}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            # Freshness/limitation fields the receipt itself carries are
+            # preserved verbatim: observed_at (when the host saw it), the
+            # card tool's top-level ``bounded`` block, or the page/snapshot
+            # ``data.omitted`` rollup. Completeness interval fields
+            # (has_more / next_cursor / incomplete) stay inside ``evidence``.
+            limitations = receipt.get("bounded")
+            if limitations is None and isinstance(data, dict):
+                limitations = data.get("omitted")
+            envelope = _evidence_envelope(
+                state="PASS",
+                evidence=data,
+                reason=(str(receipt["reason"]) if receipt.get("reason") else None),
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                observed_at=observed_at,
+                limitations=limitations,
+            )
+            # Internal marker: this receipt's execution_host was validated
+            # equal to the expected host. _evidence_respond reports it as
+            # the helper identity instead of stamping an unverified
+            # constant; every other envelope reports "unverified".
+            envelope["_verified_execution_host"] = host
+            return envelope
+        # FAIL / UNKNOWN receipts pass through with their reason.
+        return _evidence_envelope(
+            state=state,
+            reason=str(receipt.get("reason") or f"helper reported {state}"),
+            timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+        )
+    finally:
+        for fh in (out_tmp, err_tmp):
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _evidence_envelope(
+    *,
+    state: str,
+    evidence: Optional[Any] = None,
+    reason: Optional[str] = None,
+    remedy: Optional[str] = None,
+    timing: Optional[dict[str, float]] = None,
+    observed_at: Optional[float] = None,
+    limitations: Optional[Any] = None,
+) -> dict[str, Any]:
+    envelope: dict[str, Any] = {"state": state, "evidence": evidence}
+    if reason:
+        envelope["reason"] = reason
+    if remedy:
+        envelope["remedy"] = remedy
+    if observed_at is not None:
+        envelope["observed_at"] = observed_at
+    if limitations is not None:
+        envelope["limitations"] = limitations
+    envelope["timing"] = timing or {"helper_roundtrip_ms": None, "collection_ms": None}
+    return envelope
+
+
+def _evidence_respond(
+    envelope: dict[str, Any],
+    *,
+    board: str,
+    tool: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    """Wrap an envelope with board binding, fixed helper identity and the
+    validated request echo (for auditability). Exactly one HTTP response;
+    timing fields already populated by the runner."""
+    collection_started = time.monotonic()
+    wrapper = dict(envelope)
+    wrapper["board"] = board
+    # The bridge never stamps the execution host as its own observation:
+    # it is the receipt's claim, forwarded only when a PASS receipt's host
+    # was validated against the expected host; every other response says
+    # "unverified" (an unknown helper host stays UNKNOWN — never presented
+    # as an observed EVO fact).
+    verified_host = wrapper.pop("_verified_execution_host", None)
+    wrapper["helper"] = {
+        "tool": tool,
+        "execution_host": verified_host or "unverified",
+    }
+    wrapper["request"] = request_echo
+    timing = wrapper.get("timing") or {}
+    timing.setdefault("helper_roundtrip_ms", None)
+    timing.setdefault("collection_ms", None)
+    if timing.get("collection_ms") is None:
+        timing["collection_ms"] = (time.monotonic() - collection_started) * 1000.0
+    wrapper["timing"] = timing
+    return wrapper
+
+
+async def _evidence_call(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    board: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the helper off the event loop and wrap the envelope.
+
+    One HTTP request -> exactly one helper invocation. The subprocess runs
+    in a worker thread (``asyncio.to_thread``) so a 75s helper round trip
+    never blocks the dashboard event loop.
+    """
+    envelope = await asyncio.to_thread(_evidence_run_helper, tool, args)
+    return _evidence_respond(
+        envelope, board=board, tool=tool, request_echo=request_echo
+    )
+
+
+@router.get("/evidence/snapshot")
+async def evidence_snapshot(
+    board: str = Query(..., description="Shared board slug (EVO-owned; need not exist locally)"),
+    status: str = Query("all", description="'all' or a valid status"),
+    card_limit: int = Query(100, ge=1, le=200, description="Cards per page"),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only board snapshot from the shared evidence service."""
+    board = _evidence_board_slug(board)
+    if status != "all" and status not in kanban_db.VALID_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be 'all' or one of {sorted(kanban_db.VALID_STATUSES)}")
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {
+        "board": board,
+        "status": status,
+        "card_limit": card_limit,
+    }
+    if cursor is not None:
+        args["cursor"] = cursor
+    return await _evidence_call(
+        "kanban_snapshot",
+        args,
+        board=board,
+        request_echo={"board": board, "status": status, "card_limit": card_limit, **({"cursor": cursor} if cursor else {})},
+    )
+
+
+@router.get("/evidence/page")
+async def evidence_page(
+    board: str = Query(...),
+    resource: str = Query(..., description="cards | runs | events | attachments"),
+    card: Optional[str] = Query(None, description="Required unless resource=cards"),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only page of a board resource from the shared evidence service."""
+    board = _evidence_board_slug(board)
+    if resource not in ("cards", "runs", "events", "attachments"):
+        raise HTTPException(status_code=422, detail="resource must be cards|runs|events|attachments")
+    if resource != "cards" and not card:
+        raise HTTPException(status_code=422, detail=f"card is required for resource={resource}")
+    if card:
+        card = _evidence_card_id(card)
+    if status is not None and status != "all" and status not in kanban_db.VALID_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be 'all' or one of {sorted(kanban_db.VALID_STATUSES)}")
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {"board": board, "resource": resource}
+    if card is not None:
+        args["card"] = card
+    if status is not None:
+        args["status"] = status
+    args["limit"] = limit
+    if cursor is not None:
+        args["cursor"] = cursor
+    echo: dict[str, Any] = {"board": board, "resource": resource, "limit": limit}
+    if card is not None:
+        echo["card"] = card
+    return await _evidence_call(
+        "kanban_page",
+        args,
+        board=board,
+        request_echo=echo,
+    )
+
+
+@router.get("/evidence/worker")
+async def evidence_worker(
+    board: str = Query(...),
+    card: str = Query(...),
+):
+    """Read-only worker evidence for one card from the shared service."""
+    board = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    return await _evidence_call(
+        "kanban_worker",
+        {"board": board, "card": card},
+        board=board,
+        request_echo={"board": board, "card": card},
+    )
+
+
+@router.get("/evidence/card")
+async def evidence_card(
+    board: str = Query(...),
+    card: str = Query(...),
+):
+    """Read-only single-card evidence; include_body=False and
+    recent_items=10 are FIXED, not request-selectable."""
+    board = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    return await _evidence_call(
+        "kanban_card",
+        {"board": board, "card": card, "include_body": False, "recent_items": 10},
+        board=board,
+        request_echo={"board": board, "card": card},
+    )
+
+
+@router.get("/evidence/context")
+async def evidence_context(
+    board: Optional[str] = Query(None, description="Board slug (blank = server's current board)"),
+):
+    """Read-only identity alignment: whether THIS server's kanban DB for
+    *board* is the same physical database the EVO evidence bridge reads.
+
+    The EVO bridge always reads the physical EVO host's ``~/.hermes/...``
+    database. The desktop can be pointed at a DIFFERENT local server (e.g.
+    the local Archie primary) whose board happens to share a slug — evidence
+    must never attach EVO worker badges to those cards. This endpoint lets
+    the UI decide per-request whether evidence is legitimate for the current
+    board, without ever returning raw filesystem paths.
+
+    Alignment requires ALL of:
+
+      * the actual hostname is ``evo`` (``socket.gethostname()``),
+      * ``kanban_db.kanban_db_path(board)`` resolves to the OS account's
+        ``~/.hermes/kanban.db`` (default board) or
+        ``~/.hermes/kanban/boards/<board>/kanban.db`` (named board),
+      * both paths are existing regular files (not symlinks — a symlink
+        could alias a local DB onto the EVO location, or vice versa).
+
+    ``HERMES_KANBAN_DB`` / ``HERMES_HOME`` overrides can divert the local
+    server's DB elsewhere, which is exactly why hostname alone is
+    insufficient. A blank ``board`` resolves through the server's existing
+    current-board chain (``get_current_board``), never by switching the
+    global pointer. Read-only: no DB connection is opened and no file is
+    written.
+    """
+    if board is None or not board.strip():
+        # Resolve a blank selection from the server's current-board chain.
+        slug = kanban_db.get_current_board()
+    else:
+        slug = _evidence_board_slug(board)
+
+    result = _compute_alignment(slug)
+    result["observed_at"] = time.time()
+    return result
+
+
+def _compute_alignment(slug: str) -> dict[str, Any]:
+    """Whether THIS server's kanban DB for *slug* is the EVO host DB.
+
+    Governs every workflow read/write: alignment requires hostname ``evo``
+    plus a non-symlink regular DB file resolving to the canonical EVO path.
+    Returns ``{aligned, board, hostname, reason}``. Read-only: opens nothing.
+    """
+    hostname = socket.gethostname()
+    aligned = True
+    reason = "aligned"
+    home = Path.home()
+    if slug == kanban_db.DEFAULT_BOARD:
+        expected = home / ".hermes" / "kanban.db"
+    else:
+        expected = home / ".hermes" / "kanban" / "boards" / slug / "kanban.db"
+    actual = kanban_db.kanban_db_path(slug)
+    if hostname != _EVIDENCE_EXECUTION_HOST:
+        aligned = False
+        reason = "this server is not the EVO host"
+    elif not (actual.is_file() and expected.is_file()):
+        aligned = False
+        reason = "kanban database file is missing on this server"
+    elif actual.is_symlink() or expected.is_symlink():
+        aligned = False
+        reason = "kanban database path resolves through a symlink"
+    else:
+        try:
+            if actual.resolve() != expected.resolve():
+                aligned = False
+                reason = "kanban database path does not match the EVO location"
+        except OSError:
+            aligned = False
+            reason = "kanban database path could not be resolved"
+    return {"aligned": aligned, "board": slug, "hostname": hostname, "reason": reason}
+
+
+@router.get("/events/baseline")
+def events_baseline(board: str = Query(...)):
+    """Bounded baseline for this server's existing /events subscription.
+
+    A local Desktop connection must not baseline against EVO's event IDs.
+    Read only the selected connection's database; this conveys no worker
+    liveness or mutation authority and cannot create a missing board.
+    """
+    import contextlib
+    import sqlite3
+
+    slug = _evidence_board_slug(board)
+    path = kanban_db.kanban_db_path(slug)
+    try:
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+            baseline = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+        return {"state": "PASS", "board": slug, "evidence": {"board": slug, "baseline_id": baseline}, "observed_at": time.time()}
+    except (OSError, sqlite3.Error):
+        return {"state": "UNKNOWN", "board": slug, "evidence": None,
+                "reason": "The selected server's event history is unavailable",
+                "remedy": "Check this connection and board before retrying notifications.",
+                "observed_at": time.time()}
+
+
+@router.get("/evidence/attention")
+async def evidence_attention(
+    board: str = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only attention projection: blocked/triage/review cards, failed
+    latest runs and task/worker contradictions. Never mutates anything."""
+    board = _evidence_board_slug(board)
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {"board": board, "limit": limit}
+    if cursor is not None:
+        args["cursor"] = cursor
+    echo: dict[str, Any] = {"board": board, "limit": limit}
+    if cursor is not None:
+        echo["cursor"] = cursor
+    return await _evidence_call(
+        "kanban_attention", args, board=board, request_echo=echo
+    )
+
+
+@router.get("/evidence/changes")
+async def evidence_changes(
+    board: str = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only board-wide task_events tail, resumable by cursor. First read
+    is baseline-now (no history). Never returns raw payloads or secrets."""
+    board = _evidence_board_slug(board)
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {"board": board, "limit": limit}
+    if cursor is not None:
+        args["cursor"] = cursor
+    echo: dict[str, Any] = {"board": board, "limit": limit}
+    if cursor is not None:
+        echo["cursor"] = cursor
+    return await _evidence_call(
+        "kanban_changes", args, board=board, request_echo=echo
+    )
+
+
+@router.get("/evidence/timeline")
+async def evidence_timeline(
+    board: str = Query(...),
+    card: str = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None, max_length=_EVIDENCE_CURSOR_MAX_CHARS),
+):
+    """Read-only wall-time intervals for one card. Durations are observation,
+    never productivity, cost or savings."""
+    board = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    cursor = _evidence_cursor(cursor)
+    args: dict[str, Any] = {"board": board, "card": card, "limit": limit}
+    if cursor is not None:
+        args["cursor"] = cursor
+    echo: dict[str, Any] = {"board": board, "card": card, "limit": limit}
+    if cursor is not None:
+        echo["cursor"] = cursor
+    return await _evidence_call(
+        "kanban_timeline", args, board=board, request_echo=echo
+    )
+
+
+# ---------------------------------------------------------------------------
+# Workflow API: explicit readiness + continuation + hold (K2, K5)
+# ---------------------------------------------------------------------------
+#
+# These routes surface the bounded workflow tools the EVO helper exposes for
+# the two Kanban UI consumers. They differ from the read-only /evidence/*
+# bridge above in three load-bearing ways:
+#
+#   * The helper is invoked with the process's REAL ATLAS_KANBAN_WRITE_BOARDS
+#     inherited (never force-emptied, never extended): readiness and the draft
+#     must reflect the server's actual board write scope, and continue/hold
+#     need that scope to mutate. The read-only projections above stay force-
+#     empty so they can never write.
+#   * Write routes (continue, hold) refuse BEFORE invoking the helper unless
+#     the board is both aligned with the EVO host DB AND named in the server's
+#     configured ATLAS_KANBAN_WRITE_BOARDS. Absence is a visible
+#     capability/permission gap, never permission to populate it.
+#   * The readiness and continuation receipts are ROOT results (checks,
+#     fingerprint, new_card, held) rather than the data-wrapped projections
+#     the /evidence/* routes forward, so they are validated and forwarded
+#     separately here.
+#
+# The tool name is a fixed literal at each call site; no request field can
+# select a tool, an executable, argv, or a shell.
+
+_WAND = "workflow bridge: "
+
+WORKFLOW_READ_TOOLS = frozenset({"kanban_readiness", "kanban_continuation_draft"})
+WORKFLOW_WRITE_TOOLS = frozenset({"kanban_continue", "kanban_hold"})
+WORKFLOW_TOOLS = WORKFLOW_READ_TOOLS | WORKFLOW_WRITE_TOOLS
+
+_WORKFLOW_TIMEOUT_SECONDS = 75.0
+_WORKFLOW_STDOUT_CAP = 1 * 1024 * 1024
+_WORKFLOW_STDERR_CAP = 16 * 1024
+
+
+class WorkflowRemainingCheck(BaseModel):
+    """Typed parent-supplied remaining verification check (K5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    check: str
+    evidence: str
+    acceptance: str
+
+
+class ContinuationDraftBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    card: str
+    passed_checks: list[str]
+    remaining_checks: list[WorkflowRemainingCheck]
+    verification_note: str
+    workspace: Optional[str] = None
+    profile: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    max_runtime_minutes: int = 60
+    creator: Optional[str] = None
+    title: Optional[str] = None
+
+
+class ContinuationContinueBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    card: str
+    passed_checks: list[str]
+    remaining_checks: list[WorkflowRemainingCheck]
+    verification_note: str
+    fingerprint: str
+    workspace: Optional[str] = None
+    profile: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    max_runtime_minutes: int = 60
+    creator: Optional[str] = None
+    title: Optional[str] = None
+
+
+class WorkflowHoldBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    card: str
+    reason: str
+
+
+class WorkflowReadinessBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    card: str
+    check_model: bool = False
+
+
+def _configured_write_boards() -> set[str]:
+    """Parse the server's configured board write scope (comma-separated)."""
+    raw = os.environ.get("ATLAS_KANBAN_WRITE_BOARDS", "")
+    if not raw or not raw.strip():
+        return set()
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _workflow_env() -> dict[str, str]:
+    """Child env inheriting the real write scope; never adds a board."""
+    return dict(os.environ)
+
+
+def _workflow_alignment_guard(board: str) -> Optional[dict]:
+    """Return a terminal envelope when the board is not the aligned EVO board."""
+    alignment = _compute_alignment(board)
+    if alignment["aligned"]:
+        return None
+    return _evidence_envelope(
+        state="UNKNOWN",
+        reason=f"board {board!r} is not the aligned EVO board ({alignment['reason']})",
+        remedy="Point the UI at the EVO host for this board before any workflow read or write.",
+    )
+
+
+def _workflow_write_guard(board: str) -> Optional[dict]:
+    """Return a terminal envelope when a write route must refuse, else None.
+
+    A write requires BOTH EVO alignment AND the board named in the server's
+    configured ATLAS_KANBAN_WRITE_BOARDS. Absence is a visible permission
+    gap; nothing here grants board authority from API access.
+    """
+    alignment = _compute_alignment(board)
+    if not alignment["aligned"]:
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"board {board!r} is not the aligned EVO board ({alignment['reason']})",
+            remedy="Point the UI at the EVO host for this board before any workflow write.",
+        )
+    if board not in _configured_write_boards():
+        return _evidence_envelope(
+            state="FAIL",
+            reason=(
+                f"this server has no write authority for board {board!r}; "
+                "ATLAS_KANBAN_WRITE_BOARDS does not name it"
+            ),
+            remedy="Add the board to the server's ATLAS_KANBAN_WRITE_BOARDS and restart; never grant board authority from the API.",
+        )
+    return None
+
+
+def _workflow_unresolved_remedy(tool: str, cause: str) -> str:
+    """Remedy for a UNKNOWN that must not invite a blind retry.
+
+    A write whose outcome is unresolved is a possible double mutation, so the
+    remedy is always "inspect before retry". A read may simply be retried.
+    """
+    if tool in WORKFLOW_WRITE_TOOLS:
+        return f"Inspect the board and helper state before retrying; {cause}."
+    return f"Retry; if it persists, {cause}."
+
+
+def _aligned_local_task(board: str, card: str):
+    """Read the task from the ALIGNED local board DB (never the evidence host).
+
+    Returns the Task or None. Read-only: no schema init beyond a normal open.
+    """
+    conn = kanban_db.connect(board=board)
+    try:
+        return kanban_db.get_task(conn, card)
+    finally:
+        conn.close()
+
+
+# A card with more direct parents than this is a pathological dependency
+# graph; readiness must say UNKNOWN rather than feed it through blindly.
+_WORKFLOW_MAX_PARENTS = 128
+
+
+def _aligned_parent_ids(board: str, card: str):
+    """Return the card's direct parent ids from the ALIGNED local board DB, or
+    None when the dependency graph cannot be read or exceeds the safe bound.
+
+    One bounded query (no recursive traversal). A card with no links returns an
+    honest empty list; an unreadable or overbound graph returns None so the
+    caller can say UNKNOWN instead of silently treating an absent read as "no
+    dependencies" (K2 dependency readiness must reflect the real graph).
+    """
+    conn = kanban_db.connect(board=board)
+    try:
+        parents = kanban_db.parent_ids(conn, card)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if len(parents) > _WORKFLOW_MAX_PARENTS:
+        return None
+    return parents
+
+
+def _git_head(workspace: str) -> Optional[str]:
+    """Derive the current git HEAD with a FIXED argument list inside the known
+    workspace. Never a caller-supplied executable, shell or path."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+            shell=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    head = proc.stdout.decode("utf-8", errors="strict").strip()
+    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return None
+    return head
+
+
+def _commission_from_task(task) -> dict[str, Any]:
+    """Derive continuation commission defaults from the aligned local task.
+
+    Only fields the task actually carries are returned; nothing is invented.
+    """
+    if task is None:
+        return {}
+    out: dict[str, Any] = {
+        "workspace": task.workspace_path,
+        "profile": task.assignee,
+        "provider": task.provider_override,
+        "model": task.model_override,
+        "title": task.title,
+    }
+    out["creator"] = getattr(task, "created_by", None)
+    return out
+
+
+def _workflow_shape_error(
+    tool: str, receipt: dict[str, Any], args: dict[str, Any]
+) -> Optional[str]:
+    """Validate the ROOT workflow receipt per tool; never coerces a wrong type.
+
+    Readiness and continuation receipts are root results, not data-wrapped
+    projections, so they are validated here rather than through the
+    /evidence/* shape table. A contradictory or malformed receipt is a hard
+    UNKNOWN; nothing here repairs a wrong type.
+    """
+    board = args.get("board")
+    card = args.get("card")
+    if tool == "kanban_readiness":
+        requested = receipt.get("requested")
+        if not isinstance(requested, dict):
+            return "readiness requested identity is missing"
+        for field in (
+            "board", "profile", "provider", "model", "workspace",
+            "expected_revision", "python", "check_model",
+        ):
+            if requested.get(field) != args.get(field):
+                return f"readiness requested identity {field} mismatch"
+        requested_parents = requested.get("parents")
+        parents = args.get("parents") or []
+        if (
+            not isinstance(requested_parents, list)
+            or not all(isinstance(p, str) for p in requested_parents)
+            or sorted(requested_parents) != sorted(parents)
+        ):
+            return "readiness requested identity parents mismatch"
+        checks = receipt.get("checks")
+        if not isinstance(checks, list) or not checks:
+            return "readiness receipt checks are missing or empty"
+        names: list[str] = []
+        for entry in checks:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                return "a readiness check is not a well-formed object"
+            if entry.get("state") not in ("PASS", "FAIL", "UNKNOWN"):
+                return "a readiness check has an invalid state"
+            names.append(entry["name"])
+        if len(names) != len(set(names)):
+            return "readiness check names are duplicated"
+        # Every readiness dimension must be present. A short all-green subset
+        # is not evidence that the omitted dependency or runtime check passed.
+        required = {
+            "board_permission", "profile_exists", "workspace_exists",
+            "expected_revision", "python_interpreter", "required_modules",
+            "context_files", "ram_available", "parents", "model",
+        }
+        if not required.issubset(names):
+            return "readiness required checks are missing"
+        if not isinstance(receipt.get("ready_to_release"), bool):
+            return "readiness receipt ready_to_release is not a boolean"
+        freshness = receipt.get("freshness")
+        if not isinstance(freshness, dict):
+            return "readiness receipt freshness is missing"
+        checked_at = freshness.get("checked_at")
+        stale_after = freshness.get("stale_after")
+        if not (
+            _evidence_finite_number(checked_at) and _evidence_finite_number(stale_after)
+        ):
+            return "readiness receipt freshness is not finite"
+        # Both are finite numbers here (the guard above returned otherwise);
+        # the cast is only to satisfy the type checker.
+        if float(stale_after) <= float(checked_at):  # type: ignore[arg-type]
+            return "readiness receipt freshness horizon is inverted or empty"
+        # A receipt is useful only during its own declared validity window.
+        # The helper executes on this host; five seconds tolerates scheduling
+        # skew but never turns a future or expired observation into readiness.
+        now = time.time()
+        if float(checked_at) > now + 5 or float(stale_after) <= now:
+            return "readiness receipt is future-dated or expired"
+        states = {entry.get("state") for entry in checks}
+        if receipt["ready_to_release"] and states != {"PASS"}:
+            return "readiness ready_to_release is true with a failed or missing check"
+        if receipt["ready_to_release"] and not args.get("check_model"):
+            return "readiness ready_to_release is true but the model proof was skipped"
+    elif tool == "kanban_continuation_draft":
+        if receipt.get("board") != board:
+            return "continuation-draft receipt board mismatch"
+        if receipt.get("card") != card:
+            return "continuation-draft receipt card mismatch"
+        fingerprint = receipt.get("fingerprint")
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            return "continuation-draft receipt fingerprint is not a 64-char hex digest"
+        if not isinstance(receipt.get("mutation_authorized"), bool):
+            return "continuation-draft receipt mutation_authorized is not a boolean"
+        if receipt.get("no_mutation_performed") is not True:
+            return "continuation-draft receipt claims a mutation was performed"
+        for field in ("passed_checks", "remaining_checks"):
+            if not isinstance(receipt.get(field), list):
+                return f"continuation-draft receipt {field} is missing"
+        if not isinstance(receipt.get("commission"), dict):
+            return "continuation-draft receipt commission is missing or malformed"
+    elif tool == "kanban_continue":
+        if receipt.get("board") != board:
+            return "continue receipt board mismatch"
+        if receipt.get("original_card") != card:
+            return "continue receipt original_card mismatch"
+        new_card = receipt.get("new_card")
+        if not isinstance(new_card, str) or not _EVIDENCE_CARD_RE.match(new_card):
+            return "continue receipt new_card is not a valid card id"
+        if receipt.get("held") is not True:
+            return "continue receipt is not held"
+        if receipt.get("no_original_mutation") is not True:
+            return "continue receipt claims the original card was mutated"
+        if receipt.get("new_card_status") not in ("blocked", "triage"):
+            return "continue receipt new_card_status is not a held state"
+    elif tool == "kanban_hold":
+        read_back = receipt.get("read_back")
+        if not isinstance(read_back, dict):
+            return "hold receipt read_back is missing"
+        if read_back.get("state") != "PASS":
+            return "hold receipt read_back is not PASS"
+        rb_data = read_back.get("data")
+        if not isinstance(rb_data, dict) or rb_data.get("id") != card:
+            return "hold receipt read_back card identity is missing or mismatched"
+        if rb_data.get("status") not in ("blocked", "triage"):
+            return "hold receipt read_back status is not a durable hold"
+    return None
+
+
+def _workflow_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Invoke the helper ONCE for a workflow tool and normalise its receipt.
+
+    Root readiness/continuation receipts are forwarded as ``evidence`` for
+    any state (readiness is an informative projection; a FAIL still carries
+    its checks). Draft/continue/hold FAIL/UNKNOWN receipts pass through with
+    their reason and no evidence. The helper's stderr/argv/env are never
+    surfaced.
+    """
+    if tool not in WORKFLOW_TOOLS:
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_WAND}internal tool {tool!r} not in workflow allowlist",
+        )
+    helper = shutil.which("atlas-kanban-call")
+    if not helper:
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_WAND}atlas-kanban-call is not installed on this host",
+            remedy="The parent integration installs the released helper on the EVO UI host; workflow calls stay UNKNOWN until then.",
+        )
+    stdin_bytes = json.dumps(args, separators=(",", ":")).encode("utf-8")
+    out_tmp = tempfile.TemporaryFile()
+    err_tmp = tempfile.TemporaryFile()
+    try:
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                [helper, tool, "-"],
+                input=stdin_bytes,
+                stdout=out_tmp,
+                stderr=err_tmp,
+                env=_workflow_env(),
+                timeout=_WORKFLOW_TIMEOUT_SECONDS,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper timed out after {_WORKFLOW_TIMEOUT_SECONDS:.0f}s",
+                remedy=_workflow_unresolved_remedy(tool, "the EVO host's remote query cap may be exceeded"),
+            )
+        except OSError as exc:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper could not be executed ({exc.__class__.__name__})",
+            )
+        helper_ms = (time.monotonic() - started) * 1000.0
+        out_tmp.seek(0)
+        raw_stdout = out_tmp.read(_WORKFLOW_STDOUT_CAP + 1)
+        err_tmp.seek(0)
+        err_tmp.read(_WORKFLOW_STDERR_CAP)
+        err_tmp.truncate(_WORKFLOW_STDERR_CAP)
+        if len(raw_stdout) > _WORKFLOW_STDOUT_CAP:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper stdout exceeded {_WORKFLOW_STDOUT_CAP} bytes",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        try:
+            receipt = json.loads(raw_stdout.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper stdout was not valid JSON",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if not isinstance(receipt, dict):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper receipt was not a JSON object",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        state = receipt.get("state")
+        if state not in ("PASS", "FAIL", "UNKNOWN"):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper receipt state {state!r} is not PASS/FAIL/UNKNOWN",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if proc.returncode != 0 and state == "PASS":
+            # A nonzero exit can never claim PASS: the helper's own success
+            # convention was contradicted by its process status.
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_WAND}helper exited {proc.returncode} while claiming PASS",
+                remedy=_workflow_unresolved_remedy(
+                    tool, "inspect the helper installation (its stderr is not surfaced here)"
+                ),
+                evidence=None,
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if state == "PASS":
+            host = receipt.get("execution_host")
+            if host is not None and host != _EVIDENCE_EXECUTION_HOST:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_WAND}receipt execution_host {host!r} is not {_EVIDENCE_EXECUTION_HOST!r}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            observed_at = receipt.get("observed_at")
+            if observed_at is not None and not _evidence_finite_number(observed_at):
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_WAND}PASS receipt observed_at is not a finite number",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            shape_error = _workflow_shape_error(tool, receipt, args)
+            if shape_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_WAND}{shape_error}",
+                    remedy=_workflow_unresolved_remedy(tool, "the helper receipt is inconsistent"),
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            envelope = _evidence_envelope(
+                state="PASS",
+                evidence=receipt,
+                reason=(str(receipt["reason"]) if receipt.get("reason") else None),
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                observed_at=(observed_at if _evidence_finite_number(observed_at) else None),
+            )
+            envelope["_verified_execution_host"] = (
+                host if host == _EVIDENCE_EXECUTION_HOST else None
+            )
+            return envelope
+        # FAIL / UNKNOWN. A valid structured receipt is still evidence even
+        # when the helper exits nonzero: the released helper exits 1 for a
+        # legitimate structured FAIL (e.g. a denied board), so the exit code
+        # alone must not strip readiness checks. PASS+nonzero is rejected above.
+        exit_note = f" (helper exited {proc.returncode})" if proc.returncode != 0 else ""
+        if tool == "kanban_readiness":
+            # A structured readiness receipt (e.g. board_permission FAIL) still
+            # carries its checks; forward them so the UI shows why. Malformed
+            # readiness collapses to UNKNOWN.
+            shape_error = _workflow_shape_error(tool, receipt, args)
+            if shape_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_WAND}{shape_error}",
+                    remedy=_workflow_unresolved_remedy(tool, "the helper readiness receipt is inconsistent"),
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            return _evidence_envelope(
+                state=state,
+                evidence=receipt,
+                reason=str(receipt.get("reason") or f"helper reported {state}") + exit_note,
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                observed_at=(
+                    receipt.get("observed_at")
+                    if _evidence_finite_number(receipt.get("observed_at"))
+                    else None
+                ),
+            )
+        return _evidence_envelope(
+            state=state,
+            reason=str(receipt.get("reason") or f"helper reported {state}") + exit_note,
+            timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+        )
+    finally:
+        for fh in (out_tmp, err_tmp):
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _workflow_respond(
+    envelope: dict[str, Any],
+    *,
+    board: str,
+    card: str,
+    tool: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    """Wrap a workflow envelope with board/card binding and helper identity."""
+    collection_started = time.monotonic()
+    wrapper = dict(envelope)
+    wrapper["board"] = board
+    wrapper["card"] = card
+    verified_host = wrapper.pop("_verified_execution_host", None)
+    wrapper["helper"] = {
+        "tool": tool,
+        "execution_host": verified_host or "unverified",
+    }
+    wrapper["request"] = request_echo
+    timing = wrapper.get("timing") or {}
+    timing.setdefault("helper_roundtrip_ms", None)
+    timing.setdefault("collection_ms", None)
+    if timing.get("collection_ms") is None:
+        timing["collection_ms"] = (time.monotonic() - collection_started) * 1000.0
+    wrapper["timing"] = timing
+    return wrapper
+
+
+async def _workflow_call(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    board: str,
+    card: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the helper off the event loop and wrap the envelope."""
+    envelope = await asyncio.to_thread(_workflow_run_helper, tool, args)
+    return _workflow_respond(
+        envelope, board=board, card=card, tool=tool, request_echo=request_echo
+    )
+
+
+@router.post("/workflow/readiness")
+async def workflow_readiness(
+    payload: WorkflowReadinessBody,
+    board: str = Query(..., description="Aligned EVO board slug"),
+):
+    """Explicit readiness for a selected card, resolved from its configured
+    workspace/profile/provider/model on the aligned local task. Model proof
+    runs only when check_model=true; readiness never dispatches or grants
+    authority."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(payload.card)
+    echo: dict[str, Any] = {
+        "board": slug,
+        "card": card,
+        "check_model": bool(payload.check_model),
+    }
+    guard = _workflow_alignment_guard(slug)
+    if guard is not None:
+        return _workflow_respond(
+            guard, board=slug, card=card, tool="kanban_readiness", request_echo=echo
+        )
+    task = _aligned_local_task(slug, card)
+    if task is None:
+        return _workflow_respond(
+            _evidence_envelope(
+                state="UNKNOWN",
+                reason="selected card is not present in the aligned board",
+                remedy="Open an existing card on this board; readiness needs its configured workspace/profile/model.",
+            ),
+            board=slug, card=card, tool="kanban_readiness", request_echo=echo,
+        )
+    workspace = task.workspace_path
+    profile = task.assignee
+    provider = task.provider_override
+    model = task.model_override
+    missing = [
+        name
+        for name, value in (
+            ("workspace", workspace),
+            ("profile", profile),
+            ("provider", provider),
+            ("model", model),
+        )
+        if not value
+    ]
+    if missing:
+        return _workflow_respond(
+            _evidence_envelope(
+                state="UNKNOWN",
+                reason="card configuration is incomplete: " + ", ".join(missing),
+                remedy="Configure the missing field on the card before requesting readiness; nothing is invented here.",
+            ),
+            board=slug, card=card, tool="kanban_readiness", request_echo=echo,
+        )
+    if (
+        not workspace.startswith("/home/hayden/")
+        or "/../" in workspace
+        or workspace.endswith("/..")
+    ):
+        return _workflow_respond(
+            _evidence_envelope(
+                state="UNKNOWN",
+                reason="card workspace is not a provisioned EVO home directory",
+                remedy="Set a workspace under /home/hayden/ on the card.",
+            ),
+            board=slug, card=card, tool="kanban_readiness", request_echo=echo,
+        )
+    head = _git_head(workspace)
+    if head is None:
+        return _workflow_respond(
+            _evidence_envelope(
+                state="UNKNOWN",
+                reason="could not derive current git HEAD from the card workspace",
+                remedy="Ensure the workspace is a git checkout with a committed HEAD; the revision is never supplied by the caller.",
+            ),
+            board=slug, card=card, tool="kanban_readiness", request_echo=echo,
+        )
+    parents = _aligned_parent_ids(slug, card)
+    if parents is None:
+        return _workflow_respond(
+            _evidence_envelope(
+                state="UNKNOWN",
+                reason="could not derive the card's dependency graph from the aligned board",
+                remedy="Inspect the card's task_links on this board; readiness needs its real parent ids to judge dependency completion.",
+            ),
+            board=slug, card=card, tool="kanban_readiness", request_echo=echo,
+        )
+    args: dict[str, Any] = {
+        "board": slug,
+        "profile": profile,
+        "provider": provider,
+        "model": model,
+        "workspace": workspace,
+        "expected_revision": head,
+        "python": os.path.join(workspace, ".venv", "bin", "python"),
+        # This checks the Hermes worker interpreter. Hermes pyproject.toml
+        # requires >=3.11; the generic adapter default (3.12) would reject
+        # supported EVO workers. Project-specific build tests remain separate.
+        "minimum_python": "3.11",
+        "parents": parents,
+        "check_model": bool(payload.check_model),
+    }
+    return await _workflow_call(
+        "kanban_readiness", args, board=slug, card=card, request_echo=echo
+    )
+
+
+@router.post("/workflow/continuation-draft")
+async def workflow_continuation_draft(
+    payload: ContinuationDraftBody,
+    board: str = Query(..., description="Aligned EVO board slug"),
+):
+    """Read-only continuation draft. Explicit commission fields win; omitted
+    fields derive from the aligned local task (present fields only)."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(payload.card)
+    echo: dict[str, Any] = {"board": slug, "card": card}
+    guard = _workflow_alignment_guard(slug)
+    if guard is not None:
+        return _workflow_respond(
+            guard, board=slug, card=card, tool="kanban_continuation_draft",
+            request_echo=echo,
+        )
+    commission = _commission_from_task(_aligned_local_task(slug, card))
+    args: dict[str, Any] = {
+        "board": slug,
+        "card": card,
+        "passed_checks": list(payload.passed_checks),
+        "remaining_checks": [item.model_dump() for item in payload.remaining_checks],
+        "verification_note": payload.verification_note,
+        "max_runtime_minutes": payload.max_runtime_minutes,
+    }
+    for field in ("workspace", "profile", "provider", "model", "creator", "title"):
+        explicit = getattr(payload, field, None)
+        if explicit is not None:
+            args[field] = explicit
+        elif commission.get(field) is not None:
+            args[field] = commission[field]
+    return await _workflow_call(
+        "kanban_continuation_draft", args, board=slug, card=card, request_echo=echo
+    )
+
+
+@router.post("/workflow/continue")
+async def workflow_continue(
+    payload: ContinuationContinueBody,
+    board: str = Query(..., description="Aligned EVO board slug"),
+):
+    """Create the held continuation card the draft described. Write scope and
+    alignment are enforced before the helper; no dispatch or unblock occurs."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(payload.card)
+    echo: dict[str, Any] = {"board": slug, "card": card}
+    guard = _workflow_alignment_guard(slug)
+    if guard is not None:
+        return _workflow_respond(
+            guard, board=slug, card=card, tool="kanban_continue", request_echo=echo
+        )
+    write_guard = _workflow_write_guard(slug)
+    if write_guard is not None:
+        return _workflow_respond(
+            write_guard, board=slug, card=card, tool="kanban_continue",
+            request_echo=echo,
+        )
+    args: dict[str, Any] = {
+        "board": slug,
+        "card": card,
+        "passed_checks": list(payload.passed_checks),
+        "remaining_checks": [item.model_dump() for item in payload.remaining_checks],
+        "verification_note": payload.verification_note,
+        "fingerprint": payload.fingerprint,
+        "workspace": payload.workspace,
+        "profile": payload.profile,
+        "provider": payload.provider,
+        "model": payload.model,
+        "max_runtime_minutes": payload.max_runtime_minutes,
+        "creator": payload.creator,
+        "title": payload.title,
+    }
+    return await _workflow_call(
+        "kanban_continue", args, board=slug, card=card, request_echo=echo
+    )
+
+
+@router.post("/workflow/hold")
+async def workflow_hold(
+    payload: WorkflowHoldBody,
+    board: str = Query(..., description="Aligned EVO board slug"),
+):
+    """Durably hold a review/ready/running card. Does not stop a live worker."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(payload.card)
+    echo: dict[str, Any] = {"board": slug, "card": card}
+    guard = _workflow_alignment_guard(slug)
+    if guard is not None:
+        return _workflow_respond(
+            guard, board=slug, card=card, tool="kanban_hold", request_echo=echo
+        )
+    write_guard = _workflow_write_guard(slug)
+    if write_guard is not None:
+        return _workflow_respond(
+            write_guard, board=slug, card=card, tool="kanban_hold", request_echo=echo
+        )
+    args: dict[str, Any] = {"board": slug, "card": card, "reason": payload.reason}
+    return await _workflow_call(
+        "kanban_hold", args, board=slug, card=card, request_echo=echo
+    )
