@@ -19,6 +19,7 @@ on:
 
 permissions:
   actions: write
+  contents: read # checkout of the trusted default branch (helper script)
   pull-requests: read
 
 concurrency:
@@ -32,10 +33,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
+      # The helper is trusted code. Check it out from the default branch,
+      # never the PR head, so a fork cannot supply its own rerun logic with
+      # this workflow's ``actions: write`` token.
+      - name: Checkout trusted default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Wait for CI run to finish, then rerun failed jobs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
@@ -82,6 +93,14 @@ jobs:
             fi
           fi
 
-          echo "Run completed. Rerunning all failed jobs..."
-          gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
+          echo "Run completed. Rechecking the live PR head before rerunning..."
+          # The helper re-reads the PR head and reruns only if it still
+          # equals HEAD_SHA. A commit that landed during the wait yields an
+          # explicit superseded result (exit 2) and no rerun; an unreadable
+          # head yields an explicit failure (exit 1) and no blind rerun.
+          python3 .github/scripts/rerun_current_head.py \
+            --repo "$REPO" \
+            --pr "$PR" \
+            --captured-head "$HEAD_SHA" \
+            --run-id "$RUN_ID"
           echo "Done. GitHub will rerun review-labels and all dependent jobs."
