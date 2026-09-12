@@ -6372,7 +6372,17 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``running``/``ready``/``review`` → ``blocked`` (or route elsewhere).
+
+    A task parked in ``review`` (``request_review`` moved it there and closed
+    the implementer run with ``outcome=review_requested``) may be *held* with
+    the same call: it transitions to ``blocked`` with ``source_status=review``
+    recorded on the block event, so a later explicit ``unblock_task`` restores
+    ``review`` rather than ``ready``. A review hold never stops a live process
+    and never synthesizes or rewrites a run; the implementer's ended
+    ``review_requested`` run and all prior events/result/PR metadata are
+    preserved untouched, and an ``expected_run_id`` (stale for an unclaimed
+    review card) is refused exactly like the running/ready CAS guard.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6414,11 +6424,18 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        source_status = (
-            _retry_status_for_run(conn, task_id)
-            if cur_row["status"] == "running"
-            else "ready"
-        )
+        if cur_row["status"] == "review":
+            # A card parked in the review lane is being *held*, not blocked
+            # mid-execution. It has no live run (``request_review`` already
+            # closed the implementer run and cleared ``current_run_id``), so
+            # the durable provenance is ``review`` and nothing here must
+            # synthesize or rewrite a run.
+            source_status = "review"
+        elif cur_row["status"] == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        else:
+            source_status = "ready"
+        is_review_hold = cur_row["status"] == "review"
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -6441,7 +6458,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -6453,7 +6470,7 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=reason,
             )
-            if run_id is None and reason:
+            if run_id is None and reason and not is_review_hold:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
@@ -6499,7 +6516,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6511,7 +6528,7 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=reason,
             )
-            if run_id is None and reason:
+            if run_id is None and reason and not is_review_hold:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
@@ -6539,7 +6556,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                     """,
                     (reason, kind, recurrences, task_id),
                 )
@@ -6555,7 +6572,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                        AND current_run_id = ?
                     """,
                     (reason, kind, recurrences, task_id, int(expected_run_id)),
@@ -6568,8 +6585,11 @@ def block_task(
                 summary=reason,
             )
             # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
+            # reason is preserved in attempt history. A review hold is the
+            # exception: the implementer's already-ended run is the durable
+            # attestation and must not be shadowed by a synthetic "blocked"
+            # run (or rewritten), so no run is created for review holds.
+            if run_id is None and reason and not is_review_hold:
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",

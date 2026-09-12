@@ -13,7 +13,7 @@ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { $routeTiles, closeRouteTile, type RouteTile } from '@/store/route-tiles'
 
-import { ARTIFACTS_ROUTE, contributedRoutes, MESSAGING_ROUTE, ROUTES_AREA, SKILLS_ROUTE } from '../routes'
+import { ARTIFACTS_ROUTE, contributedRoutes, MESSAGING_ROUTE, ROUTES_AREA, routesFromContributions, SKILLS_ROUTE } from '../routes'
 
 import { paneMirror } from './pane-mirror'
 
@@ -50,9 +50,11 @@ function routeTitle(path: string): string {
 function RouteTilePane({ path }: { path: string }) {
   const builtin = BUILTIN_PAGES[path]
 
-  // Subscribe so a plugin page tile appears the moment its route registers.
-  useContributions(ROUTES_AREA)
-  const contrib = builtin ? null : contributedRoutes().find(r => r.path === path)
+  // Subscribe so a plugin page tile appears the moment its route registers —
+  // derive from the live snapshot (not an imperative registry read) so the
+  // React compiler sees the dependency (#issue55).
+  const contribRoutes = routesFromContributions(useContributions(ROUTES_AREA))
+  const contrib = builtin ? null : contribRoutes.find(r => r.path === path)
 
   if (builtin) {
     return (

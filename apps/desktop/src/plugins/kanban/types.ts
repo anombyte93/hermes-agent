@@ -231,3 +231,110 @@ export const SEVERITY_TONE: Record<Diagnostic['severity'], string> = {
   error: 'var(--destructive, #f87171)',
   warning: '#fbbf24'
 }
+
+// ── read-only /evidence/* bridge (physical EVO host) ─────────────────────────
+
+/** GET /evidence/context — whether the selected board's local DB is the same
+ *  physical database the EVO evidence bridge reads. `aligned=false` means the
+ *  UI must show local cards only, with no EVO badges/downloads. */
+export interface EvidenceContext {
+  aligned: boolean
+  board: string
+  hostname: string
+  reason: string
+  observed_at: number
+}
+
+/** One worker observation attached to a card by the adapter. Positive
+ *  identity for "running" requires ALL FOUR: state=PASS, process_present,
+ *  workspace_matches, run_start_matches. A bare process_present is NOT
+ *  enough (the worker may have been recycled for a different task). */
+export interface WorkerObservation {
+  task_id: string
+  state?: null | string
+  process_present?: boolean
+  reason?: null | string
+  workspace_matches?: null | boolean
+  run_start_matches?: null | boolean
+  /** Completion-record observations carry `classification`/`run_id`. */
+  classification?: null | string
+  run_id?: null | number
+}
+
+/** The worker aggregate rollup. The REAL helper nests the complete/running/
+ *  unknown/stopped verdicts HERE (``data.aggregate``), not at the top level
+ *  of ``WorkerEvidenceData``. `complete` is the helper's own "we saw the
+ *  whole run set" claim; Stopped additionally needs no running/unknown. */
+export interface WorkerAggregate {
+  overall?: null | string
+  running?: number
+  stopped?: number
+  completion_records?: number
+  unknown?: number
+  complete?: boolean
+}
+
+/** One completion record surfaced with the worker aggregate. */
+export interface CompletionRunRecord {
+  run_id?: null | number
+  summary?: null | string
+  started_at?: null | number
+  ended_at?: null | number
+}
+
+/** Snapshot count rollup: per-status counts plus the page's own bounds. */
+export interface EvidenceCounts {
+  by_status?: Record<string, number>
+  total?: number
+  matching_filter?: number
+  in_page?: number
+  omitted?: number
+}
+
+/** GET /evidence/snapshot envelope evidence payload. */
+export interface EvidenceSnapshotData {
+  board?: string
+  cards?: Array<Record<string, unknown>>
+  counts?: EvidenceCounts
+  observed_at?: number
+  status_filter?: null | string
+  worker_observations?: WorkerObservation[]
+  has_more?: boolean
+  next_cursor?: null | string
+  omitted?: null | number | Record<string, unknown>
+}
+
+/** Shared /evidence/* envelope: state PASS/FAIL/UNKNOWN + evidence payload. */
+export interface EvidenceEnvelope<T> {
+  state: 'PASS' | 'FAIL' | 'UNKNOWN'
+  evidence?: null | T
+  reason?: null | string
+  remedy?: null | string
+  board?: string
+  observed_at?: number
+  limitations?: null | number | Record<string, unknown>
+  helper?: { tool?: string; execution_host?: null | string }
+  timing?: { helper_roundtrip_ms?: null | number; collection_ms?: null | number }
+}
+
+/** GET /evidence/worker evidence payload. The REAL helper nests the
+ *  complete/running/unknown/stopped verdicts under `aggregate`; the top-level
+ *  `complete`/`running`/`unknown` booleans the earlier draft read did NOT
+ *  exist in the released contract (verified against EVIDENCE-CONTRACTS.json). */
+export interface WorkerEvidenceData {
+  task_id: string
+  observations: WorkerObservation[]
+  card_status?: null | string
+  assignee?: null | string
+  aggregate?: null | WorkerAggregate
+  completion_runs?: CompletionRunRecord[]
+  limitation?: null | string
+}
+
+/** GET /evidence/card evidence payload (bounded; include_body via page). */
+export interface EvidenceCardData {
+  task: Record<string, unknown>
+  runs: Array<Record<string, unknown>>
+  comments: Array<Record<string, unknown>>
+  events: Array<Record<string, unknown>>
+}

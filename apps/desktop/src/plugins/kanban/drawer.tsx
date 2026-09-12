@@ -24,19 +24,18 @@ import {
   Tip,
   useMutation,
   useQuery,
-  useQueryClient,
-  useValue
+  useQueryClient
 } from '@hermes/plugin-sdk'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import {
-  $boardSlug,
   addComment,
   deleteTask,
   estimateTask,
   fetchLog,
   fetchProfiles,
   fetchTask,
+  fetchTaskWithoutHistory,
   logKey,
   patchTask,
   PROFILES_KEY,
@@ -45,6 +44,8 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { DrawerEvidence, useResolvedBoardSlug } from './drawer-evidence'
+import { useEvidenceContext, WorkerEvidenceSection } from './evidence'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -72,6 +73,7 @@ import {
   useDefaultAssignee,
   useKanban
 } from './ui'
+import { CardWorkflowPanel } from './workflow'
 
 /**
  * Turn a task_events row into an operator-readable line. The backend logs
@@ -550,12 +552,22 @@ export function TaskDrawer({
 }) {
   const k = useKanban()
   const qc = useQueryClient()
-  const slug = useValue($boardSlug)
+  const slug = useResolvedBoardSlug()
+
+  // Identity alignment: only the EVO-aligned board pages its history through
+  // /evidence/* and downloads through the authenticated JSON door. The detail
+  // query waits for the alignment check to RESOLVE, and only a POSITIVE
+  // `aligned:false` may issue the legacy full-history fetch. A failed or still
+  // unresolved identity check withholds detail entirely (including any cached
+  // copy) rather than silently materialising legacy history or hanging.
+  const contextQuery = useEvidenceContext(slug)
+  const context = contextQuery.data
+  const aligned = context?.aligned === true
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
-    enabled: !!id,
-    queryFn: () => fetchTask(id!),
+    enabled: !!id && contextQuery.isSuccess,
+    queryFn: () => (aligned ? fetchTaskWithoutHistory(slug, id!) : fetchTask(id!)),
     queryKey: taskKey(slug, id ?? ''),
     refetchInterval: 30_000
   })
@@ -748,7 +760,16 @@ export function TaskDrawer({
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
-        {errorMessage ? (
+        {contextQuery.isError ? (
+          <ErrorState
+            description="The board identity check failed, so task history is withheld. Select the EVO connection and retry."
+            title="Could not verify this board"
+          />
+        ) : contextQuery.isLoading ? (
+          <div className="grid h-32 place-items-center">
+            <Loader type="lemniscate-bloom" />
+          </div>
+        ) : errorMessage ? (
           <ErrorState title={errorMessage} />
         ) : !detail || !task ? (
           <div className="grid h-32 place-items-center">
@@ -814,6 +835,23 @@ export function TaskDrawer({
               </Section>
             )}
 
+            {/* Actual worker observation from the read-only EVO bridge, kept
+                distinct from the parent result text above. Renders only when
+                the selected board is identity-aligned with the EVO database. */}
+            <WorkerEvidenceSection id={task.id} />
+            {aligned && <CardWorkflowPanel card={task.id} slug={slug} />}
+
+            {/* Aligned history: paged runs/events/attachments + authenticated
+                download. The legacy sections below render only when unaligned. */}
+            {aligned && (
+              <DrawerEvidence
+                id={task.id}
+                onUpload={file => uploadMut.mutate(file)}
+                slug={slug}
+                uploadPending={uploadMut.isPending}
+              />
+            )}
+
             {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
               <Section label={k.dependencies}>
                 {(['parents', 'children'] as const).map(side =>
@@ -869,7 +907,7 @@ export function TaskDrawer({
               />
             </Section>
 
-            {detail.events.length > 0 && (
+            {!aligned && detail.events.length > 0 && (
               <Section label={k.activity(detail.events.length)}>
                 <ScrollFade deps={detail.events.length} max="7rem">
                   <ul className="flex flex-col gap-1">
@@ -896,7 +934,7 @@ export function TaskDrawer({
               </Section>
             )}
 
-            {detail.runs.length > 0 && (
+            {!aligned && detail.runs.length > 0 && (
               <Section label={k.runs(detail.runs.length)}>
                 <ScrollFade max="11rem">
                   <ul className="flex flex-col gap-1.5">
@@ -945,11 +983,13 @@ export function TaskDrawer({
               </Section>
             )}
 
-            <AttachmentsSection
-              attachments={detail.attachments}
-              onUpload={file => uploadMut.mutate(file)}
-              pending={uploadMut.isPending}
-            />
+            {!aligned && (
+              <AttachmentsSection
+                attachments={detail.attachments}
+                onUpload={file => uploadMut.mutate(file)}
+                pending={uploadMut.isPending}
+              />
+            )}
           </div>
         )}
       </div>
