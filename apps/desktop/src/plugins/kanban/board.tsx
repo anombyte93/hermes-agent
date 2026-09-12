@@ -84,7 +84,6 @@ import { type BoardEvidence, EvidenceStateBadge, useBoardEvidence, viewsToBoardC
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { COLUMN_META, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
-import { BoardWorkflowPanel } from './workflow'
 import {
   $newTaskLane,
   ago,
@@ -103,6 +102,7 @@ import {
   useKanban,
   useOrchestration
 } from './ui'
+import { BoardWorkflowPanel } from './workflow'
 
 // ── optimistic board edits (reconciled by the follow-up refresh) ─────────────
 

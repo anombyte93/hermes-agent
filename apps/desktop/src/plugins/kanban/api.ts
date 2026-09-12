@@ -21,16 +21,6 @@ import {
 // Native completion notification.
 import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
 import type {
-  AttentionData,
-  ChangesData,
-  ContinueReceipt,
-  ContinuationDraft,
-  HoldReceipt,
-  ReadinessReceipt,
-  RemainingCheck,
-  TimelineData
-} from './workflow-api'
-import type {
   BoardExportResult,
   BoardImportResult,
   BoardMeta,
@@ -49,6 +39,16 @@ import type {
   WorkerEvidenceData,
   WorkerLog
 } from './types'
+import type {
+  AttentionData,
+  ChangesData,
+  ContinuationDraft,
+  ContinueReceipt,
+  HoldReceipt,
+  ReadinessReceipt,
+  RemainingCheck,
+  TimelineData
+} from './workflow-api'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
