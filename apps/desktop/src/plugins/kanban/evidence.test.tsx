@@ -97,14 +97,24 @@ describe('resolveWorkerState', () => {
     ).toBe('unknown')
   })
 
-  it('stopped only on nested aggregate: complete, running=0, unknown=0, with evidence', () => {
+  it('stopped only on nested aggregate: complete, running=0, unknown=0, stopped>0', () => {
+    expect(
+      resolveWorkerState({
+        task_id: 't_1',
+        observations: [],
+        aggregate: { overall: 'STOPPED', running: 0, stopped: 1, completion_records: 0, unknown: 0, complete: true }
+      })
+    ).toBe('stopped')
+  })
+
+  it('a completion_records-only aggregate is bookkeeping, not stopped', () => {
     expect(
       resolveWorkerState({
         task_id: 't_1',
         observations: [],
         aggregate: { overall: 'STOPPED', running: 0, stopped: 0, completion_records: 1, unknown: 0, complete: true }
       })
-    ).toBe('stopped')
+    ).toBe('unknown')
   })
 
   it('complete aggregate with zero runs is unknown, not stopped', () => {
@@ -257,7 +267,24 @@ describe('WorkerEvidenceSection (rendered)', () => {
     await waitFor(() => expect(screen.getByText('Unknown')).toBeTruthy())
   })
 
-  it('shows Stopped for a nested complete aggregate with a completion record', async () => {
+  it('shows Stopped for a nested complete aggregate with actual stopped-run evidence', async () => {
+    apiMock.fetchEvidenceContext.mockResolvedValue(context(true))
+    apiMock.fetchEvidenceWorker.mockResolvedValue(
+      envelope('PASS', {
+        task_id: 't_1',
+        observations: [],
+        aggregate: { overall: 'STOPPED', running: 0, stopped: 1, completion_records: 0, unknown: 0, complete: true },
+        completion_runs: [{ run_id: 43, summary: 'done', started_at: 1, ended_at: 1 }]
+      })
+    )
+
+    await renderSection('t_1')
+
+    await waitFor(() => expect(screen.getByText('Stopped')).toBeTruthy())
+    expect(screen.getByText('done')).toBeTruthy()
+  })
+
+  it('shows Unknown (not Stopped) for a completion_records-only aggregate', async () => {
     apiMock.fetchEvidenceContext.mockResolvedValue(context(true))
     apiMock.fetchEvidenceWorker.mockResolvedValue(
       envelope('PASS', {
@@ -270,8 +297,7 @@ describe('WorkerEvidenceSection (rendered)', () => {
 
     await renderSection('t_1')
 
-    await waitFor(() => expect(screen.getByText('Stopped')).toBeTruthy())
-    expect(screen.getByText('done')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('Unknown')).toBeTruthy())
   })
 
   it('shows Unavailable (not red) for a non-PASS envelope', async () => {
