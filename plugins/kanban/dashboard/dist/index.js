@@ -435,9 +435,9 @@
   //
   //   running — a live observation passing all four positive checks.
   //   stopped — aggregate.complete === true AND aggregate.running === 0 AND
-  //             aggregate.unknown === 0 AND actual stopped evidence is
-  //             present (aggregate.stopped > 0 or completion_records > 0).
-  //             Zero runs alone is NOT stopped.
+  //             aggregate.unknown === 0 AND aggregate.stopped > 0. A
+  //             completion_records-only aggregate is bookkeeping, not
+  //             stopped-worker evidence, so it is never Stopped.
   //   unknown — a missing or incomplete observation. Never stopped.
   //
   // The real aggregate lives NESTED under data.aggregate; the older React
@@ -454,8 +454,7 @@
       const running = typeof agg.running === "number" ? agg.running : 0;
       const unknown = typeof agg.unknown === "number" ? agg.unknown : 0;
       const stopped = typeof agg.stopped === "number" ? agg.stopped : 0;
-      const completionRecords = typeof agg.completion_records === "number" ? agg.completion_records : 0;
-      if (agg.complete === true && running === 0 && unknown === 0 && (stopped > 0 || completionRecords > 0)) {
+      if (agg.complete === true && running === 0 && unknown === 0 && stopped > 0) {
         return "stopped";
       }
     }
@@ -521,6 +520,8 @@
     const [loadingMore, setLoadingMore] = useState(false);
     const genRef = useRef(0);
     const pollRef = useRef(null);
+    const cardsRef = useRef([]);      // mirrors the `cards` state (for dedupe)
+    const firstPageLenRef = useRef(0); // page-0 slice length (poll replaces it)
 
     const aligned = !!(context && context.aligned === true);
 
@@ -531,6 +532,8 @@
       setCounts(null);
       setObservedAt(null);
       setCards([]);
+      cardsRef.current = [];
+      firstPageLenRef.current = 0;
       setCursor(null);
       setHasMore(false);
       setOmitted(null);
@@ -548,27 +551,45 @@
       const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
       setObservedAt(evidenceObservedAt(env));
       if (data.counts && typeof data.counts === "object") setCounts(data.counts);
-      setWorkerMap(function (prev) {
-        return Object.assign({}, prev, buildWorkerStateMap(data.worker_observations));
-      });
+      const pageCards = Array.isArray(data.cards) ? data.cards : [];
       const omitNum = typeof data.omitted === "number" ? data.omitted
         : (data.counts && typeof data.counts.omitted === "number" ? data.counts.omitted : null);
-      setOmitted(omitNum);
-      setHasMore(data.has_more === true);
-      if (data.next_cursor != null) setCursor(data.next_cursor);
-      else if (!data.has_more) setCursor(null);
-      const pageCards = Array.isArray(data.cards) ? data.cards : [];
+
       if (opts && opts.append) {
-        setCards(function (prev) {
-          const seen = {};
-          return prev.concat(pageCards).filter(function (c) {
-            if (!c || seen[c.id]) return false;
-            seen[c.id] = true;
-            return true;
-          });
+        // Load-more page: append (deduped), advance the paging state.
+        const seen = {};
+        const merged = cardsRef.current.concat(pageCards).filter(function (c) {
+          if (!c || seen[c.id]) return false;
+          seen[c.id] = true;
+          return true;
         });
+        cardsRef.current = merged;
+        setCards(merged);
+        setHasMore(data.has_more === true);
+        if (data.next_cursor != null) setCursor(data.next_cursor);
+        else if (!data.has_more) setCursor(null);
+        setOmitted(omitNum);
       } else {
-        setCards(function (prev) { return prev.length === 0 ? pageCards : prev; });
+        // Page-0 refresh: REPLACE the worker map (a removed observation must
+        // not linger as a stale RUNNING with a fresh timestamp) and replace
+        // the page-0 card slice (title/status changes become visible), while
+        // keeping appended pages stable. Paging state is set only on the
+        // initial seed, so a poll never resets cursor/omitted after Load more.
+        setWorkerMap(buildWorkerStateMap(data.worker_observations));
+        const isInitial = firstPageLenRef.current === 0 && cardsRef.current.length === 0;
+        const appended = firstPageLenRef.current > 0
+          ? cardsRef.current.slice(firstPageLenRef.current)
+          : [];
+        const next = pageCards.concat(appended);
+        firstPageLenRef.current = pageCards.length;
+        cardsRef.current = next;
+        setCards(next);
+        if (isInitial) {
+          setHasMore(data.has_more === true);
+          if (data.next_cursor != null) setCursor(data.next_cursor);
+          else if (!data.has_more) setCursor(null);
+          setOmitted(omitNum);
+        }
       }
     }, []);
 
@@ -589,28 +610,31 @@
       return function () { alive = false; };
     }, [board, reset]);
 
+    // Single snapshot refresh (page 0), generation-guarded. This is the one
+    // owning evidence data path: the poll interval, the WebSocket event
+    // callback (via loadBoard) and board actions all route through it when
+    // the board is aligned.
+    const refresh = useCallback(function () {
+      const gen = genRef.current;
+      return fetchEvidenceSnapshot(board, "all", EVIDENCE_PAGE_CARD_LIMIT, null).then(function (env) {
+        if (gen !== genRef.current) return;
+        applySnapshot(env, { append: false });
+      }).catch(function (err) {
+        if (gen !== genRef.current) return;
+        setSnapshot({ state: "UNKNOWN", reason: parseApiErrorMessage(err) });
+      });
+    }, [board, applySnapshot]);
+
     // Poll the snapshot only when aligned. One snapshot per refresh, never a
     // local /board plus snapshot.
     useEffect(function () {
       if (!aligned) return undefined;
-      let stopped = false;
-      function poll() {
-        const gen = genRef.current;
-        fetchEvidenceSnapshot(board, "all", EVIDENCE_PAGE_CARD_LIMIT, null).then(function (env) {
-          if (stopped || gen !== genRef.current) return;
-          applySnapshot(env, { append: false });
-        }).catch(function (err) {
-          if (stopped || gen !== genRef.current) return;
-          setSnapshot({ state: "UNKNOWN", reason: parseApiErrorMessage(err) });
-        });
-      }
-      poll();
-      pollRef.current = setInterval(poll, EVIDENCE_POLL_MS);
+      refresh();
+      pollRef.current = setInterval(refresh, EVIDENCE_POLL_MS);
       return function () {
-        stopped = true;
         if (pollRef.current) clearInterval(pollRef.current);
       };
-    }, [aligned, board, applySnapshot]);
+    }, [aligned, refresh]);
 
     const loadMore = useCallback(function () {
       if (loadingMore || !aligned || !hasMore || !cursor) return Promise.resolve();
@@ -640,6 +664,7 @@
       omitted: omitted,
       loadingMore: loadingMore,
       loadMore: loadMore,
+      refresh: refresh,
     };
   }
 
@@ -717,27 +742,51 @@
       return k + " " + byStatus[k];
     }).join(" \u00b7 ");
 
-    return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
-      h("span", { style: { fontWeight: "600" } }, "EVO evidence"),
-      h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "8px" } },
-        (total != null ? "total " + total : "") +
-        (inPage != null ? " \u00b7 in page " + inPage : "") +
-        (omitted != null ? " \u00b7 omitted " + omitted : "") +
-        (statusChips ? " \u00b7 " + statusChips : "")),
-      h("span", {
-        className: staleCls ? "hermes-kanban-evidence-stale " + staleCls : "hermes-kanban-evidence-stale",
-        title: age != null ? "evidence observed " + Math.round(age) + "s ago" : "freshness unknown",
-        style: { color: staleCls ? EVIDENCE_STATE_TONE.unknown : EVIDENCE_STATE_TONE.running, marginLeft: "8px" },
-      }, age != null ? "observed " + Math.round(age) + "s ago" : "freshness unknown"),
-      ev.hasMore
-        ? h("button", {
-            type: "button",
-            className: "hermes-kanban-edit-link",
-            disabled: ev.loadingMore,
-            style: { marginLeft: "12px" },
-            onClick: function () { ev.loadMore(); },
-          }, ev.loadingMore ? "Loading\u2026" : "Load more (" + (omitted != null ? omitted : "") + " omitted)")
-        : null);
+    // Bounded snapshot cards (K4): a visible, stable, pageable list of the
+    // snapshot's bounded projections. Missing card fields are simply omitted
+    // (no false defaults). Every card without an observation is UNKNOWN
+    // (missing observation is never Stopped), regardless of status.
+    const wmRef = ev.workerMap || {};
+    const cardRows = ev.cards.map(function (card) {
+      const st = wmRef[card.id] ? wmRef[card.id].state : "unknown";
+      return h("div", { key: card.id, className: "flex items-center gap-2 text-xs", style: { padding: "1px 0" } },
+        h("span", { className: "text-muted-foreground", style: { fontFamily: "monospace" } }, card.id),
+        h("span", { style: { maxWidth: "42ch", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, card.title || "(untitled)"),
+        h("span", { className: "text-muted-foreground" }, card.status),
+        st ? h(EvidenceBadge, { state: st }) : null);
+    });
+
+    return h("div", {
+      className: "hermes-kanban-evidence-banner",
+      style: Object.assign({}, bar, {
+        background: "var(--muted, rgba(0,0,0,0.04))",
+        display: "flex",
+        flexDirection: "column",
+        gap: "3px",
+      }),
+    },
+      h("div", { style: { display: "flex", alignItems: "center", flexWrap: "wrap" } },
+        h("span", { style: { fontWeight: "600" } }, "EVO evidence"),
+        h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "8px" } },
+          (total != null ? "total " + total : "") +
+          (inPage != null ? " \u00b7 in page " + inPage : "") +
+          (omitted != null ? " \u00b7 omitted " + omitted : "") +
+          (statusChips ? " \u00b7 " + statusChips : "")),
+        h("span", {
+          className: staleCls ? "hermes-kanban-evidence-stale " + staleCls : "hermes-kanban-evidence-stale",
+          title: age != null ? "evidence observed " + Math.round(age) + "s ago" : "freshness unknown",
+          style: { color: staleCls ? EVIDENCE_STATE_TONE.unknown : EVIDENCE_STATE_TONE.running, marginLeft: "8px" },
+        }, age != null ? "observed " + Math.round(age) + "s ago" : "freshness unknown"),
+        ev.hasMore
+          ? h("button", {
+              type: "button",
+              className: "hermes-kanban-edit-link",
+              disabled: ev.loadingMore,
+              style: { marginLeft: "12px" },
+              onClick: function () { ev.loadMore(); },
+            }, ev.loadingMore ? "Loading\u2026" : "Load more (" + (omitted != null ? omitted : "") + " omitted)")
+          : null),
+      cardRows.length > 0 ? h("div", null, cardRows) : null);
   }
 
   // Drawer worker-evidence panel (K9): reads /evidence/worker for the open
@@ -1202,7 +1251,7 @@
     // component had `const [board, setBoard]` for the grid data. We
     // renamed the grid data to `kanbanBoard` so the more useful name
     // (`board`) belongs to the selected slug.
-    const boardData = kanbanBoard;
+    const boardData = evidenceAligned ? snapshotBoard : kanbanBoard;
     const setBoardData = setKanbanBoard;
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -1238,6 +1287,26 @@
     // bounded snapshot + counts + load more, per-card worker map, freshness.
     // Gated on /evidence/context alignment, generation-guarded per board.
     const evidence = useKanbanEvidence(board);
+    const evidenceAligned = evidence.aligned;
+    // When the board is identity-aligned with the EVO database the snapshot
+    // is the single source of truth: the grid is derived from the bounded
+    // snapshot cards, and the local /board grid data is not read. When not
+    // aligned, the original local /board grid is unchanged.
+    const snapshotBoard = useMemo(function () {
+      if (!evidenceAligned) return null;
+      const byStatus = {};
+      (evidence.cards || []).forEach(function (c) {
+        const s = c.status || "todo";
+        (byStatus[s] = byStatus[s] || []).push(c);
+      });
+      return {
+        columns: COLUMN_ORDER.map(function (name) {
+          return { name: name, tasks: byStatus[name] || [] };
+        }),
+        latest_event_id: 0,
+        assignees: [],
+      };
+    }, [evidenceAligned, evidence.cards]);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -1256,6 +1325,13 @@
 
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
+      if (evidenceAligned) {
+        // Aligned: the snapshot is the single source of truth. The original
+        // WebSocket subscription stays live and its event callback (via
+        // scheduleReload) routes here, refreshing the snapshot instead of
+        // the local /board. Board actions call this same callback.
+        return evidence.refresh().finally(function () { setLoading(false); });
+      }
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
@@ -1270,7 +1346,7 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
+    }, [tenantFilter, includeArchived, board, evidenceAligned, evidence.refresh]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -3706,7 +3782,7 @@
       if (wm[t.id]) {
         evidenceState = wm[t.id].state;
         evidenceTitle = "Worker evidence: " + (EVIDENCE_STATE_LABEL[evidenceState] || evidenceState);
-      } else if (t.status === "running") {
+      } else {
         evidenceState = "unknown";
         evidenceTitle = "Worker evidence: no live observation (unknown, not stopped)";
       }
