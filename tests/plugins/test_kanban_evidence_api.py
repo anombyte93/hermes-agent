@@ -4,6 +4,12 @@ The /evidence/* routes shell out to the RELEASED ``atlas-kanban-call``
 helper executable and must NEVER touch the local Hermes kanban DB. These
 tests exercise the real FastAPI router with a real temporary fake
 executable placed on PATH — no module-mocked HTTP surface.
+
+The fake's contract mirrors the RELEASED helper (verified against the
+real candidate, source 27ef127, on 2026-09-12): the tool name arrives in
+argv as ``atlas-kanban-call <tool> -`` and stdin carries ONLY the flat
+JSON args object. FAIL receipts exit 1. PASS receipts carry the per-tool
+data shapes the real adapter emits, including observed_at.
 """
 
 from __future__ import annotations
@@ -90,6 +96,8 @@ def _write_fake_helper(directory: Path, behavior: str, *, cap: int | None = 1) -
       timeout    — sleeps 600s (test patches the timeout boundary down)
       garbled    — exit 0, JSON object missing required receipt keys
       oversized  — exit 0, PASS receipt padded beyond the stdout cap
+      noshape    — exit 0, PASS receipt whose data misses required fields
+      wrongscope — exit 0, PASS receipt echoing a different board/card
     """
     script = f'''#!/usr/bin/env python3
 import json, os, sys, time
@@ -109,6 +117,39 @@ def read_stdin():
     return invocation.get("stdin")
 
 payload = read_stdin()
+args = payload if isinstance(payload, dict) else {{}}
+tool = sys.argv[1] if len(sys.argv) > 1 else ""
+
+
+def make_data():
+    if tool == "kanban_snapshot":
+        return {{
+            "board": args.get("board", "evo-alpha"),
+            "cards": [{{"id": "t_00000001"}}],
+            "counts": {{}},
+            "status_filter": str(args.get("status", "all")),
+            "observed_at": 1789216932.8,
+            "omitted": {{"events": 0}},
+        }}
+    if tool == "kanban_page":
+        return {{
+            "items": [{{"id": "t_00000001"}}],
+            "returned": 1,
+            "has_more": False,
+        }}
+    if tool == "kanban_worker":
+        return {{
+            "task_id": args.get("card", "t_00000001"),
+            "observations": [],
+        }}
+    # kanban_card
+    return {{
+        "task": {{"id": args.get("card", "t_00000001")}},
+        "runs": [],
+        "comments": [],
+        "events": [],
+    }}
+
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj))
@@ -120,12 +161,15 @@ if behavior == "timeout":
 env_write = os.environ.get("ATLAS_KANBAN_WRITE_BOARDS", "<unset>")
 invocation["env_write_boards"] = env_write
 
+with open(record_path, "a", encoding="utf-8") as fh:
+    json.dump(invocation, fh)
+    fh.write("\\n")
+
 receipt = {{
     "state": "PASS",
     "execution_host": "evo",
-    "board": (payload or {{}}).get("args", {{}}).get("board"),
-    "tool": (payload or {{}}).get("tool"),
-    "data": {{"marker": "evidence", "items": [1, 2, 3]}},
+    "observed_at": 1789216932.8,
+    "data": make_data(),
 }}
 
 if behavior == "pass":
@@ -133,10 +177,13 @@ if behavior == "pass":
 elif behavior == "fail":
     receipt["state"] = "FAIL"
     receipt["reason"] = "remote board denied read"
+    receipt.pop("data", None)
     emit(receipt)
+    sys.exit(1)
 elif behavior == "unknown":
     receipt["state"] = "UNKNOWN"
     receipt["reason"] = "remote unreachable"
+    receipt.pop("data", None)
     emit(receipt)
 elif behavior == "wronghost":
     receipt["execution_host"] = "elsewhere"
@@ -153,10 +200,18 @@ elif behavior == "nonzero":
     emit(receipt)
     sys.stderr.write("helper exploded\\n")
     sys.exit(3)
+elif behavior == "noshape":
+    receipt["data"] = {{"unrelated": True}}
+    emit(receipt)
+elif behavior == "wrongscope":
+    receipt["data"] = make_data()
+    if tool == "kanban_snapshot":
+        receipt["data"]["board"] = "a-different-board"
+    else:
+        receipt["data"]["task"] = {{"id": "t_ffffffff"}}
+        receipt["data"]["task_id"] = "t_ffffffff"
+    emit(receipt)
 
-with open(record_path, "a", encoding="utf-8") as fh:
-    json.dump(invocation, fh)
-    fh.write("\\n")
 '''
     exe = directory / "atlas-kanban-call"
     exe.write_text(script, encoding="utf-8")
@@ -207,9 +262,15 @@ def test_snapshot_pass(client, helper_bin):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["state"] == "PASS"
-    assert body["evidence"]["marker"] == "evidence"
+    assert body["evidence"]["board"] == "evo-alpha"
+    assert body["evidence"]["cards"] == [{"id": "t_00000001"}]
     assert body["board"] == "evo-alpha"
     assert body["helper"]["tool"] == "kanban_snapshot"
+    # Validated PASS: observed_at and the verified execution host are
+    # forwarded from the receipt (never stamped by the bridge itself).
+    assert body["observed_at"] == 1789216932.8
+    assert body["helper"]["execution_host"] == "evo"
+    assert body["limitations"] == {"events": 0}
     # Board binding visible in the wrapper.
     assert body["request"]["board"] == "evo-alpha"
     # Timing surfaces are separate fields, present and non-negative.
@@ -219,11 +280,13 @@ def test_snapshot_pass(client, helper_bin):
     # Exactly ONE helper invocation for one snapshot request.
     assert len(_invocations(helper_bin.record_path)) == 1
     inv = _invocations(helper_bin.record_path)[0]
-    # Fixed tool name, stdin JSON payload with the validated args.
+    # Fixed tool name in argv; stdin carries ONLY the flat args object
+    # (the real helper rejects the nested {"tool":..., "args":...} envelope).
     assert inv["argv"][1:] == ["kanban_snapshot", "-"]
-    assert inv["stdin"]["tool"] == "kanban_snapshot"
-    assert inv["stdin"]["args"]["board"] == "evo-alpha"
-    assert inv["stdin"]["args"]["card_limit"] == 50
+    assert inv["stdin"]["board"] == "evo-alpha"
+    assert inv["stdin"]["card_limit"] == 50
+    assert "tool" not in inv["stdin"]
+    assert "args" not in inv["stdin"]
 
 
 def test_snapshot_pass_never_touches_local_db(client, helper_bin, evidence_home):
@@ -241,7 +304,7 @@ def test_snapshot_empty_cursor_omitted_from_helper_args(client, helper_bin):
     r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=10")
     assert r.status_code == 200
     inv = _invocations(helper_bin.record_path)[0]
-    assert "cursor" not in inv["stdin"]["args"]
+    assert "cursor" not in inv["stdin"]
 
 
 def test_snapshot_with_cursor_forwarded(client, helper_bin):
@@ -252,7 +315,7 @@ def test_snapshot_with_cursor_forwarded(client, helper_bin):
     )
     assert r.status_code == 200
     inv = _invocations(helper_bin.record_path)[0]
-    assert inv["stdin"]["args"]["cursor"] == "abc123"
+    assert inv["stdin"]["cursor"] == "abc123"
 
 
 def test_snapshot_default_card_limit(client, helper_bin):
@@ -260,7 +323,7 @@ def test_snapshot_default_card_limit(client, helper_bin):
     r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all")
     assert r.status_code == 200
     inv = _invocations(helper_bin.record_path)[0]
-    assert inv["stdin"]["args"]["card_limit"] == 100
+    assert inv["stdin"]["card_limit"] == 100
 
 
 def test_page_cards_pass(client, helper_bin):
@@ -272,8 +335,8 @@ def test_page_cards_pass(client, helper_bin):
     assert body["helper"]["tool"] == "kanban_page"
     inv = _invocations(helper_bin.record_path)[0]
     assert inv["argv"][1:] == ["kanban_page", "-"]
-    assert inv["stdin"]["args"]["resource"] == "cards"
-    assert "card" not in inv["stdin"]["args"]  # card omitted for cards resource
+    assert inv["stdin"]["resource"] == "cards"
+    assert "card" not in inv["stdin"]  # card omitted for cards resource
 
 
 def test_page_events_requires_card(client, helper_bin):
@@ -292,7 +355,7 @@ def test_page_card_forwarded(client, helper_bin):
     )
     assert r.status_code == 200
     inv = _invocations(helper_bin.record_path)[0]
-    assert inv["stdin"]["args"]["card"] == "t_deadbeef"
+    assert inv["stdin"]["card"] == "t_deadbeef"
 
 
 def test_worker_pass(client, helper_bin):
@@ -303,7 +366,7 @@ def test_worker_pass(client, helper_bin):
     assert body["helper"]["tool"] == "kanban_worker"
     inv = _invocations(helper_bin.record_path)[0]
     assert inv["argv"][1:] == ["kanban_worker", "-"]
-    assert inv["stdin"]["args"] == {"board": "evo-alpha", "card": "t_deadbeef"}
+    assert inv["stdin"] == {"board": "evo-alpha", "card": "t_deadbeef"}
 
 
 def test_card_pass_fixed_args(client, helper_bin):
@@ -314,7 +377,7 @@ def test_card_pass_fixed_args(client, helper_bin):
     assert body["helper"]["tool"] == "kanban_card"
     inv = _invocations(helper_bin.record_path)[0]
     # include_body / recent_items are FIXED — not request-selectable.
-    assert inv["stdin"]["args"] == {
+    assert inv["stdin"] == {
         "board": "evo-alpha",
         "card": "t_deadbeef",
         "include_body": False,
@@ -337,7 +400,15 @@ def test_fail_unknown_envelopes_forwarded(client, helper_bin, behavior):
     assert body["evidence"] is None
     assert body["reason"]
     # Helper's own reason preserved without raw logs.
-    assert body["reason"] == ("remote board denied read" if behavior == "fail" else "remote unreachable")
+    assert body["reason"].startswith(
+        "remote board denied read" if behavior == "fail" else "remote unreachable"
+    )
+    # FAIL receipts arrive with exit 1 (real helper behaviour): the reason
+    # survives, annotated with the exit code but not replaced by it.
+    if behavior == "fail":
+        assert "exited 1" in body["reason"]
+    # Helper identity is never stamped from an unverified receipt.
+    assert body["helper"]["execution_host"] == "unverified"
 
 
 def test_helper_exit_nonzero_with_pass_receipt_is_unknown(client, helper_bin):
@@ -349,6 +420,7 @@ def test_helper_exit_nonzero_with_pass_receipt_is_unknown(client, helper_bin):
     assert body["state"] == "UNKNOWN"
     assert body["evidence"] is None
     assert body["reason"]
+    assert "exited 3" in body["reason"]
 
 
 def test_wrong_execution_host_is_unknown(client, helper_bin):
@@ -358,6 +430,7 @@ def test_wrong_execution_host_is_unknown(client, helper_bin):
     body = r.json()
     assert body["state"] == "UNKNOWN"
     assert "execution_host" in body["reason"]
+    assert body["helper"]["execution_host"] == "unverified"
 
 
 def test_malformed_stdout_is_unknown(client, helper_bin):
@@ -445,7 +518,7 @@ def test_board_slug_normalized_not_locality_checked(client, helper_bin):
     )
     assert r.status_code == 200, r.text
     inv = _invocations(helper_bin.record_path)[0]
-    assert inv["stdin"]["args"]["board"] == "evo-alpha"
+    assert inv["stdin"]["board"] == "evo-alpha"
 
 
 def test_missing_board_rejected(client, helper_bin):
@@ -590,3 +663,183 @@ def test_evidence_routes_are_read_only(client, helper_bin):
             route, "path", ""
         ):
             assert route.methods is None or set(route.methods) <= {"GET", "HEAD"}
+
+
+# ---------------------------------------------------------------------------
+# Real-helper contract repairs (t_8bfaf14e): flat stdin, status=all on page,
+# PASS shape/scope validation, FAIL-reason preservation, envelope honesty.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_pass_never_sends_nested_tool_envelope(client, helper_bin):
+    """RED proof for the original bridge bug: the released helper rejects
+    the nested {"tool": ..., "args": ...} stdin envelope. The bridge must
+    send ONLY the flat args object; no key the real helper would reject."""
+    helper_bin("pass")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200, r.text
+    inv = _invocations(helper_bin.record_path)[0]
+    forbidden = {"tool", "args", "cmd", "name", "method"}
+    assert not (forbidden & set(inv["stdin"])), inv["stdin"]
+
+
+def test_page_accepts_status_all(client, helper_bin):
+    """GET /evidence/page with status=all must reach the helper (the MCP
+    accepts it) instead of 422ing FastAPI validation."""
+    helper_bin("pass")
+    r = _get(client, "/evidence/page?board=evo-alpha&resource=cards&status=all&limit=5")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "PASS"
+    inv = _invocations(helper_bin.record_path)[0]
+    assert inv["stdin"]["status"] == "all"
+
+
+def test_page_invalid_status_still_rejected(client, helper_bin):
+    helper_bin("pass")
+    r = _get(client, "/evidence/page?board=evo-alpha&resource=cards&status=bogus&limit=5")
+    assert r.status_code == 422
+    assert _invocations(helper_bin.record_path) == []
+
+
+def test_pass_missing_required_data_shape_is_unknown(client, helper_bin):
+    helper_bin("noshape")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "missing data fields" in body["reason"]
+
+
+def test_pass_wrong_board_scope_is_unknown(client, helper_bin):
+    helper_bin("wrongscope")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "does not match requested board" in body["reason"]
+
+
+def test_pass_wrong_card_scope_is_unknown(client, helper_bin):
+    helper_bin("wrongscope")
+    r = _get(client, "/evidence/card?board=evo-alpha&card=t_deadbeef")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "does not match requested card" in body["reason"]
+
+
+def test_nonzero_fail_preserves_helper_reason(client, helper_bin):
+    """The real helper exits 1 on ordinary FAILs (missing board, missing
+    card). The reason must survive so 'board absent' stays distinguishable
+    from 'helper unavailable'."""
+    helper_bin("fail")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "FAIL"
+    assert body["reason"].startswith("remote board denied read")
+    assert "exited 1" in body["reason"]
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_env_stripped_and_stderr_never_in_reason(client, helper_bin, monkeypatch):
+    helper_bin("fail")
+    monkeypatch.setenv("ATLAS_KANBAN_WRITE_BOARDS", "prod-board")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200
+    body = r.json()
+    inv = _invocations(helper_bin.record_path)[0]
+    assert inv["env_write_boards"] == ""
+    # No raw child stderr leaks into the response.
+    assert "helper exploded" not in json.dumps(body)
+
+
+def test_snapshot_envelope_preserves_freshness_fields(client, helper_bin):
+    helper_bin("pass")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "PASS"
+    assert isinstance(body["observed_at"], float)
+    assert body["limitations"] == {"events": 0}
+    # Completeness/interval fields stay inside evidence.
+    assert body["evidence"]["cards"] is not None
+    # Execution host is forwarded from a validated PASS receipt only.
+    assert body["helper"]["execution_host"] == "evo"
+    assert body["request"]["board"] == "evo-alpha"  # request echo
+
+
+def test_helper_stdout_bound_is_read_bound_not_write_cap(client, helper_bin):
+    """Over-cap stdout → UNKNOWN even though the child completed; the cap
+    is enforced on the read-back, documented as a read/parse bound."""
+    helper_bin("oversized")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "exceeded" in body["reason"]
+
+
+@pytest.mark.skipif(
+    not Path(
+        "/home/hayden/atlas/work/trajectory-20260912/ui-helper-candidate/.venv/bin/atlas-kanban-call"
+    ).exists(),
+    reason="real helper candidate not staged on this host",
+)
+class TestRealHelperCandidate:
+    """Controls against the actual released helper candidate (source
+    27ef127), real local EVO transport, read-only board
+    relay-vault-build-20260912. Skipped unless the candidate is staged."""
+
+    HELPER_DIR = "/home/hayden/atlas/work/trajectory-20260912/ui-helper-candidate/.venv/bin"
+
+    @pytest.fixture
+    def real_helper(self, evidence_home, monkeypatch):
+        monkeypatch.setenv(
+            "PATH", self.HELPER_DIR + os.pathsep + os.environ.get("PATH", "")
+        )
+        return self.HELPER_DIR
+
+    def test_real_card_positive_pass(self, client, real_helper):
+        r = _get(
+            client,
+            "/evidence/card?board=relay-vault-build-20260912&card=t_1b7a5c96",
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["state"] == "PASS", body
+        assert body["evidence"]["task"]["id"] == "t_1b7a5c96"
+        assert isinstance(body["observed_at"], float)
+        assert body["helper"]["execution_host"] == "evo"
+
+    def test_real_missing_board_fail_preserves_reason(self, client, real_helper):
+        r = _get(
+            client,
+            "/evidence/card?board=no-such-board-xyz&card=t_1b7a5c96",
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["state"] == "FAIL"
+        assert "Board database is absent" in body["reason"]
+        assert "exited 1" in body["reason"]
+
+    def test_real_missing_card_fail(self, client, real_helper):
+        r = _get(
+            client,
+            "/evidence/card?board=relay-vault-build-20260912&card=t_ffffffffffff",
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["state"] == "FAIL"
+        assert "Card does not exist" in body["reason"]
+
+    def test_real_page_status_all(self, client, real_helper):
+        r = _get(
+            client,
+            "/evidence/page?board=relay-vault-build-20260912&resource=cards&status=all&limit=2",
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["state"] == "PASS", body
+        assert isinstance(body["evidence"]["items"], list)

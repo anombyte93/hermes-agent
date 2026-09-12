@@ -3041,9 +3041,12 @@ async def stream_events(ws: WebSocket):
 #   * Hermes runs MCP 2.0.0; AtlasKanban is an MCP 1.x runtime. The helper
 #     is therefore NEVER imported into this process — it owns its isolated
 #     runtime and is invoked without a shell as
-#     ``[<absolute helper>, <fixed tool>, "-"]`` with a bounded JSON payload
-#     on stdin. Resolved once per invocation with ``shutil.which``; the
-#     request can never select the executable, argv or tool name.
+#     ``[<absolute helper>, <fixed tool>, "-"]`` with the flat JSON args
+#     object on stdin — the tool name arrives ONLY in argv; the released
+#     helper rejects the nested ``{"tool": ..., "args": ...}`` envelope
+#     (verified against candidate source 27ef127, 2026-09-12). Resolved
+#     once per invocation with ``shutil.which``; the request can never
+#     select the executable, argv or tool name.
 #   * The selected board belongs to EVO and NEED NOT EXIST in the local
 #     Hermes DB. Board params are validated with PURE slug validation
 #     (``kanban_db._normalize_board_slug``) — never ``_resolve_board``,
@@ -3079,8 +3082,12 @@ EVIDENCE_READ_TOOLS = frozenset(
 _EVIDENCE_CARD_RE = re.compile(r"^t_[0-9a-f]{8,32}$")
 
 # Subprocess budget: helper remote-side cap is 60s; local wall clock is
-# bounded above it. stdout is captured to disk with a 1 MiB cap; stderr with
-# a 16 KiB cap (never surfaced — only its size may appear).
+# bounded above it. Output bounds are READ/PARSE bounds, not disk-write
+# caps: while the child runs it may write unbounded temporary files, and
+# only after exit does the bridge read back at most _EVIDENCE_STDOUT_CAP
+# bytes of stdout (over-cap → UNKNOWN) and truncate its captured stderr
+# copy to _EVIDENCE_STDERR_CAP (content never surfaced). Both temporary
+# files are closed — and so unlinked — in ``finally``.
 EVIDENCE_HELPER_TIMEOUT_SECONDS = 75.0
 _EVIDENCE_STDOUT_CAP = 1 * 1024 * 1024
 _EVIDENCE_STDERR_CAP = 16 * 1024
@@ -3148,6 +3155,79 @@ def _evidence_env(child_record_path: Optional[Path] = None) -> dict[str, str]:
     return env
 
 
+# Minimal REQUIRED structure of a PASS receipt's ``data`` per tool — only
+# keys actually emitted by the released helper (observed against candidate
+# source 27ef127 on board relay-vault-build-20260912, 2026-09-12). A PASS
+# receipt with missing or malformed data is UNKNOWN, never a green light.
+_EVIDENCE_PASS_SHAPES: dict[str, tuple[str, ...]] = {
+    "kanban_snapshot": ("board", "cards", "counts", "observed_at", "status_filter"),
+    "kanban_page": ("items", "returned", "has_more"),
+    "kanban_worker": ("task_id", "observations"),
+    "kanban_card": ("task", "runs", "comments", "events"),
+}
+
+
+def _evidence_pass_shape_error(tool: str, data: Any) -> Optional[str]:
+    """Validate the required per-tool structure of PASS ``data``.
+
+    Returns None when the shape is acceptable, else a short reason. No
+    fields are required that the adapter does not emit.
+    """
+    if not isinstance(data, dict) or not data:
+        return f"PASS receipt for {tool} carried no data object"
+    missing = [k for k in _EVIDENCE_PASS_SHAPES.get(tool, ()) if k not in data]
+    if missing:
+        return (
+            f"PASS receipt for {tool} was missing data fields "
+            f"{sorted(missing)} required by the helper contract"
+        )
+    return None
+
+
+def _evidence_scope_error(
+    tool: str, receipt: dict[str, Any], args: dict[str, Any]
+) -> Optional[str]:
+    """Wherever a PASS receipt echoes the requested board/card scope, verify
+    it matches the request; a mismatched receipt is UNKNOWN.
+
+    Scope echoes observed in real receipts: ``kanban_snapshot`` →
+    ``data.board`` (and ``data.status_filter`` when present),
+    ``kanban_card`` → ``data.task.id``, ``kanban_worker`` →
+    ``data.task_id``. ``kanban_page`` emits no board/card echo (its data
+    carries evolving-view pagination keys only), so a page receipt's scope
+    is not independently verifiable and is not claimed to be.
+    """
+    data = receipt.get("data")
+    if not isinstance(data, dict):
+        return None  # shape validation reports this first
+    board = args.get("board")
+    if tool == "kanban_snapshot":
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not match "
+                f"requested board {board!r}"
+            )
+        status_filter = data.get("status_filter")
+        requested = str(args.get("status", "all"))
+        if status_filter is not None and str(status_filter) != requested:
+            return (
+                f"PASS receipt status_filter {status_filter!r} does not "
+                f"match requested status {requested!r}"
+            )
+    elif tool == "kanban_card":
+        task = data.get("task")
+        card = args.get("card")
+        if not isinstance(task, dict) or task.get("id") != card:
+            return f"PASS receipt card id does not match requested card {card!r}"
+    elif tool == "kanban_worker":
+        if data.get("task_id") != args.get("card"):
+            return (
+                f"PASS receipt task_id {data.get('task_id')!r} does not "
+                f"match requested card {args.get('card')!r}"
+            )
+    return None
+
+
 def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     """Invoke the released helper ONCE and normalise its receipt.
 
@@ -3174,9 +3254,11 @@ def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                    "EVO UI host; evidence reads stay UNKNOWN until then.",
         )
 
-    stdin_bytes = json.dumps(
-        {"tool": tool, "args": args}, separators=(",", ":")
-    ).encode("utf-8")
+    # Released helper contract: TOOL arrives in argv; stdin carries ONLY the
+    # flat JSON args object. The nested {"tool": ..., "args": ...} envelope
+    # this bridge used to send is rejected by the real helper (the original
+    # fake accepted it — that divergence is what this repair fixed).
+    stdin_bytes = json.dumps(args, separators=(",", ":")).encode("utf-8")
 
     out_tmp = tempfile.TemporaryFile()
     err_tmp = tempfile.TemporaryFile()
@@ -3212,6 +3294,12 @@ def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
 
         out_tmp.seek(0)
         raw_stdout = out_tmp.read(_EVIDENCE_STDOUT_CAP + 1)
+        # Honest bound-keeping: the stderr temp file may hold more than the
+        # cap while the child ran; truncate the retained copy now (content
+        # is never surfaced either way).
+        err_tmp.seek(0)
+        err_tmp.read(_EVIDENCE_STDERR_CAP)
+        err_tmp.truncate(_EVIDENCE_STDERR_CAP)
         if len(raw_stdout) > _EVIDENCE_STDOUT_CAP:
             return _evidence_envelope(
                 state="UNKNOWN",
@@ -3241,17 +3329,25 @@ def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
             )
         if proc.returncode != 0:
-            # A nonzero exit must never be read as success even when the
-            # receipt claims PASS; and a claimed FAIL/UNKNOWN from a process
-            # that itself errored loses its reason's authority — keep it
-            # short but preserve the claimed state's class.
-            claimed = state
+            # The released helper exits 1 on ORDINARY FAIL outcomes (a
+            # missing board, a missing card), so a nonzero exit is not an
+            # error class of its own: the receipt's claimed state keeps its
+            # authority AND its safe reason, so "board absent" stays
+            # distinguishable from "helper unavailable". Only a claimed
+            # PASS from a nonzero-exit process is untrustworthy (→ UNKNOWN).
+            if state == "PASS":
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}helper exited {proc.returncode} while claiming PASS",
+                    remedy="Retry; if it persists, inspect the helper installation "
+                           "on the EVO host (its stderr is not surfaced here).",
+                    evidence=None,
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            reason = str(receipt.get("reason") or f"helper reported {state}")
             return _evidence_envelope(
-                state="UNKNOWN" if claimed == "PASS" else claimed,
-                reason=f"{_EAND}helper exited {proc.returncode} while claiming {claimed}",
-                remedy="Retry; if it persists, inspect the helper installation "
-                       "on the EVO host (its stderr is not surfaced here).",
-                evidence=None,
+                state=state,
+                reason=f"{reason} (helper exited {proc.returncode})",
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
             )
         if state == "PASS":
@@ -3263,12 +3359,53 @@ def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                            f"{_EVIDENCE_EXECUTION_HOST!r}",
                     timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
                 )
-            return _evidence_envelope(
+            observed_at = receipt.get("observed_at")
+            if (
+                not isinstance(observed_at, (int, float))
+                or isinstance(observed_at, bool)
+            ):
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}PASS receipt is missing a numeric observed_at",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            data = receipt.get("data")
+            shape_error = _evidence_pass_shape_error(tool, data)
+            if shape_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}{shape_error}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            scope_error = _evidence_scope_error(tool, receipt, args)
+            if scope_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_EAND}{scope_error}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            # Freshness/limitation fields the receipt itself carries are
+            # preserved verbatim: observed_at (when the host saw it), the
+            # card tool's top-level ``bounded`` block, or the page/snapshot
+            # ``data.omitted`` rollup. Completeness interval fields
+            # (has_more / next_cursor / incomplete) stay inside ``evidence``.
+            limitations = receipt.get("bounded")
+            if limitations is None and isinstance(data, dict):
+                limitations = data.get("omitted")
+            envelope = _evidence_envelope(
                 state="PASS",
-                evidence=receipt.get("data"),
-                reason=receipt.get("reason"),
+                evidence=data,
+                reason=(str(receipt["reason"]) if receipt.get("reason") else None),
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                observed_at=observed_at,
+                limitations=limitations,
             )
+            # Internal marker: this receipt's execution_host was validated
+            # equal to the expected host. _evidence_respond reports it as
+            # the helper identity instead of stamping an unverified
+            # constant; every other envelope reports "unverified".
+            envelope["_verified_execution_host"] = host
+            return envelope
         # FAIL / UNKNOWN receipts pass through with their reason.
         return _evidence_envelope(
             state=state,
@@ -3290,12 +3427,18 @@ def _evidence_envelope(
     reason: Optional[str] = None,
     remedy: Optional[str] = None,
     timing: Optional[dict[str, float]] = None,
+    observed_at: Optional[float] = None,
+    limitations: Optional[Any] = None,
 ) -> dict[str, Any]:
     envelope: dict[str, Any] = {"state": state, "evidence": evidence}
     if reason:
         envelope["reason"] = reason
     if remedy:
         envelope["remedy"] = remedy
+    if observed_at is not None:
+        envelope["observed_at"] = observed_at
+    if limitations is not None:
+        envelope["limitations"] = limitations
     envelope["timing"] = timing or {"helper_roundtrip_ms": None, "collection_ms": None}
     return envelope
 
@@ -3313,7 +3456,16 @@ def _evidence_respond(
     collection_started = time.monotonic()
     wrapper = dict(envelope)
     wrapper["board"] = board
-    wrapper["helper"] = {"tool": tool, "execution_host": _EVIDENCE_EXECUTION_HOST}
+    # The bridge never stamps the execution host as its own observation:
+    # it is the receipt's claim, forwarded only when a PASS receipt's host
+    # was validated against the expected host; every other response says
+    # "unverified" (an unknown helper host stays UNKNOWN — never presented
+    # as an observed EVO fact).
+    verified_host = wrapper.pop("_verified_execution_host", None)
+    wrapper["helper"] = {
+        "tool": tool,
+        "execution_host": verified_host or "unverified",
+    }
     wrapper["request"] = request_echo
     timing = wrapper.get("timing") or {}
     timing.setdefault("helper_roundtrip_ms", None)
@@ -3387,8 +3539,8 @@ async def evidence_page(
         raise HTTPException(status_code=422, detail=f"card is required for resource={resource}")
     if card:
         card = _evidence_card_id(card)
-    if status is not None and status not in kanban_db.VALID_STATUSES:
-        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(kanban_db.VALID_STATUSES)}")
+    if status is not None and status != "all" and status not in kanban_db.VALID_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be 'all' or one of {sorted(kanban_db.VALID_STATUSES)}")
     cursor = _evidence_cursor(cursor)
     args: dict[str, Any] = {"board": board, "resource": resource}
     if card is not None:
