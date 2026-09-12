@@ -24,19 +24,18 @@ import {
   Tip,
   useMutation,
   useQuery,
-  useQueryClient,
-  useValue
+  useQueryClient
 } from '@hermes/plugin-sdk'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import {
-  $boardSlug,
   addComment,
   deleteTask,
   estimateTask,
   fetchLog,
   fetchProfiles,
   fetchTask,
+  fetchTaskWithoutHistory,
   logKey,
   patchTask,
   PROFILES_KEY,
@@ -45,8 +44,9 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { DrawerEvidence, useResolvedBoardSlug } from './drawer-evidence'
+import { useEvidenceContext, WorkerEvidenceSection } from './evidence'
 import { ModelOverrideField, overridePatch } from './model-override'
-import { WorkerEvidenceSection } from './evidence'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -551,12 +551,19 @@ export function TaskDrawer({
 }) {
   const k = useKanban()
   const qc = useQueryClient()
-  const slug = useValue($boardSlug)
+  const slug = useResolvedBoardSlug()
+
+  // Identity alignment: only the EVO-aligned board pages its history through
+  // /evidence/* and downloads through the authenticated JSON door. The detail
+  // query waits for that check so an aligned drawer never materialises legacy
+  // history (and an unaligned one keeps the full-history contract).
+  const contextQuery = useEvidenceContext(slug)
+  const aligned = contextQuery.data?.aligned === true
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
-    enabled: !!id,
-    queryFn: () => fetchTask(id!),
+    enabled: !!id && !contextQuery.isLoading,
+    queryFn: () => (aligned ? fetchTaskWithoutHistory(slug, id!) : fetchTask(id!)),
     queryKey: taskKey(slug, id ?? ''),
     refetchInterval: 30_000
   })
@@ -820,6 +827,17 @@ export function TaskDrawer({
                 the selected board is identity-aligned with the EVO database. */}
             <WorkerEvidenceSection id={task.id} />
 
+            {/* Aligned history: paged runs/events/attachments + authenticated
+                download. The legacy sections below render only when unaligned. */}
+            {aligned && (
+              <DrawerEvidence
+                id={task.id}
+                onUpload={file => uploadMut.mutate(file)}
+                slug={slug}
+                uploadPending={uploadMut.isPending}
+              />
+            )}
+
             {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
               <Section label={k.dependencies}>
                 {(['parents', 'children'] as const).map(side =>
@@ -875,7 +893,7 @@ export function TaskDrawer({
               />
             </Section>
 
-            {detail.events.length > 0 && (
+            {!aligned && detail.events.length > 0 && (
               <Section label={k.activity(detail.events.length)}>
                 <ScrollFade deps={detail.events.length} max="7rem">
                   <ul className="flex flex-col gap-1">
@@ -902,7 +920,7 @@ export function TaskDrawer({
               </Section>
             )}
 
-            {detail.runs.length > 0 && (
+            {!aligned && detail.runs.length > 0 && (
               <Section label={k.runs(detail.runs.length)}>
                 <ScrollFade max="11rem">
                   <ul className="flex flex-col gap-1.5">
@@ -951,11 +969,13 @@ export function TaskDrawer({
               </Section>
             )}
 
-            <AttachmentsSection
-              attachments={detail.attachments}
-              onUpload={file => uploadMut.mutate(file)}
-              pending={uploadMut.isPending}
-            />
+            {!aligned && (
+              <AttachmentsSection
+                attachments={detail.attachments}
+                onUpload={file => uploadMut.mutate(file)}
+                pending={uploadMut.isPending}
+              />
+            )}
           </div>
         )}
       </div>
