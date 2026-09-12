@@ -196,6 +196,16 @@ export const fetchBoard = (archived: boolean) =>
 
 export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
 
+/** Resolve detail without materialising legacy history; pages supply that history. */
+export const fetchTaskWithoutHistory = (slug: string, id: string) =>
+  call<KanbanTaskDetail>(withBoardSlug(`/tasks/${id}`, slug, { include_history: 'false' }))
+
+/** JSON uses the existing authenticated desktop REST transport, including SSH. */
+export const fetchAttachmentDownload = (slug: string, id: number | string) =>
+  call<{ id: number; filename: string; content_type: string; size: number; content_base64: string }>(
+    withBoardSlug(`/attachments/${id}`, slug, { format: 'json' })
+  )
+
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
 export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
 
