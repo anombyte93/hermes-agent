@@ -79,7 +79,7 @@ import {
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
-import { EvidenceStateBadge, useBoardEvidence, viewsToBoardColumns, type BoardEvidence, type WorkerState } from './evidence'
+import { type BoardEvidence, EvidenceStateBadge, useBoardEvidence, viewsToBoardColumns, type WorkerState } from './evidence'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { COLUMN_META, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'

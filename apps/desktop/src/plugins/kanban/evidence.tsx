@@ -15,9 +15,8 @@
  * under a new board's query key.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react'
-
 import { Codicon, useQuery, useValue } from '@hermes/plugin-sdk'
+import { useCallback, useMemo, useRef, useState } from 'react'
 
 import {
   $boardSlug,
@@ -262,6 +261,7 @@ export function useBoardEvidence(): BoardEvidence {
     cursor: null,
     hasMore: false
   })
+
   const [loadingMore, setLoadingMore] = useState(false)
   const [loadMoreError, setLoadMoreError] = useState<null | string>(null)
   const loadingRef = useRef(false)
