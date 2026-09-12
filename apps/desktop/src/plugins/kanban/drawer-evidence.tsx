@@ -18,7 +18,7 @@
  * No direct renderer fetch, no token in a URL, no new binary IPC.
  */
 
-import { Button, Codicon, useQuery, useValue } from '@hermes/plugin-sdk'
+import { Button, Codicon, useQuery, useQueryClient, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useRef, useState } from 'react'
 
 import {
@@ -80,19 +80,46 @@ export function triggerDownload(blob: Blob, filename: string): void {
 }
 
 /** One bounded page per resource: accumulated rows, an explicit cursor, and a
- *  hard reset whenever the board or card identity changes. */
+ *  hard reset whenever the board or card identity changes. Page 1 (cursor
+ *  null) REPLACES the accumulated rows; later pages append (deduped by id) —
+ *  that is what makes a refresh show changed rows rather than retaining a
+ *  pre-refresh row under the same id, and what discards previously loaded
+ *  later pages when the paging resets. A genuine refresh (an invalidate over
+ *  this resource's page key) resets the cursor back to page 1. */
 function usePagedResource(slug: string, card: string, resource: EvidenceResource) {
+  const qc = useQueryClient()
   const [cursor, setCursor] = useState<null | string>(null)
   const [rows, setRows] = useState<Array<Record<string, unknown>>>([])
   const [exhausted, setExhausted] = useState(false)
 
-  // Identity change (board switch / card switch / genuine refresh) resets the
-  // accumulated pages so a stale page can never append under a new identity.
+  // Identity change (board switch / card switch) resets the accumulated pages
+  // so a stale page can never append under a new identity.
   useEffect(() => {
     setCursor(null)
     setRows([])
     setExhausted(false)
   }, [slug, card, resource])
+
+  // A genuine refresh (invalidateQueries over this resource's page key) resets
+  // the cursor to page 1, so the next fetch replaces the accumulated rows and
+  // any previously loaded later pages are discarded rather than re-appended.
+  useEffect(() => {
+    const base = ['kanban', 'evidence', 'page', slug, resource, card] as const
+
+    return qc.getQueryCache().subscribe(event => {
+      if (event.type !== 'updated' || event.action.type !== 'invalidate') {
+        return
+      }
+
+      const key = event.query.queryKey
+
+      if (!Array.isArray(key) || key.length < base.length || base.some((segment, index) => key[index] !== segment)) {
+        return
+      }
+
+      setCursor(null)
+    })
+  }, [qc, slug, card, resource])
 
   const query = useQuery({
     queryKey: evidencePageKey(slug, resource, card, cursor),
@@ -104,20 +131,24 @@ function usePagedResource(slug: string, card: string, resource: EvidenceResource
   const envelope = query.data as EvidenceEnvelope<EvidencePageData> | undefined
   const pageData = envelope?.state === 'PASS' ? (envelope.evidence ?? null) : null
 
-  // Append the current page's rows once (deduped by id) and record exhaustion.
+  // Page 1 (cursor null) replaces; a later page appends (deduped by id).
   useEffect(() => {
     if (!pageData || !Array.isArray(pageData.items)) {
       return
     }
 
     setRows(prev => {
+      if (cursor === null) {
+        return pageData.items
+      }
+
       const seen = new Set(prev.map(row => String(row.id)))
       const fresh = pageData.items.filter(row => !seen.has(String(row.id)))
 
       return fresh.length ? [...prev, ...fresh] : prev
     })
     setExhausted(!pageData.has_more)
-  }, [pageData])
+  }, [pageData, cursor])
 
   const hasMore = pageData ? pageData.has_more && !!pageData.next_cursor : false
 
@@ -242,6 +273,17 @@ function EvidenceSection({ card, resource, slug }: { card: string; resource: Evi
     )
   }
 
+  if (!query.data) {
+    return (
+      <Section label={label}>
+        <div className="flex items-center gap-2 text-[0.71rem] text-(--ui-text-quaternary)">
+          <Codicon name="loading" size="0.75rem" spinning />
+          Loading {name}…
+        </div>
+      </Section>
+    )
+  }
+
   if (rows.length === 0) {
     return (
       <Section label={label}>
@@ -337,6 +379,11 @@ function EvidenceAttachmentsSection({
             {query.data.reason ?? 'Evidence for attachments is unavailable for this card.'}
           </p>
         </Callout>
+      ) : !query.data ? (
+        <div className="flex items-center gap-2 text-[0.71rem] text-(--ui-text-quaternary)">
+          <Codicon name="loading" size="0.75rem" spinning />
+          Loading attachments…
+        </div>
       ) : rows.length === 0 ? (
         <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noAttachments}</p>
       ) : (

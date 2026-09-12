@@ -555,14 +555,17 @@ export function TaskDrawer({
 
   // Identity alignment: only the EVO-aligned board pages its history through
   // /evidence/* and downloads through the authenticated JSON door. The detail
-  // query waits for that check so an aligned drawer never materialises legacy
-  // history (and an unaligned one keeps the full-history contract).
+  // query waits for the alignment check to RESOLVE, and only a POSITIVE
+  // `aligned:false` may issue the legacy full-history fetch. A failed or still
+  // unresolved identity check withholds detail entirely (including any cached
+  // copy) rather than silently materialising legacy history or hanging.
   const contextQuery = useEvidenceContext(slug)
-  const aligned = contextQuery.data?.aligned === true
+  const context = contextQuery.data
+  const aligned = context?.aligned === true
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
-    enabled: !!id && !contextQuery.isLoading,
+    enabled: !!id && contextQuery.isSuccess,
     queryFn: () => (aligned ? fetchTaskWithoutHistory(slug, id!) : fetchTask(id!)),
     queryKey: taskKey(slug, id ?? ''),
     refetchInterval: 30_000
@@ -756,7 +759,16 @@ export function TaskDrawer({
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
-        {errorMessage ? (
+        {contextQuery.isError ? (
+          <ErrorState
+            description="The board identity check failed, so task history is withheld. Select the EVO connection and retry."
+            title="Could not verify this board"
+          />
+        ) : contextQuery.isLoading ? (
+          <div className="grid h-32 place-items-center">
+            <Loader type="lemniscate-bloom" />
+          </div>
+        ) : errorMessage ? (
           <ErrorState title={errorMessage} />
         ) : !detail || !task ? (
           <div className="grid h-32 place-items-center">

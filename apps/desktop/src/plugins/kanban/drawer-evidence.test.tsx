@@ -13,7 +13,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $boardSlug } from './api'
+import { $boardSlug, evidenceContextKey } from './api'
 import { TaskDrawer } from './drawer'
 
 // ── electron bridge (reuse model-override.test.tsx setup) ────────────────────
@@ -327,5 +327,109 @@ describe('TaskDrawer — late response after card switch', () => {
 
     await waitFor(() => expect(apiMock.fetchEvidencePage).toHaveBeenCalled())
     expect(screen.queryByText('A run')).toBeNull()
+  })
+})
+
+
+describe('parent acceptance controls', () => {
+  it('does not use legacy detail when identity lookup fails', async () => {
+    apiMock.fetchEvidenceContext.mockRejectedValue(new Error('identity unavailable'))
+    const { client } = renderDrawer()
+    await waitFor(() => expect(client.getQueryCache().getAll().some(q => q.state.status === 'error')).toBe(true))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(apiMock.fetchTask).not.toHaveBeenCalled()
+    expect(apiMock.fetchTaskWithoutHistory).not.toHaveBeenCalled()
+  })
+
+  it('does not call pending history an empty history', async () => {
+    const pending = deferred<ReturnType<typeof page>>()
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) => resource === 'runs' ? pending.promise : Promise.resolve(emptyPage()))
+    renderDrawer()
+    await waitFor(() => expect(apiMock.fetchEvidencePage).toHaveBeenCalled())
+    expect(screen.queryByText('No runs.')).toBeNull()
+    expect(screen.getByText(/loading runs/i)).toBeTruthy()
+  })
+
+  it('replaces changed first-page evidence on refresh instead of retaining old rows', async () => {
+    let refreshed = false
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) => Promise.resolve(resource === 'runs' ? page([run(1, refreshed ? 'corrected run summary' : 'old run summary')], false, null) : emptyPage()))
+    const { client } = renderDrawer()
+    expect(await screen.findByText('old run summary')).toBeTruthy()
+    refreshed = true
+    await client.invalidateQueries({ queryKey: ['kanban', 'evidence'] })
+    expect(await screen.findByText('corrected run summary')).toBeTruthy()
+    expect(screen.queryByText('old run summary')).toBeNull()
+  })
+})
+
+// ── evo repair controls: cached-detail transition + later-page refresh ────────
+describe('TaskDrawer — evo repair controls', () => {
+  it('withholds cached legacy detail when the identity check later fails', async () => {
+    // Start positively unaligned so the legacy full-history detail (with runs)
+    // is fetched and cached by the drawer.
+    apiMock.fetchEvidenceContext.mockResolvedValue({ ...alignedContext, aligned: false })
+    apiMock.fetchTask.mockImplementation((id: string) =>
+      Promise.resolve({
+        ...detailFor(id, 'Legacy'),
+        runs: [
+          {
+            id: 1,
+            task_id: id,
+            profile: 'evo',
+            status: 'completed',
+            outcome: 'completed',
+            summary: 'legacy run summary',
+            error: null,
+            started_at: 100,
+            ended_at: 200
+          }
+        ]
+      })
+    )
+
+    const { client } = renderDrawer()
+    expect(await screen.findByText('legacy run summary')).toBeTruthy()
+
+    // The identity check now fails on a refetch; the cached legacy detail must
+    // be visibly withheld rather than retained or re-fetched.
+    apiMock.fetchEvidenceContext.mockRejectedValue(new Error('identity unavailable'))
+    await client.invalidateQueries({ queryKey: evidenceContextKey('evo') })
+
+    expect(await screen.findByText('Could not verify this board')).toBeTruthy()
+    expect(screen.queryByText('legacy run summary')).toBeNull()
+  })
+
+  it('resets accumulated pages and replaces changed rows on a later-page refresh', async () => {
+    let page1Summary = 'first run summary'
+
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource, _card, cursor) => {
+      if (resource !== 'runs') {
+        return Promise.resolve(emptyPage())
+      }
+
+      if (!cursor) {
+        return Promise.resolve(page([run(1, page1Summary), run(2, 'second run summary')], true, 'runs:2'))
+      }
+
+      return Promise.resolve(page([run(3, 'stale third run')], false, null))
+    })
+
+    const { client } = renderDrawer()
+    expect(await screen.findByText('first run summary')).toBeTruthy()
+    expect(screen.getByText('second run summary')).toBeTruthy()
+
+    // Load page 2 (a third accumulated row).
+    fireEvent.click(screen.getByRole('button', { name: 'Load more runs' }))
+    expect(await screen.findByText('stale third run')).toBeTruthy()
+
+    // Refresh: page 1 changed; the accumulated page 2 must be discarded and the
+    // changed page 1 replaced.
+    page1Summary = 'corrected first run'
+    await client.invalidateQueries({ queryKey: ['kanban', 'evidence'] })
+
+    expect(await screen.findByText('corrected first run')).toBeTruthy()
+    expect(screen.getByText('second run summary')).toBeTruthy()
+    expect(screen.queryByText('first run summary')).toBeNull()
+    expect(screen.queryByText('stale third run')).toBeNull()
   })
 })
