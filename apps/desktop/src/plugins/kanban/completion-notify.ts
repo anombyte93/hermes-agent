@@ -21,7 +21,7 @@
  *    door that covers "walked away and the worker hit a blocker".
  *
  * Cursor contract: first observation of a board baselines
- * seen[board] from a bounded /evidence/changes read (baseline-now returns the
+ * seen[board] from a bounded /events/baseline read (baseline-now returns the
  * current high-water event id, never a full /board poll). Events id <= seen
  * are historical/replay — never notified, no cursor change. id > seen advances
  * cursor for EVERY kind; only terminal kinds emit. Reconnect replays from 0;
@@ -108,7 +108,7 @@ export function bindCompletionNotify(r: Rest, pluginTranslate?: PluginTranslate,
 }
 
 /** Baseline from a bounded changes read, never a full /board poll. The first
- *  /evidence/changes call is "baseline-now": it returns the current high-water
+ *  /events/baseline call is "baseline-now": it returns the current high-water
  *  event id (evidence.baseline_id) without replaying history, and is capped by
  *  the server's own page bound. */
 async function ensureBaseline(slug: string): Promise<void> {
@@ -120,7 +120,7 @@ async function ensureBaseline(slug: string): Promise<void> {
 
   try {
     const changes = (await rest!<{ state?: unknown; board?: unknown; evidence?: { baseline_id?: unknown } }>(
-      `/evidence/changes?board=${encodeURIComponent(slug)}&limit=1`
+      `/events/baseline?board=${encodeURIComponent(slug)}`
     )) as { state?: unknown; board?: unknown; evidence?: { baseline_id?: unknown } }
 
     const baselineId = changes?.evidence?.baseline_id

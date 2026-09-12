@@ -52,12 +52,12 @@ type NotifyInput = {
 const lastNotify = (): NotifyInput =>
   hostMock.notify.mock.calls[hostMock.notify.mock.calls.length - 1][0] as NotifyInput
 
-/** Rest stub: GET /evidence/changes resolves to a bounded changes baseline
+/** Rest stub: GET /events/baseline resolves to a bounded changes baseline
  *  carrying the current high-water event id (baseline-now), wrapped in the
  *  standard PASS envelope with the exact board. */
 function makeRest(latest: () => number) {
   return vi.fn(async (path: string) => {
-    if (path.startsWith('/evidence/changes')) {
+    if (path.startsWith('/events/baseline')) {
       const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
 
       return { state: 'PASS', board: slug, evidence: { baseline_id: latest() } }
@@ -90,7 +90,7 @@ beforeEach(() => {
 })
 
 describe('authoritative baseline', () => {
-  it('baselines from a bounded /evidence/changes read and suppresses replay history', async () => {
+  it('baselines from a bounded /events/baseline read and suppresses replay history', async () => {
     const rest = makeRest(() => 100)
     const m = await loadModule()
     m.bindCompletionNotify(rest as never)
@@ -100,7 +100,7 @@ describe('authoritative baseline', () => {
 
     expect(fired).toBe(false)
     expect(hostMock.notify).not.toHaveBeenCalled()
-    expect(rest).toHaveBeenCalledWith('/evidence/changes?board=smoke&limit=1')
+    expect(rest).toHaveBeenCalledWith('/events/baseline?board=smoke')
   })
 
   it('post-baseline completion notifies exactly once', async () => {
@@ -153,7 +153,7 @@ describe('authoritative baseline', () => {
     let resolveChanges!: (value: { state: string; board: string; evidence: { baseline_id: number } }) => void
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         return new Promise<{ state: string; board: string; evidence: { baseline_id: number } }>(resolve => {
           resolveChanges = resolve
         })
@@ -194,7 +194,7 @@ describe('authoritative baseline', () => {
     let failChanges = true
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         if (failChanges) {
           throw new Error('changes unavailable')
         }
@@ -236,7 +236,7 @@ describe('baseline validation (HTTP 200 states)', () => {
     const m = await loadModule()
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         if (mode === 'PASS') {
           return { state: 'PASS', board: 'smoke', evidence: { baseline_id: 100 } }
         }
@@ -283,7 +283,7 @@ describe('baseline validation (HTTP 200 states)', () => {
     const m = await loadModule()
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         if (index >= malformed.length) {
           return { state: 'PASS', board: 'smoke', evidence: { baseline_id: 100 } }
         }
@@ -316,7 +316,7 @@ describe('baseline validation (HTTP 200 states)', () => {
     const m = await loadModule()
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         return { state: 'PASS', board: 'other-board', evidence: { baseline_id: 100 } }
       }
 
@@ -376,7 +376,7 @@ describe('board isolation', () => {
     ])
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
 
         return { state: 'PASS', board: slug, evidence: { baseline_id: latest.get(slug) ?? 0 } }
@@ -403,7 +403,7 @@ describe('board isolation', () => {
     ])
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/evidence/changes')) {
+      if (path.startsWith('/events/baseline')) {
         const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
 
         return { state: 'PASS', board: slug, evidence: { baseline_id: latest.get(slug) ?? 0 } }
@@ -427,7 +427,7 @@ describe('board isolation', () => {
     const fired = await m.onKanbanEventsFrame('a', [ev(100, 'completed'), ev(150, 'completed')])
     expect(fired).toBe(false)
     expect(hostMock.notify).toHaveBeenCalledTimes(2)
-    const boardCalls = rest.mock.calls.filter(call => String(call[0]).startsWith('/evidence/changes?board=a'))
+    const boardCalls = rest.mock.calls.filter(call => String(call[0]).startsWith('/events/baseline?board=a'))
     expect(boardCalls).toHaveLength(1)
   })
 })
