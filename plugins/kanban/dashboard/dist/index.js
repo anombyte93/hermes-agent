@@ -626,10 +626,10 @@
     }, [board, applySnapshot]);
 
     // Poll the snapshot only when aligned. One snapshot per refresh, never a
-    // local /board plus snapshot.
+    // local /board plus snapshot. The initial load is performed by loadBoard
+    // (the single owning data path); this effect only schedules the interval.
     useEffect(function () {
       if (!aligned) return undefined;
-      refresh();
       pollRef.current = setInterval(refresh, EVIDENCE_POLL_MS);
       return function () {
         if (pollRef.current) clearInterval(pollRef.current);
@@ -1245,6 +1245,32 @@
     const [showBoardSettings, setShowBoardSettings] = useState(false);
 
     const [kanbanBoard, setKanbanBoard] = useState(null);  // the grid data
+
+    // Read-only shared-evidence layer (K3/K4/K9/K10): identity alignment,
+    // bounded snapshot + counts + load more, per-card worker map, freshness.
+    // Gated on /evidence/context alignment, generation-guarded per board.
+    const evidence = useKanbanEvidence(board);
+    const evidenceAligned = evidence.aligned;
+    // When the board is identity-aligned with the EVO database the snapshot
+    // is the single source of truth: the grid is derived from the bounded
+    // snapshot cards, and the local /board grid data is not read. When not
+    // aligned, the original local /board grid is unchanged.
+    const snapshotBoard = useMemo(function () {
+      if (!evidenceAligned) return null;
+      const byStatus = {};
+      (evidence.cards || []).forEach(function (c) {
+        const s = c.status || "todo";
+        (byStatus[s] = byStatus[s] || []).push(c);
+      });
+      return {
+        columns: COLUMN_ORDER.map(function (name) {
+          return { name: name, tasks: byStatus[name] || [] };
+        }),
+        latest_event_id: 0,
+        assignees: [],
+      };
+    }, [evidenceAligned, evidence.cards]);
+
     // Alias so the rest of the function can keep using `board` semantically
     // for the grid data (card columns + tenants + assignees) without
     // colliding with the selected-board slug above. History: the old
@@ -1283,31 +1309,6 @@
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
 
-    // Read-only shared-evidence layer (K3/K4/K9/K10): identity alignment,
-    // bounded snapshot + counts + load more, per-card worker map, freshness.
-    // Gated on /evidence/context alignment, generation-guarded per board.
-    const evidence = useKanbanEvidence(board);
-    const evidenceAligned = evidence.aligned;
-    // When the board is identity-aligned with the EVO database the snapshot
-    // is the single source of truth: the grid is derived from the bounded
-    // snapshot cards, and the local /board grid data is not read. When not
-    // aligned, the original local /board grid is unchanged.
-    const snapshotBoard = useMemo(function () {
-      if (!evidenceAligned) return null;
-      const byStatus = {};
-      (evidence.cards || []).forEach(function (c) {
-        const s = c.status || "todo";
-        (byStatus[s] = byStatus[s] || []).push(c);
-      });
-      return {
-        columns: COLUMN_ORDER.map(function (name) {
-          return { name: name, tasks: byStatus[name] || [] };
-        }),
-        latest_event_id: 0,
-        assignees: [],
-      };
-    }, [evidenceAligned, evidence.cards]);
-
     // --- load config once ---------------------------------------------------
     useEffect(function () {
       SDK.fetchJSON(withBoard(`${API}/config`, board))
@@ -1332,6 +1333,12 @@
         // the local /board. Board actions call this same callback.
         return evidence.refresh().finally(function () { setLoading(false); });
       }
+      if (!evidence.context && !evidence.ctxErr) {
+        // Alignment still unresolved: hold off fetching the local /board so an
+        // aligned EVO board never performs a /board read that would be
+        // discarded the moment /evidence/context resolves.
+        return Promise.resolve();
+      }
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
@@ -1346,7 +1353,7 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board, evidenceAligned, evidence.refresh]);
+    }, [tenantFilter, includeArchived, board, evidenceAligned, evidence.context, evidence.ctxErr, evidence.refresh]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
