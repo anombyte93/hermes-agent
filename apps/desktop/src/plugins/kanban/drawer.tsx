@@ -46,6 +46,7 @@ import {
   uploadAttachment
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { WorkerEvidenceSection } from './evidence'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -813,6 +814,11 @@ export function TaskDrawer({
                 <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.latest_summary}</p>
               </Section>
             )}
+
+            {/* Actual worker observation from the read-only EVO bridge, kept
+                distinct from the parent result text above. Renders only when
+                the selected board is identity-aligned with the EVO database. */}
+            <WorkerEvidenceSection id={task.id} />
 
             {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
               <Section label={k.dependencies}>

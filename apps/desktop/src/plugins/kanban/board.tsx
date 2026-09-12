@@ -79,9 +79,10 @@ import {
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
+import { type BoardEvidence, EvidenceStateBadge, useBoardEvidence, viewsToBoardColumns, type WorkerState } from './evidence'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
-import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import { COLUMN_META, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
   ago,
@@ -133,6 +134,37 @@ function removeCard(board: KanbanBoard, id: string): KanbanBoard {
   return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(t => t.id !== id) })) }
 }
 
+// ── aligned snapshot → board ─────────────────────────────────────────────────
+
+/** Canonical column order for the snapshot grid (backend BOARD_COLUMNS plus the
+ *  archived lane). Unknown backend statuses sort to the end. */
+const SNAPSHOT_COLUMN_ORDER = Object.keys(COLUMN_META) as readonly string[]
+
+/** Build the board the grid renders from a resolved aligned snapshot. Columns
+ *  come from the loaded cards; counted statuses with no loaded card (their
+ *  cards sit on a later page) still render as an empty lane so the structure
+ *  stays complete. The snapshot is display-only, so tenants/assignees lists are
+ *  empty: the aligned grid has no per-column filter roster of its own. */
+function snapshotBoard(evidence: Extract<BoardEvidence, { phase: 'aligned' }>): KanbanBoard {
+  const columns = viewsToBoardColumns(evidence.cards, SNAPSHOT_COLUMN_ORDER)
+  const present = new Set(columns.map(col => col.name))
+
+  for (const name of SNAPSHOT_COLUMN_ORDER) {
+    if (!present.has(name) && Object.prototype.hasOwnProperty.call(evidence.byStatus, name)) {
+      columns.push({ name, tasks: [] })
+    }
+  }
+
+  columns.sort((a, b) => {
+    const ia = SNAPSHOT_COLUMN_ORDER.indexOf(a.name)
+    const ib = SNAPSHOT_COLUMN_ORDER.indexOf(b.name)
+
+    return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib) || a.name.localeCompare(b.name)
+  })
+
+  return { columns, tenants: [], assignees: [], latest_event_id: 0, now: 0 }
+}
+
 // ── card ─────────────────────────────────────────────────────────────────────
 
 function Meta({ children, icon }: { children: ReactNode; icon: string }) {
@@ -144,7 +176,7 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
-function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+function CardFooter({ arc, task, workerState }: { arc: ArcState | null; task: KanbanTask; workerState?: null | WorkerState }) {
   const k = useKanban()
   const created = ago(task.created_at)
   const links = task.link_counts ? task.link_counts.parents + task.link_counts.children : 0
@@ -163,6 +195,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
 
   return (
     <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+      {workerState && <EvidenceStateBadge state={workerState} />}
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -244,7 +277,8 @@ function Card({
   onOpen,
   onToggleSelect,
   selected,
-  task
+  task,
+  workerState
 }: {
   columns: string[]
   onDelete: (id: string) => void
@@ -253,6 +287,7 @@ function Card({
   onToggleSelect: (id: string) => void
   selected: boolean
   task: KanbanTask
+  workerState?: null | WorkerState
 }) {
   const k = useKanban()
   const [dragging, setDragging] = useState(false)
@@ -300,7 +335,7 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          <CardFooter arc={arc} task={task} />
+          <CardFooter arc={arc} task={task} workerState={workerState} />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -344,7 +379,8 @@ function Column({
   onOpen,
   onToggle,
   onToggleSelect,
-  selected
+  selected,
+  workerStates
 }: {
   collapsed: boolean
   column: { name: string; tasks: KanbanTask[] }
@@ -357,6 +393,7 @@ function Column({
   onToggle: () => void
   onToggleSelect: (id: string) => void
   selected: ReadonlySet<string>
+  workerStates?: ReadonlyMap<string, WorkerState>
 }) {
   const k = useKanban()
   const [over, setOver] = useState(false)
@@ -480,6 +517,7 @@ function Column({
                     onToggleSelect={onToggleSelect}
                     selected={selected.has(task.id)}
                     task={task}
+                    workerState={workerStates?.get(task.id)}
                   />
                 ))}
               </div>
@@ -494,6 +532,7 @@ function Column({
                 onToggleSelect={onToggleSelect}
                 selected={selected.has(task.id)}
                 task={task}
+                workerState={workerStates?.get(task.id)}
               />
             ))}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
@@ -1085,13 +1124,26 @@ export function KanbanBoardPage() {
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
 
+  const boardEvidence = useBoardEvidence()
+
+  // The aligned snapshot IS the board while the selected board is the EVO DB.
+  // The local /board read runs ONLY when the board is proven unaligned (or the
+  // archived view is on): no /board query while alignment is unresolved or
+  // aligned, so a local poll can never masquerade as EVO truth.
+  const alignedEvidence = boardEvidence.phase === 'aligned' ? boardEvidence : null
+  const useSnapshot = alignedEvidence !== null && alignedEvidence.error === null && !archived
+
   // Live updates ride the events socket (bindApi); this interval is only the
   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
-  const { data: board, error } = useQuery({
+  const { data: localBoard, error: localError } = useQuery({
     queryFn: () => fetchBoard(archived),
     queryKey: boardKey(slug, archived),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: archived || boardEvidence.phase === 'unaligned'
   })
+
+  const board = useSnapshot && alignedEvidence ? snapshotBoard(alignedEvidence) : localBoard
+  const error = useSnapshot ? null : localError
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1250,6 +1302,18 @@ export function KanbanBoardPage() {
 
   const errorMessage = error ? errText(error) : null
 
+  // The three visible evidence states: a failed identity check, a failed
+  // snapshot/helper read, and a proven unaligned board (which keeps the local
+  // grid but states the choose-EVO remedy). Never a silent local fallback.
+  const evidenceError =
+    boardEvidence.phase === 'context-error'
+      ? 'Worker evidence could not be checked: the EVO identity check failed.'
+      : alignedEvidence && alignedEvidence.error !== null
+        ? alignedEvidence.error
+        : null
+
+  const chooseEvoRemedy = boardEvidence.phase === 'unaligned'
+
   // Grab-to-scrub the lane strip (shared primitive, same as the dashboard's pan).
   const lanesRef = useRef<HTMLDivElement>(null)
   const { grabbing, onMouseDown } = useGrabScroll(lanesRef)
@@ -1332,6 +1396,24 @@ export function KanbanBoardPage() {
         <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
           {total}
         </span>
+        {alignedEvidence && alignedEvidence.error === null && (
+          <span
+            className="inline-flex items-center gap-1.5 rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)"
+            title="Worker evidence from the EVO snapshot"
+          >
+            <EvidenceStateBadge state="running" />
+            <span>{alignedEvidence.running}</span>
+            {alignedEvidence.unknown > 0 && (
+              <>
+                <EvidenceStateBadge state="unknown" />
+                <span>{alignedEvidence.unknown}</span>
+              </>
+            )}
+            {alignedEvidence.omitted > 0 && (
+              <span className="text-(--ui-text-quaternary)">+{alignedEvidence.omitted} more</span>
+            )}
+          </span>
+        )}
         {board && (
           <FilterMenu
             archived={archived}
@@ -1367,7 +1449,11 @@ export function KanbanBoardPage() {
 
       {board && <Intro />}
 
-      {errorMessage && !board ? (
+      {evidenceError ? (
+        <div className="grid flex-1 place-items-center px-4">
+          <ErrorState title={evidenceError} />
+        </div>
+      ) : errorMessage && !board ? (
         <div className="grid flex-1 place-items-center">
           <ErrorState title={errorMessage} />
         </div>
@@ -1387,31 +1473,60 @@ export function KanbanBoardPage() {
           </div>
         </div>
       ) : (
-        <div
-          className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
-          onMouseDown={onMouseDown}
-          ref={lanesRef}
-        >
-          {filtered.columns.map(col => {
-            const auto = boardHasWork && col.tasks.length === 0
+        <div className="flex min-h-0 flex-1 flex-col">
+          {chooseEvoRemedy && (
+            <div className="mx-4 mb-1 flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2 text-[0.75rem] text-(--ui-text-secondary)">
+              <Codicon className="text-amber-500" name="warning" size="0.85rem" />
+              <span>Choose the EVO connection</span>
+            </div>
+          )}
+          <div
+            className={cn('flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+            onMouseDown={onMouseDown}
+            ref={lanesRef}
+          >
+            {filtered.columns.map(col => {
+              const auto = boardHasWork && col.tasks.length === 0
 
-            return (
-              <Column
-                collapsed={laneOverrides[col.name] ?? auto}
-                column={col}
-                columns={columnNames}
-                key={col.name}
-                onAdd={setAddStatus}
-                onDelete={id => deleteMut.mutate(id)}
-                onDropTask={onMove}
-                onMove={onMove}
-                onOpen={setOpenId}
-                onToggle={() => toggleLane(col.name, auto)}
-                onToggleSelect={toggleSelect}
-                selected={selected}
-              />
-            )
-          })}
+              return (
+                <Column
+                  collapsed={laneOverrides[col.name] ?? auto}
+                  column={col}
+                  columns={columnNames}
+                  key={col.name}
+                  onAdd={setAddStatus}
+                  onDelete={id => deleteMut.mutate(id)}
+                  onDropTask={onMove}
+                  onMove={onMove}
+                  onOpen={setOpenId}
+                  onToggle={() => toggleLane(col.name, auto)}
+                  onToggleSelect={toggleSelect}
+                  selected={selected}
+                  workerStates={alignedEvidence?.states}
+                />
+              )
+            })}
+          </div>
+          {alignedEvidence && alignedEvidence.error === null && alignedEvidence.hasMore && (
+            <div className="flex items-center justify-center gap-2 px-4 py-1.5">
+              <Button
+                disabled={alignedEvidence.loadingMore}
+                onClick={() => alignedEvidence.loadMore()}
+                size="sm"
+                variant="outline"
+              >
+                {alignedEvidence.loadingMore ? 'Loading…' : 'Load more'}
+              </Button>
+              {alignedEvidence.omitted > 0 && (
+                <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">
+                  +{alignedEvidence.omitted} more
+                </span>
+              )}
+              {alignedEvidence.loadMoreError && (
+                <span className="text-[0.625rem] text-destructive">{alignedEvidence.loadMoreError}</span>
+              )}
+            </div>
+          )}
         </div>
       )}
 
