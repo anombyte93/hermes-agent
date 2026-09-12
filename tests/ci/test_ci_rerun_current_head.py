@@ -80,7 +80,10 @@ _MOCK_GH = textwrap.dedent(
             print("mock gh: rerun failed", file=sys.stderr)
             sys.exit(1)
     elif argv[:2] == ["run", "view"]:
-        print("completed")
+        if "conclusion" in argv:
+            print(os.environ.get("MOCK_CONCLUSION", "failure"))
+        else:
+            print("completed")
     elif argv[:2] == ["run", "watch"]:
         sys.exit(0)
     else:
@@ -293,3 +296,15 @@ def test_ci_gate_workflow_calls_the_evaluate_helper():
     assert "evaluate_gate.py" in run
     # The aggregate logic lives in the helper, not inline python in YAML.
     assert "sys.exit(1)" not in run
+
+
+def test_successful_run_needs_no_rerun(tmp_path):
+    result = _run_label_rerun(tmp_path, {"MOCK_CONCLUSION": "success", "MOCK_RERUN_FAIL": "1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _rerun_calls(tmp_path) == ""
+
+
+def test_unreadable_conclusion_cannot_authorise_rerun(tmp_path):
+    result = _run_label_rerun(tmp_path, {"MOCK_CONCLUSION": ""})
+    assert result.returncode != 0
+    assert _rerun_calls(tmp_path) == ""

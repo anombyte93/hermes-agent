@@ -153,3 +153,6 @@ the gate tests execute the extracted `echo "$NEEDS" | python3
   explicit `cwd=ROOT`.
 - The terminal sandbox blocks `python3 -c` and pipe-to-interpreter, so
   standalone helper checks used a `.sh` script with heredoc input instead.
+
+## Parent live-CI correction, 2026-09-13
+The actual Label rerun run 34713311665 exposed an already-successful CI run: GitHub refuses --failed when there are no failed jobs. Parent reproduced two RED cases in the exact extracted workflow shell, then added an explicit completed-conclusion read. Successful/neutral/skipped runs stop successfully; unknown conclusions fail closed; failed runs retain fresh-head validation and loud rerun errors. Physical EVO verification: 19 tests passed, including the two new controls. This is parent mechanical completion after the worker same-profile retry, not a claim that the worker delivered these cases.
