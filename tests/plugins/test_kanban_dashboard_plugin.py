@@ -1297,3 +1297,26 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_task_detail_can_omit_paged_history_before_reading(client, monkeypatch):
+    task = client.post('/api/plugins/kanban/tasks', json={'title': 'paged history'}).json()['task']
+    path = f"/api/plugins/kanban/tasks/{task['id']}"
+    positive = client.get(path).json()
+    assert positive['events']  # actual SQLite creation event, not an empty oracle
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('paged detail must not materialise legacy histories')
+
+    for name in ('list_events', 'list_runs', 'list_attachments'):
+        monkeypatch.setattr(kb, name, forbidden)
+    module = sys.modules['hermes_dashboard_plugin_kanban_test']
+    monkeypatch.setattr(module, '_compute_task_diagnostics', forbidden)
+    response = client.get(path, params={'include_history': 'false'})
+    assert response.status_code == 200
+    data = response.json()
+    assert data['task']['id'] == task['id']
+    assert data['events'] == data['runs'] == data['attachments'] == []
+    assert data['history_included'] is False
+    assert data['diagnostics_state'] == 'UNKNOWN'
+    assert client.get('/api/plugins/kanban/tasks/t_ffffffff', params={'include_history': 'false'}).status_code == 404

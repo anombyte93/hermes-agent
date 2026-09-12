@@ -528,6 +528,7 @@ def get_board(
 def get_task(
     task_id: str,
     board: Optional[str] = Query(None),
+    include_history: bool = Query(True, description="Include legacy runs/events/attachments and diagnostics; false lets evidence pages supply them"),
     run_state_type: Optional[str] = Query(
         None, description="With run_state_name: filter runs by column 'status' or 'outcome'",
     ),
@@ -573,16 +574,18 @@ def get_task(
             })
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
-        diags = _compute_task_diagnostics(conn, task_ids=[task_id])
+        diags = _compute_task_diagnostics(conn, task_ids=[task_id]) if include_history else {}
         diag_list = diags.get(task_id) or []
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
             "task": task_d,
+            "history_included": include_history,
+            "diagnostics_state": "PASS" if include_history else "UNKNOWN",
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
-            "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
-            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
+            "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)] if include_history else [],
+            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)] if include_history else [],
             "links": links,
             "child_results": child_results,
             "runs": [
@@ -593,7 +596,7 @@ def get_task(
                     state_type=run_state_type,
                     state_name=run_state_name,
                 )
-            ],
+            ] if include_history else [],
         }
     finally:
         conn.close()
