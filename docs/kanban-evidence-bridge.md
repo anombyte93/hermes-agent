@@ -51,15 +51,23 @@ Hermes runs MCP 2.0.0; AtlasKanban is an MCP 1.x runtime. The helper is
 
 - resolved with `shutil.which("atlas-kanban-call")` per invocation;
 - executed without a shell as `[<absolute path>, <fixed tool>, "-"]`;
-- bounded JSON payload (`{"tool": ..., "args": ...}`) on stdin;
+  the tool name arrives **only in argv** and stdin carries **only the flat
+  JSON args object** (`{"board": ..., ...}`). The released helper rejects
+  the nested `{"tool": ..., "args": ...}` envelope this bridge originally
+  sent — the original fake accepted it, which is why fake-only tests
+  never caught the divergence (repaired 2026-09-12, card `t_8bfaf14e`,
+  verified against candidate source 27ef127);
 - the request can never select the executable, the argv or the tool name —
   the tool is a literal at each route, drawn from the fixed read allowlist
   `EVIDENCE_READ_TOOLS = {kanban_snapshot, kanban_page, kanban_worker,
   kanban_card}`. No write tool name appears in the module.
 
-The helper is **not currently installed** on this EVO UI test host, so every
-route returns `UNKNOWN` with reason "not installed" and the remedy naming
-the parent-owned released installation. That is by design.
+The helper was **not installed** on this host during the original build, so
+routes returned `UNKNOWN` ("not installed") by design. A released candidate
+(source 27ef127, isolated MCP 1.x venv at `../ui-helper-candidate/`) is now
+staged for verification; the live install pointer remains parent-owned. On
+hosts without the helper the routes still return `UNKNOWN` with the
+"not installed" reason.
 
 ## Hardening
 
@@ -72,16 +80,37 @@ the parent-owned released installation. That is by design.
 - **One HTTP request = exactly one helper invocation** (never per-card
   subprocesses). The subprocess runs off the event loop via
   `asyncio.to_thread`, so a 75s round trip never blocks the dashboard.
-- **Bounded capture:** stdout disk-backed, capped at 1 MiB (over-cap →
-  UNKNOWN); stderr capped at 16 KiB and never surfaced — its content is
-  never logged or returned.
+- **Bounded capture (read/parse bounds, not disk-write caps):** stdout is
+  captured to a temporary file and at most 1 MiB is read back after child
+  exit (over-cap → UNKNOWN); while the child runs it may write more than
+  that to the temporary file — the cap is enforced on the read-back, not
+  on the child's writes. The retained stderr copy is truncated to 16 KiB
+  after exit and its content is never logged or returned. Both temporary
+  files are closed (unlinked) in `finally`.
 - **Timeout:** 75s local wall clock (helper's own remote cap is 60s);
   timeout → UNKNOWN with remedy.
 - **Nonzero exit claiming PASS → UNKNOWN.** Exit status is checked before
-  the receipt is trusted; a claimed FAIL/UNKNOWN from a nonzero exit keeps
-  its state class with a short reason.
-- **Receipt validation:** `state` must be PASS/FAIL/UNKNOWN; PASS receipts
-  must carry `execution_host == "evo"` or the result is UNKNOWN.
+  the receipt is trusted.
+- **FAIL reasons survive exit 1.** The released helper exits 1 on ordinary
+  FAIL outcomes (missing board, missing card); the receipt's safe reason is
+  preserved (annotated with the exit code) so "board absent" stays
+  distinguishable from "helper unavailable". Raw stdout/stderr are never
+  forwarded.
+- **Receipt validation:** `state` must be PASS/FAIL/UNKNOWN. A PASS receipt
+  must carry `execution_host == "evo"`, a numeric `observed_at`, the
+  per-tool required `data` shape (only fields the adapter actually emits),
+  and — wherever the receipt echoes scope — a board/card match with the
+  request (`kanban_snapshot` → `data.board` + `status_filter`,
+  `kanban_card` → `data.task.id`, `kanban_worker` → `data.task_id`;
+  `kanban_page` emits no scope echo and none is claimed). Any violation is
+  UNKNOWN, never PASS.
+- **Envelope honesty:** `execution_host` is forwarded only when validated
+  from a PASS receipt; every other response reports `"unverified"` — the
+  bridge never stamps the host as its own observation. Validated responses
+  preserve the receipt's `observed_at` and its limitations block
+  (`bounded` for card, `data.omitted` rollup otherwise); completeness
+  fields (`has_more` / `next_cursor` / `incomplete`) stay inside
+  `evidence`.
 - **Child env:** `ATLAS_KANBAN_WRITE_BOARDS` is forced empty in the child
   regardless of what this process was granted; the rest of the runtime env
   is inherited unchanged (never printed).
