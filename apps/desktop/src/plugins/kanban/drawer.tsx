@@ -46,6 +46,7 @@ import {
 } from './api'
 import { DrawerEvidence, useResolvedBoardSlug } from './drawer-evidence'
 import { useEvidenceContext, WorkerEvidenceSection } from './evidence'
+import { CardWorkflowPanel } from './workflow'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -838,6 +839,7 @@ export function TaskDrawer({
                 distinct from the parent result text above. Renders only when
                 the selected board is identity-aligned with the EVO database. */}
             <WorkerEvidenceSection id={task.id} />
+            {aligned && <CardWorkflowPanel card={task.id} slug={slug} />}
 
             {/* Aligned history: paged runs/events/attachments + authenticated
                 download. The legacy sections below render only when unaligned. */}

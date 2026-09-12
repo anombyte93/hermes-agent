@@ -21,6 +21,16 @@ import {
 // Native completion notification.
 import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
 import type {
+  AttentionData,
+  ChangesData,
+  ContinueReceipt,
+  ContinuationDraft,
+  HoldReceipt,
+  ReadinessReceipt,
+  RemainingCheck,
+  TimelineData
+} from './workflow-api'
+import type {
   BoardExportResult,
   BoardImportResult,
   BoardMeta,
@@ -391,3 +401,72 @@ export const autoDescribeProfile = (name: string) =>
     `/profiles/${encodeURIComponent(name)}/describe-auto`,
     { method: 'POST', body: { overwrite: true } }
   )
+
+// ── workflow REST (read-only evidence reads + explicit-action writes) ────────
+// The three reads are board-scoped bounded pages of the read-only /evidence/*
+// bridge. The three writes are EXPLICIT-ACTION routes: readiness never fires
+// unless the user clicks, and none of them dispatches, unblocks or grants
+// mutation authority. Each takes the board slug explicitly (never the global
+// atom) so a late response from a previous board cannot land under the new one.
+
+/** Bounded attention queue: cards needing operator attention, capped page. */
+export const fetchAttentionQueue = (slug: string, limit = 50, cursor: null | string = null) =>
+  call<EvidenceEnvelope<AttentionData>>(
+    withBoardSlug('/evidence/attention', slug, { limit: String(limit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Bounded changes page. First call is baseline-now (no historical flood). */
+export const fetchChanges = (slug: string, limit = 50, cursor: null | string = null) =>
+  call<EvidenceEnvelope<ChangesData>>(
+    withBoardSlug('/evidence/changes', slug, { limit: String(limit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Bounded timeline intervals for one card (execution/blocked/review/unknown). */
+export const fetchTimeline = (slug: string, card: string, limit = 50, cursor: null | string = null) =>
+  call<EvidenceEnvelope<TimelineData>>(
+    withBoardSlug('/evidence/timeline', slug, { card, limit: String(limit), ...(cursor ? { cursor } : {}) })
+  )
+
+/** Explicit-action readiness check. check_model gates the exact provider/model
+ *  proof; never invoked automatically by the UI. Returns the standard envelope;
+ *  the root helper readiness receipt is forwarded as `evidence`. */
+export const runReadiness = (slug: string, card: string, checkModel: boolean) =>
+  call<EvidenceEnvelope<ReadinessReceipt>>(withBoardSlug('/workflow/readiness', slug), {
+    method: 'POST',
+    body: { card, check_model: checkModel }
+  })
+
+export interface ContinuationInput {
+  card: string
+  passed_checks?: string[]
+  remaining_checks?: RemainingCheck[]
+  verification_note: string
+  workspace?: string
+  profile?: string
+  provider?: string
+  model?: string
+  max_runtime_minutes?: number
+  creator?: string
+  title?: string
+}
+
+/** Read-only continuation draft. Parent-supplied checks stay labelled; the
+ *  original source excerpt is returned marked unverified. No mutation. Returns
+ *  the standard envelope with the root draft receipt as `evidence`. */
+export const draftContinuation = (slug: string, input: ContinuationInput) =>
+  call<EvidenceEnvelope<ContinuationDraft>>(withBoardSlug('/workflow/continuation-draft', slug), {
+    method: 'POST',
+    body: input
+  })
+
+/** Separate user click after reviewing the draft: creates ONE held card, never
+ *  dispatches or unblocks. A stale fingerprint rejects; UNKNOWN asks to inspect. */
+export const continueCard = (slug: string, input: ContinuationInput & { fingerprint: string }) =>
+  call<EvidenceEnvelope<ContinueReceipt>>(withBoardSlug('/workflow/continue', slug), {
+    method: 'POST',
+    body: input
+  })
+
+/** Separate explicit review hold. Preserves history; never stops a live worker. */
+export const holdCard = (slug: string, card: string, reason: string) =>
+  call<EvidenceEnvelope<HoldReceipt>>(withBoardSlug('/workflow/hold', slug), { method: 'POST', body: { card, reason } })

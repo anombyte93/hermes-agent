@@ -20,6 +20,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const http = require("http");
+const crypto = require("crypto");
 const { chromium } = require("playwright");
 
 const REPO = path.resolve(__dirname, "..", "..", "..", "..", "..");
@@ -36,6 +37,10 @@ const state = {
   evoSnapshotCalls: 0,
   evoDelayMs: 0, // delay applied to the NEXT evo page-0 snapshot call
   pageDelay: null, // {ms, card, resource} — delay the NEXT matching /evidence/page
+  revision: 0, // bumped to simulate a concurrent card change (stale draft)
+  continueUnknown: false, // when true, /workflow/continue returns UNKNOWN
+  timelineDelayMs: 0, // delay the NEXT /evidence/timeline for timelineDelayCard
+  timelineDelayCard: null,
 };
 
 function resetState() {
@@ -43,6 +48,10 @@ function resetState() {
   state.evoSnapshotCalls = 0;
   state.evoDelayMs = 0;
   state.pageDelay = null;
+  state.revision = 0;
+  state.continueUnknown = false;
+  state.timelineDelayMs = 0;
+  state.timelineDelayCard = null;
 }
 
 function json(res, code, obj) {
@@ -209,7 +218,250 @@ function localBoard() {
   };
 }
 
+// --- workflow fixtures (WORKFLOW-API-CONTRACT.md standard envelope) ---------
+function wfEnvelope(state_, board, card, evidence, reason, remedy, tool, extra) {
+  const e = {
+    state: state_,
+    board: board,
+    card: card || null,
+    evidence: evidence == null ? null : evidence,
+    helper: { tool: tool || "kanban_workflow", execution_host: "evo" },
+    request: {},
+    timing: { helper_roundtrip_ms: 1.0, collection_ms: 0.5 },
+    observed_at: Math.floor(Date.now() / 1000),
+  };
+  if (reason != null) e.reason = reason;
+  if (remedy != null) e.remedy = remedy;
+  if (extra) Object.assign(e, extra);
+  return e;
+}
+
+function attentionCard(id, title, status, reasons, nextAction) {
+  return {
+    id: id, title: title, assignee: "evo", status: status, block_reason: null,
+    block_kind: null, current_run_id: null, created_at: now - 60, started_at: null,
+    completed_at: null, reasons: reasons || ["status " + status],
+    next_action: nextAction || "inspect card", operator_authority_needed: null,
+    running_total: 0, running_truncated: false, process_state: "not_applicable", process_present: null,
+  };
+}
+
+function attentionData(board, cursor) {
+  if (board !== "evo" && board !== "denied") {
+    return { cards: [], returned: 0, has_more: false, next_cursor: null, omitted: 0 };
+  }
+  const p2 = cursor === "attn:p2";
+  const cards = p2
+    ? [attentionCard("t_attn3", "Attention triage card", "triage", ["raw idea"], "specify before dispatch")]
+    : [
+        attentionCard("t_attn1", "Attention blocked card", "blocked", ["status blocked"], "inspect worker / review block reason"),
+        attentionCard("t_attn2", "Attention review card", "review", ["implementation complete"], "review and complete"),
+      ];
+  return {
+    board: board, read_at: now, observed_at: now, freshness: { read_at: now, note: "one bounded read" },
+    cards: cards, returned: cards.length, has_more: !p2, next_cursor: p2 ? null : "attn:p2",
+    omitted: p2 ? 0 : 1, remaining_after_page: p2 ? 0 : 1, high_water_rowid: 40,
+    running_verification: { selected: 0, checked: 0, absent: 0, healthy: 0, unexamined: 0, truncated: false },
+    process_checks: { performed: 0, capped: 0, cap: 20, note: "bounded" },
+    bounded: { limit: 50, max_limit: 200, process_check_cap: 20, runs_per_card_cap: 20 },
+    incomplete: false,
+  };
+}
+
+function changeEvent(id, kind, taskId, ts) {
+  return { id: id, task_id: taskId, kind: kind, created_at: ts, run_id: null };
+}
+
+function changesData(board, cursor) {
+  if (board !== "evo" && board !== "denied") {
+    return { events: [], returned: 0, has_more: false, next_cursor: null };
+  }
+  const base = {
+    board: board, read_at: now, observed_at: now, freshness: { read_at: now, note: "one bounded read" },
+    first_read_policy: "baseline-now: no historical events returned",
+    total_events: 874, baseline_id: 874, empty_means_no_observed_changes: true,
+    id_gap_note: "id gaps alone do not prove loss", incomplete: false,
+  };
+  if (cursor === "chg:p3") {
+    return Object.assign({}, base, { events: [changeEvent(877, "commented", "t_run1", now - 3)], returned: 1, has_more: false, next_cursor: null, high_water_rowid: 877, anchor_state: "poll" });
+  }
+  if (cursor === "chg:p2") {
+    return Object.assign({}, base, { events: [changeEvent(875, "blocked", "t_attn1", now - 10), changeEvent(876, "claimed", "t_run1", now - 5)], returned: 2, has_more: true, next_cursor: "chg:p3", high_water_rowid: 876, anchor_state: "poll" });
+  }
+  return Object.assign({}, base, { events: [], returned: 0, has_more: true, next_cursor: "chg:p2", high_water_rowid: 874, anchor_state: "baseline" });
+}
+
+function interval(kind, start, end, runIds, evIds) {
+  return { kind: kind, start: start, end: end, duration_seconds: end - start, source_runs: runIds || [], source_events: evIds || [] };
+}
+
+function timelineData(board, card, cursor) {
+  if (board !== "evo" && board !== "denied") {
+    return { intervals: [], returned: 0, has_more: false, next_cursor: null };
+  }
+  // t_attn2 is the discriminator for the late-card test: one lone execution
+  // interval, no blocked/review/unknown kinds, no gap, no further page.
+  if (card === "t_attn2") {
+    return {
+      board: board, card: card, card_status: "review", read_at: now, observed_at: now,
+      freshness: { read_at: now, note: "one bounded read" },
+      boundary: { read_at: now, clamped_at: now, note: "clamped" },
+      intervals: [interval("execution", now - 600, now - 120, [99], [])],
+      returned: 1, has_more: false, next_cursor: null,
+      totals: { covered_window: { execution_seconds: 480, blocked_seconds: 0, review_wait_seconds: 0, unknown_seconds: 0 }, page: {}, all_time: null },
+      coverage: { window_start: now - 600, window_end: now, gaps: [], note: "covered window" },
+      incomplete: false,
+    };
+  }
+  const t0 = now - 2000;
+  if (cursor === "tl:p2") {
+    const ints = [interval("execution", t0 - 2000, t0 - 1500, [52], [])];
+    return {
+      board: board, card: card, card_status: "blocked", read_at: now, observed_at: now,
+      freshness: { read_at: now, note: "one bounded read" },
+      boundary: { read_at: now, clamped_at: now, note: "clamped" },
+      intervals: ints, returned: 1, has_more: false, next_cursor: null,
+      totals: { covered_window: { execution_seconds: 978, blocked_seconds: 1212, review_wait_seconds: 0, unknown_seconds: 387 }, page: {}, all_time: null },
+      coverage: { window_start: t0 - 2000, window_end: now, gaps: [], note: "covered window" },
+      incomplete: false,
+    };
+  }
+  const ints = [
+    interval("execution", t0, t0 + 978, [51], []),
+    interval("blocked", t0 + 978, t0 + 1038, [], [724]),
+    interval("unknown", t0 + 1038, t0 + 1425, [], []),
+    interval("review", t0 + 1425, t0 + 1545, [], []),
+  ];
+  return {
+    board: board, card: card, card_status: "blocked", read_at: now, observed_at: now,
+    freshness: { read_at: now, note: "one bounded read" },
+    boundary: { read_at: now, clamped_at: now, note: "clamped" },
+    intervals: ints, returned: 4, has_more: true, next_cursor: "tl:p2",
+    totals: { covered_window: { execution_seconds: 978, blocked_seconds: 60, review_wait_seconds: 120, unknown_seconds: 387 }, page: {}, all_time: null },
+    coverage: { window_start: t0, window_end: now, gaps: [{ start: t0 + 1200, end: t0 + 1380, duration_seconds: 180, note: "no record" }], note: "covered window" },
+    incomplete: true,
+  };
+}
+
+function readinessReceipt(board, card) {
+  if (board === "denied") {
+    return wfEnvelope("FAIL", board, card, {
+      state: "FAIL",
+      requested: { board: board, profile: "evo", provider: "deepseek", model: "deepseek-v4-pro", workspace: "/tmp/ws", expected_revision: "0000000000000000000000000000000000000000", parents: [], check_model: true, python: ".venv/bin/python", minimum_python: "3.12", require_modules: [], context_files: [] },
+      observed_at: now,
+      freshness: { checked_at: now, stale_after: now + 60, note: "bounded" },
+      ready_to_release: false,
+      checks: [
+        { name: "board_permission", state: "FAIL", reason: "this server is read-only for the board; ATLAS_KANBAN_WRITE_BOARDS must name it", exists: true, write_scope_configured: false, mutation_authorized: false },
+      ],
+      boundary: "readiness-boundary",
+    }, "readiness not established", "Add the board to ATLAS_KANBAN_WRITE_BOARDS to permit writes", "kanban_readiness");
+  }
+  return wfEnvelope("PASS", board, card, {
+    state: "PASS",
+    requested: { board: board, profile: "evo", provider: "deepseek", model: "deepseek-v4-pro", workspace: "/tmp/ws", expected_revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", parents: [], check_model: true, python: ".venv/bin/python", minimum_python: "3.12", require_modules: [], context_files: [] },
+    observed_at: now,
+    freshness: { checked_at: now, stale_after: now + 60, note: "bounded evidence validity" },
+    ready_to_release: true,
+    checks: [
+      { name: "board_permission", state: "PASS", reason: "board exists and this server may mutate it", exists: true, write_scope_configured: true, mutation_authorized: true },
+      { name: "profile_exists", state: "PASS", reason: "profile evo exists" },
+      { name: "workspace_exists", state: "PASS", reason: "workspace present" },
+      { name: "expected_revision", state: "PASS", reason: "git HEAD matches" },
+      { name: "model", state: "PASS", reason: "deepseek-v4-pro READY under installed runtime" },
+    ],
+    boundary: "readiness-boundary",
+  }, null, null, "kanban_readiness");
+}
+
+function computeFingerprint(board, body) {
+  const canonical = {
+    board: board,
+    card: body.card,
+    revision: state.revision,
+    passed_checks: body.passed_checks || [],
+    remaining_checks: body.remaining_checks || [],
+    verification_note: body.verification_note || "",
+    workspace: body.workspace || "",
+    profile: body.profile || "",
+    provider: body.provider || "",
+    model: body.model || "",
+    title: body.title || "",
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function draftReceipt(board, body) {
+  const fp = computeFingerprint(board, body);
+  return wfEnvelope("PASS", board, body.card, {
+    state: "PASS",
+    board: board,
+    card: body.card,
+    fingerprint: fp,
+    original: { status: "blocked", assignee: "evo", result_excerpt: "prior attempt result excerpt", latest_run_summary_excerpt: "previous worker stopped after verified work", source: "unverified source excerpt; truncated; not confirmed by a worker" },
+    worker: { verdict: "STOPPED", reason: "previous workers are stopped; safe to continue", aggregate: { overall: "STOPPED", running: 0, stopped: 1, completion_records: 0, unknown: 0, complete: true } },
+    passed_checks: body.passed_checks || [],
+    remaining_checks: body.remaining_checks || [],
+    verification_note: body.verification_note || "",
+    commission: { workspace: body.workspace || "", profile: body.profile || "", provider: body.provider || "", model: body.model || "", max_runtime_minutes: 60, creator: body.creator || "", title: body.title || "" },
+    read_at: { original: now, worker: now, note: "fresh reads at draft time" },
+    mutation_authorized: board === "evo",
+    limitation: "fingerprint is an optimistic concurrency check, not signed authority",
+    no_mutation_performed: true,
+  }, null, null, "kanban_continuation_draft");
+}
+
+function continueReceipt(board, body) {
+  if (board === "denied") {
+    return wfEnvelope("FAIL", board, body.card, null,
+      "This client refuses mutations outside ATLAS_KANBAN_WRITE_BOARDS; it is read-only for this board",
+      "Add the board to ATLAS_KANBAN_WRITE_BOARDS to permit writes", "kanban_continue");
+  }
+  if (state.continueUnknown) {
+    return wfEnvelope("UNKNOWN", board, body.card, null,
+      "continuation create accepted but the new card identity could not be re-read; hold state is UNKNOWN, inspect before release",
+      "Inspect the result before retrying", "kanban_continue", { new_card: "t_held1" });
+  }
+  const fresh = computeFingerprint(board, body);
+  if (fresh !== body.fingerprint) {
+    return wfEnvelope("FAIL", board, body.card, null,
+      "fingerprint does not match the fresh original state; the draft is stale or the intent changed. Re-draft before continuing",
+      "Re-draft before continuing", "kanban_continue", { fingerprint_mismatch: true });
+  }
+  return wfEnvelope("PASS", board, body.card, {
+    state: "PASS", board: board, original_card: body.card, new_card: "t_held1",
+    new_card_status: "blocked", new_card_assignee: "evo", held: true,
+    released_after_previous_creation: false, reblocked_after_release: false,
+    origin: { board: board, card: body.card, original_status: "blocked", note: "original card was not rewritten, reopened, reset or completed, and is not a dependency" },
+    worker: { verdict: "STOPPED", reason: "previous workers are stopped; safe to continue" },
+    no_original_mutation: true,
+  }, null, null, "kanban_continue");
+}
+
+function holdReceipt(board, card) {
+  if (board === "denied") {
+    return wfEnvelope("FAIL", board, card, null,
+      "This client refuses mutations outside ATLAS_KANBAN_WRITE_BOARDS; it is read-only for this board",
+      "Add the board to ATLAS_KANBAN_WRITE_BOARDS to permit writes", "kanban_hold");
+  }
+  return wfEnvelope("PASS", board, card, {
+    state: "PASS",
+    read_back: { state: "PASS", data: { id: card, title: "Attention blocked card", status: "blocked", assignee: "evo", block_reason: "held for review", workspace_path: null, branch_name: null, model_override: null, provider_override: null, created_at: now, started_at: null, completed_at: null } },
+    worker_before: { overall: "STOPPED", running: 0, stopped: 1, unknown: 0, complete: true },
+    worker_after: { overall: "STOPPED", running: 0, stopped: 1, unknown: 0, complete: true },
+    warning: "Holding blocks dispatch, not the process. A live worker may still write its workspace.",
+  }, null, null, "kanban_hold");
+}
+
 function handle(req, res) {
+  const chunks = [];
+  req.on("data", function (c) { chunks.push(c); });
+  req.on("end", function () {
+    handleRoutes(req, res, Buffer.concat(chunks).toString("utf8"));
+  });
+}
+
+function handleRoutes(req, res, reqBody) {
   const u = new URL(req.url, "http://localhost");
   const p = u.pathname;
   const q = u.searchParams;
@@ -242,6 +494,7 @@ function handle(req, res) {
       { slug: "local", name: "Local", total: 2 },
       { slug: "broken", name: "Broken", total: 0 },
       { slug: "stale", name: "Stale", total: 1 },
+      { slug: "denied", name: "Denied", total: 1 },
     ],
     current: "evo",
   });
@@ -309,8 +562,17 @@ function handle(req, res) {
   const task = p.match(new RegExp("^" + API + "/tasks/([^/]+)$"));
   if (task) {
     const id = task[1];
-    const title = id === "t_run1" ? "Run card one" : id === "t_run2" ? "Run card two" : "Done card";
-    const status = id === "t_done1" ? "done" : "running";
+    const titles = {
+      t_run1: "Run card one", t_run2: "Run card two", t_done1: "Done card",
+      t_attn1: "Attention blocked card", t_attn2: "Attention review card",
+      t_attn3: "Attention triage card", t_deny1: "Denied board card", t_held1: "Held continuation card",
+    };
+    const statuses = {
+      t_done1: "done", t_attn1: "blocked", t_attn2: "review", t_attn3: "triage",
+      t_deny1: "blocked", t_held1: "blocked",
+    };
+    const title = titles[id] || "Task " + id;
+    const status = statuses[id] || "running";
     const includeHistory = q.get("include_history") !== "false";
     const detail = { task: localTask(id, title, status), comments: [], links: { parents: [], children: [] }, child_results: [] };
     // Mirror the parent-owned detail-route contract: include_history=false
@@ -337,6 +599,58 @@ function handle(req, res) {
   }
   if (p === `${API}/home-channels`) {
     return json(res, 200, { home_channels: [] });
+  }
+
+  if (p === `${API}/evidence/attention`) {
+    state.hits.push("attention:" + board);
+    return json(res, 200, wfEnvelope("PASS", board, null, attentionData(board, q.get("cursor")), null, null, "kanban_attention"));
+  }
+  if (p === `${API}/evidence/changes`) {
+    state.hits.push("changes:" + board + (q.get("cursor") ? ":cursor" : ""));
+    return json(res, 200, wfEnvelope("PASS", board, null, changesData(board, q.get("cursor")), null, null, "kanban_changes"));
+  }
+  if (p === `${API}/evidence/timeline`) {
+    const card = q.get("card") || "";
+    state.hits.push("timeline:" + card);
+    const respond = function () {
+      json(res, 200, wfEnvelope("PASS", board, card, timelineData(board, card, q.get("cursor")), null, null, "kanban_timeline"));
+    };
+    if (state.timelineDelayMs > 0 && card === state.timelineDelayCard) {
+      const d = state.timelineDelayMs;
+      state.timelineDelayMs = 0;
+      setTimeout(respond, d);
+    } else {
+      respond();
+    }
+    return;
+  }
+  if (p === `${API}/workflow/readiness`) {
+    let body = {};
+    try { body = reqBody ? JSON.parse(reqBody) : {}; } catch (_e) { body = {}; }
+    state.hits.push("readiness:" + (body.card || ""));
+    return json(res, 200, readinessReceipt(board, body.card));
+  }
+  if (p === `${API}/workflow/continuation-draft`) {
+    let body = {};
+    try { body = reqBody ? JSON.parse(reqBody) : {}; } catch (_e) { body = {}; }
+    state.hits.push("draft:" + (body.card || ""));
+    return json(res, 200, draftReceipt(board, body));
+  }
+  if (p === `${API}/workflow/continue`) {
+    let body = {};
+    try { body = reqBody ? JSON.parse(reqBody) : {}; } catch (_e) { body = {}; }
+    state.hits.push("continue:" + (body.card || ""));
+    return json(res, 200, continueReceipt(board, body));
+  }
+  if (p === `${API}/workflow/hold`) {
+    let body = {};
+    try { body = reqBody ? JSON.parse(reqBody) : {}; } catch (_e) { body = {}; }
+    state.hits.push("hold:" + (body.card || ""));
+    return json(res, 200, holdReceipt(board, body.card));
+  }
+  if (p === `${API}/dispatch`) {
+    state.hits.push("dispatch");
+    return json(res, 200, { dispatched: 0, reason: "fixture records only" });
   }
 
   json(res, 404, { detail: "not found: " + p });
@@ -382,6 +696,14 @@ async function main() {
     await scenarioStale(base);
     await scenarioDrawerRace(base);
     await scenarioPhone(base);
+    await scenarioWorkflowAttention(base);
+    await scenarioWorkflowTimeline(base);
+    await scenarioWorkflowReadiness(base);
+    await scenarioWorkflowContinuation(base);
+    await scenarioWorkflowStale(base);
+    await scenarioWorkflowDenied(base);
+    await scenarioWorkflowLateCard(base);
+    await scenarioWorkflowPhone(base);
   } finally {
     await browser.close();
     server.close();
@@ -611,6 +933,220 @@ async function scenarioPhone(base) {
   await page.locator("[data-task-id='t_run1']").first().click();
   await page.waitForSelector("text=Worker evidence", { timeout: 5000 });
   check("phone: card click target visible and opens drawer", await page.locator("text=Worker evidence").count() > 0);
+
+  await page.close();
+}
+
+// K2: bounded attention queue, Load-more paging, and exact drawer open.
+async function scenarioWorkflowAttention(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.waitForSelector("text=Attention blocked card", { timeout: 5000 });
+
+  check("attention: bounded queue shows both cards",
+    await page.locator("[data-workflow-attention-card='t_attn1']").count() === 1 &&
+    await page.locator("[data-workflow-attention-card='t_attn2']").count() === 1);
+  check("attention: omitted count button present", await page.locator("[data-workflow-attention-more]").count() === 1);
+
+  await page.click("[data-workflow-attention-more]");
+  await page.waitForSelector("[data-workflow-attention-card='t_attn3']", { timeout: 5000 });
+  check("attention: load more appended paged card", await page.locator("[data-workflow-attention-card='t_attn3']").count() === 1);
+  check("attention: load more gone after exhaustion", await page.locator("[data-workflow-attention-more]").count() === 0);
+
+  // Clicking a queue card opens the EXACT drawer for that card.
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector(".hermes-kanban-drawer-head", { timeout: 5000 });
+  check("attention: exact drawer opens for t_attn1", await page.locator(".hermes-kanban-drawer-head").locator("text=t_attn1").count() > 0);
+
+  await page.close();
+}
+
+// K4: card timeline — disjoint interval kinds, visible gaps, bounded paging.
+async function scenarioWorkflowTimeline(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-timeline='true']", { timeout: 5000 });
+  await page.waitForSelector("[data-workflow-timeline-interval='execution']", { timeout: 5000 });
+
+  check("timeline: execution interval rendered", true);
+  check("timeline: blocked interval rendered", await page.locator("[data-workflow-timeline-interval='blocked']").count() > 0);
+  check("timeline: review interval rendered", await page.locator("[data-workflow-timeline-interval='review']").count() > 0);
+  check("timeline: unknown interval rendered", await page.locator("[data-workflow-timeline-interval='unknown']").count() > 0);
+
+  check("timeline: gap visible", await page.locator("[data-workflow-timeline-gap]").count() > 0);
+
+  const totals = await page.locator(".hermes-kanban-workflow-totals").textContent();
+  check("timeline: covered-window totals shown, never productivity", /covered window/.test(totals) && /not productivity/.test(totals), totals);
+
+  await page.click("[data-workflow-timeline-more]");
+  await page.waitForTimeout(300);
+  check("timeline: load more appended second execution interval", await page.locator("[data-workflow-timeline-interval='execution']").count() === 2);
+  check("timeline: load more gone after exhaustion", await page.locator("[data-workflow-timeline-more]").count() === 0);
+
+  await page.close();
+}
+
+// K5: explicit readiness — POST only on click, separate permission check.
+async function scenarioWorkflowReadiness(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-readiness='true']", { timeout: 5000 });
+
+  check("readiness: no POST before click", !state.hits.some((h) => h.startsWith("readiness:")), state.hits.join(","));
+
+  await page.click("[data-workflow-readiness-check]");
+  await page.waitForSelector("[data-workflow-readiness-item='board_permission']", { timeout: 5000 });
+
+  check("readiness: POST fired only on click", state.hits.some((h) => h.startsWith("readiness:")), state.hits.join(","));
+  check("readiness: separate permission check rendered", await page.locator("[data-workflow-readiness-item='board_permission']").count() === 1);
+  check("readiness: permission shows mutation authorized", await page.locator("[data-workflow-readiness-item='board_permission']").locator("text=mutation authorized").count() > 0);
+  check("readiness: model check rendered", await page.locator("[data-workflow-readiness-item='model']").count() === 1);
+  check("readiness: ready to release yes", await page.locator("text=ready to release: yes").count() > 0);
+
+  await page.close();
+}
+
+// K6+K7: continuation draft (read-only) then a separate create click -> held.
+async function scenarioWorkflowContinuation(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-continuation='true']", { timeout: 5000 });
+
+  await page.fill("[data-workflow-cont-note]", "Synthetic continuation acceptance control.");
+  await page.fill("[data-workflow-cont-passed]", "Parent source validation passed");
+  await page.fill("[data-workflow-cont-remaining]", "Non-executing protocol acceptance control");
+  await page.fill("[data-workflow-cont-acceptance]", "Create one held card; original history unchanged; never dispatch");
+  await page.fill("[data-workflow-cont-workspace]", "/tmp/adapter-integration");
+  await page.fill("[data-workflow-cont-profile]", "evo");
+  await page.fill("[data-workflow-cont-provider]", "deepseek");
+  await page.fill("[data-workflow-cont-model]", "deepseek-v4-pro");
+  await page.fill("[data-workflow-cont-title]", "Non-executing continuation control");
+
+  check("continuation: no create button before draft", await page.locator("[data-workflow-continue]").count() === 0);
+
+  await page.click("[data-workflow-draft]");
+  await page.waitForSelector("[data-workflow-draft-result]", { timeout: 5000 });
+
+  check("continuation: draft hit recorded", state.hits.some((h) => h.startsWith("draft:")), state.hits.join(","));
+  check("continuation: no continue hit during draft", !state.hits.some((h) => h.startsWith("continue:")), state.hits.join(","));
+  check("continuation: fingerprint shown", await page.locator(".hermes-kanban-workflow-fingerprint").count() > 0);
+  check("continuation: original labelled unverified", await page.locator("[data-workflow-draft-original]").locator("text=unverified source excerpt").count() > 0);
+  check("continuation: entered remaining check echoed", await page.locator("[data-workflow-draft-result]").locator("text=Non-executing protocol acceptance control").count() > 0);
+
+  await page.click("[data-workflow-continue]");
+  await page.waitForSelector("[data-workflow-continue-result]", { timeout: 5000 });
+  await page.waitForSelector("text=continuation held: t_held1", { timeout: 5000 });
+
+  check("continuation: held result shown", await page.locator("[data-workflow-continue-result]").locator("text=t_held1").count() > 0);
+  check("continuation: open new card affordance", await page.locator("[data-workflow-open-new]").count() === 1);
+  check("continuation: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
+
+  await page.close();
+}
+
+// K7: stale fingerprint requires a re-draft, never a blind retry.
+async function scenarioWorkflowStale(base) {
+  resetState();
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-continuation='true']", { timeout: 5000 });
+
+  await page.fill("[data-workflow-cont-note]", "stale draft test");
+  await page.fill("[data-workflow-cont-passed]", "A");
+  await page.fill("[data-workflow-cont-remaining]", "B");
+  await page.fill("[data-workflow-cont-workspace]", "/tmp/ws");
+  await page.fill("[data-workflow-cont-profile]", "evo");
+  await page.fill("[data-workflow-cont-provider]", "deepseek");
+  await page.fill("[data-workflow-cont-model]", "deepseek-v4-pro");
+
+  await page.click("[data-workflow-draft]");
+  await page.waitForSelector("[data-workflow-draft-result]", { timeout: 5000 });
+
+  state.revision += 1; // simulate a concurrent card change after the draft
+
+  await page.click("[data-workflow-continue]");
+  await page.waitForSelector("[data-workflow-continue-result]", { timeout: 5000 });
+  await page.waitForSelector("text=Stale draft", { timeout: 5000 });
+
+  check("stale: re-draft required, no held card", await page.locator("text=Stale draft").count() > 0);
+  check("stale: no new card shown", await page.locator("text=t_held1").count() === 0);
+
+  await page.close();
+}
+
+// K5/K8 denied writes: board outside ATLAS_KANBAN_WRITE_BOARDS is read-only.
+async function scenarioWorkflowDenied(base) {
+  resetState();
+  const page = await (await newPage(base, "denied"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-readiness='true']", { timeout: 5000 });
+
+  await page.click("[data-workflow-readiness-check]");
+  await page.waitForSelector("[data-workflow-readiness-item='board_permission']", { timeout: 5000 });
+  check("denied: readiness permission FAIL visible", await page.locator("[data-workflow-readiness-item='board_permission']").locator("text=FAIL").count() > 0);
+  check("denied: ready to release no", await page.locator("text=ready to release: no").count() > 0);
+  check("denied: write-scope remedy visible", await page.locator("text=ATLAS_KANBAN_WRITE_BOARDS").count() > 0);
+
+  await page.fill("[data-workflow-hold-reason]", "hold for review");
+  await page.click("[data-workflow-hold-submit]");
+  await page.waitForSelector("[data-workflow-hold-result]", { timeout: 5000 });
+  check("denied: hold refused read-only", await page.locator("[data-workflow-hold-result]").locator("text=read-only").count() > 0);
+  check("denied: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
+
+  await page.close();
+}
+
+// Late workflow response: a delayed timeline for card A never leaks into card B.
+async function scenarioWorkflowLateCard(base) {
+  resetState();
+  state.timelineDelayMs = 800;
+  state.timelineDelayCard = "t_attn1";
+  const page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-readiness='true']", { timeout: 5000 });
+  await page.click(".hermes-kanban-drawer-close");
+  await page.click("[data-workflow-attention-card='t_attn2']");
+  await page.waitForSelector("[data-workflow-timeline-interval='execution']", { timeout: 5000 });
+  await page.waitForTimeout(1200);
+
+  check("late-card: card two shows its own execution interval", await page.locator("[data-workflow-timeline-interval='execution']").count() > 0);
+  check("late-card: card one blocked interval dropped", await page.locator("[data-workflow-timeline-interval='blocked']").count() === 0);
+  check("late-card: card one review interval dropped", await page.locator("[data-workflow-timeline-interval='review']").count() === 0);
+
+  await page.close();
+}
+
+// 390px phone: workflow surface renders and the queue opens the drawer.
+async function scenarioWorkflowPhone(base) {
+  resetState();
+  const page = await (await newPage(base, "evo", { width: 390, height: 844 }));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-workflow-attention='true']", { timeout: 5000 });
+  await page.waitForSelector("[data-workflow-attention-card='t_attn1']", { timeout: 5000 });
+
+  await page.click("[data-workflow-attention-card='t_attn1']");
+  await page.waitForSelector("[data-workflow-continuation='true']", { timeout: 5000 });
+  check("phone-workflow: queue card opens drawer with continuation", await page.locator("[data-workflow-continuation='true']").count() > 0);
+  check("phone-workflow: readiness check button visible", await page.locator("[data-workflow-readiness-check]").count() === 1);
+  check("phone-workflow: timeline section visible", await page.locator("[data-workflow-timeline='true']").count() > 0);
 
   await page.close();
 }

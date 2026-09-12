@@ -78,11 +78,13 @@ import {
   PROFILES_KEY
 } from './api'
 import { BoardSwitcher } from './board-switcher'
+import { $openCard } from './completion-notify'
 import { TaskDrawer } from './drawer'
 import { type BoardEvidence, EvidenceStateBadge, useBoardEvidence, viewsToBoardColumns, type WorkerState } from './evidence'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { COLUMN_META, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import { BoardWorkflowPanel } from './workflow'
 import {
   $newTaskLane,
   ago,
@@ -1148,6 +1150,7 @@ export function KanbanBoardPage() {
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [workflowOpen, setWorkflowOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
@@ -1167,6 +1170,24 @@ export function KanbanBoardPage() {
     setAddStatus(requestedLane)
     $newTaskLane.set(null)
   }, [requestedLane])
+
+  // Exact-card open request carried through the shared atom (a terminal toast
+  // action or the attention queue). Consumed whether the page is already
+  // mounted or mounting next; cleared so a later remount can't reopen it.
+  const requestedOpen = useValue($openCard)
+
+  useEffect(() => {
+    if (requestedOpen === null) {
+      return
+    }
+
+    if (requestedOpen.board && requestedOpen.board !== slug) {
+      $boardSlug.set(requestedOpen.board)
+    }
+
+    setOpenId(requestedOpen.card)
+    $openCard.set(null)
+  }, [requestedOpen, slug])
 
   const toggleSelect = (id: string) => {
     setSelected(prev => {
@@ -1427,6 +1448,17 @@ export function KanbanBoardPage() {
         )}
         <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
         <div className="ml-auto flex items-center gap-1">
+          <Tip label="Workflow">
+            <Button
+              aria-label="Workflow"
+              className={cn(workflowOpen && 'bg-(--ui-control-active-background) text-foreground')}
+              onClick={() => setWorkflowOpen(!workflowOpen)}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name="checklist" size="0.85rem" />
+            </Button>
+          </Tip>
           <Tip label={k.orchestrationSettings}>
             <Button
               aria-label={k.orchestrationSettings}
@@ -1446,6 +1478,7 @@ export function KanbanBoardPage() {
       </header>
 
       {settingsOpen && <OrchestrationPanel />}
+      {workflowOpen && <BoardWorkflowPanel />}
 
       {board && <Intro />}
 
