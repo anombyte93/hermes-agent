@@ -157,9 +157,13 @@ unless the board is aligned AND named in that setting.
 
 Tool `kanban_readiness`. The API resolves workspace/profile/provider/model from
 the aligned local task, derives the current git HEAD with a fixed argument
-list inside that workspace, and uses `<workspace>/.venv/bin/python`. The
-caller never supplies an executable, shell, path or revision. Model proof runs
-only when `check_model` is true (explicit action, never a polling loop).
+list inside that workspace, and uses `<workspace>/.venv/bin/python`. It also
+derives the card's real parent ids from the aligned board's `task_links`
+(bounded, one query; no recursive traversal) and passes them as `parents` so
+dependency completion is judged against the actual graph, never a hardcoded
+empty list. The caller never supplies an executable, shell, path or revision.
+Model proof runs only when `check_model` is true (explicit action, never a
+polling loop).
 
 Body:
 
@@ -188,6 +192,22 @@ A board-permission FAIL is NOT readiness: it reports the server's write scope
 without granting it. Never auto-release on `ready_to_release`. Missing or
 unsupported configuration returns `state=UNKNOWN` with `reason` naming the
 missing field and a `remedy`; nothing is invented.
+
+The bridge validates every readiness receipt before forwarding it (a
+contradictory receipt is `state=UNKNOWN`, never a coerced PASS):
+
+- `requested` identity must bind board/profile/provider/model/workspace/
+  `expected_revision`/`python`/`check_model`/`parents` to the exact args sent.
+- checks must be uniquely named with strict `PASS`/`FAIL`/`UNKNOWN` states.
+- `freshness.checked_at`/`stale_after` must be finite with a non-inverted
+  horizon.
+- `ready_to_release` must be false when any check is FAIL/UNKNOWN/missing or
+  when the model proof was skipped (`check_model=false`).
+
+The released helper exits 1 for a legitimate structured FAIL (e.g. a denied
+board); the bridge still forwards that receipt's `checks` and only rejects a
+`PASS` that contradicts a nonzero exit. An unreadable or overbound dependency
+graph is `state=UNKNOWN`, never silently `parents=[]`.
 
 ### POST /workflow/continuation-draft?board=...  body {...}
 
@@ -267,10 +287,12 @@ On success `evidence`:
 }
 ```
 
-`held` must be true: no unblock or dispatch ever occurs here. On UNKNOWN, the
-UI must tell the user to inspect before retrying; on a stale fingerprint
-(`fingerprint_mismatch`) require a re-draft. Never silently retry with a new
-key.
+`held` must be true: no unblock or dispatch ever occurs here. The bridge also
+requires `no_original_mutation=true` and `new_card_status` in `blocked`/
+`triage` (a held state); a receipt claiming otherwise is `state=UNKNOWN`. On
+UNKNOWN, the UI must tell the user to inspect before retrying; on a stale
+fingerprint (`fingerprint_mismatch`) require a re-draft. Never silently retry
+with a new key.
 
 ### POST /workflow/hold?board=...  body {card, reason}
 
@@ -289,6 +311,13 @@ its profile; it does NOT stop a live worker. A review card held here records
   "warning": "Holding blocks dispatch, not the process. A live worker may still write its workspace."
 }
 ```
+
+The bridge requires the hold receipt to be a durable, verified hold: `read_back.state`
+must be `PASS`, `read_back.data.id` must equal the requested card, and
+`read_back.data.status` must be `blocked` or `triage`. A missing or
+contradictory `read_back` (e.g. an empty object or a still-running status) is
+`state=UNKNOWN`, never a silent PASS. A held card stays held; nothing here
+stops a live worker.
 
 ## Validation errors
 

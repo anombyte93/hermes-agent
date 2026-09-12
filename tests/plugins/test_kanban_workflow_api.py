@@ -142,13 +142,20 @@ def projection():
 
 def workflow():
     if tool == "kanban_readiness":
+        check_model = bool(args.get("check_model"))
+        checks = [{{"name": "board_permission", "state": "PASS", "reason": "board exists and may mutate"}}]
+        if check_model:
+            checks.append({{"name": "model", "state": "PASS", "reason": "model proof verified", "resolved_model": args.get("model"), "response_model": args.get("model"), "ready": True, "observed_at": 1789216932.8}})
+        else:
+            checks.append({{"name": "model", "state": "UNKNOWN", "reason": "model proof skipped"}})
+        ready = all(c.get("state") == "PASS" for c in checks)
         return {{
-            "state": "PASS",
-            "requested": {{"board": args.get("board"), "profile": args.get("profile"), "provider": args.get("provider"), "model": args.get("model"), "workspace": args.get("workspace"), "expected_revision": args.get("expected_revision"), "parents": [], "check_model": args.get("check_model"), "python": args.get("python")}},
+            "state": "PASS" if ready else "UNKNOWN",
+            "requested": {{"board": args.get("board"), "profile": args.get("profile"), "provider": args.get("provider"), "model": args.get("model"), "workspace": args.get("workspace"), "expected_revision": args.get("expected_revision"), "parents": args.get("parents") or [], "check_model": check_model, "python": args.get("python")}},
             "observed_at": 1789216932.8,
             "freshness": {{"checked_at": 1789216932.8, "stale_after": 1789216932.8 + 300, "note": "n"}},
-            "ready_to_release": True,
-            "checks": [{{"name": "board_permission", "state": "PASS", "reason": "board exists and may mutate"}}],
+            "ready_to_release": ready,
+            "checks": checks,
             "execution_host": "evo",
             "boundary": "readiness never dispatches",
         }}
@@ -210,6 +217,13 @@ if behavior == "malformed":
     sys.stdout.flush()
     sys.exit(0)
 
+if behavior == "malformed_nonzero":
+    # A helper that dies mid-write with garbage on stdout: the bridge must
+    # report UNKNOWN, never a silent PASS or a crash.
+    sys.stdout.write("not json <<<")
+    sys.stdout.flush()
+    sys.exit(1)
+
 if behavior == "noshape":
     # PASS receipt missing the fields the validator requires -> UNKNOWN.
     if tool in ("kanban_readiness", "kanban_continuation_draft", "kanban_continue", "kanban_hold"):
@@ -238,14 +252,14 @@ if behavior == "fail":
     elif tool == "kanban_readiness":
         emit({{
             "state": "FAIL",
-            "requested": {{"board": args.get("board")}},
+            "requested": {{"board": args.get("board"), "profile": args.get("profile"), "provider": args.get("provider"), "model": args.get("model"), "workspace": args.get("workspace"), "expected_revision": args.get("expected_revision"), "parents": args.get("parents") or [], "check_model": bool(args.get("check_model")), "python": args.get("python")}},
             "observed_at": 1789216932.8,
             "freshness": {{"checked_at": 1789216932.8, "stale_after": 1789216932.8 + 300, "note": "n"}},
             "ready_to_release": False,
             "checks": [{{"name": "board_permission", "state": "FAIL", "reason": "read-only for the board"}}],
             "execution_host": "evo",
         }})
-        sys.exit(0)
+        sys.exit(1)
     else:
         emit({{"state": "FAIL", "reason": "original card is running", "board": args.get("board"), "card": args.get("card")}})
         sys.exit(1)
@@ -437,7 +451,7 @@ def test_readiness_pass_resolves_task_and_git_head(client, helper_bin, aligned_e
     r = client.post(
         "/api/plugins/kanban/workflow/readiness",
         params={"board": "default"},
-        json={"card": aligned_evo, "check_model": False},
+        json={"card": aligned_evo, "check_model": True},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -455,7 +469,7 @@ def test_readiness_pass_resolves_task_and_git_head(client, helper_bin, aligned_e
     workspace = str(Path(__file__).resolve().parents[2])
     assert stdin["workspace"] == workspace
     assert stdin["python"] == os.path.join(workspace, ".venv", "bin", "python")
-    assert stdin["check_model"] is False
+    assert stdin["check_model"] is True
     assert stdin["parents"] == []
 
 
@@ -510,6 +524,8 @@ def test_readiness_unaligned_is_refused(client, helper_bin, aligned_evo, monkeyp
 
 
 def test_readiness_fail_forward_checks(client, helper_bin, aligned_evo):
+    # The released helper exits 1 for a legitimate structured FAIL; the bridge
+    # must still forward the structured checks, not strip them on the exit code.
     helper_bin("fail")
     r = client.post(
         "/api/plugins/kanban/workflow/readiness",
@@ -519,8 +535,22 @@ def test_readiness_fail_forward_checks(client, helper_bin, aligned_evo):
     assert r.status_code == 200
     body = r.json()
     assert body["state"] == "FAIL"
+    assert "exited 1" in body["reason"]
     assert body["evidence"]["ready_to_release"] is False
     assert body["evidence"]["checks"][0]["name"] == "board_permission"
+
+
+def test_readiness_malformed_nonzero_is_unknown(client, helper_bin, aligned_evo):
+    helper_bin("malformed_nonzero")
+    r = client.post(
+        "/api/plugins/kanban/workflow/readiness",
+        params={"board": "default"},
+        json={"card": aligned_evo, "check_model": False},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +795,34 @@ def test_workflow_routes_present_and_typed():
     assert methods["/workflow/continuation-draft"] == {"POST"}
     assert methods["/workflow/continue"] == {"POST"}
     assert methods["/workflow/hold"] == {"POST"}
+
+
+def test_parent_readiness_includes_real_dependencies(client, helper_bin, aligned_evo):
+    conn = kb.connect(board="default")
+    try:
+        parent = kb.create_task(conn, title="unfinished prerequisite", assignee="evo")
+        kb.link_tasks(conn, parent, aligned_evo)
+    finally:
+        conn.close()
+    helper_bin("pass")
+    response = client.post("/api/plugins/kanban/workflow/readiness?board=default", json={"card": aligned_evo, "check_model": False})
+    assert response.status_code == 200
+    assert _invocations(helper_bin.record_path)[0]["stdin"]["parents"] == [parent]
+
+
+@pytest.mark.parametrize("route,mutation", [
+    ("readiness", "obj['checks'][0]['state'] = 'FAIL'; obj['ready_to_release'] = True"),
+    ("readiness", "obj['requested']['workspace'] = '/home/hayden/wrong-checkout'"),
+    ("hold", "obj['read_back'] = {}"),
+    ("hold", "obj['read_back']['data']['status'] = 'running'"),
+])
+def test_parent_refuses_contradictory_pass(client, helper_bin, aligned_evo, monkeypatch, route, mutation):
+    monkeypatch.setenv("ATLAS_KANBAN_WRITE_BOARDS", "default")
+    exe = helper_bin("pass")
+    script = exe.read_text()
+    script = script.replace("def emit(obj):", "def emit(obj):\n    " + mutation)
+    exe.write_text(script)
+    payload = {"card": aligned_evo, "check_model": False} if route == "readiness" else {"card": aligned_evo, "reason": "parent synthetic control"}
+    response = client.post("/api/plugins/kanban/workflow/" + route + "?board=default", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "UNKNOWN", response.json()
