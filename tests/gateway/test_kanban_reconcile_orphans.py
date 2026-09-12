@@ -142,9 +142,12 @@ class TestReconcileOrphanedRunning:
     def test_non_running_statuses_ignored(self, conn):
         for status in ("todo", "ready", "blocked", "done"):
             tid = kb.create_task(conn, title=f"s-{status}", assignee="w")
+            # ``blocked`` requires a current reason (kernel-level trigger); the
+            # other non-running statuses carry none.
+            block_reason = "test-only block reason" if status == "blocked" else None
             conn.execute(
-                "UPDATE tasks SET status=?, claim_lock=NULL, "
-                "claim_expires=NULL WHERE id=?", (status, tid),
+                "UPDATE tasks SET status=?, block_reason=?, claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (status, block_reason, tid),
             )
         conn.commit()
         assert kb.reconcile_orphaned_running(conn) == []
