@@ -894,20 +894,10 @@
       return k + " " + byStatus[k];
     }).join(" \u00b7 ");
 
-    // Bounded snapshot cards (K4): a visible, stable, pageable list of the
-    // snapshot's bounded projections. Missing card fields are simply omitted
-    // (no false defaults). Every card without an observation is UNKNOWN
-    // (missing observation is never Stopped), regardless of status.
-    const wmRef = ev.workerMap || {};
-    const cardRows = ev.cards.map(function (card) {
-      const st = wmRef[card.id] ? wmRef[card.id].state : "unknown";
-      return h("div", { key: card.id, className: "flex items-center gap-2 text-xs", style: { padding: "1px 0" } },
-        h("span", { className: "text-muted-foreground", style: { fontFamily: "monospace" } }, card.id),
-        h("span", { style: { maxWidth: "42ch", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, card.title || "(untitled)"),
-        h("span", { className: "text-muted-foreground" }, card.status),
-        st ? h(EvidenceBadge, { state: st }) : null);
-    });
-
+    // Compact strip only: identity, counts, freshness and Load more. The
+    // actual cards (with per-card worker badges) live in BoardColumns, driven
+    // by the same snapshot. A per-card list here would duplicate the board and
+    // push it below the fold, so it is intentionally not rendered.
     return h("div", {
       className: "hermes-kanban-evidence-banner",
       style: Object.assign({}, bar, {
@@ -937,8 +927,7 @@
               style: { marginLeft: "12px" },
               onClick: function () { ev.loadMore(); },
             }, ev.loadingMore ? "Loading\u2026" : "Load more (" + (omitted != null ? omitted : "") + " omitted)")
-          : null),
-      cardRows.length > 0 ? h("div", null, cardRows) : null);
+          : null));
   }
 
   // Drawer worker-evidence panel (K9): reads /evidence/worker for the open
@@ -1027,6 +1016,22 @@
 
   const WORKFLOW_CHANGES_POLL_MS = 30000;
 
+  // K7 notification region: event kinds that surface an actionable in-page
+  // notification on the EXISTING /events stream (extended onmessage, never a
+  // second WebSocket / poll notifier). review_requested and changes_requested
+  // are the review-feedback kinds; the rest are the existing terminal kinds
+  // the gateway already notifies on.
+  const NOTICE_KINDS = {
+    review_requested: "Review requested",
+    changes_requested: "Changes requested",
+    completed: "Completed",
+    blocked: "Blocked",
+    gave_up: "Gave up",
+    crashed: "Crashed",
+    timed_out: "Timed out",
+  };
+  const NOTICE_MAX = 20;
+
   // Workflow responses use the standard evidence envelope; the helper's own
   // receipt (readiness / draft / continue / hold) lives under ``evidence``.
   // This normalizer mirrors evidenceEnvelope but never claims the "worker
@@ -1055,6 +1060,14 @@
   function fetchEvidenceTimeline(board, card, limit, cursor) {
     const qs = evQuery({ limit: limit || 50, cursor: cursor || undefined });
     return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/timeline?card=${encodeURIComponent(card)}&${qs}`, board)));
+  }
+  // K7 notification baseline: one MAX(id) read from the same selected-server
+  // DB as the existing /events stream (works local and EVO alike), never a
+  // remote worker claim and never a full/board poll. The changes panel keeps
+  // its own /evidence/changes cursor; this endpoint feeds ONLY the notice
+  // region's historical-flood guard.
+  function fetchEventsBaseline(board) {
+    return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}/events/baseline`, board)));
   }
   function postWorkflow(board, path, body) {
     return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}${path}`, board), {
@@ -1095,6 +1108,75 @@
         env.reason || "workflow response unavailable"),
       env.remedy
         ? h("span", { style: { marginLeft: "6px", color: "var(--muted-foreground, #6b7280)" } }, env.remedy)
+        : null);
+  }
+
+  // K7 — actionable, deduplicated change notifications. Driven exclusively by
+  // the EXISTING /events WebSocket stream (the onmessage is extended, never a
+  // second notifier). Each row opens the exact card; the baseline (bounded
+  // baseline-now /evidence/changes read) gates what may notify, so historical
+  // events never flood. Unknown baseline pauses notifications and offers a
+  // retry rather than replaying history.
+  function WorkflowNoticeRegion(props) {
+    const baselineState = props.baselineState; // null | "unknown" | number
+    const notices = props.notices || [];
+    const stateLabel = baselineState === "unknown" ? "unknown"
+      : (typeof baselineState === "number" ? "ready" : "pending");
+    const rows = notices.map(function (n) {
+      const label = NOTICE_KINDS[n.kind] || n.kind;
+      return h("div", {
+        key: n.id,
+        className: "hermes-kanban-workflow-notice",
+        "data-workflow-notice-item": n.task_id || "",
+        "data-workflow-notice-kind": n.kind || "",
+      },
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-workflow-notice-open",
+          "data-workflow-notice-open-item": n.task_id || "",
+          onClick: function () { if (props.onOpen && n.task_id) props.onOpen(n.task_id); },
+        },
+          h("span", { className: "hermes-kanban-workflow-notice-kind" }, label),
+          h("span", { className: "hermes-kanban-workflow-notice-task" }, n.task_id || ""),
+          n.created_at != null
+            ? h("span", { className: "hermes-kanban-comment-ago" }, timeAgo ? timeAgo(n.created_at) : "")
+            : null),
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-workflow-notice-dismiss",
+          "aria-label": "dismiss notification",
+          onClick: function () { if (props.onDismiss) props.onDismiss(n.id); },
+        }, "×"));
+    });
+    return h("div", {
+      className: "hermes-kanban-section",
+      "data-workflow-notice": "true",
+      "data-workflow-notice-baseline": stateLabel,
+      "data-workflow-notice-baseline-id": typeof baselineState === "number" ? String(baselineState) : "",
+    },
+      h("div", { className: "hermes-kanban-section-head" }, "Notifications"),
+      baselineState === "unknown"
+        ? h("div", { className: "hermes-kanban-workflow-notice-paused" },
+            h("span", { className: "text-xs text-muted-foreground" },
+              "Change notifications are paused: the change baseline could not be established."),
+            h("button", {
+              type: "button",
+              className: "hermes-kanban-workflow-btn",
+              "data-workflow-notice-retry": "true",
+              onClick: props.onRetry,
+            }, "Retry baseline"))
+        : null,
+      baselineState === null
+        ? h("div", { className: "text-xs text-muted-foreground" }, "Establishing change baseline…")
+        : null,
+      rows.length > 0 ? h("div", { className: "hermes-kanban-workflow-list" }, rows) : null,
+      rows.length > 0
+        ? h("button", {
+            type: "button",
+            className: "hermes-kanban-workflow-btn",
+            "data-workflow-notice-clear": "true",
+            onClick: props.onClear,
+          }, "Clear")
         : null);
   }
 
@@ -2147,6 +2229,96 @@
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
 
+    // K7 notification region state. The WebSocket onmessage feeds
+    // ingestNoticeEvents; a per-board ref holds the baseline + dedup set so
+    // switching boards isolates notifications and duplicate frames collapse.
+    const [workflowNotices, setWorkflowNotices] = useState([]);
+    const [noticeBaselineState, setNoticeBaselineState] = useState(null); // null | "unknown" | number
+    const noticeRef = useRef({ board: null, baseline: null, seen: {} });
+    const noticeGenRef = useRef(0);
+
+    const resetNotices = useCallback(function (slug) {
+      noticeGenRef.current += 1;
+      noticeRef.current = { board: slug || null, baseline: null, seen: {} };
+      setWorkflowNotices([]);
+      setNoticeBaselineState(null);
+    }, []);
+
+    // Establish the notification baseline from GET /events/baseline (one
+    // MAX(id) read from the same selected-server DB as the existing /events
+    // stream). Strict gate: PASS state, exact board, and a nonnegative integer
+    // baseline id. Anything else (FAIL/UNKNOWN/malformed baseline or a wrong
+    // board) is "unknown": historical notifications are suppressed and the UI
+    // offers a retry, it never replays history.
+    const establishNoticeBaseline = useCallback(function (slug) {
+      noticeGenRef.current += 1;
+      const gen = noticeGenRef.current;
+      noticeRef.current = { board: slug, baseline: null, seen: {} };
+      setWorkflowNotices([]);
+      setNoticeBaselineState(null);
+      return fetchEventsBaseline(slug).then(function (env) {
+        if (gen !== noticeGenRef.current) return; // board switched mid-flight
+        const data = (env && env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        const stateOk = env && env.state === "PASS";
+        const boardOk = data.board === slug;
+        const baselineId = data.baseline_id;
+        const baselineOk = typeof baselineId === "number" && Number.isFinite(baselineId)
+          && baselineId >= 0 && Math.floor(baselineId) === baselineId;
+        if (stateOk && boardOk && baselineOk) {
+          noticeRef.current.baseline = baselineId;
+          setNoticeBaselineState(baselineId);
+        } else {
+          noticeRef.current.baseline = "unknown";
+          setNoticeBaselineState("unknown");
+        }
+      }).catch(function () {
+        if (gen !== noticeGenRef.current) return;
+        noticeRef.current.baseline = "unknown";
+        setNoticeBaselineState("unknown");
+      });
+    }, []);
+
+    // Feed WS events into the notice region. Only events for the current board,
+    // after a valid baseline, of a notification-worthy kind, and not already
+    // seen, are surfaced. Replayed/historical and duplicate ids are dropped.
+    const ingestNoticeEvents = useCallback(function (slug, events) {
+      const nr = noticeRef.current;
+      if (!nr || nr.board !== slug) return;      // late frame from another board
+      if (nr.baseline == null || nr.baseline === "unknown") return; // suppressed
+      const baseline = nr.baseline;
+      if (!Array.isArray(events)) return;
+      const fresh = [];
+      for (let i = 0; i < events.length; i += 1) {
+        const e = events[i];
+        if (!e || e.id == null) continue;
+        if (!Object.prototype.hasOwnProperty.call(NOTICE_KINDS, e.kind)) continue;
+        if (e.id <= baseline) continue;          // historical / replay
+        if (nr.seen[e.id]) continue;             // duplicate frame
+        nr.seen[e.id] = true;
+        fresh.push({ id: e.id, kind: e.kind, task_id: e.task_id, created_at: e.created_at });
+      }
+      if (fresh.length === 0) return;
+      setWorkflowNotices(function (prev) {
+        const merged = fresh.concat(prev);
+        const seenIds = {};
+        const out = [];
+        for (let i = 0; i < merged.length; i += 1) {
+          const n = merged[i];
+          if (seenIds[n.id]) continue;
+          seenIds[n.id] = true;
+          out.push(n);
+        }
+        return out.slice(0, NOTICE_MAX);
+      });
+    }, []);
+
+    const dismissNotice = useCallback(function (id) {
+      setWorkflowNotices(function (prev) { return prev.filter(function (n) { return n.id !== id; }); });
+    }, []);
+    const clearNotices = useCallback(function () {
+      setWorkflowNotices([]);
+    }, []);
+
     const cursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
@@ -2281,6 +2453,9 @@
                   return next;
                 });
                 scheduleReload();
+                // K7: feed notification-worthy events into the in-page notice
+                // region (extended existing stream, never a second notifier).
+                ingestNoticeEvents(board, msg.events);
               }
             } catch (_e) { /* ignore */ }
           };
@@ -2309,7 +2484,19 @@
         wsClosedRef.current = true;
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
       };
-    }, [!!boardData, board, scheduleReload]);
+    }, [!!boardData, board, scheduleReload, ingestNoticeEvents]);
+
+    // K7: (re)establish the notification baseline whenever the selected board
+    // or alignment changes. When not aligned there is no EVO evidence stream,
+    // so any prior notices are cleared and no baseline is attempted.
+    useEffect(function () {
+      if (!board) return undefined;
+      if (!evidenceAligned) {
+        resetNotices(board);
+        return undefined;
+      }
+      establishNoticeBaseline(board);
+    }, [board, evidenceAligned, establishNoticeBaseline, resetNotices]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
@@ -2875,6 +3062,14 @@
           dialogState: kanbanDialogs.dialogState,
         }),
         h(EvidenceBanner, { evidence: evidence }),
+        evidenceAligned ? h(WorkflowNoticeRegion, {
+          notices: workflowNotices,
+          baselineState: noticeBaselineState,
+          onOpen: setSelectedTaskId,
+          onDismiss: dismissNotice,
+          onClear: clearNotices,
+          onRetry: function () { establishNoticeBaseline(board); },
+        }) : null,
         evidenceAligned ? h(WorkflowAttentionSection, { boardSlug: board, onOpen: setSelectedTaskId }) : null,
         evidenceAligned ? h(WorkflowChangesSection, { boardSlug: board }) : null,
         h(BoardColumns, {
