@@ -22,18 +22,24 @@ interface OsDoor {
 interface Mod {
   bindCompletionNotify(r: Rest, t?: Translate, os?: OsDoor): void
   onKanbanEventsFrame(slug: string, events?: CompletionEvent[]): Promise<boolean>
+  $openCard: { get(): { board: string; card: string } | null; set(v: { board: string; card: string } | null): void }
 }
 
 const { hostMock } = vi.hoisted(() => ({
   hostMock: { notify: vi.fn(), navigate: vi.fn() }
 }))
 
-vi.mock('@hermes/plugin-sdk', () => ({
-  host: hostMock,
-  // Pulled in transitively via ./i18n (the module reads its `en` bundle for
-  // fallback titles); never called in these tests.
-  usePluginI18n: () => (key: string) => key
-}))
+vi.mock('@hermes/plugin-sdk', async () => {
+  const { atom } = await import('nanostores')
+
+  return {
+    host: hostMock,
+    atom,
+    // Pulled in transitively via ./i18n (the module reads its `en` bundle for
+    // fallback titles); never called in these tests.
+    usePluginI18n: () => (key: string) => key
+  }
+})
 
 type NotifyInput = {
   message: string
@@ -46,11 +52,15 @@ type NotifyInput = {
 const lastNotify = (): NotifyInput =>
   hostMock.notify.mock.calls[hostMock.notify.mock.calls.length - 1][0] as NotifyInput
 
-/** Rest stub: GET /board resolves to the current latest_event_id. */
+/** Rest stub: GET /evidence/changes resolves to a bounded changes baseline
+ *  carrying the current high-water event id (baseline-now), wrapped in the
+ *  standard PASS envelope with the exact board. */
 function makeRest(latest: () => number) {
   return vi.fn(async (path: string) => {
-    if (path.startsWith('/board')) {
-      return { latest_event_id: latest() }
+    if (path.startsWith('/evidence/changes')) {
+      const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
+
+      return { state: 'PASS', board: slug, evidence: { baseline_id: latest() } }
     }
 
     throw new Error(`unexpected rest call: ${path}`)
@@ -80,7 +90,7 @@ beforeEach(() => {
 })
 
 describe('authoritative baseline', () => {
-  it('baselines from GET /board latest_event_id and suppresses replay history', async () => {
+  it('baselines from a bounded /evidence/changes read and suppresses replay history', async () => {
     const rest = makeRest(() => 100)
     const m = await loadModule()
     m.bindCompletionNotify(rest as never)
@@ -90,7 +100,7 @@ describe('authoritative baseline', () => {
 
     expect(fired).toBe(false)
     expect(hostMock.notify).not.toHaveBeenCalled()
-    expect(rest).toHaveBeenCalledWith('/board?board=smoke')
+    expect(rest).toHaveBeenCalledWith('/evidence/changes?board=smoke&limit=1')
   })
 
   it('post-baseline completion notifies exactly once', async () => {
@@ -140,12 +150,12 @@ describe('authoritative baseline', () => {
   })
 
   it('missed unseen event: frame arriving before the baseline resolves is classified after it', async () => {
-    let resolveBoard!: (value: { latest_event_id: number }) => void
+    let resolveChanges!: (value: { state: string; board: string; evidence: { baseline_id: number } }) => void
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/board')) {
-        return new Promise<{ latest_event_id: number }>(resolve => {
-          resolveBoard = resolve
+      if (path.startsWith('/evidence/changes')) {
+        return new Promise<{ state: string; board: string; evidence: { baseline_id: number } }>(resolve => {
+          resolveChanges = resolve
         })
       }
 
@@ -157,7 +167,7 @@ describe('authoritative baseline', () => {
 
     // Fire the frame before the baseline resolves.
     const pending = m.onKanbanEventsFrame('smoke', [ev(100, 'created'), ev(105, 'completed')])
-    resolveBoard({ latest_event_id: 100 })
+    resolveChanges({ state: 'PASS', board: 'smoke', evidence: { baseline_id: 100 } })
     const fired = await pending
 
     expect(fired).toBe(true)
@@ -181,15 +191,15 @@ describe('authoritative baseline', () => {
   })
 
   it('baseline failure is fail-closed: unknown baseline suppresses, later success binds', async () => {
-    let failBoard = true
+    let failChanges = true
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/board')) {
-        if (failBoard) {
-          throw new Error('board unavailable')
+      if (path.startsWith('/evidence/changes')) {
+        if (failChanges) {
+          throw new Error('changes unavailable')
         }
 
-        return { latest_event_id: 200 }
+        return { state: 'PASS', board: 'smoke', evidence: { baseline_id: 200 } }
       }
 
       throw new Error(`unexpected rest call: ${path}`)
@@ -203,7 +213,7 @@ describe('authoritative baseline', () => {
     expect(hostMock.notify).not.toHaveBeenCalled()
 
     // Baseline now succeeds: 150 <= 200 stays suppressed, 201 notifies.
-    failBoard = false
+    failChanges = false
     const fired2 = await m.onKanbanEventsFrame('smoke', [ev(150, 'completed')])
     expect(fired2).toBe(false)
 
@@ -217,6 +227,118 @@ describe('authoritative baseline', () => {
     const fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'completed')])
     expect(fired).toBe(false)
     expect(hostMock.notify).not.toHaveBeenCalled()
+  })
+})
+
+describe('baseline validation (HTTP 200 states)', () => {
+  it('a FAIL/UNKNOWN 200 envelope never falls back to baseline 0 and suppresses history', async () => {
+    let mode: 'FAIL' | 'UNKNOWN' | 'PASS' = 'FAIL'
+    const m = await loadModule()
+
+    const rest = vi.fn(async (path: string) => {
+      if (path.startsWith('/evidence/changes')) {
+        if (mode === 'PASS') {
+          return { state: 'PASS', board: 'smoke', evidence: { baseline_id: 100 } }
+        }
+
+        return { state: mode, board: 'smoke', evidence: null, reason: 'changes unavailable' }
+      }
+
+      throw new Error(`unexpected rest call: ${path}`)
+    })
+
+    m.bindCompletionNotify(rest as never)
+
+    // FAIL: if the code had fallen back to baseline 0, ev(150) would notify.
+    let fired = await m.onKanbanEventsFrame('smoke', [ev(5, 'completed'), ev(150, 'completed')])
+    expect(fired).toBe(false)
+    expect(hostMock.notify).not.toHaveBeenCalled()
+
+    // UNKNOWN: same suppression, no historical flood.
+    mode = 'UNKNOWN'
+    fired = await m.onKanbanEventsFrame('smoke', [ev(150, 'completed')])
+    expect(fired).toBe(false)
+    expect(hostMock.notify).not.toHaveBeenCalled()
+
+    // Recovery: a later PASS baseline (100) is authoritative — 90 is history,
+    // 101 is new.
+    mode = 'PASS'
+    fired = await m.onKanbanEventsFrame('smoke', [ev(90, 'completed')])
+    expect(fired).toBe(false)
+    fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'completed')])
+    expect(fired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('a malformed baseline_id (missing/string/negative/float/NaN) stays unknown and a later PASS recovers', async () => {
+    const malformed: unknown[] = [
+      {},
+      { baseline_id: '100' },
+      { baseline_id: -1 },
+      { baseline_id: 1.5 },
+      { baseline_id: Number.NaN }
+    ]
+
+    let index = 0
+    const m = await loadModule()
+
+    const rest = vi.fn(async (path: string) => {
+      if (path.startsWith('/evidence/changes')) {
+        if (index >= malformed.length) {
+          return { state: 'PASS', board: 'smoke', evidence: { baseline_id: 100 } }
+        }
+
+        const evidence = malformed[index]
+        index += 1
+
+        return { state: 'PASS', board: 'smoke', evidence }
+      }
+
+      throw new Error(`unexpected rest call: ${path}`)
+    })
+
+    m.bindCompletionNotify(rest as never)
+
+    for (let i = 0; i < malformed.length; i++) {
+      const fired = await m.onKanbanEventsFrame('smoke', [ev(150, 'completed')])
+      expect(fired).toBe(false)
+    }
+
+    expect(hostMock.notify).not.toHaveBeenCalled()
+
+    // Recovery: PASS baseline 100 is authoritative — 90 is history, 101 is new.
+    expect(await m.onKanbanEventsFrame('smoke', [ev(90, 'completed')])).toBe(false)
+    expect(await m.onKanbanEventsFrame('smoke', [ev(101, 'completed')])).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('a board-mismatched baseline envelope is rejected (board identity isolated)', async () => {
+    const m = await loadModule()
+
+    const rest = vi.fn(async (path: string) => {
+      if (path.startsWith('/evidence/changes')) {
+        return { state: 'PASS', board: 'other-board', evidence: { baseline_id: 100 } }
+      }
+
+      throw new Error(`unexpected rest call: ${path}`)
+    })
+
+    m.bindCompletionNotify(rest as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [ev(150, 'completed')])
+    expect(fired).toBe(false)
+    expect(hostMock.notify).not.toHaveBeenCalled()
+  })
+
+  it('never falls back to a full /board baseline poll', async () => {
+    const m = await loadModule()
+    const rest = makeRest(() => 100)
+    m.bindCompletionNotify(rest as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed')])
+
+    const boardCalls = rest.mock.calls.filter(call => String(call[0]).startsWith('/board'))
+    expect(boardCalls).toHaveLength(0)
   })
 })
 
@@ -254,10 +376,10 @@ describe('board isolation', () => {
     ])
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/board')) {
+      if (path.startsWith('/evidence/changes')) {
         const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
 
-        return { latest_event_id: latest.get(slug) ?? 0 }
+        return { state: 'PASS', board: slug, evidence: { baseline_id: latest.get(slug) ?? 0 } }
       }
 
       throw new Error(`unexpected rest call: ${path}`)
@@ -281,10 +403,10 @@ describe('board isolation', () => {
     ])
 
     const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/board')) {
+      if (path.startsWith('/evidence/changes')) {
         const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
 
-        return { latest_event_id: latest.get(slug) ?? 0 }
+        return { state: 'PASS', board: slug, evidence: { baseline_id: latest.get(slug) ?? 0 } }
       }
 
       throw new Error(`unexpected rest call: ${path}`)
@@ -305,7 +427,7 @@ describe('board isolation', () => {
     const fired = await m.onKanbanEventsFrame('a', [ev(100, 'completed'), ev(150, 'completed')])
     expect(fired).toBe(false)
     expect(hostMock.notify).toHaveBeenCalledTimes(2)
-    const boardCalls = rest.mock.calls.filter(call => String(call[0]).startsWith('/board?board=a'))
+    const boardCalls = rest.mock.calls.filter(call => String(call[0]).startsWith('/evidence/changes?board=a'))
     expect(boardCalls).toHaveLength(1)
   })
 })
@@ -551,5 +673,98 @@ describe('i18n routing', () => {
     await m.onKanbanEventsFrame('smoke', [ev(101, 'timed_out')])
 
     expect(lastNotify().title).toBe('Task timed out — will retry')
+  })
+})
+
+describe('review handoffs', () => {
+  it('review_requested notifies with the payload summary', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'review_requested', { summary: 'Ready for review' })])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'info',
+      title: 'Task handed off for review',
+      message: 'Ready for review',
+      detail: 't101'
+    })
+  })
+
+  it('changes_requested notifies with the payload reason', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'changes_requested', { reason: 'fix the retry path' })])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      title: 'Review changes requested',
+      message: 'fix the retry path',
+      detail: 't101'
+    })
+  })
+
+  it('review handoffs advance the cursor like every other terminal kind', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'review_requested')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Same event replayed must not re-notify.
+    const again = await m.onKanbanEventsFrame('smoke', [ev(101, 'review_requested')])
+    expect(again).toBe(false)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('review handoff toasts also carry board + card through $openCard', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'review_requested', { summary: 'Ready' })])
+    let input = lastNotify()
+    expect(m.$openCard.get()).toBeNull()
+    input.action?.onClick()
+    expect(m.$openCard.get()).toEqual({ board: 'smoke', card: 't101' })
+
+    m.$openCard.set(null)
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'changes_requested', { reason: 'fix it' })])
+    input = lastNotify()
+    input.action?.onClick()
+    expect(m.$openCard.get()).toEqual({ board: 'smoke', card: 't102' })
+  })
+})
+
+describe('exact-card action', () => {
+  it('a terminal toast action carries board + card through $openCard, then navigates', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done' })])
+
+    const input = lastNotify()
+    expect(input.action?.label).toBe('Open Kanban')
+    expect(m.$openCard.get()).toBeNull()
+
+    input.action?.onClick()
+
+    expect(m.$openCard.get()).toEqual({ board: 'smoke', card: 't101' })
+    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
+  })
+
+  it('a terminal event with no task id still navigates but sets no card request', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const noTask = { id: 101, kind: 'completed', task_id: '', payload: null } as CompletionEvent
+    await m.onKanbanEventsFrame('smoke', [noTask])
+
+    const input = lastNotify()
+    input.action?.onClick()
+    expect(m.$openCard.get()).toBeNull()
+    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
   })
 })
