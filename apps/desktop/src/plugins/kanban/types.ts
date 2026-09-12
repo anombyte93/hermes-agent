@@ -338,4 +338,3 @@ export interface EvidenceCardData {
   comments: Array<Record<string, unknown>>
   events: Array<Record<string, unknown>>
 }
-

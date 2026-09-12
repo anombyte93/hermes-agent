@@ -51,7 +51,7 @@ const h = vi.hoisted(() => {
   }
 
   // Populated by the ./api mock factory with real nanostore atoms.
-   
+
   const atoms: Record<string, any> = {}
 
   return { fetch, atoms }

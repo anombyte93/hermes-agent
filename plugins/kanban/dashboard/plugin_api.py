@@ -4771,4 +4771,3 @@ async def workflow_hold(
     return await _workflow_call(
         "kanban_hold", args, board=slug, card=card, request_echo=echo
     )
-
