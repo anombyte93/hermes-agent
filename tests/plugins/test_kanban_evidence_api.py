@@ -98,6 +98,10 @@ def _write_fake_helper(directory: Path, behavior: str, *, cap: int | None = 1) -
       oversized  — exit 0, PASS receipt padded beyond the stdout cap
       noshape    — exit 0, PASS receipt whose data misses required fields
       wrongscope — exit 0, PASS receipt echoing a different board/card
+      badtypes  — exit 0, PASS receipt with wrong consumed field types
+      badreturned — exit 0, PASS page receipt with returned != len(items)
+      nonfinite_top — exit 0, PASS receipt with NaN top-level observed_at
+      nonfinite_snapshot — exit 0, PASS snapshot with Inf data.observed_at
     """
     script = f'''#!/usr/bin/env python3
 import json, os, sys, time
@@ -146,6 +150,38 @@ def make_data():
     return {{
         "task": {{"id": args.get("card", "t_00000001")}},
         "runs": [],
+        "comments": [],
+        "events": [],
+    }}
+
+
+def make_bad_data():
+    # Wrong consumed types mirroring the parent malformed-boundary examples
+    # (verify-ui-malformed.py): each tool returns one field with a wrong type
+    # while the rest stay correctly shaped (scope echoes still match).
+    if tool == "kanban_snapshot":
+        return {{
+            "board": args.get("board", "evo-alpha"),
+            "cards": "wrong",
+            "counts": {{}},
+            "status_filter": str(args.get("status", "all")),
+            "observed_at": 1,
+        }}
+    if tool == "kanban_page":
+        return {{
+            "items": "wrong",
+            "returned": True,
+            "has_more": "false",
+        }}
+    if tool == "kanban_worker":
+        return {{
+            "task_id": args.get("card", "t_00000001"),
+            "observations": {{}},
+        }}
+    # kanban_card
+    return {{
+        "task": {{"id": args.get("card", "t_00000001")}},
+        "runs": None,
         "comments": [],
         "events": [],
     }}
@@ -210,6 +246,19 @@ elif behavior == "wrongscope":
     else:
         receipt["data"]["task"] = {{"id": "t_ffffffff"}}
         receipt["data"]["task_id"] = "t_ffffffff"
+    emit(receipt)
+elif behavior == "badtypes":
+    receipt["data"] = make_bad_data()
+    emit(receipt)
+elif behavior == "badreturned":
+    receipt["data"] = make_data()
+    receipt["data"]["returned"] = 99
+    emit(receipt)
+elif behavior == "nonfinite_top":
+    receipt["observed_at"] = float("nan")
+    emit(receipt)
+elif behavior == "nonfinite_snapshot":
+    receipt["data"]["observed_at"] = float("inf")
     emit(receipt)
 
 '''
@@ -727,6 +776,108 @@ def test_pass_wrong_card_scope_is_unknown(client, helper_bin):
     body = r.json()
     assert body["state"] == "UNKNOWN"
     assert "does not match requested card" in body["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Typed malformed-boundary controls (t_a8f1ecec): a PASS receipt whose
+# consumed field carries the wrong TYPE is UNKNOWN, never coerced to green.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("route", "params", "bad_field"),
+    [
+        (
+            "/evidence/snapshot",
+            {"board": "evo-alpha", "status": "all", "card_limit": 50},
+            "cards",
+        ),
+        (
+            "/evidence/page",
+            {"board": "evo-alpha", "resource": "cards", "limit": 50},
+            "items",
+        ),
+        (
+            "/evidence/worker",
+            {"board": "evo-alpha", "card": "t_deadbeef"},
+            "observations",
+        ),
+        (
+            "/evidence/card",
+            {"board": "evo-alpha", "card": "t_deadbeef"},
+            "runs",
+        ),
+    ],
+)
+def test_wrong_consumed_type_is_unknown(client, helper_bin, route, params, bad_field):
+    """The four parent malformed-boundary examples (cards:string,
+    page items:string/returned:bool/has_more:string, worker observations:dict,
+    card runs:null) must each collapse to UNKNOWN — a wrong type is never
+    coerced to a usable value."""
+    helper_bin("badtypes")
+    r = client.get("/api/plugins/kanban" + route, params=params)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN", body
+    assert body["evidence"] is None
+    assert bad_field in body["reason"], body["reason"]
+
+
+def test_page_returned_mismatching_items_length_is_unknown(client, helper_bin):
+    """returned must be a non-negative integer consistent with len(items)."""
+    helper_bin("badreturned")
+    r = _get(client, "/evidence/page?board=evo-alpha&resource=cards&limit=50")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN", body
+    assert "returned" in body["reason"]
+
+
+def test_nonfinite_top_observed_at_is_unknown(client, helper_bin):
+    """NaN at the top-level observed_at must be rejected before FastAPI
+    serialises a non-standard NaN token."""
+    helper_bin("nonfinite_top")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN", body
+    assert body["evidence"] is None
+    assert "observed_at" in body["reason"]
+
+
+def test_nonfinite_snapshot_observed_at_is_unknown(client, helper_bin):
+    """+Infinity in snapshot data.observed_at must be rejected the same way."""
+    helper_bin("nonfinite_snapshot")
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN", body
+    assert body["evidence"] is None
+    assert "observed_at" in body["reason"]
+
+
+def test_correct_typed_shapes_still_pass(client, helper_bin):
+    """Correct-shaped positives stay green: the type checks must not reject
+    the released helper's real data (list cards/items, dict counts, int
+    returned == len(items), bool has_more, finite float observed_at)."""
+    helper_bin("pass")
+    for path in (
+        "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50",
+        "/evidence/page?board=evo-alpha&resource=cards&limit=50",
+        "/evidence/worker?board=evo-alpha&card=t_deadbeef",
+        "/evidence/card?board=evo-alpha&card=t_deadbeef",
+    ):
+        r = _get(client, path)
+        assert r.status_code == 200, path
+        body = r.json()
+        assert body["state"] == "PASS", (path, body)
+    # Snapshot counts and observed_at are the specific fields the type checks
+    # consume: assert they are forwarded untouched, not coerced.
+    r = _get(client, "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50")
+    body = r.json()
+    assert isinstance(body["evidence"]["counts"], dict)
+    assert isinstance(body["evidence"]["observed_at"], float)
+    assert isinstance(body["observed_at"], float)
 
 
 def test_nonzero_fail_preserves_helper_reason(client, helper_bin):

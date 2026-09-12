@@ -97,13 +97,23 @@ hosts without the helper the routes still return `UNKNOWN` with the
   distinguishable from "helper unavailable". Raw stdout/stderr are never
   forwarded.
 - **Receipt validation:** `state` must be PASS/FAIL/UNKNOWN. A PASS receipt
-  must carry `execution_host == "evo"`, a numeric `observed_at`, the
-  per-tool required `data` shape (only fields the adapter actually emits),
-  and — wherever the receipt echoes scope — a board/card match with the
-  request (`kanban_snapshot` → `data.board` + `status_filter`,
+  must carry `execution_host == "evo"`, a **finite** numeric `observed_at`
+  (NaN/Infinity are rejected before FastAPI serialises them), the per-tool
+  required `data` shape (only fields the adapter actually emits), and —
+  wherever the receipt echoes scope — a board/card match with the request
+  (`kanban_snapshot` → `data.board` + `status_filter`,
   `kanban_card` → `data.task.id`, `kanban_worker` → `data.task_id`;
   `kanban_page` emits no scope echo and none is claimed). Any violation is
   UNKNOWN, never PASS.
+- **Typed field validation (never coerce):** a PASS receipt whose consumed
+  field carries the wrong type is UNKNOWN. `cards`/`items`/`observations`/
+  `runs`/`comments`/`events` must be lists of objects; `snapshot.counts`
+  must be an object (of per-status counts); `snapshot.data.observed_at`
+  must be a finite number (never a boolean); `page.returned` must be a
+  non-negative integer (never a boolean) equal to `len(items)`;
+  `page.has_more` must be a boolean; a page cursor is absent, null, or a
+  string; `card.task` must be an object retaining its `id`. Optional
+  forward-compatible fields are preserved and their types not second-guessed.
 - **Envelope honesty:** `execution_host` is forwarded only when validated
   from a PASS receipt; every other response reports `"unverified"` — the
   bridge never stamps the host as its own observation. Validated responses
