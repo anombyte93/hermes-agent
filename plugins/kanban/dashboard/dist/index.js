@@ -313,6 +313,593 @@
     return `${url}${sep}board=${encodeURIComponent(board)}`;
   }
 
+  // -------------------------------------------------------------------------
+  // Read-only shared-evidence bridge (/evidence/*) — the IIFE consumer.
+  //
+  // These helpers read the EVO host's shared board evidence through the
+  // released atlas-kanban-call helper, proxied by the plugin backend. Every
+  // read is gated on /evidence/context reporting that the SELECTED board's
+  // local DB IS the same physical EVO database: the bridge always reads EVO,
+  // so attaching EVO badges to a local board that merely shares a slug would
+  // be a lie. When alignment is false (or unresolved) the original local UI
+  // renders unchanged, with no EVO badges, downloads or paging — but the
+  // mismatch is VISIBLE, never silent.
+  //
+  // The bridge envelope is {state: PASS|FAIL|UNKNOWN, evidence: <helper
+  // data>, reason?, remedy?, board, observed_at?, helper:{tool,
+  // execution_host}, request, timing}. ``evidence`` carries the helper's
+  // per-tool ``data`` directly (no nested helper envelope). A non-PASS
+  // envelope is never presented as green.
+  // -------------------------------------------------------------------------
+
+  const EVIDENCE_STATE_LABEL = {
+    running: "Running",
+    stopped: "Stopped",
+    unknown: "Unknown",
+    unavailable: "Unavailable",
+  };
+  const EVIDENCE_STATE_TONE = {
+    running: "#34d399",
+    stopped: "var(--ui-text-tertiary, #9ca3af)",
+    unknown: "#fbbf24",
+    unavailable: "var(--ui-text-quaternary, #6b7280)",
+  };
+  // Seconds after observed_at before evidence is shown as stale (amber, then
+  // red). The poll interval (15s) sits comfortably under amber so a healthy
+  // board never shows stale; a dead helper drifts into amber then red.
+  const EVIDENCE_STALE_AMBER_S = 60;
+  const EVIDENCE_STALE_RED_S = 300;
+  const EVIDENCE_POLL_MS = 15000;
+  const EVIDENCE_PAGE_CARD_LIMIT = 100;
+
+  // Build a query string from an object, skipping null/undefined/empty values.
+  function evQuery(params) {
+    const qs = new URLSearchParams();
+    Object.keys(params).forEach(function (k) {
+      const v = params[k];
+      if (v == null || v === "") return;
+      qs.set(k, String(v));
+    });
+    return qs.toString();
+  }
+
+  // All evidence fetchers return a Promise that resolves to a normalised
+  // envelope. A network/HTTP failure (endpoint absent on an older backend,
+  // session error) resolves to an UNKNOWN envelope with a safe reason and
+  // remedy — never throws, so callers can treat it uniformly.
+  function evidenceEnvelope(promise) {
+    return promise.then(function (res) {
+      return (res && typeof res === "object") ? res : { state: "UNKNOWN", reason: "empty evidence response" };
+    }).catch(function (err) {
+      return {
+        state: "UNKNOWN",
+        reason: parseApiErrorMessage(err) || "evidence endpoint unreachable",
+        remedy: "Worker evidence is unavailable on this server.",
+      };
+    });
+  }
+
+  function fetchEvidenceContext(board) {
+    return evidenceEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/context`, board)));
+  }
+
+  function fetchEvidenceSnapshot(board, status, cardLimit, cursor) {
+    const qs = evQuery({
+      status: status || "all",
+      card_limit: cardLimit || EVIDENCE_PAGE_CARD_LIMIT,
+      cursor: cursor || undefined,
+    });
+    const url = qs ? `${API}/evidence/snapshot?${qs}` : `${API}/evidence/snapshot`;
+    return evidenceEnvelope(SDK.fetchJSON(withBoard(url, board)));
+  }
+
+  function fetchEvidencePage(board, resource, card, status, limit, cursor) {
+    const qs = evQuery({
+      resource: resource,
+      card: card || undefined,
+      status: status || undefined,
+      limit: limit || undefined,
+      cursor: cursor || undefined,
+    });
+    return evidenceEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/page?${qs}`, board)));
+  }
+
+  function fetchEvidenceWorker(board, card) {
+    return evidenceEnvelope(SDK.fetchJSON(
+      withBoard(`${API}/evidence/worker?card=${encodeURIComponent(card)}`, board)));
+  }
+
+  function fetchEvidenceCard(board, card) {
+    return evidenceEnvelope(SDK.fetchJSON(
+      withBoard(`${API}/evidence/card?card=${encodeURIComponent(card)}`, board)));
+  }
+
+  // One observation is a live running worker only when EVERY positive check
+  // passes: state PASS, a process present now, and both the workspace and the
+  // run-start match the card. process_present alone is NOT running (the older
+  // React resolver's bug).
+  function resolveObservationState(o) {
+    if (!o || typeof o !== "object") return "unknown";
+    if (
+      o.state === "PASS" &&
+      o.process_present === true &&
+      o.workspace_matches === true &&
+      o.run_start_matches === true
+    ) {
+      return "running";
+    }
+    return "unknown";
+  }
+
+  // Reduce a /evidence/worker helper ``data`` payload to one honest state.
+  //
+  //   running — a live observation passing all four positive checks.
+  //   stopped — aggregate.complete === true AND aggregate.running === 0 AND
+  //             aggregate.unknown === 0 AND actual stopped evidence is
+  //             present (aggregate.stopped > 0 or completion_records > 0).
+  //             Zero runs alone is NOT stopped.
+  //   unknown — a missing or incomplete observation. Never stopped.
+  //
+  // The real aggregate lives NESTED under data.aggregate; the older React
+  // resolver read a top-level running/complete/unknown the helper never
+  // emits, which is why its Stopped/Running answers were wrong.
+  function resolveWorkerState(data) {
+    if (!data || typeof data !== "object") return "unknown";
+    const obs = Array.isArray(data.observations) ? data.observations : [];
+    for (let i = 0; i < obs.length; i++) {
+      if (resolveObservationState(obs[i]) === "running") return "running";
+    }
+    const agg = (data.aggregate && typeof data.aggregate === "object") ? data.aggregate : null;
+    if (agg) {
+      const running = typeof agg.running === "number" ? agg.running : 0;
+      const unknown = typeof agg.unknown === "number" ? agg.unknown : 0;
+      const stopped = typeof agg.stopped === "number" ? agg.stopped : 0;
+      const completionRecords = typeof agg.completion_records === "number" ? agg.completion_records : 0;
+      if (agg.complete === true && running === 0 && unknown === 0 && (stopped > 0 || completionRecords > 0)) {
+        return "stopped";
+      }
+    }
+    return "unknown";
+  }
+
+  // Map a snapshot's worker_observations (running run records on the current
+  // page) to {cardId: {state, observation}}.
+  function buildWorkerStateMap(workerObservations) {
+    const map = {};
+    (workerObservations || []).forEach(function (o) {
+      if (!o || typeof o !== "object") return;
+      const id = o.task_id || o.card_id || o.id;
+      if (!id) return;
+      map[id] = { state: resolveObservationState(o), observation: o };
+    });
+    return map;
+  }
+
+  // Freshness: the envelope's validated observed_at (epoch seconds) is the
+  // single source of truth for how old the evidence is.
+  function evidenceObservedAt(envelope) {
+    if (!envelope || typeof envelope !== "object") return null;
+    if (typeof envelope.observed_at === "number") return envelope.observed_at;
+    const data = envelope.evidence;
+    if (data && typeof data.observed_at === "number") return data.observed_at;
+    return null;
+  }
+
+  function evidenceAgeSeconds(envelope) {
+    const at = evidenceObservedAt(envelope);
+    if (at == null) return null;
+    return Math.max(0, (Date.now() / 1000) - at);
+  }
+
+  function evidenceStaleClass(age) {
+    if (age == null) return "";
+    if (age >= EVIDENCE_STALE_RED_S) return "hermes-kanban-evidence--stale-red";
+    if (age >= EVIDENCE_STALE_AMBER_S) return "hermes-kanban-evidence--stale-amber";
+    return "";
+  }
+
+  // -------------------------------------------------------------------------
+  // useKanbanEvidence — one snapshot per aligned refresh, generation-guarded.
+  //
+  // Drives: identity alignment, the bounded snapshot (cards + counts + load
+  // more), the per-card worker map, and evidence freshness. Every async
+  // response is tagged with the generation at request time and dropped when a
+  // board/filter switch has advanced the generation — so a slow response from
+  // the previous board can never overwrite the new board's evidence.
+  // -------------------------------------------------------------------------
+  function useKanbanEvidence(board) {
+    const [context, setContext] = useState(null);   // raw /evidence/context payload
+    const [ctxErr, setCtxErr] = useState(false);    // context fetch failed outright
+    const [snapshot, setSnapshot] = useState(null); // latest snapshot envelope
+    const [workerMap, setWorkerMap] = useState({});
+    const [counts, setCounts] = useState(null);
+    const [observedAt, setObservedAt] = useState(null);
+    const [cards, setCards] = useState([]);          // stable bounded pages
+    const [cursor, setCursor] = useState(null);
+    const [hasMore, setHasMore] = useState(false);
+    const [omitted, setOmitted] = useState(null);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const genRef = useRef(0);
+    const pollRef = useRef(null);
+
+    const aligned = !!(context && context.aligned === true);
+
+    const reset = useCallback(function () {
+      genRef.current += 1;
+      setSnapshot(null);
+      setWorkerMap({});
+      setCounts(null);
+      setObservedAt(null);
+      setCards([]);
+      setCursor(null);
+      setHasMore(false);
+      setOmitted(null);
+    }, []);
+
+    // Apply a snapshot envelope. page 0 (append=false) seeds cards only when
+    // nothing is loaded yet; on a poll it refreshes the counts/worker map/
+    // freshness but keeps the already-loaded pages stable (they must not
+    // silently vanish on polling). append=true merges the next page for Load
+    // more, deduped by id.
+    const applySnapshot = useCallback(function (env, opts) {
+      if (!env || typeof env !== "object") return;
+      setSnapshot(env);
+      if (env.state !== "PASS") return;
+      const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+      setObservedAt(evidenceObservedAt(env));
+      if (data.counts && typeof data.counts === "object") setCounts(data.counts);
+      setWorkerMap(function (prev) {
+        return Object.assign({}, prev, buildWorkerStateMap(data.worker_observations));
+      });
+      const omitNum = typeof data.omitted === "number" ? data.omitted
+        : (data.counts && typeof data.counts.omitted === "number" ? data.counts.omitted : null);
+      setOmitted(omitNum);
+      setHasMore(data.has_more === true);
+      if (data.next_cursor != null) setCursor(data.next_cursor);
+      else if (!data.has_more) setCursor(null);
+      const pageCards = Array.isArray(data.cards) ? data.cards : [];
+      if (opts && opts.append) {
+        setCards(function (prev) {
+          const seen = {};
+          return prev.concat(pageCards).filter(function (c) {
+            if (!c || seen[c.id]) return false;
+            seen[c.id] = true;
+            return true;
+          });
+        });
+      } else {
+        setCards(function (prev) { return prev.length === 0 ? pageCards : prev; });
+      }
+    }, []);
+
+    // (Re)load /evidence/context whenever the board changes.
+    useEffect(function () {
+      let alive = true;
+      reset();
+      setContext(null);
+      setCtxErr(false);
+      const gen = genRef.current;
+      fetchEvidenceContext(board).then(function (ctx) {
+        if (!alive || gen !== genRef.current) return;
+        setContext(ctx);
+      }).catch(function () {
+        if (!alive || gen !== genRef.current) return;
+        setCtxErr(true);
+      });
+      return function () { alive = false; };
+    }, [board, reset]);
+
+    // Poll the snapshot only when aligned. One snapshot per refresh, never a
+    // local /board plus snapshot.
+    useEffect(function () {
+      if (!aligned) return undefined;
+      let stopped = false;
+      function poll() {
+        const gen = genRef.current;
+        fetchEvidenceSnapshot(board, "all", EVIDENCE_PAGE_CARD_LIMIT, null).then(function (env) {
+          if (stopped || gen !== genRef.current) return;
+          applySnapshot(env, { append: false });
+        }).catch(function (err) {
+          if (stopped || gen !== genRef.current) return;
+          setSnapshot({ state: "UNKNOWN", reason: parseApiErrorMessage(err) });
+        });
+      }
+      poll();
+      pollRef.current = setInterval(poll, EVIDENCE_POLL_MS);
+      return function () {
+        stopped = true;
+        if (pollRef.current) clearInterval(pollRef.current);
+      };
+    }, [aligned, board, applySnapshot]);
+
+    const loadMore = useCallback(function () {
+      if (loadingMore || !aligned || !hasMore || !cursor) return Promise.resolve();
+      setLoadingMore(true);
+      const gen = genRef.current;
+      return fetchEvidenceSnapshot(board, "all", EVIDENCE_PAGE_CARD_LIMIT, cursor).then(function (env) {
+        if (gen !== genRef.current) return; // late response: board switched
+        setLoadingMore(false);
+        applySnapshot(env, { append: true });
+      }).catch(function () {
+        if (gen !== genRef.current) return;
+        setLoadingMore(false);
+      });
+    }, [loadingMore, aligned, hasMore, cursor, board, applySnapshot]);
+
+    return {
+      aligned: aligned,
+      context: context,
+      ctxErr: ctxErr,
+      snapshot: snapshot,
+      workerMap: workerMap,
+      counts: counts,
+      observedAt: observedAt,
+      cards: cards,
+      cursor: cursor,
+      hasMore: hasMore,
+      omitted: omitted,
+      loadingMore: loadingMore,
+      loadMore: loadMore,
+    };
+  }
+
+  // Compact per-card worker-evidence badge (K3). ``state`` is one of the
+  // four EVIDENCE_STATE_LABEL keys; tone rendered inline so no stylesheet
+  // change is required.
+  function EvidenceBadge(props) {
+    const state = props.state || "unknown";
+    const tone = EVIDENCE_STATE_TONE[state] || EVIDENCE_STATE_TONE.unknown;
+    const label = EVIDENCE_STATE_LABEL[state] || "Unknown";
+    return h("span", {
+      className: "hermes-kanban-evidence-badge",
+      title: props.title || label,
+      style: { color: tone },
+    },
+      h("span", { className: "hermes-kanban-evidence-dot", style: { backgroundColor: tone } }),
+      label);
+  }
+
+  // Board-level evidence strip (K3/K4/K10): identity alignment, freshness,
+  // snapshot counts, the bounded card pages with Load more, and the visible
+  // stale / helper-unavailable / alignment-remedy surfaces. Rendered inside
+  // the existing KanbanPage flow (between toolbar and board), not a second UI.
+  function EvidenceBanner(props) {
+    const ev = props.evidence;
+    if (!ev) return null;
+    const bar = { padding: "6px 10px", borderRadius: "6px", fontSize: "12px", lineHeight: "1.5" };
+
+    if (ev.ctxErr) {
+      return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
+        h("span", { style: { color: EVIDENCE_STATE_TONE.unavailable } },
+          "Worker evidence unavailable: could not reach the evidence endpoint."),
+        h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "6px" } },
+          "Choose the EVO connection to see worker evidence."));
+    }
+
+    if (ev.context && ev.context.aligned !== true) {
+      return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
+        h("span", { style: { color: EVIDENCE_STATE_TONE.unavailable } },
+          "This board is not the EVO evidence database."),
+        h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "6px" } },
+          "Choose the EVO connection to see worker evidence."));
+    }
+
+    if (!ev.aligned && !ev.ctxErr) {
+      return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
+        "Checking EVO connection\u2026");
+    }
+
+    if (!ev.snapshot) {
+      return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
+        "Loading evidence\u2026");
+    }
+
+    const age = evidenceAgeSeconds(ev.snapshot);
+    const staleCls = evidenceStaleClass(age);
+
+    if (ev.snapshot.state !== "PASS") {
+      const reason = ev.snapshot.reason || "helper reported " + ev.snapshot.state;
+      return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
+        h("span", { style: { color: EVIDENCE_STATE_TONE.unavailable, fontWeight: "600" } },
+          "Worker evidence " + EVIDENCE_STATE_LABEL.unavailable.toLowerCase() + ":"),
+        h("span", { style: { marginLeft: "6px" } }, reason),
+        ev.snapshot.remedy
+          ? h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "6px" } }, ev.snapshot.remedy)
+          : null);
+    }
+
+    const c = ev.counts || {};
+    const total = typeof c.total === "number" ? c.total : null;
+    const inPage = typeof c.in_page === "number" ? c.in_page : null;
+    const omitted = ev.omitted;
+    const byStatus = c.by_status || {};
+    const statusChips = Object.keys(byStatus).map(function (k) {
+      return k + " " + byStatus[k];
+    }).join(" \u00b7 ");
+
+    return h("div", { className: "hermes-kanban-evidence-banner", style: Object.assign({}, bar, { background: "var(--muted, rgba(0,0,0,0.04))" }) },
+      h("span", { style: { fontWeight: "600" } }, "EVO evidence"),
+      h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "8px" } },
+        (total != null ? "total " + total : "") +
+        (inPage != null ? " \u00b7 in page " + inPage : "") +
+        (omitted != null ? " \u00b7 omitted " + omitted : "") +
+        (statusChips ? " \u00b7 " + statusChips : "")),
+      h("span", {
+        className: staleCls ? "hermes-kanban-evidence-stale " + staleCls : "hermes-kanban-evidence-stale",
+        title: age != null ? "evidence observed " + Math.round(age) + "s ago" : "freshness unknown",
+        style: { color: staleCls ? EVIDENCE_STATE_TONE.unknown : EVIDENCE_STATE_TONE.running, marginLeft: "8px" },
+      }, age != null ? "observed " + Math.round(age) + "s ago" : "freshness unknown"),
+      ev.hasMore
+        ? h("button", {
+            type: "button",
+            className: "hermes-kanban-edit-link",
+            disabled: ev.loadingMore,
+            style: { marginLeft: "12px" },
+            onClick: function () { ev.loadMore(); },
+          }, ev.loadingMore ? "Loading\u2026" : "Load more (" + (omitted != null ? omitted : "") + " omitted)")
+        : null);
+  }
+
+  // Drawer worker-evidence panel (K9): reads /evidence/worker for the open
+  // card, gated on alignment. Renders the resolved state plus the raw
+  // observations and the aggregate block, all readable, never a bare green.
+  function WorkerEvidenceSection(props) {
+    const [envelope, setEnvelope] = useState(null);
+    const [loading, setLoading] = useState(true);
+    useEffect(function () {
+      let alive = true;
+      setLoading(true);
+      fetchEvidenceWorker(props.boardSlug, props.cardId).then(function (env) {
+        if (!alive) return;
+        setEnvelope(env);
+        setLoading(false);
+      });
+      return function () { alive = false; };
+    }, [props.boardSlug, props.cardId]);
+
+    const head = "Worker evidence";
+
+    if (loading) {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, head),
+        h("div", { className: "text-xs text-muted-foreground" }, "Loading evidence\u2026"));
+    }
+
+    if (!envelope || envelope.state !== "PASS") {
+      const reason = (envelope && envelope.reason) || "Evidence is unavailable for this card.";
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, head),
+        h("div", { className: "text-xs" },
+          h("span", { style: { color: EVIDENCE_STATE_TONE.unavailable, fontWeight: "600" } },
+            EVIDENCE_STATE_LABEL.unavailable + ":"),
+          h("span", { style: { marginLeft: "6px", color: "var(--muted-foreground, #6b7280)" } }, reason)),
+        envelope && envelope.remedy
+          ? h("div", { className: "text-xs text-muted-foreground" }, envelope.remedy)
+          : null);
+    }
+
+    const data = envelope.evidence || {};
+    const state = resolveWorkerState(data);
+    const tone = EVIDENCE_STATE_TONE[state];
+    const observations = Array.isArray(data.observations) ? data.observations : [];
+    const agg = data.aggregate;
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, head),
+      h("div", { className: "flex items-center gap-2 text-sm" },
+        h("span", { className: "hermes-kanban-evidence-dot", style: { backgroundColor: tone } }),
+        h("span", { style: { color: tone, fontWeight: "600" } }, EVIDENCE_STATE_LABEL[state]),
+        evidenceObservedAt(envelope) != null
+          ? h("span", { className: "text-xs text-muted-foreground" },
+              "observed " + timeAgo(evidenceObservedAt(envelope)))
+          : null),
+      observations.length > 0
+        ? observations.map(function (o, i) {
+            const oState = resolveObservationState(o);
+            return h("div", { key: o.run_id || o.task_id || i, className: "text-xs flex items-baseline gap-2 py-0.5" },
+              h("span", { className: "hermes-kanban-evidence-dot",
+                style: { backgroundColor: EVIDENCE_STATE_TONE[oState] } }),
+              h("span", { style: { color: EVIDENCE_STATE_TONE[oState] } },
+                (o.state || "unknown") + (o.classification ? " \u00b7 " + o.classification : "")),
+              o.reason
+                ? h("span", { className: "text-muted-foreground", style: { wordBreak: "break-word" } }, o.reason)
+                : null);
+          })
+        : h("div", { className: "text-xs text-muted-foreground" },
+            "No worker observation for this card: treated as unknown, not stopped."),
+      agg && typeof agg === "object"
+        ? h("div", { className: "text-xs text-muted-foreground", style: { marginTop: "4px" } },
+            "aggregate: running " + (agg.running != null ? agg.running : "?") +
+            " \u00b7 stopped " + (agg.stopped != null ? agg.stopped : "?") +
+            " \u00b7 unknown " + (agg.unknown != null ? agg.unknown : "?") +
+            " \u00b7 complete " + (agg.complete === true ? "yes" : "no"))
+        : null);
+  }
+
+  // Drawer evidence-attachment list (K9). Reads /evidence/page
+  // resource=attachments for the open card (gated on alignment) and offers a
+  // download through the authenticated /attachments/<id>?board route only.
+  // Never a stored_path URL. A missing file is surfaced separately from the
+  // metadata, and no content proof is claimed for an unopened attachment.
+  function EvidenceAttachmentsSection(props) {
+    const [envelope, setEnvelope] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [dlErr, setDlErr] = useState(null);
+    useEffect(function () {
+      let alive = true;
+      setLoading(true);
+      fetchEvidencePage(props.boardSlug, "attachments", props.cardId, null, null, null).then(function (env) {
+        if (!alive) return;
+        setEnvelope(env);
+        setLoading(false);
+      });
+      return function () { alive = false; };
+    }, [props.boardSlug, props.cardId]);
+
+    const head = "Evidence attachments";
+
+    if (loading) {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, head),
+        h("div", { className: "text-xs text-muted-foreground" }, "Loading\u2026"));
+    }
+
+    if (!envelope || envelope.state !== "PASS") {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, head),
+        h("div", { className: "text-xs text-muted-foreground" },
+          (envelope && envelope.reason) || "Attachment metadata is unavailable."));
+    }
+
+    const items = (envelope.evidence && envelope.evidence.items) || [];
+    if (items.length === 0) {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, head),
+        h("div", { className: "text-xs text-muted-foreground" }, "\u2014 no evidence attachments \u2014"));
+    }
+
+    function openAttachment(a) {
+      // Authenticated GET /attachments/<id>?board streams the file. A 404 is
+      // a missing file (distinct from the metadata row) and is reported, not
+      // hidden.
+      const url = withBoard(`${API}/attachments/${a.id}`, props.boardSlug);
+      setDlErr(null);
+      SDK.authedFetch(url).then(function (resp) {
+        if (!resp.ok) {
+          return resp.text().then(function (txt) {
+            throw new Error((resp.status === 404 ? "missing file: " : "") +
+              parseApiErrorMessage(new Error(resp.status + ": " + txt)));
+          });
+        }
+        return resp.blob();
+      }).then(function (blob) {
+        const objUrl = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = objUrl;
+        link.download = a.filename || "attachment";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(function () { URL.revokeObjectURL(objUrl); }, 10000);
+      }).catch(function (e) { setDlErr(String(e.message || e)); });
+    }
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, `${head} (${items.length})`),
+      dlErr ? h("div", { className: "text-xs text-destructive mb-1" }, dlErr) : null,
+      items.map(function (a) {
+        return h("div", { key: a.id, className: "flex items-center justify-between gap-2 py-1 text-sm" },
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-attachment-link truncate",
+            title: a.filename,
+            onClick: function () { openAttachment(a); },
+          }, a.filename || ("attachment " + a.id)),
+          h("span", { className: "text-xs text-muted-foreground whitespace-nowrap" },
+            a.size != null ? _fmtBytes(a.size) : ""));
+      }));
+  }
+
   // The SDK's Select component fires ``onValueChange(value)`` directly
   // (it's a shadcn-style popup, not a native <select>). Older plugin
   // code calls ``onChange({target: {value}})`` which silently never
@@ -646,6 +1233,11 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+
+    // Read-only shared-evidence layer (K3/K4/K9/K10): identity alignment,
+    // bounded snapshot + counts + load more, per-card worker map, freshness.
+    // Gated on /evidence/context alignment, generation-guarded per board.
+    const evidence = useKanbanEvidence(board);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -1355,6 +1947,7 @@
           dialogProps: kanbanDialogs.dialogProps,
           dialogState: kanbanDialogs.dialogState,
         }),
+        h(EvidenceBanner, { evidence: evidence }),
         h(BoardColumns, {
           board: filteredBoard,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
@@ -1362,6 +1955,9 @@
           selectedIds,
           failedIds,
           draggingTaskId,
+          evidenceWorkerMap: evidence.workerMap,
+          evidenceAligned: evidence.aligned,
+          evidenceObservedAt: evidence.observedAt,
           onDragStart: handleDragStart,
           onDragEnd: handleDragEnd,
           toggleSelected,
@@ -1378,6 +1974,7 @@
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
+          evidenceAligned: evidence.aligned,
           onClose: function () { setSelectedTaskId(null); },
           onOpenTask: setSelectedTaskId,
           onRefresh: loadBoard,
@@ -2846,6 +3443,9 @@
           selectedIds: props.selectedIds,
           failedIds: props.failedIds,
           draggingTaskId: props.draggingTaskId,
+          evidenceWorkerMap: props.evidenceWorkerMap,
+          evidenceAligned: props.evidenceAligned,
+          evidenceObservedAt: props.evidenceObservedAt,
           toggleSelected: props.toggleSelected,
           toggleRange: props.toggleRange,
           selectAllInColumn: props.selectAllInColumn,
@@ -2987,6 +3587,9 @@
                       failed: props.failedIds && props.failedIds.has(tk.id),
                       draggingTaskId: props.draggingTaskId,
                       draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
+                      evidenceWorkerMap: props.evidenceWorkerMap,
+                      evidenceAligned: props.evidenceAligned,
+                      evidenceObservedAt: props.evidenceObservedAt,
                       toggleSelected: props.toggleSelected,
                       toggleRange: props.toggleRange,
                       onOpen: props.onOpen,
@@ -3001,6 +3604,9 @@
                   failed: props.failedIds && props.failedIds.has(tk.id),
                   draggingTaskId: props.draggingTaskId,
                   draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
+                  evidenceWorkerMap: props.evidenceWorkerMap,
+                  evidenceAligned: props.evidenceAligned,
+                  evidenceObservedAt: props.evidenceObservedAt,
                   toggleSelected: props.toggleSelected,
                   toggleRange: props.toggleRange,
                   onOpen: props.onOpen,
@@ -3090,6 +3696,25 @@
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
 
+    // Worker-evidence badge (K3). Shown only when the board is identity-aligned
+    // with the EVO database. A card with a snapshot observation gets that
+    // state; a running card with no observation is UNKNOWN (never stopped).
+    let evidenceState = null;
+    let evidenceTitle = null;
+    if (props.evidenceAligned) {
+      const wm = props.evidenceWorkerMap || {};
+      if (wm[t.id]) {
+        evidenceState = wm[t.id].state;
+        evidenceTitle = "Worker evidence: " + (EVIDENCE_STATE_LABEL[evidenceState] || evidenceState);
+      } else if (t.status === "running") {
+        evidenceState = "unknown";
+        evidenceTitle = "Worker evidence: no live observation (unknown, not stopped)";
+      }
+      if (evidenceState && props.evidenceObservedAt != null) {
+        evidenceTitle += " · evidence observed " + timeAgo(props.evidenceObservedAt);
+      }
+    }
+
     return h("div", {
       ref: cardRef,
       "data-task-id": t.id,
@@ -3177,6 +3802,9 @@
                               ? tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile.")
                               : "No profile assigned." },
                   tx(i18n, "unassigned", "unassigned")),
+            evidenceState
+              ? h(EvidenceBadge, { state: evidenceState, title: evidenceTitle })
+              : null,
             t.comment_count > 0
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.comment_count} comment${t.comment_count === 1 ? "" : "s"} on this task` }, "💬 ", t.comment_count)
@@ -3738,6 +4366,7 @@
           allTasks: props.allTasks,
           assignees: props.assignees || [],
           boardSlug: boardSlug,
+          evidenceAligned: props.evidenceAligned,
           onPatch: doPatch,
           onSpecify: doSpecify,
           onDecompose: doDecompose,
@@ -4121,6 +4750,12 @@
         }),
       ),
       h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
+      props.evidenceAligned
+        ? h(WorkerEvidenceSection, { boardSlug: props.boardSlug, cardId: t.id })
+        : null,
+      props.evidenceAligned
+        ? h(EvidenceAttachmentsSection, { boardSlug: props.boardSlug, cardId: t.id })
+        : null,
       h(RunHistorySection, { runs: props.data.runs || [] }),
     );
   }
