@@ -15,26 +15,28 @@
  * under a new board's query key.
  */
 
-import { Codicon, Loader, useQuery, useValue } from '@hermes/plugin-sdk'
+import { Codicon, useQuery, useValue } from '@hermes/plugin-sdk'
 
 import {
   $boardSlug,
   BOARDS_KEY,
   evidenceContextKey,
+  evidencePageKey,
   evidenceSnapshotKey,
   evidenceWorkerKey,
   fetchBoards,
   fetchEvidenceContext,
+  fetchEvidencePage,
   fetchEvidenceSnapshot,
   fetchEvidenceWorker
 } from './api'
-import { Callout, Section } from './ui'
 import type {
   EvidenceContext,
   EvidenceSnapshotData,
   WorkerEvidenceData,
   WorkerObservation
 } from './types'
+import { Callout, Section } from './ui'
 
 export type WorkerState = 'running' | 'stopped' | 'unknown' | 'unavailable'
 
@@ -162,6 +164,63 @@ export function resolveSnapshotWorkerStates(data: EvidenceSnapshotData | null | 
   }
 
   return { running, unknown }
+}
+
+/** Per-card worker state map from a snapshot's worker_observations. A card
+ *  with a positive observation maps to `running`, one with a non-positive
+ *  observation to `unknown`; a card absent from the page has NO entry (the
+ *  board falls back to its local status). */
+export function snapshotWorkerStateMap(data: EvidenceSnapshotData | null | undefined): Map<string, WorkerState> {
+  const observations = Array.isArray(data?.worker_observations) ? data.worker_observations : []
+  const map = new Map<string, WorkerState>()
+
+  for (const obs of observations) {
+    if (obs.task_id) {
+      map.set(obs.task_id, isRunningObservation(obs) ? 'running' : 'unknown')
+    }
+  }
+
+  return map
+}
+
+/**
+ * The board's single bounded snapshot (K9) — ONE poll per aligned refresh
+ * that feeds both the header badge and every card's worker-evidence state.
+ * Returns null while alignment is unresolved or false, so the local board
+ * keeps rendering unchanged.
+ */
+export function useBoardEvidence(): null | {
+  states: Map<string, WorkerState>
+  running: number
+  unknown: number
+  byStatus: Record<string, number>
+  total: number
+  omitted: number
+} {
+  const slug = useResolvedBoardSlug()
+  const { data: context, isError } = useEvidenceContext(slug)
+  const aligned = context?.aligned === true
+  const { data: snapshotEnvelope } = useEvidenceSnapshot(slug, aligned)
+
+  if (isError || !aligned) {
+    return null
+  }
+
+  if (!snapshotEnvelope || snapshotEnvelope.state !== 'PASS' || !snapshotEnvelope.evidence) {
+    return null
+  }
+
+  const snapshot = snapshotEnvelope.evidence
+  const { running, unknown } = resolveSnapshotWorkerStates(snapshot)
+
+  return {
+    states: snapshotWorkerStateMap(snapshot),
+    running,
+    unknown,
+    byStatus: snapshot.counts?.by_status ?? {},
+    total: typeof snapshot.counts?.total === 'number' ? snapshot.counts.total : 0,
+    omitted: typeof snapshot.counts?.omitted === 'number' ? snapshot.counts.omitted : 0
+  }
 }
 
 /** One worker observation line: state + reason, with the pid/workspace match

@@ -79,7 +79,7 @@ import {
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
-import { BoardEvidenceBadge } from './evidence'
+import { EvidenceStateBadge, useBoardEvidence, type WorkerState } from './evidence'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
@@ -145,7 +145,7 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
-function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+function CardFooter({ arc, task, workerState }: { arc: ArcState | null; task: KanbanTask; workerState?: null | WorkerState }) {
   const k = useKanban()
   const created = ago(task.created_at)
   const links = task.link_counts ? task.link_counts.parents + task.link_counts.children : 0
@@ -164,6 +164,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
 
   return (
     <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+      {workerState && <EvidenceStateBadge state={workerState} />}
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -245,7 +246,8 @@ function Card({
   onOpen,
   onToggleSelect,
   selected,
-  task
+  task,
+  workerState
 }: {
   columns: string[]
   onDelete: (id: string) => void
@@ -254,6 +256,7 @@ function Card({
   onToggleSelect: (id: string) => void
   selected: boolean
   task: KanbanTask
+  workerState?: null | WorkerState
 }) {
   const k = useKanban()
   const [dragging, setDragging] = useState(false)
@@ -301,7 +304,7 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          <CardFooter arc={arc} task={task} />
+          <CardFooter arc={arc} task={task} workerState={workerState} />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -345,7 +348,8 @@ function Column({
   onOpen,
   onToggle,
   onToggleSelect,
-  selected
+  selected,
+  workerStates
 }: {
   collapsed: boolean
   column: { name: string; tasks: KanbanTask[] }
@@ -358,6 +362,7 @@ function Column({
   onToggle: () => void
   onToggleSelect: (id: string) => void
   selected: ReadonlySet<string>
+  workerStates?: ReadonlyMap<string, WorkerState>
 }) {
   const k = useKanban()
   const [over, setOver] = useState(false)
@@ -481,6 +486,7 @@ function Column({
                     onToggleSelect={onToggleSelect}
                     selected={selected.has(task.id)}
                     task={task}
+                    workerState={workerStates?.get(task.id)}
                   />
                 ))}
               </div>
@@ -495,6 +501,7 @@ function Column({
                 onToggleSelect={onToggleSelect}
                 selected={selected.has(task.id)}
                 task={task}
+                workerState={workerStates?.get(task.id)}
               />
             ))}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
@@ -1086,6 +1093,10 @@ export function KanbanBoardPage() {
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
 
+  // Single bounded snapshot per aligned refresh (K9): feeds the header badge
+  // AND every card's worker-evidence state, without a second local /board poll.
+  const boardEvidence = useBoardEvidence()
+
   // Live updates ride the events socket (bindApi); this interval is only the
   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
   const { data: board, error } = useQuery({
@@ -1333,7 +1344,24 @@ export function KanbanBoardPage() {
         <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
           {total}
         </span>
-        <BoardEvidenceBadge />
+        {boardEvidence && (
+          <span
+            className="inline-flex items-center gap-1.5 rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)"
+            title="Worker evidence from the EVO snapshot"
+          >
+            <EvidenceStateBadge state="running" />
+            <span>{boardEvidence.running}</span>
+            {boardEvidence.unknown > 0 && (
+              <>
+                <EvidenceStateBadge state="unknown" />
+                <span>{boardEvidence.unknown}</span>
+              </>
+            )}
+            {boardEvidence.omitted > 0 && (
+              <span className="text-(--ui-text-quaternary)">+{boardEvidence.omitted} more</span>
+            )}
+          </span>
+        )}
         {board && (
           <FilterMenu
             archived={archived}
@@ -1411,6 +1439,7 @@ export function KanbanBoardPage() {
                 onToggle={() => toggleLane(col.name, auto)}
                 onToggleSelect={toggleSelect}
                 selected={selected}
+                workerStates={boardEvidence?.states}
               />
             )
           })}
