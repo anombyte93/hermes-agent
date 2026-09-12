@@ -36,7 +36,9 @@ Environment:
                          ';' also works and drive letters are handled;
                          default: 'tests')
 
-Exit code: 0 if every file's pytest exited 0; 1 otherwise.
+Exit code: 0 if every file's pytest exited 0; 1 if any file failed or no
+tests ran; 2 on a usage error (a malformed ``--slice``, or an explicitly
+requested path that does not exist).
 """
 
 from __future__ import annotations
@@ -243,6 +245,36 @@ def _discover_files(roots: List[Path]) -> List[Path]:
             seen.add(real)
             out.append(path)
     return sorted(out)
+
+
+def _missing_explicit_paths(paths: List[Path]) -> List[Path]:
+    """Return the explicitly named paths that do not exist on disk.
+
+    Discovery intentionally tolerates a nonexistent root so a default run
+    over ``tests/`` in a checkout without that directory still reports
+    "No test files to run" instead of crashing. But an EXPLICIT selection
+    (a positional path, a ``--paths`` entry, or a ``--files`` entry) is a
+    request the caller expects to be honoured: silently skipping it reports
+    a green run over a subset of what was asked for, which is a correctness
+    bug rather than a convenience.
+    """
+    return [p for p in paths if not p.exists()]
+
+
+def _report_missing_explicit_paths(missing: List[Path]) -> None:
+    """Print every missing explicit path and refuse to run (stderr)."""
+    print(
+        f"error: {len(missing)} explicitly requested test "
+        f"path{'s' if len(missing) != 1 else ''} do not exist:",
+        file=sys.stderr,
+    )
+    for p in missing:
+        print(f"  - {p}", file=sys.stderr)
+    print(
+        "Refusing to run: every explicitly named path must exist. "
+        "Fix or drop the path(s) above, then retry.",
+        file=sys.stderr,
+    )
 
 
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
@@ -986,17 +1018,36 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parent.parent
 
+    # --paths (or HERMES_TEST_PATHS) is an explicit selection whose missing
+    # entries must be rejected. The hardcoded default 'tests' is NOT explicit:
+    # it keeps its historical "No test files to run" behaviour when the repo
+    # has no tests/ directory, rather than being reported as a missing path.
+    paths_explicit = "HERMES_TEST_PATHS" in os.environ or any(
+        tok == "--paths" or tok.startswith("--paths=") for tok in our_args
+    )
+
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:
         files = [repo_root / f for f in _split_pathspec(args.files)]
         roots = []
+        missing = _missing_explicit_paths(files)
+        if missing:
+            _report_missing_explicit_paths(missing)
+            return 2
     else:
         # Resolve discovery roots: positional path args override --paths if any
         # were supplied, otherwise --paths (which itself defaults to 'tests').
         if args.paths_positional:
             roots = [repo_root / p for p in args.paths_positional]
+            reject_missing = True
         else:
             roots = [repo_root / p for p in _split_pathspec(args.paths)]
+            reject_missing = paths_explicit
+        if reject_missing:
+            missing = _missing_explicit_paths(roots)
+            if missing:
+                _report_missing_explicit_paths(missing)
+                return 2
 
         if args.include_integration:
             # Caller takes responsibility — typically used via explicit -k filter.
