@@ -16,6 +16,7 @@
  */
 
 import { Codicon, useQuery, useValue } from '@hermes/plugin-sdk'
+import { useCallback, useMemo, useRef, useState } from 'react'
 
 import {
   $boardSlug,
@@ -31,6 +32,8 @@ import {
 import type {
   EvidenceContext,
   EvidenceSnapshotData,
+  KanbanColumn,
+  KanbanTask,
   WorkerEvidenceData,
   WorkerObservation
 } from './types'
@@ -95,9 +98,12 @@ export function resolveWorkerState(data: WorkerEvidenceData | null | undefined):
     const runningCount = typeof aggregate.running === 'number' ? aggregate.running : 0
     const unknownCount = typeof aggregate.unknown === 'number' ? aggregate.unknown : 0
     const stoppedCount = typeof aggregate.stopped === 'number' ? aggregate.stopped : 0
-    const completionRecords = typeof aggregate.completion_records === 'number' ? aggregate.completion_records : 0
 
-    if (aggregate.complete === true && runningCount === 0 && unknownCount === 0 && stoppedCount + completionRecords > 0) {
+    // Stopped needs the helper's own complete verdict PLUS actual stopped-run
+    // evidence (aggregate.stopped > 0). A completion_records-only aggregate is
+    // BOOKKEEPING (an upstream-authored row with no observed worker stop) —
+    // that is UNKNOWN here, never Stopped.
+    if (aggregate.complete === true && runningCount === 0 && unknownCount === 0 && stoppedCount > 0) {
       return 'stopped'
     }
   }
@@ -182,43 +188,251 @@ export function snapshotWorkerStateMap(data: EvidenceSnapshotData | null | undef
 }
 
 /**
- * The board's single bounded snapshot (K9) — ONE poll per aligned refresh
- * that feeds both the header badge and every card's worker-evidence state.
- * Returns null while alignment is unresolved or false, so the local board
- * keeps rendering unchanged.
+ * The board data source, resolved from the read-only /evidence/* bridge.
+ *
+ * `phase` is the discriminator the board renders from:
+ *
+ * - `resolving`: the /evidence/context identity check is still in flight. The
+ *   board shows its loader and MUST NOT fall back to a local /board read, a
+ *   local read here would silently present a board that may not be the EVO DB.
+ * - `unaligned`: context resolved with `aligned === false`. The local /board is
+ *   the honest source, and the board states the choose-the-EVO remedy.
+ * - `context-error`: the identity check itself failed. Visible, never a silent
+ *   local fallback.
+ * - `aligned`: the local DB IS the EVO DB; the grid, the counts, and every
+ *   worker badge come from the bounded snapshot. A failed snapshot or helper
+ *   read sets `error` (visible), never a silent local substitute.
  */
-export function useBoardEvidence(): null | {
-  states: Map<string, WorkerState>
-  running: number
-  unknown: number
-  byStatus: Record<string, number>
-  total: number
-  omitted: number
-} {
+export type BoardEvidence =
+  | { phase: 'resolving' | 'unaligned' | 'context-error' }
+  | {
+      phase: 'aligned'
+      states: Map<string, WorkerState>
+      running: number
+      unknown: number
+      byStatus: Record<string, number>
+      total: number
+      omitted: number
+      cards: KanbanTask[]
+      hasMore: boolean
+      nextCursor: null | string
+      observedAt: null | number
+      error: null | string
+      loadMoreError: null | string
+      loadMore: () => void
+      loadingMore: boolean
+    }
+
+/** An empty aligned result for the two failure shapes (snapshot read failed,
+ *  helper receipt not PASS). The board renders a visible error, never cards. */
+function alignedError(error: string): Extract<BoardEvidence, { phase: 'aligned' }> {
+  return {
+    phase: 'aligned',
+    states: new Map(),
+    running: 0,
+    unknown: 0,
+    byStatus: {},
+    total: 0,
+    omitted: 0,
+    cards: [],
+    hasMore: false,
+    nextCursor: null,
+    observedAt: null,
+    error,
+    loadMoreError: null,
+    loadMore: () => undefined,
+    loadingMore: false
+  }
+}
+
+export function useBoardEvidence(): BoardEvidence {
   const slug = useResolvedBoardSlug()
-  const { data: context, isError } = useEvidenceContext(slug)
+  const { data: context, isError: contextError } = useEvidenceContext(slug)
   const aligned = context?.aligned === true
-  const { data: snapshotEnvelope } = useEvidenceSnapshot(slug, aligned)
+  const { data: snapshotEnvelope, isError: snapshotError } = useEvidenceSnapshot(slug, aligned)
 
-  if (isError || !aligned) {
-    return null
+  // Load-more pages: cards appended beyond the first page, plus the cursor and
+  // has_more of the LAST page loaded. Stamped with the first page's observed_at
+  // so a refresh (or a board switch) advances the stamp and the stale pages are
+  // ignored, a refresh can never mix old worker claims under a new timestamp.
+  const [extra, setExtra] = useState<{ observedAt: null | number; cards: KanbanTask[]; cursor: null | string; hasMore: boolean }>({
+    observedAt: null,
+    cards: [],
+    cursor: null,
+    hasMore: false
+  })
+
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [loadMoreError, setLoadMoreError] = useState<null | string>(null)
+  const loadingRef = useRef(false)
+
+  const snapshot = snapshotEnvelope?.state === 'PASS' ? snapshotEnvelope.evidence : null
+  const observedAt = typeof snapshot?.observed_at === 'number' ? snapshot.observed_at : null
+
+  // Guard against the past: pages stamped with an older observed_at (or board)
+  // are dropped once the first page's timestamp advances.
+  const liveExtra = extra.observedAt === observedAt ? extra : { observedAt, cards: [], cursor: null, hasMore: false }
+
+  const firstCards = useMemo(() => snapshotCardsToViews(snapshot), [snapshot])
+
+  const cards = liveExtra.cards.length > 0 ? [...firstCards, ...liveExtra.cards] : firstCards
+  const hasMore = liveExtra.cards.length > 0 ? liveExtra.hasMore : snapshot?.has_more === true
+  const nextCursor = liveExtra.cards.length > 0 ? liveExtra.cursor : (snapshot?.next_cursor ?? null)
+
+  // Per-card worker state for EVERY loaded card: a positive observation maps to
+  // running, everything else (weak OR missing) to unknown. A missing observation
+  // is UNKNOWN, never the card's local status.
+  const observedStates = snapshotWorkerStateMap(snapshot)
+  const states = new Map<string, WorkerState>()
+
+  for (const card of cards) {
+    states.set(card.id, observedStates.get(card.id) ?? 'unknown')
   }
 
-  if (!snapshotEnvelope || snapshotEnvelope.state !== 'PASS' || !snapshotEnvelope.evidence) {
-    return null
+  const running = [...states.values()].filter(state => state === 'running').length
+  const unknown = states.size - running
+
+  // Load more fetches the NEXT page under the snapshot's stable cursor and
+  // APPENDS fresh cards (duplicate ids from a keyset page under the high-water
+  // bound are dropped). A board switch or refresh mid-flight stamps the append
+  // with the old observed_at, so it can never relabel the current view.
+  const loadMore = useCallback(() => {
+    if (loadingRef.current) {
+      return
+    }
+
+    const cursor = nextCursor
+
+    if (!cursor) {
+      return
+    }
+
+    loadingRef.current = true
+    setLoadingMore(true)
+    setLoadMoreError(null)
+
+    fetchEvidenceSnapshot(slug, 'all', cursor)
+      .then(envelope => {
+        if (envelope.state !== 'PASS' || !envelope.evidence) {
+          setLoadMoreError(envelope.reason ?? 'evidence page failed')
+
+          return
+        }
+
+        const pageCards = snapshotCardsToViews(envelope.evidence)
+        const known = new Set([...firstCards, ...liveExtra.cards].map(card => card.id))
+        const fresh = pageCards.filter(card => !known.has(card.id))
+
+        setExtra({
+          observedAt,
+          cards: [...liveExtra.cards, ...fresh],
+          cursor: envelope.evidence.next_cursor ?? null,
+          hasMore: envelope.evidence.has_more === true
+        })
+      })
+      .catch(() => setLoadMoreError('evidence page failed'))
+      .finally(() => {
+        loadingRef.current = false
+        setLoadingMore(false)
+      })
+  }, [slug, nextCursor, observedAt, firstCards, liveExtra.cards])
+
+  if (contextError) {
+    return { phase: 'context-error' }
   }
 
-  const snapshot = snapshotEnvelope.evidence
-  const { running, unknown } = resolveSnapshotWorkerStates(snapshot)
+  if (!context) {
+    return { phase: 'resolving' }
+  }
+
+  if (!context.aligned) {
+    return { phase: 'unaligned' }
+  }
+
+  if (snapshotError) {
+    return alignedError('evidence snapshot failed')
+  }
+
+  if (!snapshotEnvelope || snapshotEnvelope.state !== 'PASS' || !snapshot) {
+    return alignedError(snapshotEnvelope?.reason ?? 'worker evidence unavailable')
+  }
 
   return {
-    states: snapshotWorkerStateMap(snapshot),
+    phase: 'aligned',
+    states,
     running,
     unknown,
     byStatus: snapshot.counts?.by_status ?? {},
     total: typeof snapshot.counts?.total === 'number' ? snapshot.counts.total : 0,
-    omitted: typeof snapshot.counts?.omitted === 'number' ? snapshot.counts.omitted : 0
+    omitted: typeof snapshot.counts?.omitted === 'number' ? snapshot.counts.omitted : 0,
+    cards,
+    hasMore,
+    nextCursor,
+    observedAt,
+    error: null,
+    loadMoreError,
+    loadMore,
+    loadingMore
   }
+}
+
+/** Convert one snapshot card row (helper contract: kanban_page cards items)
+ *  into the board's KanbanTask view shape. Field names follow the released
+ *  contract (id/title/status/assignee/…); unknown keys pass through ignored. */
+export function snapshotCardToTask(raw: Record<string, unknown>): KanbanTask {
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+  const str = (v: unknown): null | string => (typeof v === 'string' ? v : null)
+
+  return {
+    id: String(raw.id ?? ''),
+    title: typeof raw.title === 'string' ? raw.title : '',
+    body: str(raw.body),
+    status: typeof raw.status === 'string' ? raw.status : 'todo',
+    assignee: str(raw.assignee),
+    priority: num(raw.priority),
+    tenant: str(raw.tenant),
+    created_at: num(raw.created_at),
+    latest_summary: str(raw.latest_summary),
+    comment_count: num(raw.comment_count),
+    started_at: str(raw.started_at) === null ? num(raw.started_at) : null,
+    worker_pid: num(raw.worker_pid) ?? null,
+    last_heartbeat_at: num(raw.last_heartbeat_at) ?? null
+  }
+}
+
+/** All cards of one snapshot page, converted. */
+export function snapshotCardsToViews(data: EvidenceSnapshotData | null | undefined): KanbanTask[] {
+  const cards = Array.isArray(data?.cards) ? data.cards : []
+
+  return cards.map(raw => snapshotCardToTask(raw))
+}
+
+/** Fold loaded pages (first page first) into the board's column shape.
+ *  Duplicate ids (a keyset page can overlap after concurrent inserts under
+ *  the high-water bound) are dropped, preserving first occurrence. */
+export function viewsToBoardColumns(views: KanbanTask[], statusOrder: readonly string[]): KanbanColumn[] {
+  const seen = new Set<string>()
+  const byStatus = new Map<string, KanbanTask[]>()
+
+  for (const view of views) {
+    if (seen.has(view.id)) {
+      continue
+    }
+
+    seen.add(view.id)
+
+    const status = view.status || 'todo'
+    byStatus.set(status, [...(byStatus.get(status) ?? []), view])
+  }
+
+  return [...byStatus.entries()]
+    .sort(([a], [b]) => {
+      const ia = statusOrder.indexOf(a)
+      const ib = statusOrder.indexOf(b)
+
+      return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib) || a.localeCompare(b)
+    })
+    .map(([name, tasks]) => ({ name, tasks }))
 }
 
 /** One worker observation line: state + reason, with the pid/workspace match

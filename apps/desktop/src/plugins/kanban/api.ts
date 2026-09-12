@@ -75,6 +75,10 @@ function onEventsFrame(slug: string, data: unknown): void {
   void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
   // Any event can change a board's card count — keep the switcher badge honest.
   void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
+  // A task event can also change worker evidence (a claim, stop, or completion),
+  // so the aligned snapshot/context refresh through the SAME callback — no
+  // second poller or notifier.
+  void queryClient.invalidateQueries({ queryKey: ['kanban', 'evidence'] })
 
   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
     void queryClient.invalidateQueries({ queryKey: taskKey(slug, taskId!) })
