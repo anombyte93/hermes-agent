@@ -226,14 +226,41 @@ export interface EvidenceContext {
   observed_at: number
 }
 
-/** One worker observation attached to a card by the snapshot adapter:
- *  task_id / state / process_present / reason / workspace_matches. */
+/** One worker observation attached to a card by the adapter. Positive
+ *  identity for "running" requires ALL FOUR: state=PASS, process_present,
+ *  workspace_matches, run_start_matches. A bare process_present is NOT
+ *  enough (the worker may have been recycled for a different task). */
 export interface WorkerObservation {
   task_id: string
   state?: null | string
   process_present?: boolean
   reason?: null | string
   workspace_matches?: null | boolean
+  run_start_matches?: null | boolean
+  /** Completion-record observations carry `classification`/`run_id`. */
+  classification?: null | string
+  run_id?: null | number
+}
+
+/** The worker aggregate rollup. The REAL helper nests the complete/running/
+ *  unknown/stopped verdicts HERE (``data.aggregate``), not at the top level
+ *  of ``WorkerEvidenceData``. `complete` is the helper's own "we saw the
+ *  whole run set" claim; Stopped additionally needs no running/unknown. */
+export interface WorkerAggregate {
+  overall?: null | string
+  running?: number
+  stopped?: number
+  completion_records?: number
+  unknown?: number
+  complete?: boolean
+}
+
+/** One completion record surfaced with the worker aggregate. */
+export interface CompletionRunRecord {
+  run_id?: null | number
+  summary?: null | string
+  started_at?: null | number
+  ended_at?: null | number
 }
 
 /** Snapshot count rollup: per-status counts plus the page's own bounds. */
@@ -271,13 +298,18 @@ export interface EvidenceEnvelope<T> {
   timing?: { helper_roundtrip_ms?: null | number; collection_ms?: null | number }
 }
 
-/** GET /evidence/worker evidence payload. */
+/** GET /evidence/worker evidence payload. The REAL helper nests the
+ *  complete/running/unknown/stopped verdicts under `aggregate`; the top-level
+ *  `complete`/`running`/`unknown` booleans the earlier draft read did NOT
+ *  exist in the released contract (verified against EVIDENCE-CONTRACTS.json). */
 export interface WorkerEvidenceData {
   task_id: string
   observations: WorkerObservation[]
-  complete?: boolean
-  unknown?: boolean
-  running?: boolean
+  card_status?: null | string
+  assignee?: null | string
+  aggregate?: null | WorkerAggregate
+  completion_runs?: CompletionRunRecord[]
+  limitation?: null | string
 }
 
 /** GET /evidence/card evidence payload (bounded; include_body via page). */

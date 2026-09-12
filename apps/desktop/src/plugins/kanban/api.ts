@@ -153,6 +153,23 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
   return qs ? `${path}?${qs}` : path
 }
 
+/** Append an EXPLICIT board slug to a path. The evidence fetchers take the
+ *  slug as a parameter and capture it in their closure, so an in-flight
+ *  request can never read a board that changed after it was issued — the
+ *  global atom is not consulted. A blank slug is omitted (the server resolves
+ *  the current board); callers resolve '' to the real slug before asking. */
+function withBoardSlug(path: string, slug: string, params: Record<string, string> = {}): string {
+  const search = new URLSearchParams(params)
+
+  if (slug) {
+    search.set('board', slug)
+  }
+
+  const qs = search.toString()
+
+  return qs ? `${path}?${qs}` : path
+}
+
 // ── query keys (all board-scoped so switching boards is a clean cache miss) ──
 
 export const boardKey = (slug: string, archived: boolean) => ['kanban', 'board', slug, archived] as const
@@ -193,28 +210,30 @@ export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestrat
 
 // ── read-only /evidence/* bridge (physical EVO host) ──────────────────────────
 // These never touch the local /board or /tasks data; they read the shared
-// EVO evidence bridge. `withBoard` appends `?board=<slug>` so the evidence
-// read is pinned to the selected board, never the server's current pointer.
+// EVO evidence bridge. Each takes an EXPLICIT slug captured at call time (not
+// the global atom) so a late response from a previous board can never land
+// under a new board's query key.
 
 /** Identity alignment: is the selected board's local DB the same EVO DB? */
-export const fetchEvidenceContext = () => call<EvidenceContext>(withBoard('/evidence/context'))
+export const fetchEvidenceContext = (slug: string) => call<EvidenceContext>(withBoardSlug('/evidence/context', slug))
 
 /** Bounded board snapshot with running/stopped/unknown worker evidence. */
-export const fetchEvidenceSnapshot = (status: string, cursor: null | string, cardLimit = 100) =>
+export const fetchEvidenceSnapshot = (slug: string, status: string, cursor: null | string, cardLimit = 100) =>
   call<EvidenceEnvelope<EvidenceSnapshotData>>(
-    withBoard('/evidence/snapshot', { status, card_limit: String(cardLimit), ...(cursor ? { cursor } : {}) })
+    withBoardSlug('/evidence/snapshot', slug, { status, card_limit: String(cardLimit), ...(cursor ? { cursor } : {}) })
   )
 
 /** Full worker aggregate for one card (complete/unknown/running + observations). */
-export const fetchEvidenceWorker = (id: string) =>
-  call<EvidenceEnvelope<WorkerEvidenceData>>(withBoard('/evidence/worker', { card: id }))
+export const fetchEvidenceWorker = (slug: string, id: string) =>
+  call<EvidenceEnvelope<WorkerEvidenceData>>(withBoardSlug('/evidence/worker', slug, { card: id }))
 
 /** Bounded single-card evidence (include_body/recent_items are server-fixed). */
-export const fetchEvidenceCard = (id: string) =>
-  call<EvidenceEnvelope<EvidenceCardData>>(withBoard('/evidence/card', { card: id }))
+export const fetchEvidenceCard = (slug: string, id: string) =>
+  call<EvidenceEnvelope<EvidenceCardData>>(withBoardSlug('/evidence/card', slug, { card: id }))
 
 /** Bounded page of a card resource (cards|runs|events|attachments). */
 export const fetchEvidencePage = (
+  slug: string,
   resource: string,
   card: null | string,
   cursor: null | string,
@@ -222,7 +241,7 @@ export const fetchEvidencePage = (
   status?: string
 ) =>
   call<EvidenceEnvelope<{ items: Array<Record<string, unknown>>; returned: number; has_more: boolean; next_cursor?: null | string }>>(
-    withBoard('/evidence/page', {
+    withBoardSlug('/evidence/page', slug, {
       resource,
       limit: String(limit),
       ...(card ? { card } : {}),

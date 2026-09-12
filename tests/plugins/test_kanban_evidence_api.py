@@ -508,8 +508,22 @@ def test_oversized_stdout_is_unknown(client, helper_bin):
     assert body["evidence"] is None
 
 
-def test_missing_helper_is_unknown(client, helper_bin):
-    # No helper installed on PATH — every route returns UNKNOWN, no 500.
+def test_missing_helper_is_unknown(client, helper_bin, monkeypatch):
+    # The released helper IS installed on this host now, so the "not installed"
+    # branch must be exercised by replacing ONLY the executable-discovery
+    # boundary (shutil.which) for this test — real routes, assertions, no-500
+    # and remedy all stay intact. No production change satisfies this.
+    import shutil
+
+    real_which = shutil.which
+
+    def _which_no_helper(name, *args, **kwargs):
+        if name == "atlas-kanban-call":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", _which_no_helper)
+
     for path in (
         "/evidence/snapshot?board=evo-alpha&status=all&card_limit=50",
         "/evidence/page?board=evo-alpha&resource=cards",
