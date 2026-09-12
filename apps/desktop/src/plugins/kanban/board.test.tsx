@@ -256,6 +256,18 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('KanbanBoardPage (mounted)', () => {
+  it('never reuses cached local cards after alignment changes and the helper fails', async () => {
+    h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(false))
+    h.fetch.fetchBoard.mockResolvedValue(localBoard())
+    const qc = renderBoard()
+    await screen.findByText('Local run card')
+    h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
+    h.fetch.fetchEvidenceSnapshot.mockResolvedValue({ state: 'UNKNOWN', reason: 'helper unavailable', evidence: null })
+    await act(async () => { await qc.invalidateQueries({ queryKey: ['kanban', 'evidence', 'context'] }) })
+    await screen.findByText(/helper unavailable/i)
+    expect(screen.queryByText('Local run card')).toBeNull()
+  })
+
   it('aligned: renders snapshot card titles and never polls /board', async () => {
     h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
     h.fetch.fetchEvidenceSnapshot.mockResolvedValue(
