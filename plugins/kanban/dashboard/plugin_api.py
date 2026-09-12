@@ -3827,6 +3827,30 @@ def _compute_alignment(slug: str) -> dict[str, Any]:
     return {"aligned": aligned, "board": slug, "hostname": hostname, "reason": reason}
 
 
+@router.get("/events/baseline")
+def events_baseline(board: str = Query(...)):
+    """Bounded baseline for this server's existing /events subscription.
+
+    A local Desktop connection must not baseline against EVO's event IDs.
+    Read only the selected connection's database; this conveys no worker
+    liveness or mutation authority and cannot create a missing board.
+    """
+    import contextlib
+    import sqlite3
+
+    slug = _evidence_board_slug(board)
+    path = kanban_db.kanban_db_path(slug)
+    try:
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+            baseline = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+        return {"state": "PASS", "board": slug, "evidence": {"board": slug, "baseline_id": baseline}, "observed_at": time.time()}
+    except (OSError, sqlite3.Error):
+        return {"state": "UNKNOWN", "board": slug, "evidence": None,
+                "reason": "The selected server's event history is unavailable",
+                "remedy": "Check this connection and board before retrying notifications.",
+                "observed_at": time.time()}
+
+
 @router.get("/evidence/attention")
 async def evidence_attention(
     board: str = Query(...),
