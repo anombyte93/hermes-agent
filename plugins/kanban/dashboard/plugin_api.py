@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -50,7 +51,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
@@ -793,7 +794,11 @@ async def upload_task_attachment(
 
 
 @router.get("/attachments/{attachment_id}")
-def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+def download_attachment(
+    attachment_id: int,
+    board: Optional[str] = Query(None),
+    response_format: Literal["binary", "json"] = Query("binary", alias="format"),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -810,6 +815,25 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
             raise HTTPException(status_code=404, detail="attachment file unavailable")
         if not stored.is_file():
             raise HTTPException(status_code=404, detail="attachment file missing on disk")
+        if response_format == "json":
+            # Desktop plugin REST already owns connection-scoped token/OAuth
+            # authentication but transports JSON only. Keep file bytes on that
+            # same door, with the existing attachment cap, rather than exposing
+            # tokens in a renderer URL or relaxing CORS.
+            try:
+                with stored.open("rb") as source:
+                    content = source.read(KANBAN_ATTACHMENT_MAX_BYTES + 1)
+            except OSError:
+                raise HTTPException(status_code=404, detail="attachment file unavailable")
+            if len(content) > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="attachment exceeds the supported download size")
+            return {
+                "id": att.id,
+                "filename": att.filename,
+                "content_type": att.content_type or "application/octet-stream",
+                "size": len(content),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
         return FileResponse(
             path=str(stored),
             filename=att.filename,
