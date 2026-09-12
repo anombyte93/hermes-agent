@@ -119,12 +119,28 @@ async function ensureBaseline(slug: string): Promise<void> {
   baselinePending.add(slug)
 
   try {
-    const changes = (await rest!<{ evidence?: { baseline_id?: unknown } }>(
+    const changes = (await rest!<{ state?: unknown; board?: unknown; evidence?: { baseline_id?: unknown } }>(
       `/evidence/changes?board=${encodeURIComponent(slug)}&limit=1`
-    )) as { evidence?: { baseline_id?: unknown } }
+    )) as { state?: unknown; board?: unknown; evidence?: { baseline_id?: unknown } }
 
     const baselineId = changes?.evidence?.baseline_id
-    seenEventIdByBoard.set(slug, typeof baselineId === 'number' ? baselineId : 0)
+
+    // Only a PASS, board-exact, nonnegative finite integer baseline is
+    // authoritative. A FAIL/UNKNOWN or malformed HTTP 200 response must NOT
+    // fall back to baseline 0 (that would notify historical events): leave the
+    // board unknown so notifications stay suppressed and a later frame can
+    // recover with a fresh read.
+    const authoritative =
+      changes?.state === 'PASS' &&
+      changes?.board === slug &&
+      typeof baselineId === 'number' &&
+      Number.isFinite(baselineId) &&
+      Number.isInteger(baselineId) &&
+      baselineId >= 0
+
+    if (authoritative) {
+      seenEventIdByBoard.set(slug, baselineId as number)
+    }
   } catch {
     // Fail-closed: unknown baseline → notifications stay suppressed.
   } finally {
