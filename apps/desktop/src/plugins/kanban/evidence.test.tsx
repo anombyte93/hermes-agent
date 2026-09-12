@@ -13,10 +13,10 @@
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { resolveWorkerState, type WorkerState } from './evidence'
+import { resolveSnapshotWorkerStates, resolveWorkerState, snapshotWorkerStateMap, type WorkerState } from './evidence'
 
 // ---------------------------------------------------------------------------
 // Mock the HTTP/network boundary (./api) and the SDK host.
@@ -76,6 +76,7 @@ describe('resolveWorkerState', () => {
         { task_id: 't_1', state: 'PASS', process_present: true, workspace_matches: true, run_start_matches: true }
       ]
     }
+
     expect(resolveWorkerState(positive)).toBe('running')
   })
 
@@ -142,6 +143,37 @@ describe('resolveWorkerState', () => {
         aggregate: { overall: 'STOPPED', running: 0, stopped: 0, completion_records: 1, unknown: 0, complete: true }
       })
     ).toBe('running')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Snapshot worker-state rollup + per-card map (the board's K9 feed).
+// ---------------------------------------------------------------------------
+
+describe('snapshot worker-state rollup', () => {
+  const runningObs = { task_id: 't_1', state: 'PASS', process_present: true, workspace_matches: true, run_start_matches: true }
+  const weakObs = { task_id: 't_2', state: 'PASS', process_present: true, workspace_matches: true, run_start_matches: false }
+  const nonPass = { task_id: 't_3', state: 'FAIL', process_present: false }
+
+  it('counts running vs unknown from worker_observations', () => {
+    expect(resolveSnapshotWorkerStates({ worker_observations: [runningObs, weakObs, nonPass] })).toEqual({
+      running: 1,
+      unknown: 2
+    })
+  })
+
+  it('maps only observations with a task_id, absent cards have no entry', () => {
+    const map = snapshotWorkerStateMap({ worker_observations: [runningObs, weakObs, { ...nonPass, task_id: '' }] })
+
+    expect(map.get('t_1')).toBe('running')
+    expect(map.get('t_2')).toBe('unknown')
+    expect(map.has('')).toBe(false)
+    expect(map.has('t_missing')).toBe(false)
+  })
+
+  it('empty observations roll up to zero, empty map', () => {
+    expect(resolveSnapshotWorkerStates({ worker_observations: [] })).toEqual({ running: 0, unknown: 0 })
+    expect(snapshotWorkerStateMap(undefined).size).toBe(0)
   })
 })
 

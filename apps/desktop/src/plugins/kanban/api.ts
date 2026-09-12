@@ -310,6 +310,15 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
+/**
+ * Authenticated attachment download route for one card. `id` is the integer
+ * attachment id; the download goes through the SAME identity the REST door
+ * uses (`/attachments/<id>?board=<slug>`), never a raw `stored_path` URL.
+ * Returns the namespaced path for the caller to open/download.
+ */
+export const attachmentDownloadPath = (slug: string, id: number | string) =>
+  withBoardSlug(`/attachments/${id}`, slug)
+
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
     method: 'POST',

@@ -21,12 +21,10 @@ import {
   $boardSlug,
   BOARDS_KEY,
   evidenceContextKey,
-  evidencePageKey,
   evidenceSnapshotKey,
   evidenceWorkerKey,
   fetchBoards,
   fetchEvidenceContext,
-  fetchEvidencePage,
   fetchEvidenceSnapshot,
   fetchEvidenceWorker
 } from './api'
