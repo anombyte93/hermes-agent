@@ -850,3 +850,25 @@ def test_parent_readiness_uses_hermes_supported_worker_python(client, helper_bin
     response = client.post("/api/plugins/kanban/workflow/readiness?board=default", json={"card": aligned_evo, "check_model": True})
     assert response.json()["state"] == "PASS"
     assert _invocations(helper_bin.record_path)[0]["stdin"]["minimum_python"] == "3.11"
+
+
+def test_parent_event_baseline_matches_local_stream(client, aligned_evo, monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: "archie")
+    conn = kb.connect(board="default")
+    try:
+        expected = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events").fetchone()[0]
+    finally:
+        conn.close()
+    result = client.get("/api/plugins/kanban/events/baseline?board=default").json()
+    assert result["state"] == "PASS"
+    assert result["board"] == result["evidence"]["board"] == "default"
+    assert result["evidence"]["baseline_id"] == expected and expected > 0
+
+
+def test_parent_event_baseline_missing_board_cannot_create(client, evidence_home):
+    path = kb.kanban_db_path("missing-baseline-control")
+    assert not path.exists()
+    result = client.get("/api/plugins/kanban/events/baseline?board=missing-baseline-control").json()
+    assert result["state"] == "UNKNOWN" and result["evidence"] is None
+    assert not path.exists()

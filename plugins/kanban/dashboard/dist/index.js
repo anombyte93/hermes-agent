@@ -1017,6 +1017,782 @@
         : null);
   }
 
+  // -------------------------------------------------------------------------
+  // Workflow bridge (K2/K3/K4/K5/K6/K7/K8): attention queue, board changes,
+  // card timeline, explicit readiness, continuation draft -> continue, and
+  // review hold. Gated on /evidence/context alignment. Reads use the evidence
+  // envelope; every write is an explicit user click, never automatic, never a
+  // dispatch. Tests mock the network layer only.
+  // -------------------------------------------------------------------------
+
+  const WORKFLOW_CHANGES_POLL_MS = 30000;
+
+  // Workflow responses use the standard evidence envelope; the helper's own
+  // receipt (readiness / draft / continue / hold) lives under ``evidence``.
+  // This normalizer mirrors evidenceEnvelope but never claims the "worker
+  // evidence unavailable" remedy (workflow projections are not worker
+  // evidence), so it cannot collide with the worker-evidence UI surface.
+  function workflowEnvelope(promise) {
+    return promise.then(function (res) {
+      return (res && typeof res === "object") ? res : { state: "UNKNOWN", reason: "empty workflow response" };
+    }).catch(function (err) {
+      return {
+        state: "UNKNOWN",
+        reason: parseApiErrorMessage(err) || "workflow endpoint unreachable",
+        remedy: "Workflow is unavailable on this server.",
+      };
+    });
+  }
+
+  function fetchEvidenceAttention(board, limit, cursor) {
+    const qs = evQuery({ limit: limit || 50, cursor: cursor || undefined });
+    return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/attention?${qs}`, board)));
+  }
+  function fetchEvidenceChanges(board, limit, cursor) {
+    const qs = evQuery({ limit: limit || 50, cursor: cursor || undefined });
+    return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/changes?${qs}`, board)));
+  }
+  function fetchEvidenceTimeline(board, card, limit, cursor) {
+    const qs = evQuery({ limit: limit || 50, cursor: cursor || undefined });
+    return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/timeline?card=${encodeURIComponent(card)}&${qs}`, board)));
+  }
+  function postWorkflow(board, path, body) {
+    return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}${path}`, board), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }));
+  }
+
+  function workflowStateTone(state) {
+    if (state === "PASS") return EVIDENCE_STATE_TONE.running;
+    if (state === "FAIL") return "#ef4444";
+    if (state === "UNKNOWN") return EVIDENCE_STATE_TONE.unknown;
+    return EVIDENCE_STATE_TONE.unavailable;
+  }
+
+  function splitNonEmpty(text) {
+    return String(text || "").split("\n").map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  function fmtDuration(seconds) {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.round(s / 60) + "m";
+    return (s / 3600).toFixed(1) + "h";
+  }
+
+  function WorkflowStateLine(props) {
+    // A single envelope state + reason + remedy line, never presented as green
+    // when the envelope is not PASS.
+    const env = props.envelope;
+    if (!env) return null;
+    if (env.state === "PASS") return null;
+    const tone = workflowStateTone(env.state || "UNKNOWN");
+    return h("div", { className: "text-xs", style: { marginTop: "4px" } },
+      h("span", { style: { color: tone, fontWeight: "600" } }, env.state || "UNKNOWN"),
+      h("span", { style: { marginLeft: "6px", color: "var(--muted-foreground, #6b7280)" } },
+        env.reason || "workflow response unavailable"),
+      env.remedy
+        ? h("span", { style: { marginLeft: "6px", color: "var(--muted-foreground, #6b7280)" } }, env.remedy)
+        : null);
+  }
+
+  // K2 — board attention queue: bounded, pageable, exact card opens.
+  function WorkflowAttentionSection(props) {
+    const [envelope, setEnvelope] = useState(null);
+    const [items, setItems] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [hasMore, setHasMore] = useState(false);
+    const [cursor, setCursor] = useState(null);
+    const [omitted, setOmitted] = useState(null);
+    const genRef = useRef(0);
+
+    const loadFirst = useCallback(function () {
+      genRef.current += 1;
+      const gen = genRef.current;
+      setLoading(true);
+      return fetchEvidenceAttention(props.boardSlug, 50, null).then(function (env) {
+        if (gen !== genRef.current) return;
+        setLoading(false);
+        setEnvelope(env);
+        if (!env || env.state !== "PASS") { setItems([]); return; }
+        const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        const cards = Array.isArray(data.cards) ? data.cards : [];
+        setItems(cards);
+        setHasMore(data.has_more === true);
+        setCursor(data.next_cursor != null ? data.next_cursor : null);
+        setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+      });
+    }, [props.boardSlug]);
+
+    useEffect(function () { loadFirst(); }, [loadFirst]);
+
+    const loadMore = useCallback(function () {
+      if (loadingMore || !hasMore || !cursor) return Promise.resolve();
+      setLoadingMore(true);
+      const gen = genRef.current;
+      return fetchEvidenceAttention(props.boardSlug, 50, cursor).then(function (env) {
+        if (gen !== genRef.current) return;
+        setLoadingMore(false);
+        setEnvelope(env);
+        if (!env || env.state !== "PASS") return;
+        const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        const cards = Array.isArray(data.cards) ? data.cards : [];
+        const seen = {};
+        const merged = items.concat(cards).filter(function (c) {
+          if (!c || seen[c.id]) return false;
+          seen[c.id] = true;
+          return true;
+        });
+        setItems(merged);
+        setHasMore(data.has_more === true);
+        setCursor(data.next_cursor != null ? data.next_cursor : null);
+        setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+      });
+    }, [loadingMore, hasMore, cursor, items, props.boardSlug]);
+
+    const rows = items.map(function (card) {
+      const reasons = Array.isArray(card.reasons) ? card.reasons.join("; ") : "";
+      const authority = card.operator_authority_needed != null
+        ? (" · operator authority: " + card.operator_authority_needed)
+        : "";
+      return h("button", {
+        key: card.id,
+        type: "button",
+        className: "hermes-kanban-workflow-attention-card",
+        "data-workflow-attention-card": card.id,
+        onClick: function () { if (props.onOpen) props.onOpen(card.id); },
+      },
+        h("span", { className: "hermes-kanban-workflow-attention-id" }, card.id),
+        h("span", { className: "hermes-kanban-workflow-attention-title" }, card.title || "(untitled)"),
+        h("span", { className: "hermes-kanban-workflow-attention-status" }, card.status || ""),
+        reasons ? h("span", { className: "hermes-kanban-workflow-attention-reasons" }, reasons) : null,
+        card.next_action ? h("span", { className: "hermes-kanban-workflow-attention-action" }, card.next_action) : null,
+        authority ? h("span", { className: "hermes-kanban-workflow-attention-action" }, authority) : null);
+    });
+
+    return h("div", { className: "hermes-kanban-section", "data-workflow-attention": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Attention"),
+      loading ? h("div", { className: "text-xs text-muted-foreground" }, "Loading attention\u2026") : null,
+      rows.length > 0 ? h("div", { className: "hermes-kanban-workflow-list" }, rows) :
+        (!loading && (!envelope || envelope.state === "PASS")
+          ? h("div", { className: "text-xs text-muted-foreground" }, "No cards need attention.")
+          : null),
+      hasMore
+        ? h("button", {
+            type: "button",
+            className: "hermes-kanban-edit-link",
+            "data-workflow-attention-more": "true",
+            disabled: loadingMore,
+            onClick: loadMore,
+          }, loadingMore ? "Loading\u2026" : "More attention" + (omitted != null ? " (" + omitted + " omitted)" : ""))
+        : null,
+      h(WorkflowStateLine, { envelope: envelope }));
+  }
+
+  // K3 — board change tail: baseline-now first read, bounded paging, 30s poll.
+  function WorkflowChangesSection(props) {
+    const [envelope, setEnvelope] = useState(null);
+    const [events, setEvents] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [hasMore, setHasMore] = useState(false);
+    const [cursor, setCursor] = useState(null);
+    const [omitted, setOmitted] = useState(null);
+    const [anchor, setAnchor] = useState(null);
+    const genRef = useRef(0);
+    const cursorRef = useRef(null);
+
+    const apply = useCallback(function (env, append) {
+      setEnvelope(env);
+      if (!env || env.state !== "PASS") { setEvents([]); return; }
+      const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+      const page = Array.isArray(data.events) ? data.events : [];
+      if (append) {
+        const seen = {};
+        setEvents(function (prev) {
+          return prev.concat(page).filter(function (e) {
+            if (!e || e.id == null || seen[e.id]) return false;
+            seen[e.id] = true;
+            return true;
+          });
+        });
+      } else {
+        setEvents(page);
+      }
+      setHasMore(data.has_more === true);
+      const next = data.next_cursor != null ? data.next_cursor : null;
+      setCursor(next);
+      cursorRef.current = next;
+      setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+      if (data.anchor_state) setAnchor(data.anchor_state);
+    }, []);
+
+    const loadFirst = useCallback(function () {
+      genRef.current += 1;
+      const gen = genRef.current;
+      setLoading(true);
+      return fetchEvidenceChanges(props.boardSlug, 50, null).then(function (env) {
+        if (gen !== genRef.current) return;
+        setLoading(false);
+        apply(env, false);
+      });
+    }, [props.boardSlug, apply]);
+
+    const loadMore = useCallback(function () {
+      if (loadingMore || !hasMore || !cursorRef.current) return Promise.resolve();
+      setLoadingMore(true);
+      const gen = genRef.current;
+      return fetchEvidenceChanges(props.boardSlug, 50, cursorRef.current).then(function (env) {
+        if (gen !== genRef.current) return;
+        setLoadingMore(false);
+        apply(env, true);
+      });
+    }, [loadingMore, hasMore, props.boardSlug, apply]);
+
+    useEffect(function () { loadFirst(); }, [loadFirst]);
+
+    // Bounded 30s poll while visible; uses the latest consumed cursor so it is
+    // an incremental tail, never a historical flood.
+    useEffect(function () {
+      const id = setInterval(function () { loadMore(); }, WORKFLOW_CHANGES_POLL_MS);
+      return function () { clearInterval(id); };
+    }, [loadMore]);
+
+    const data = (envelope && envelope.evidence && typeof envelope.evidence === "object") ? envelope.evidence : {};
+    const eventRows = events.map(function (e) {
+      return h("div", { key: e.id, className: "hermes-kanban-workflow-change-event", "data-workflow-changes-event": e.id },
+        h("span", { className: "hermes-kanban-event-kind" }, e.kind || "event"),
+        e.task_id ? h("span", { className: "hermes-kanban-workflow-change-task" }, e.task_id) : null,
+        h("span", { className: "hermes-kanban-comment-ago" }, timeAgo ? timeAgo(e.created_at) : ""));
+    });
+
+    return h("div", { className: "hermes-kanban-section", "data-workflow-changes": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Changes"),
+      loading ? h("div", { className: "text-xs text-muted-foreground" }, "Loading changes\u2026") : null,
+      !loading && envelope && envelope.state === "PASS" && events.length === 0
+        ? h("div", { className: "text-xs text-muted-foreground" },
+            anchor === "baseline" ? "No observed changes since the baseline." : "No observed changes.")
+        : null,
+      eventRows.length > 0 ? h("div", { className: "hermes-kanban-workflow-list" }, eventRows) : null,
+      hasMore
+        ? h("button", {
+            type: "button",
+            className: "hermes-kanban-edit-link",
+            "data-workflow-changes-more": "true",
+            disabled: loadingMore,
+            onClick: loadMore,
+          }, loadingMore ? "Loading\u2026" : "More changes" + (omitted != null ? " (" + omitted + " omitted)" : ""))
+        : null,
+      envelope && envelope.state === "PASS"
+        ? h("div", { className: "hermes-kanban-workflow-changes-fresh text-xs text-muted-foreground" },
+            data.first_read_policy ? data.first_read_policy : "",
+            evidenceObservedAt(envelope) != null
+              ? " · observed " + (timeAgo ? timeAgo(evidenceObservedAt(envelope)) : "")
+              : "")
+        : null,
+      h(WorkflowStateLine, { envelope: envelope }));
+  }
+
+  // K4 — card timeline: disjoint execution/blocked/review/unknown intervals,
+  // covered-window totals (never productivity), visible gaps, bounded paging.
+  function WorkflowTimelineSection(props) {
+    const [envelope, setEnvelope] = useState(null);
+    const [intervals, setIntervals] = useState([]);
+    const [totals, setTotals] = useState(null);
+    const [gaps, setGaps] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [hasMore, setHasMore] = useState(false);
+    const [cursor, setCursor] = useState(null);
+    const [omitted, setOmitted] = useState(null);
+    const genRef = useRef(0);
+
+    const loadFirst = useCallback(function () {
+      genRef.current += 1;
+      const gen = genRef.current;
+      setLoading(true);
+      return fetchEvidenceTimeline(props.boardSlug, props.cardId, 50, null).then(function (env) {
+        if (gen !== genRef.current) return;
+        setLoading(false);
+        setEnvelope(env);
+        if (!env || env.state !== "PASS") { setIntervals([]); return; }
+        const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        setIntervals(Array.isArray(data.intervals) ? data.intervals : []);
+        setTotals((data.totals && typeof data.totals === "object") ? data.totals : null);
+        setGaps((data.coverage && Array.isArray(data.coverage.gaps)) ? data.coverage.gaps : []);
+        setHasMore(data.has_more === true);
+        setCursor(data.next_cursor != null ? data.next_cursor : null);
+        setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+      });
+    }, [props.boardSlug, props.cardId]);
+
+    useEffect(function () { loadFirst(); }, [loadFirst]);
+
+    const loadMore = useCallback(function () {
+      if (loadingMore || !hasMore || !cursor) return Promise.resolve();
+      setLoadingMore(true);
+      const gen = genRef.current;
+      return fetchEvidenceTimeline(props.boardSlug, props.cardId, 50, cursor).then(function (env) {
+        if (gen !== genRef.current) return;
+        setLoadingMore(false);
+        setEnvelope(env);
+        if (!env || env.state !== "PASS") return;
+        const data = (env.evidence && typeof env.evidence === "object") ? env.evidence : {};
+        const page = Array.isArray(data.intervals) ? data.intervals : [];
+        const seen = {};
+        setIntervals(function (prev) {
+          return prev.concat(page).filter(function (it) {
+            const key = it.kind + ":" + it.start + ":" + it.end;
+            if (seen[key]) return false;
+            seen[key] = true;
+            return true;
+          });
+        });
+        setHasMore(data.has_more === true);
+        setCursor(data.next_cursor != null ? data.next_cursor : null);
+        setOmitted(typeof data.omitted === "number" ? data.omitted : null);
+      });
+    }, [loadingMore, hasMore, cursor, props.boardSlug, props.cardId]);
+
+    const covered = totals && totals.covered_window ? totals.covered_window : null;
+    const intervalRows = intervals.map(function (it, i) {
+      return h("div", {
+        key: it.start + ":" + it.end + ":" + i,
+        className: "hermes-kanban-workflow-interval",
+        "data-workflow-timeline-interval": it.kind,
+      },
+        h("span", { className: "hermes-kanban-workflow-interval-kind" }, it.kind || "unknown"),
+        h("span", { className: "hermes-kanban-workflow-interval-dur" }, fmtDuration(it.duration_seconds)),
+        h("span", { className: "hermes-kanban-comment-ago" }, timeAgo ? timeAgo(it.start) : ""));
+    });
+
+    return h("div", { className: "hermes-kanban-section", "data-workflow-timeline": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Timeline"),
+      loading ? h("div", { className: "text-xs text-muted-foreground" }, "Loading timeline\u2026") : null,
+      covered
+        ? h("div", { className: "hermes-kanban-workflow-totals text-xs text-muted-foreground" },
+            "covered window · execution " + fmtDuration(covered.execution_seconds) +
+            " · blocked " + fmtDuration(covered.blocked_seconds) +
+            " · review " + fmtDuration(covered.review_wait_seconds) +
+            " · unknown " + fmtDuration(covered.unknown_seconds) +
+            " (wall-clock observation, not productivity)")
+        : null,
+      gaps.length > 0
+        ? h("div", { className: "hermes-kanban-workflow-gaps text-xs" },
+            h("span", { style: { color: workflowStateTone("UNKNOWN"), fontWeight: "600" } }, gaps.length + " gap(s):"),
+            gaps.map(function (g, i) {
+              return h("span", {
+                key: i,
+                className: "hermes-kanban-workflow-gap",
+                "data-workflow-timeline-gap": "true",
+              }, " " + fmtDuration(g.duration_seconds || (g.end - g.start)));
+            }))
+        : null,
+      intervalRows.length > 0 ? h("div", { className: "hermes-kanban-workflow-list" }, intervalRows) :
+        (!loading && (!envelope || envelope.state === "PASS")
+          ? h("div", { className: "text-xs text-muted-foreground" }, "No timeline intervals.")
+          : null),
+      hasMore
+        ? h("button", {
+            type: "button",
+            className: "hermes-kanban-edit-link",
+            "data-workflow-timeline-more": "true",
+            disabled: loadingMore,
+            onClick: loadMore,
+          }, loadingMore ? "Loading\u2026" : "More timeline" + (omitted != null ? " (" + omitted + " omitted)" : ""))
+        : null,
+      h(WorkflowStateLine, { envelope: envelope }));
+  }
+
+  // K5 — explicit readiness: POST only on click; separate permission check.
+  function WorkflowReadinessSection(props) {
+    const [receipt, setReceipt] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    function doCheck() {
+      setLoading(true);
+      setReceipt(null);
+      return postWorkflow(props.boardSlug, "/workflow/readiness", {
+        card: props.cardId,
+        check_model: true,
+      }).then(function (env) {
+        setLoading(false);
+        setReceipt(env);
+      });
+    }
+
+    const ev = (receipt && receipt.evidence && typeof receipt.evidence === "object") ? receipt.evidence : null;
+    const checks = (ev && Array.isArray(ev.checks)) ? ev.checks : [];
+    const checkRows = checks.map(function (c) {
+      const isPermission = c.name === "board_permission";
+      return h("div", {
+        key: c.name,
+        className: "hermes-kanban-workflow-check",
+        "data-workflow-readiness-item": c.name,
+      },
+        h("span", { className: "hermes-kanban-workflow-check-name" },
+          isPermission ? "Permission" : c.name),
+        h("span", {
+          className: "hermes-kanban-workflow-check-state",
+          style: { color: workflowStateTone(c.state) },
+        }, c.state || "UNKNOWN"),
+        c.reason
+          ? h("span", { className: "hermes-kanban-workflow-check-reason" }, c.reason)
+          : null,
+        isPermission && typeof c.mutation_authorized === "boolean"
+          ? h("span", { className: "hermes-kanban-workflow-check-reason" },
+              "mutation " + (c.mutation_authorized ? "authorized" : "not authorized"))
+          : null);
+    });
+
+    return h("div", { className: "hermes-kanban-section", "data-workflow-readiness": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Readiness"),
+      h("div", { className: "text-xs text-muted-foreground" },
+        "Readiness is never automatic. A board permission check alone is never readiness."),
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-workflow-btn",
+        "data-workflow-readiness-check": "true",
+        disabled: loading,
+        onClick: doCheck,
+      }, loading ? "Checking\u2026" : "Check readiness"),
+      checkRows.length > 0 ? h("div", { className: "hermes-kanban-workflow-list" }, checkRows) : null,
+      ev && typeof ev.ready_to_release === "boolean"
+        ? h("div", {
+            className: "hermes-kanban-workflow-verdict text-xs",
+            style: { color: workflowStateTone(ev.ready_to_release ? "PASS" : "FAIL") },
+          }, ev.ready_to_release
+            ? "ready to release: yes"
+            : "ready to release: no")
+        : null,
+      receipt && receipt.state && receipt.state !== "PASS"
+        ? h("div", { className: "text-xs", style: { color: workflowStateTone(receipt.state) } },
+            receipt.reason || ("readiness " + receipt.state))
+        : null);
+  }
+
+  // K6 + K7 — continuation draft (read-only) then a separate create click.
+  function WorkflowContinuationSection(props) {
+    const task = props.task || {};
+    const [note, setNote] = useState("");
+    const [passedText, setPassedText] = useState("");
+    const [remainingText, setRemainingText] = useState("");
+    const [evidenceText, setEvidenceText] = useState("");
+    const [acceptanceText, setAcceptanceText] = useState("");
+    const [title, setTitle] = useState("");
+    const [workspace, setWorkspace] = useState(task.workspace_path ? String(task.workspace_path) : "");
+    const [profile, setProfile] = useState(task.assignee ? String(task.assignee) : "");
+    const [model, setModel] = useState(task.model_override ? String(task.model_override) : "");
+    const [provider, setProvider] = useState(task.provider_override ? String(task.provider_override) : "");
+    const [draft, setDraft] = useState(null);
+    const [draftErr, setDraftErr] = useState(null);
+    const [drafting, setDrafting] = useState(false);
+    const [result, setResult] = useState(null);
+    const [continuing, setContinuing] = useState(false);
+    const genRef = useRef(0);
+
+    // Any change to a draft input invalidates the current draft and any prior
+    // mutation result, so a stale draft is never continued and a late mutation
+    // reply is discarded (the generation bump is checked in doDraft/doContinue).
+    useEffect(function () {
+      genRef.current += 1;
+      setDraft(null);
+      setDraftErr(null);
+      setResult(null);
+    }, [note, passedText, remainingText, evidenceText, acceptanceText, title, workspace, profile, model, provider]);
+
+    function buildBody() {
+      const passed = splitNonEmpty(passedText);
+      const names = splitNonEmpty(remainingText);
+      const evs = splitNonEmpty(evidenceText);
+      const accs = splitNonEmpty(acceptanceText);
+      const remaining = names.map(function (name, i) {
+        return { check: name, evidence: evs[i] || "", acceptance: accs[i] || "" };
+      });
+      const body = {
+        card: props.cardId,
+        passed_checks: passed,
+        remaining_checks: remaining,
+        verification_note: note.trim(),
+      };
+      if (workspace.trim()) body.workspace = workspace.trim();
+      if (profile.trim()) body.profile = profile.trim();
+      if (provider.trim()) body.provider = provider.trim();
+      if (model.trim()) body.model = model.trim();
+      if (title.trim()) body.title = title.trim();
+      return body;
+    }
+
+    function doDraft() {
+      setDrafting(true);
+      setDraft(null);
+      setDraftErr(null);
+      setResult(null);
+      const gen = genRef.current;
+      return postWorkflow(props.boardSlug, "/workflow/continuation-draft", buildBody()).then(function (env) {
+        if (gen !== genRef.current) return; // late draft reply: inputs changed
+        setDrafting(false);
+        const ev = (env && env.evidence && typeof env.evidence === "object") ? env.evidence : null;
+        if (!env || env.state !== "PASS" || !ev || !ev.fingerprint) {
+          setDraftErr((env && env.reason) || "continuation draft unavailable");
+          return;
+        }
+        setDraft(ev);
+      });
+    }
+
+    function doContinue() {
+      if (!draft || !draft.fingerprint) return Promise.resolve();
+      setContinuing(true);
+      setResult(null);
+      const gen = genRef.current;
+      // Continue sends the EXACT reviewed draft: the draft's own commission,
+      // passed/remaining checks and note, never a rebuild from live inputs
+      // (which the invalidation effect has already discarded as stale).
+      const comm = (draft.commission && typeof draft.commission === "object") ? draft.commission : {};
+      const body = {
+        card: props.cardId,
+        passed_checks: draft.passed_checks || [],
+        remaining_checks: draft.remaining_checks || [],
+        verification_note: draft.verification_note || "",
+        fingerprint: draft.fingerprint,
+      };
+      if (comm.workspace) body.workspace = comm.workspace;
+      if (comm.profile) body.profile = comm.profile;
+      if (comm.provider) body.provider = comm.provider;
+      if (comm.model) body.model = comm.model;
+      if (comm.title) body.title = comm.title;
+      return postWorkflow(props.boardSlug, "/workflow/continue", body).then(function (env) {
+        if (gen !== genRef.current) return; // late mutation reply: discarded
+        setContinuing(false);
+        setResult(env);
+      });
+    }
+
+    function draftOriginal(d) {
+      const orig = d.original || {};
+      return h("div", { className: "hermes-kanban-workflow-draft-original", "data-workflow-draft-original": "true" },
+        h("div", { className: "hermes-kanban-section-head" }, "Original card"),
+        h("div", { className: "text-xs" }, "status: " + (orig.status || "?") + " · assignee: " + (orig.assignee || "?")),
+        h("div", { className: "text-xs", style: { color: workflowStateTone("UNKNOWN") } },
+          (orig.source || "unverified source excerpt")),
+        orig.result_excerpt
+          ? h("div", { className: "hermes-kanban-workflow-excerpt" }, "result (unverified): " + orig.result_excerpt)
+          : null,
+        orig.latest_run_summary_excerpt
+          ? h("div", { className: "hermes-kanban-workflow-excerpt" }, "latest run (unverified): " + orig.latest_run_summary_excerpt)
+          : null);
+    }
+
+    function draftChecks(d) {
+      const remaining = Array.isArray(d.remaining_checks) ? d.remaining_checks : [];
+      return h("div", { className: "hermes-kanban-workflow-draft-checks" },
+        h("div", { className: "text-xs", style: { fontWeight: "600" } },
+          "passed: " + (Array.isArray(d.passed_checks) ? d.passed_checks.join("; ") : "")),
+        remaining.map(function (rc, i) {
+          return h("div", { key: i, className: "hermes-kanban-workflow-remaining" },
+            h("span", { className: "hermes-kanban-workflow-remaining-check" }, rc.check || "(check)"),
+            rc.acceptance
+              ? h("span", { className: "hermes-kanban-workflow-remaining-acceptance" }, rc.acceptance)
+              : null);
+        }));
+    }
+
+    let resultBlock = null;
+    if (result) {
+      const rev = (result.evidence && typeof result.evidence === "object") ? result.evidence : null;
+      if (result.state === "PASS" && rev) {
+        resultBlock = h("div", { className: "hermes-kanban-workflow-result", "data-workflow-continue-result": "true" },
+          h("div", { className: "text-xs", style: { color: workflowStateTone("PASS") } },
+            "continuation held: " + rev.new_card + " (" + (rev.new_card_status || "held") + ")"),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-workflow-btn",
+            "data-workflow-open-new": "true",
+            onClick: function () { if (props.onOpenTask && rev.new_card) props.onOpenTask(rev.new_card); },
+          }, "Open new card"));
+      } else if (result.state === "UNKNOWN") {
+        resultBlock = h("div", { className: "hermes-kanban-workflow-result", "data-workflow-continue-result": "true" },
+          h("div", { className: "text-xs", style: { color: workflowStateTone("UNKNOWN") } },
+            "UNKNOWN: " + (result.reason || "inspect the result before retrying") + ". Inspect before retrying."));
+      } else if (result.fingerprint_mismatch === true || /fingerprint|stale|re-draft/i.test(result.reason || "")) {
+        resultBlock = h("div", { className: "hermes-kanban-workflow-result", "data-workflow-continue-result": "true" },
+          h("div", { className: "text-xs", style: { color: workflowStateTone("FAIL") } },
+            "Stale draft: " + (result.reason || "the fingerprint no longer matches") + ". Re-draft before continuing."));
+      } else {
+        resultBlock = h("div", { className: "hermes-kanban-workflow-result", "data-workflow-continue-result": "true" },
+          h("div", { className: "text-xs", style: { color: workflowStateTone("FAIL") } },
+            (result.reason || "continuation failed")),
+          result.remedy ? h("div", { className: "text-xs text-muted-foreground" }, result.remedy) : null);
+      }
+    }
+
+    return h("div", { className: "hermes-kanban-section", "data-workflow-continuation": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Continuation"),
+      h("div", { className: "text-xs text-muted-foreground" },
+        "Draft is read-only. Creating the held continuation card is a separate click; it never dispatches."),
+      h("textarea", {
+        className: "hermes-kanban-workflow-input",
+        "data-workflow-cont-note": "true",
+        rows: 2,
+        placeholder: "Verification note (parent-supplied)",
+        value: note,
+        onChange: function (e) { setNote(e.target.value); },
+      }),
+      h("textarea", {
+        className: "hermes-kanban-workflow-input",
+        "data-workflow-cont-passed": "true",
+        rows: 2,
+        placeholder: "Passed checks (one per line)",
+        value: passedText,
+        onChange: function (e) { setPassedText(e.target.value); },
+      }),
+      h("textarea", {
+        className: "hermes-kanban-workflow-input",
+        "data-workflow-cont-remaining": "true",
+        rows: 2,
+        placeholder: "Remaining checks (one per line)",
+        value: remainingText,
+        onChange: function (e) { setRemainingText(e.target.value); },
+      }),
+      h("textarea", {
+        className: "hermes-kanban-workflow-input",
+        "data-workflow-cont-evidence": "true",
+        rows: 1,
+        placeholder: "Evidence per remaining check (one per line, optional)",
+        value: evidenceText,
+        onChange: function (e) { setEvidenceText(e.target.value); },
+      }),
+      h("textarea", {
+        className: "hermes-kanban-workflow-input",
+        "data-workflow-cont-acceptance": "true",
+        rows: 1,
+        placeholder: "Acceptance per remaining check (one per line, optional)",
+        value: acceptanceText,
+        onChange: function (e) { setAcceptanceText(e.target.value); },
+      }),
+      h("div", { className: "hermes-kanban-workflow-comm" },
+        h("input", {
+          className: "hermes-kanban-workflow-input",
+          "data-workflow-cont-workspace": "true",
+          placeholder: "workspace",
+          value: workspace,
+          onChange: function (e) { setWorkspace(e.target.value); },
+        }),
+        h("input", {
+          className: "hermes-kanban-workflow-input",
+          "data-workflow-cont-profile": "true",
+          placeholder: "profile",
+          value: profile,
+          onChange: function (e) { setProfile(e.target.value); },
+        }),
+        h("input", {
+          className: "hermes-kanban-workflow-input",
+          "data-workflow-cont-provider": "true",
+          placeholder: "provider",
+          value: provider,
+          onChange: function (e) { setProvider(e.target.value); },
+        }),
+        h("input", {
+          className: "hermes-kanban-workflow-input",
+          "data-workflow-cont-model": "true",
+          placeholder: "model",
+          value: model,
+          onChange: function (e) { setModel(e.target.value); },
+        }),
+        h("input", {
+          className: "hermes-kanban-workflow-input",
+          "data-workflow-cont-title": "true",
+          placeholder: "title (optional)",
+          value: title,
+          onChange: function (e) { setTitle(e.target.value); },
+        })),
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-workflow-btn",
+        "data-workflow-draft": "true",
+        disabled: drafting,
+        onClick: doDraft,
+      }, drafting ? "Drafting\u2026" : "Draft continuation"),
+      draftErr ? h("div", { className: "text-xs", style: { color: workflowStateTone("FAIL") } }, draftErr) : null,
+      draft
+        ? h("div", { className: "hermes-kanban-workflow-draft", "data-workflow-draft-result": "true" },
+            h("div", { className: "text-xs" },
+              h("span", { style: { fontWeight: "600" } }, "fingerprint "),
+              h("code", { className: "hermes-kanban-workflow-fingerprint" }, String(draft.fingerprint).slice(0, 16) + "\u2026")),
+            h("div", { className: "text-xs" },
+              "worker: " + ((draft.worker && draft.worker.verdict) || "unknown") +
+              ((draft.worker && draft.worker.reason) ? " · " + draft.worker.reason : "")),
+            draftOriginal(draft),
+            draftChecks(draft),
+            draft.no_mutation_performed
+              ? h("div", { className: "text-xs text-muted-foreground" }, "no mutation performed")
+              : null,
+            h("button", {
+              type: "button",
+              className: "hermes-kanban-workflow-btn",
+              "data-workflow-continue": "true",
+              disabled: continuing,
+              onClick: doContinue,
+            }, continuing ? "Creating\u2026" : "Create continuation"))
+        : null,
+      resultBlock);
+  }
+
+  // K8 — review hold: separate explicit click; preserves history, never stops
+  // a live worker.
+  function WorkflowHoldSection(props) {
+    const [reason, setReason] = useState("");
+    const [receipt, setReceipt] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    function doHold() {
+      if (!reason.trim()) return;
+      setLoading(true);
+      setReceipt(null);
+      return postWorkflow(props.boardSlug, "/workflow/hold", {
+        card: props.cardId,
+        reason: reason.trim(),
+      }).then(function (env) {
+        setLoading(false);
+        setReceipt(env);
+      });
+    }
+
+    return h("div", { className: "hermes-kanban-section", "data-workflow-hold": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Hold for review"),
+      h("div", { className: "text-xs text-muted-foreground" },
+        "Holding blocks dispatch, not the process. A live worker may still write its workspace."),
+      h("input", {
+        className: "hermes-kanban-workflow-input",
+        "data-workflow-hold-reason": "true",
+        placeholder: "Hold reason",
+        value: reason,
+        onChange: function (e) { setReason(e.target.value); },
+      }),
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-workflow-btn",
+        "data-workflow-hold-submit": "true",
+        disabled: loading || !reason.trim(),
+        onClick: doHold,
+      }, loading ? "Holding\u2026" : "Hold card"),
+      receipt
+        ? h("div", { className: "hermes-kanban-workflow-result", "data-workflow-hold-result": "true" },
+            receipt.state === "PASS"
+              ? h("div", { className: "text-xs", style: { color: workflowStateTone("PASS") } },
+                  "held: " + props.cardId + " (preserves history; does not stop a live worker)")
+              : h("div", { className: "text-xs", style: { color: workflowStateTone(receipt.state) } },
+                  (receipt.state || "UNKNOWN") + ": " + (receipt.reason || "hold did not complete")),
+            receipt.evidence && receipt.evidence.warning
+              ? h("div", { className: "text-xs text-muted-foreground" }, receipt.evidence.warning)
+              : null)
+        : null);
+  }
+
   // The SDK's Select component fires ``onValueChange(value)`` directly
   // (it's a shadcn-style popup, not a native <select>). Older plugin
   // code calls ``onChange({target: {value}})`` which silently never
@@ -2099,6 +2875,8 @@
           dialogState: kanbanDialogs.dialogState,
         }),
         h(EvidenceBanner, { evidence: evidence }),
+        evidenceAligned ? h(WorkflowAttentionSection, { boardSlug: board, onOpen: setSelectedTaskId }) : null,
+        evidenceAligned ? h(WorkflowChangesSection, { boardSlug: board }) : null,
         h(BoardColumns, {
           board: filteredBoard,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
@@ -4973,6 +5751,10 @@
         loadingMore: evidenceAligned ? runsPage.loadingMore : false,
         onLoadMore: evidenceAligned ? runsPage.loadMore : null,
       }),
+      evidenceAligned ? h(WorkflowTimelineSection, { boardSlug: props.boardSlug, cardId: t.id }) : null,
+      evidenceAligned ? h(WorkflowReadinessSection, { boardSlug: props.boardSlug, cardId: t.id, task: t }) : null,
+      evidenceAligned ? h(WorkflowContinuationSection, { boardSlug: props.boardSlug, cardId: t.id, task: t, onOpenTask: props.onOpenTask }) : null,
+      evidenceAligned ? h(WorkflowHoldSection, { boardSlug: props.boardSlug, cardId: t.id, task: t }) : null,
     );
   }
 
