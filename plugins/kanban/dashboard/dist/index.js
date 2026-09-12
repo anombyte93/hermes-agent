@@ -811,6 +811,7 @@
     return h("button", {
       type: "button",
       className: "hermes-kanban-edit-link",
+      "data-evidence-resource": props.resource || undefined,
       disabled: !!props.loadingMore,
       style: { marginTop: "4px" },
       onClick: props.onLoadMore,
@@ -4710,6 +4711,7 @@
           }),
       props.evidenceMode
         ? h(EvidenceLoadMoreButton, {
+            resource: "attachments",
             hasMore: props.hasMore,
             omitted: props.omitted,
             loadingMore: props.loadingMore,
@@ -4950,6 +4952,7 @@
         }),
         evidenceAligned
           ? h(EvidenceLoadMoreButton, {
+              resource: "events",
               hasMore: eventsPage.hasMore,
               omitted: eventsPage.omitted,
               loadingMore: eventsPage.loadingMore,
@@ -5048,6 +5051,7 @@
       }),
       hasLoadMore
         ? h(EvidenceLoadMoreButton, {
+            resource: "runs",
             hasMore: props.hasMore,
             omitted: props.omitted,
             loadingMore: props.loadingMore,
