@@ -491,6 +491,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "block_reason": task.block_reason,
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
@@ -539,6 +540,7 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "block_reason": t.block_reason,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
@@ -885,6 +887,7 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                block_reason=landed.block_reason if landed else reason,
             )
         finally:
             conn.close()
@@ -1397,6 +1400,7 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    block_reason = args.get("block_reason")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1459,6 +1463,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                block_reason=block_reason,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1467,6 +1472,7 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                block_reason=new_task.block_reason if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
@@ -2245,6 +2251,13 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "block_reason": {
+                "type": "string",
+                "description": (
+                    "Required non-blank human-readable explanation when "
+                    "initial_status is 'blocked'."
                 ),
             },
             "skills": {

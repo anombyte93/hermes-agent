@@ -905,7 +905,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                try:
+                    ok = kanban_db.block_task(
+                        conn, task_id, reason=payload.block_reason
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "review":
@@ -1302,6 +1307,7 @@ class BulkTaskBody(BaseModel):
     priority: Optional[int] = None
     archive: bool = False
     result: Optional[str] = None
+    block_reason: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
@@ -1349,7 +1355,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task(
+                            conn, tid, reason=payload.block_reason
+                        )
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(
@@ -2374,6 +2382,26 @@ class RenameBoardBody(BaseModel):
     project_id: Optional[str] = None
 
 
+# Board transfer exchanges filesystem PATHS, not bytes — same contract as
+# profile export/import, and for the same reason: the clients that drive it
+# (desktop, dashboard) run the native save/open dialog on the machine that
+# hosts the backend, so a path is all either side needs.
+
+class ExportBoardBody(BaseModel):
+    # Where to write the archive. Empty → a staging path under the kanban root.
+    output: str = ""
+    attachments: bool = True
+    logs: bool = False
+
+
+class ImportBoardBody(BaseModel):
+    # Path to a board .tar.gz on the backend's filesystem.
+    archive: str
+    # Override the slug from the archive. Collisions auto-suffix either way.
+    slug: Optional[str] = None
+    switch: bool = False
+
+
 def _resolve_project(ref: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve a project id/slug to ``(id, name, primary_path)``.
 
@@ -2584,6 +2612,70 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"result": res, "current": kanban_db.get_current_board()}
+
+
+@router.post("/boards/{slug}/export")
+async def export_board_endpoint(slug: str, body: ExportBoardBody):
+    """Write ``slug`` to a portable archive; return the path written."""
+    from hermes_cli import kanban_transfer
+
+    output = (body.output or "").strip()
+    if not output:
+        staging = kanban_db.kanban_home() / "kanban" / "board-exports"
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Could not create export directory: {exc}"
+            )
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        output = str(staging / f"{slug}-{stamp}.tar.gz")
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: kanban_transfer.export_board(
+                slug, output,
+                include_attachments=body.attachments,
+                include_logs=body.logs,
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        log.exception("POST /boards/%s/export failed", slug)
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@router.post("/boards/import")
+async def import_board_endpoint(body: ImportBoardBody):
+    """Import a board archive as a NEW board; return the landed board."""
+    from hermes_cli import kanban_transfer
+
+    archive = (body.archive or "").strip()
+    if not archive:
+        raise HTTPException(status_code=400, detail="archive path is required")
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: kanban_transfer.import_board(
+                archive, (body.slug or "").strip() or None, activate=body.switch
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        log.exception("POST /boards/import failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {**result, "current": kanban_db.get_current_board()}
 
 
 @router.post("/boards/{slug}/switch")

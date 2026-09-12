@@ -1,0 +1,27 @@
+# Fork hygiene allowlist — upstream test fixtures only.
+# Suppresses default-rule false positives on upstream NousResearch/hermes-agent
+# test code (dummy keys/UUIDs that pre-date this fork's changes).
+# Re-run: gitleaks git . --log-opts="main --not a47f117ed0 --" --verbose
+
+title = "hermes fork gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "known upstream test fixtures — dummy keys, epoch markers, UUID fixture"
+paths = [
+  '''tests/tui_gateway/test_groups_methods\.py''',
+  '''tests/gateway/test_hosted_room_replicas\.py''',
+  '''tests/gateway/test_agent_cache\.py''',
+  '''tests/tools/test_delegate_request_overrides\.py''',
+  '''tests/run_agent/test_primary_runtime_restore\.py''',
+  '''agent/anthropic_credentials\.py''',
+]
+regexes = [
+  '''default-api-key-1234567890''',
+  '''observed_epoch=[0-9]+''',
+  '''test-key-1234567890''',
+  '''sk-tes[a-z0-9\-]*7890''',
+  '''9d1c250a-e61b-44d9-88ed-5944d1962f5e''',
+]

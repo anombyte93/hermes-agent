@@ -123,6 +123,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+LEGACY_UNKNOWN_BLOCK_REASON = "Legacy block reason unknown"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -366,6 +367,10 @@ def _fire_dispatch_tick_hook(
 # ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` to raise the default claim window for
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+
+# Finite safety backstop for tasks that do not set a per-task runtime cap.
+# Operators can set kanban.default_max_runtime to 0 to disable inheritance.
+DEFAULT_MAX_RUNTIME_SECONDS = 2 * 60 * 60
 
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
@@ -1135,6 +1140,9 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Current human-readable reason for a task in ``blocked``. Cleared when the
+    # task leaves blocked; immutable events and run summaries retain history.
+    block_reason: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1227,6 +1235,11 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            block_reason=(
+                row["block_reason"]
+                if "block_reason" in keys and row["block_reason"]
+                else None
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1411,6 +1424,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Authoritative current human-readable reason while the task is blocked.
+    -- Immutable events and run summaries retain historical reasons after this
+    -- field is cleared on exit from ``blocked``.
+    block_reason         TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2675,6 +2692,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "block_reason" not in cols:
+        # Additive current-reason field. Legacy blocked rows have no trustworthy
+        # cause, so persist an explicit unknown label rather than guessing from
+        # comments or historical events.
+        _add_column_if_missing(conn, "tasks", "block_reason", "block_reason TEXT")
+    if "status" in cols:
+        conn.execute(
+            "UPDATE tasks SET block_reason = ? "
+            "WHERE status = 'blocked' AND TRIM(COALESCE(block_reason, '')) = ''",
+            (LEGACY_UNKNOWN_BLOCK_REASON,),
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2690,6 +2719,40 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    # Kernel-level invariant: no writer, including direct SQL used by plugins or
+    # future integrations, may create a reasonless blocked row. The companion
+    # trigger clears only the mutable current reason when a card leaves blocked;
+    # events and run summaries remain immutable history.
+    if "status" in cols:
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_insert
+            BEFORE INSERT ON tasks
+            WHEN NEW.status = 'blocked'
+             AND TRIM(COALESCE(NEW.block_reason, '')) = ''
+            BEGIN
+                SELECT RAISE(ABORT, 'block reason is required');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_update
+            BEFORE UPDATE ON tasks
+            WHEN NEW.status = 'blocked'
+             AND TRIM(COALESCE(NEW.block_reason, '')) = ''
+            BEGIN
+                SELECT RAISE(ABORT, 'block reason is required');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_clear
+            AFTER UPDATE OF status ON tasks
+            WHEN OLD.status = 'blocked'
+             AND NEW.status != 'blocked'
+             AND NEW.block_reason IS NOT NULL
+            BEGIN
+                UPDATE tasks SET block_reason = NULL WHERE id = NEW.id;
+            END
+        """)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3191,6 +3254,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    block_reason: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3247,6 +3311,9 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    block_reason = (block_reason or "").strip() or None
+    if initial_status == "blocked" and block_reason is None:
+        raise ValueError("block reason is required when initial_status='blocked'")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -3509,8 +3576,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, block_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3536,6 +3603,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        block_reason if task_status == "blocked" else None,
                     ),
                 )
                 for pid in parents:
@@ -3554,6 +3622,7 @@ def create_task(
                     {
                         "assignee": assignee,
                         "status": task_status,
+                        "block_reason": block_reason if task_status == "blocked" else None,
                         "parents": list(parents),
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
@@ -3566,6 +3635,22 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # Initial blocked creation is an explicit operator handoff,
+                    # just like block_task().  Emit the canonical event so
+                    # _has_sticky_block() keeps it parked across list/dispatcher
+                    # recomputation until an explicit unblock.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": block_reason,
+                            "kind": None,
+                            "recurrences": 0,
+                            "source_status": "created",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4641,6 +4726,7 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    default_max_runtime = configured_default_max_runtime()
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4693,12 +4779,13 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   max_runtime_seconds = COALESCE(max_runtime_seconds, ?)
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, default_max_runtime, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4769,6 +4856,7 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    default_max_runtime = configured_default_max_runtime()
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -4793,12 +4881,13 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   max_runtime_seconds = COALESCE(max_runtime_seconds, ?)
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, default_max_runtime, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -6314,6 +6403,9 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    reason = (reason or "").strip() or None
+    if reason is None:
+        raise ValueError("block reason is required")
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6443,12 +6535,13 @@ def block_task(
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
+                           block_reason  = ?,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (reason, kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -6458,13 +6551,14 @@ def block_task(
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
+                           block_reason  = ?,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (reason, kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -9374,24 +9468,28 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            block_reason = (
+                f"Circuit breaker tripped after {failures} consecutive "
+                f"{outcome} failure(s): {error[:500]}"
+            ).strip()
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, block_reason = ?, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (block_reason, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
                 # cleared; just flip to blocked + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = 'blocked', block_reason = ?, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (block_reason, failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:
@@ -9833,6 +9931,31 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
+def configured_default_max_runtime() -> Optional[int]:
+    """Return the effective ``kanban.default_max_runtime`` in seconds.
+
+    The shipped fallback is finite. A configured value of 0 explicitly
+    disables inheritance; malformed values fail safe to the shipped default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        kanban_cfg = (load_config_readonly() or {}).get("kanban", {})
+        raw = kanban_cfg.get(
+            "default_max_runtime",
+            DEFAULT_MAX_RUNTIME_SECONDS,
+        )
+    except Exception:
+        return DEFAULT_MAX_RUNTIME_SECONDS
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RUNTIME_SECONDS
+    if parsed == 0:
+        return None
+    return parsed if parsed > 0 else DEFAULT_MAX_RUNTIME_SECONDS
+
+
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
@@ -9944,6 +10067,31 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _preview_dispatch_once(
+    conn: sqlite3.Connection,
+    **kwargs,
+) -> DispatchResult:
+    """Run a dispatch tick against an in-memory snapshot of ``conn``.
+
+    Dry-run must exercise the same promotion, reclaim, timeout, and candidate
+    selection code as a real tick without writing the source database or
+    signalling worker processes. SQLite's backup API includes committed WAL
+    frames in the snapshot while leaving the source connection untouched.
+    """
+    preview = sqlite3.connect(":memory:", isolation_level=None)
+    preview.row_factory = sqlite3.Row
+    try:
+        conn.backup(preview)
+        return _dispatch_once_locked(
+            preview,
+            dry_run=True,
+            preview=True,
+            **kwargs,
+        )
+    finally:
+        preview.close()
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9974,56 +10122,92 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    def _run_tick() -> DispatchResult:
+        kwargs = {
+            "spawn_fn": spawn_fn,
+            "ttl_seconds": ttl_seconds,
+            "max_spawn": max_spawn,
+            "max_in_progress": max_in_progress,
+            "failure_limit": failure_limit,
+            "stale_timeout_seconds": stale_timeout_seconds,
+            "board": board,
+            "default_assignee": default_assignee,
+            "max_in_progress_per_profile": max_in_progress_per_profile,
+            "reconcile_orphans": reconcile_orphans,
+        }
+        if dry_run:
+            return _preview_dispatch_once(conn, **kwargs)
+        return _dispatch_once_locked(conn, dry_run=False, **kwargs)
+
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
+        result = _run_tick()
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                reconcile_orphans=reconcile_orphans,
-            )
+            result = _run_tick()
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
-            _maybe_checkpoint_wal(conn, db_path)
+            # A dry-run must leave the source SQLite files byte-for-byte alone.
+            if not dry_run:
+                _maybe_checkpoint_wal(conn, db_path)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _append_skill_rejected_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    missing_skills: list[str],
+) -> None:
+    """Record a forced-skill refusal as a durable ``skill_rejected`` event,
+    rate-limited to one event per unchanged refusal streak (#20).
+
+    A dispatch tick that rejects the same task for the same assignee and the
+    same missing skill set appends nothing — the first event already says
+    everything, and the default 60s dispatcher loop would otherwise spam an
+    unbounded stream of identical rows. A changed assignee or skill set, or a
+    fresh refusal after an intervening claim/spawn, IS a new refusal and is
+    recorded again. The payload is deliberately minimal — assignee and missing
+    skill names only; the task id is the event row's own identity.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None and row["kind"] == "skill_rejected":
+            try:
+                prev = json.loads(row["payload"] or "{}")
+            except Exception:
+                prev = {}
+            if (
+                isinstance(prev, dict)
+                and prev.get("assignee") == assignee
+                and sorted(prev.get("missing_skills") or []) == sorted(missing_skills)
+            ):
+                return
+        _append_event(
+            conn,
+            task_id,
+            "skill_rejected",
+            {"assignee": assignee, "missing_skills": sorted(missing_skills)},
+        )
 
 
 def _missing_worker_skills(
@@ -10080,6 +10264,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    preview: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10116,19 +10301,37 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    # Reject wrong-host dispatch before claiming cards or changing run state.
+    # A max=0 maintenance tick may still retire already-existing local runs.
+    if spawn_fn is None and max_spawn != 0 and not preview:
+        from hermes_cli.config import load_config
+        from hermes_cli.kanban_host import require_execution_host
 
+        require_execution_host(load_config())
+
+    # Reap zombie children from previously spawned workers. See
+    # reap_worker_zombies() for the full rationale. Preview runs against an
+    # in-memory snapshot and must not mutate process-lifecycle state.
+    if not preview:
+        reap_worker_zombies()
+
+    def _preview_signal(*_args) -> None:
+        # Simulate an already-gone worker so reclaim/timeout classification is
+        # accurate without signalling or waiting on a real process.
+        raise ProcessLookupError
+
+    signal_fn = _preview_signal if preview else None
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = release_stale_claims(conn, signal_fn=signal_fn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
+        conn,
+        stale_timeout_seconds=stale_timeout_seconds,
+        signal_fn=signal_fn,
     )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
@@ -10147,7 +10350,7 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, signal_fn=signal_fn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -10366,6 +10569,16 @@ def _dispatch_once_locked(
         )
         if missing_skills:
             result.rejected_skills.append((row["id"], missing_skills))
+            # Durable, rate-limited event so `show` / `tail` / diagnostics
+            # can explain why the card stayed READY (#20) — previously the
+            # refusal existed only in this in-memory result and every
+            # operator surface rendered an unexplained no-op. Fail-closed
+            # loading is unchanged: the card is never spawned, edited or
+            # auto-blocked here.
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row_assignee, missing_skills
+                )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10910,6 +11123,12 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
+    # A remote model endpoint does not move this process or its tools off-box.
+    # Validate placement before opening logs or starting any worker process.
+    from hermes_cli.config import load_config
+    from hermes_cli.kanban_host import require_execution_host
+
+    require_execution_host(load_config())
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -11063,13 +11282,12 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # Every dispatcher-owned worker must take the fully-quiet single-query path.
+    # That branch maps structured agent failures to rc=1 and provider quota /
+    # rate-limit failures to rc=75, allowing the existing reap classifier to
+    # distinguish crashes from temporary provider failures. Goal-mode also
+    # installs its continuation loop in this branch.
+    cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

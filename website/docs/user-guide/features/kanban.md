@@ -10,6 +10,19 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+### Worker execution host
+
+Set `kanban.execution_host` to the physical hostname that should run workers.
+The dispatcher refuses to spawn on a different host, regardless of the selected
+model or provider. Start the dispatcher on the required host with a locally
+provisioned board, profile and workspace. This setting does not transfer boards,
+files or running workers. There is no automatic local fallback. Leave it unset
+to preserve the default same-host execution behaviour.
+
+A `dispatch --max 0` maintenance tick can still inspect and retire existing
+local runs without starting new workers. Treat model selection and execution
+placement as separate facts in status reports.
+
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
@@ -787,18 +800,26 @@ All commands are also available as a slash command in the interactive CLI and in
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
+`hermes kanban dispatch --dry-run` runs the normal dependency-promotion,
+recovery, timeout, and candidate-selection logic against an in-memory SQLite
+snapshot. It reports what would be promoted or spawned but does not update task
+rows, append events, claim work, signal workers, call the spawn function, or
+checkpoint the source database. JSON output includes `"dry_run": true`.
+
 ### Concurrency, scheduling, and child promotion config
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.default_max_runtime` | `7200` (2 hours) | Finite backstop for tasks created without `--max-runtime`. The effective value is written to both the task and its run when claimed, so timeout evidence is explicit. A task's own `--max-runtime` always wins. Set `0` to disable default inheritance. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
   max_in_progress: 2
+  default_max_runtime: 7200
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
@@ -960,7 +981,7 @@ abandons its own. Instead, create a reconciliation card assigned to a **third,
 neutral profile** with **both** conflicted cards linked as parents: the parent
 links carry both sides' completion summaries into the reconciler's context, so
 it receives both diffs *and* both intents. The bundled
-[`merge-reconciler` skill](https://github.com/NousResearch/hermes-agent/blob/main/skills/autonomous-ai-agents/merge-reconciler/SKILL.md)
+[`agent-merge-conflict-arbiter` optional skill](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/autonomous-ai-agents/agent-merge-conflict-arbiter/SKILL.md)
 gives that worker the full procedure: classify each conflicted hunk, resolve
 impartially, verify, and hand back a summary naming every decision.
 
@@ -984,7 +1005,7 @@ path** should create a dedicated refactor/decomposition card for that file
 **before** queuing more work that touches it — splitting the magnet file is
 cheaper than reconciling every future collision it would cause. For conflicts
 that have *already* happened, use the reconciliation-card pattern above with
-the `merge-reconciler` skill; hotspot flagging is the upstream fix that keeps
+the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
 
 ## Multi-tenant usage

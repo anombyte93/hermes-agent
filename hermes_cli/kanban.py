@@ -63,6 +63,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "block_reason": t.block_reason,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -326,6 +327,44 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_export = boards_sub.add_parser(
+        "export",
+        help="Export a board to a portable .tar.gz archive",
+        description=(
+            "Package a board's tasks, comments, links, history, and file "
+            "attachments into one archive that can be imported on another "
+            "machine. Claims, worker PIDs, chat subscriptions, and paths "
+            "belonging to this machine are stripped. Workspaces are never "
+            "included — they are rebuilt on demand."
+        ),
+    )
+    b_export.add_argument("slug", nargs="?", default=None,
+                          help="Board to export (default: the current board)")
+    b_export.add_argument("-o", "--output", default=None,
+                          help="Archive path (default: ./<slug>.tar.gz)")
+    b_export.add_argument("--no-attachments", action="store_true",
+                          help="Skip attachment files, keeping the archive small")
+    b_export.add_argument("--include-logs", action="store_true",
+                          help="Include per-task worker logs")
+    b_export.add_argument("--json", action="store_true")
+
+    b_import = boards_sub.add_parser(
+        "import",
+        help="Import a board archive as a new board",
+        description=(
+            "Import a .tar.gz produced by `hermes kanban boards export`. "
+            "The board always lands as a NEW board — the slug gains a "
+            "numeric suffix if it is already taken — so an import can "
+            "never overwrite or merge into a board you already have."
+        ),
+    )
+    b_import.add_argument("archive", help="Path to the .tar.gz archive")
+    b_import.add_argument("--as", dest="as_slug", default=None,
+                          help="Slug for the imported board (default: from the archive)")
+    b_import.add_argument("--switch", action="store_true",
+                          help="Switch to the imported board afterwards")
+    b_import.add_argument("--json", action="store_true")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -399,6 +438,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--block-reason", default=None,
+                          help="Required human-readable reason when "
+                               "--initial-status=blocked.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1268,6 +1310,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "export":
+        return _cmd_boards_export(args)
+    if sub == "import":
+        return _cmd_boards_import(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1443,6 +1489,64 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_export(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_transfer
+    from hermes_cli.sizefmt import format_bytes
+
+    slug = args.slug or kb.get_current_board()
+    output = args.output or f"{slug}.tar.gz"
+    try:
+        res = kanban_transfer.export_board(
+            slug,
+            output,
+            include_attachments=not args.no_attachments,
+            include_logs=args.include_logs,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"kanban boards export: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    counts = res["counts"]
+    print(f"Exported board {res['board']!r} → {res['archive']}")
+    print(f"  Size:        {format_bytes(res['size'])}")
+    print(f"  Tasks:       {counts['tasks']}")
+    print(f"  Comments:    {counts['task_comments']}")
+    print(f"  Attachments: {counts['attachment_files']}")
+    print("Import it with `hermes kanban boards import <archive>`.")
+    return 0
+
+
+def _cmd_boards_import(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_transfer
+
+    try:
+        res = kanban_transfer.import_board(
+            args.archive, args.as_slug, activate=args.switch
+        )
+    except (OSError, ValueError) as exc:
+        print(f"kanban boards import: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Imported board {res['board']!r} ({res['name']}).")
+    if res["renamed"]:
+        print(f"  Renamed from {res['requested_board']!r} — that slug was taken.")
+    print(f"  Path:  {res['path']}")
+    print(f"  Tasks: {res['counts']['tasks']}")
+    for warning in res["warnings"]:
+        print(f"  Note:  {warning}")
+    if res["activated"]:
+        print(f"  Active board is now {res['board']!r}.")
+    else:
+        print(f"  Switch to it with `hermes kanban boards switch {res['board']}`.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1562,6 +1666,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    initial_status = getattr(args, "initial_status", "running")
+    block_reason = getattr(args, "block_reason", None)
+    if initial_status == "blocked" and not (block_reason or "").strip():
+        print(
+            "kanban create: --block-reason is required when "
+            "--initial-status=blocked",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1585,7 +1698,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
+            block_reason=block_reason,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1750,6 +1864,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if task.status == "blocked" and task.block_reason:
+        print(f"  blocked:   {task.block_reason}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -2670,6 +2786,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         print(json.dumps({
+            "dry_run": bool(args.dry_run),
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -2686,24 +2803,41 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "rejected_skills": [
+                {"task_id": tid, "missing_skills": missing}
+                for (tid, missing) in res.rejected_skills
+            ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
-    print(f"Reclaimed:    {res.reclaimed}")
-    print(f"Crashed:      {len(res.crashed)}")
+    if args.dry_run:
+        print(f"Would reclaim: {res.reclaimed}")
+        print(f"Would mark crashed: {len(res.crashed)}")
+        print(f"Would time out: {len(res.timed_out)}")
+        print(f"Would mark stale: {len(res.stale)}")
+        print(f"Would auto-block: {len(res.auto_blocked)}")
+        print(f"Would promote: {res.promoted}")
+        print(f"Would spawn:   {len(res.spawned)}")
+    else:
+        print(f"Reclaimed:    {res.reclaimed}")
+        print(f"Crashed:      {len(res.crashed)}")
+        print(f"Timed out:    {len(res.timed_out)}")
+        print(f"Stale:        {len(res.stale)}")
+        print(f"Auto-blocked: {len(res.auto_blocked)}")
+        print(f"Promoted:     {res.promoted}")
+        print(f"Spawned:      {len(res.spawned)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
-    print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
-    print(f"Stale:        {len(res.stale)}")
     if res.stale:
         print(f"  {', '.join(res.stale)}")
-    print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
-    print(f"Promoted:     {res.promoted}")
-    print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
@@ -2724,6 +2858,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, missing in res.rejected_skills:
+        print(
+            f"Rejected (forced skills unavailable): {tid}: "
+            f"{', '.join(missing)}"
+        )
+    for tid, reason in res.respawn_guarded:
+        print(f"Deferred (respawn guard: {reason}): {tid}")
     return 0
 
 
@@ -2875,7 +3016,15 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         if args.kinds else None
     )
     cursor = 0
-    print("Watching kanban events. Ctrl-C to stop.", flush=True)
+    _db = kb.kanban_db_path(None)
+    _board_name = (
+        "default" if _db.parent.name == "kanban" or _db.parent.name == "boards"
+        else _db.parent.name
+    )
+    print(
+        f"Watching kanban events on board '{_board_name}'. Ctrl-C to stop.",
+        flush=True,
+    )
     # Seed cursor at the latest id so we don't replay history.
     with kb.connect_closing() as conn:
         row = conn.execute(
@@ -3031,7 +3180,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"(no runs yet for {args.task_id})")
         return 0
     print(f"{'#':3s}  {'OUTCOME':12s}  {'PROFILE':16s}  {'ELAPSED':>8s}  STARTED")
-    for i, r in enumerate(runs, 1):
+    for r in runs:
         end = r.ended_at or int(time.time())
         # Clamp to 0 so NTP backward-jumps don't print negative durations.
         elapsed = max(0, end - r.started_at)
@@ -3042,7 +3191,12 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         else:
             el = f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
-        print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        # Print the task_runs ROW ID, not a per-task ordinal: `kanban show`
+        # and its event stream already reference runs by row id ([run N],
+        # Runs #N), so a per-task ordinal here made one run look like several
+        # (troubleshooting#83, 2026-08-31: run 1 printed as "run 5" read as
+        # worker churn that never happened).
+        print(f"{r.id:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
         if r.summary:
             # Indent and truncate long summaries to keep the table readable.
             summary = r.summary.splitlines()[0][:100]

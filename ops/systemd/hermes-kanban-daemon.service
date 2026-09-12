@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes Kanban daemon (default board)
+Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes/hermes-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/mkdir -p %h/.hermes/kanban
+ExecStart=/usr/bin/flock --no-fork --nonblock %h/.hermes/kanban/.dispatcher.lock %h/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main kanban --board default daemon --force --interval 30 --verbose --pidfile %t/hermes-kanban-default.pid
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -136,6 +136,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
         "INSERT INTO tasks (id, title, status, created_at) "
         "VALUES ('legacy', 'old board task', 'ready', 1)"
     )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy-blocked', 'old blocked task', 'blocked', 1)"
+    )
     conn.commit()
     conn.close()
 
@@ -153,6 +157,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_blocked = kb.get_task(migrated, "legacy-blocked")
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
@@ -164,12 +169,75 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+    assert legacy_blocked is not None
+    assert legacy_blocked.block_reason == kb.LEGACY_UNKNOWN_BLOCK_REASON
 
 
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+
+def test_create_blocked_task_requires_reason(kanban_home):
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="block reason is required"):
+            kb.create_task(conn, title="blocked without reason", initial_status="blocked")
+
+
+def test_create_blocked_task_persists_trimmed_reason(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="blocked with reason",
+            initial_status="blocked",
+            block_reason="  waiting for credentials  ",
+        )
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, task_id)
+        block_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "blocked"
+        ]
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_reason == "waiting for credentials"
+    assert block_events
+    assert block_events[-1].payload["reason"] == "waiting for credentials"
+
+
+def test_block_task_requires_reason(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="block without reason")
+        with pytest.raises(ValueError, match="block reason is required"):
+            kb.block_task(conn, task_id)
+
+
+def test_block_task_persists_trimmed_current_reason(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="blocked with reason")
+        assert kb.block_task(conn, task_id, reason="  waiting for operator  ")
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_reason == "waiting for operator"
+
+
+def test_kernel_rejects_direct_reasonless_block_and_clears_reason_on_exit(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="kernel invariant")
+        with pytest.raises(sqlite3.IntegrityError, match="block reason is required"):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+
+        assert kb.block_task(conn, task_id, reason="operator input required")
+        assert kb.unblock_task(conn, task_id)
+        row = conn.execute(
+            "SELECT status, block_reason FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+
+    assert row["status"] == "ready"
+    assert row["block_reason"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -398,9 +466,9 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         # with failures below the configured limit must still recover.
         t = kb.create_task(conn, title="lenient", assignee="a")
         conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=? "
+            "UPDATE tasks SET status='blocked', block_reason=?, consecutive_failures=? "
             "WHERE id=?",
-            (kb.DEFAULT_FAILURE_LIMIT, t),
+            ("circuit breaker test", kb.DEFAULT_FAILURE_LIMIT, t),
         )
         conn.commit()
         # Default-limit call would stick it (failures >= default).
@@ -419,9 +487,9 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         # stricter limit must stay blocked even though it's below default.
         t2 = kb.create_task(conn, title="strict", assignee="a")
         conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=1 "
+            "UPDATE tasks SET status='blocked', block_reason=?, consecutive_failures=1 "
             "WHERE id=?",
-            (t2,),
+            ("circuit breaker test", t2),
         )
         conn.commit()
         # Default-limit (2) would recover it (1 < 2).
