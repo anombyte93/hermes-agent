@@ -1,110 +1,151 @@
 # CI stale-head rerun and cancellation truth
 
-Repairs two defects captured in ISSUE60.md. Parent retains acceptance and all
-release authority; this report records the exact RED/GREEN state and the
+Repairs two defects captured in ISSUE60.md. Parent retains acceptance and
+all release authority; this report records the exact RED/GREEN state and the
 boundaries of what was and was not exercised.
+
+This is a bounded same-profile retry that addresses the two parent findings
+against the earlier attempt (whose four commits are preserved in history).
+The parent independently executed the ORIGINAL workflow scripts and
+confirmed 2 RED (stale-head rerun and cancelled aggregate fail correctly)
+and 2 passing controls; this report does not reimplement that RED.
+
+## Parent findings addressed
+
+1. **Return-code swallowing.** The earlier `label-rerun.yml` ended with a
+   trailing `echo` after the helper call and relied on `set -uo pipefail`,
+   so a helper failure was swallowed. The fresh-head recheck and rerun are
+   now inline, and every failure path is an explicit `exit 1` (unreadable
+   live head, failed `gh run rerun`). A superseded head is a successful
+   no-op (`exit 0`), exactly as required: superseded means nothing to rerun,
+   not an error.
+2. **Helper bootstrap on the default branch.** The earlier helper was
+   checked out from `repository.default_branch`, which on this fork is
+   `feat/kanban-desktop-release-20260913`, not `main` where this PR merges,
+   so the helper would be absent from default. The small fresh-head guard is
+   now inline in the existing trusted `label-rerun` workflow, and the
+   checkout step is gone entirely. No helper, no bootstrap dependency, and
+   the `contents: read` permission was dropped with it (no checkout needs
+   it).
 
 ## What changed
 
-- `.github/scripts/rerun_current_head.py` (new): re-reads the live PR head
-  before rerun and refuses to rerun a stale one.
-- `.github/scripts/evaluate_gate.py` (new): the `all-checks-pass` aggregate
-  gate, extracted from ci.yaml and fixed to block on `cancelled`.
-- `.github/workflows/label-rerun.yml`: checks out the trusted default branch,
-  then calls the rerun helper instead of `gh run rerun --failed` inline.
-- `.github/workflows/ci.yaml`: `all-checks-pass` now calls `evaluate_gate.py`
-  instead of the inline Python gate.
-- `tests/ci/test_ci_rerun_current_head.py` (new): 14 behavioural and wiring
-  tests.
+- `.github/workflows/label-rerun.yml`: the fresh-head recheck and rerun are
+  inline in the run step. The `actions/checkout` step (which fetched the
+  helper from the default branch) and the `contents: read` permission are
+  removed. Errors propagate with explicit non-zero exits; a superseded head
+  is a successful no-op.
+- `.github/scripts/rerun_current_head.py`: deleted. The guard is inline and
+  no longer needs a separate helper.
+- `.github/scripts/evaluate_gate.py`: unchanged. The aggregate gate helper
+  remains, consumed by `all-checks-pass` via `actions/checkout` of the PR
+  merge ref (the same trust model as the pre-existing `detect` job).
+- `.github/workflows/ci.yaml`: unchanged in this retry.
+- `tests/ci/test_ci_rerun_current_head.py`: rewritten to extract and execute
+  the ACTUAL `run` scripts from the final YAML at a mock `gh` command
+  boundary, plus the gate cases against the real `evaluate_gate.py` helper.
+
+## Trust model (stated accurately)
+
+The `label-rerun` workflow checks out nothing. It executes only the inline
+script in its own workflow file, which is part of this repository's reviewed
+workflow. Because no PR-controlled code is checked out, the `actions: write`
+token is never exposed to anything a fork can edit. The `ci-reviewed` label
+is a review signal added by a human; it does not mechanically contain or
+authorise arbitrary source. The `all-checks-pass` gate helper
+`evaluate_gate.py` is sourced from the PR merge ref, matching the existing
+`detect` job; any `.github/` change (which includes the helper) triggers the
+fail-open `ci_review` lane and therefore the `ci-reviewed` label and human
+review, so a fork cannot silently substitute it.
 
 ## RED / GREEN
 
-RED: NOT RE-RUN. I did not execute the exact original workflow run-step
-scripts (the `gh run rerun "$RUN_ID" --failed || true` bash in label-rerun.yml
-and the inline `info['result'] == 'failure'` gate in ci.yaml) against a mock
-`gh`. Per operator direction this honest gap is recorded rather than a
-simulated reproduction. The original live failure is already captured in
-ISSUE60.md (label workflow 34710287809 started against the old head
-7cd3427777fbb9182b92bcb96abc460c8cc47eb0; new CI 34710820430 cancelled at
-18:20 UTC; old CI 34710235273 became attempt 2 on the old SHA). Parent will
-independently execute the original script against a mock `gh`.
+RED: owned by the parent. Parent independently executed the original
+workflow run-step scripts and confirmed the stale-head rerun and the
+cancelled aggregate both fail correctly (2 RED), with success/failure
+controls passing (2). Receipts live in
+`../parent-controls/test_ci_original.py` and
+`/tmp/relay-parent-ci-original-red.log` on Archie; this retry does not
+reimplement that RED.
 
-GREEN: the corrected helpers are exercised directly. 14/14 tests pass in
-`tests/ci/test_ci_rerun_current_head.py`, and 156/156 pass across `tests/ci/`.
+GREEN (fresh, this retry): `tests/ci/test_ci_rerun_current_head.py` passes
+17/17 via the canonical runner, and 159/159 pass across `tests/ci/`. The
+rerun tests execute the extracted workflow run script against a mock `gh`;
+the gate tests execute the extracted `echo "$NEEDS" | python3
+.github/scripts/evaluate_gate.py` step against the real helper.
 
-## Behavioural controls
+## Behavioural controls (workflow-level)
 
-- Positive: an unchanged head reruns completed failed jobs (`rerun`).
-- Changed head: a newer commit during the wait makes zero rerun calls
-  (`superseded`, exit 2).
-- API failure: an unreadable live head makes zero rerun calls (`api-error`,
-  exit 1).
-- Rerun failure: a failed rerun call is explicit, never swallowed
-  (`rerun-failed`, exit 1).
-- Cancelled gate: a cancelled required job blocks the merge (exit 1).
-- Failed gate: a failed required job blocks the merge (exit 1).
-- Intentionally-skipped: a path-filter skip still passes (exit 0).
-- All-success: a fully green gate passes (exit 0).
-
-The rerun tests run at a mocked `gh` command boundary (subprocess.run faked),
-so they assert the exact commands the helper issues, not a string search. The
-gate tests feed the real `needs` JSON shape and assert the real exit codes.
+- Positive (current rerun): an unchanged live head issues the rerun call
+  (`rerun 42` recorded), exit 0.
+- Stale no-op: a changed live head makes zero rerun calls and exits 0
+  (successful superseded).
+- Real gh failure (API): an unreadable live head exits non-zero and makes
+  zero rerun calls.
+- Rerun failure: a failed `gh run rerun` exits non-zero, never swallowed.
+- Cancelled aggregate: a cancelled required job blocks the gate (non-zero).
+- Failed aggregate: a failed required job blocks the gate (non-zero).
+- Success/skipped policy: all-success and success+skipped both pass (exit 0).
 
 ## Limitations
 
-- The `all-checks-pass` checkout uses the PR merge ref (default
-  `actions/checkout` behaviour), matching the existing `detect` job. A fork
-  could in principle ship its own `evaluate_gate.py`, but any `.github/`
-  change triggers the fail-open `ci_review` lane and therefore the
-  `ci-reviewed` label and human review, so a fork cannot silently bypass the
-  gate.
-- `label-rerun` checks out the default branch for the helper. Until this
-  change lands on the default branch, the helper step fails closed (no blind
-  rerun), which is the safe direction.
+- The gate step's helper is read from the PR merge ref. This is the same
+  trust model as the pre-existing `detect` job and the original inline gate;
+  it is not a new widening, and the `ci_review` lane still gates any
+  `.github/` change behind the `ci-reviewed` label and human review.
 - The review-comment poller (`scripts/ci/assemble_review_comment.py`
-  `collect_failed_jobs`) still renders only `failure` jobs as error items.
-  Cancelled jobs now block the merge via the gate, but are not listed as
+  `collect_failed_jobs`) still renders only `failure` jobs as error items;
+  cancelled jobs now block the merge via the gate but are not listed as
   error items in the PR comment. Out of scope here.
+- The mock `gh` tests exercise the extracted run script against a simulated
+  command boundary, not against the live GitHub API. A live re-run remains
+  the parent's call.
 
 ## ACTUALLY_USED
 
-- `.github/scripts/rerun_current_head.py`, `.github/scripts/evaluate_gate.py`
 - `.github/workflows/label-rerun.yml`, `.github/workflows/ci.yaml`
+- `.github/scripts/evaluate_gate.py`
 - `tests/ci/test_ci_rerun_current_head.py`
-- `.venv/bin/python` (Python 3.12.3, pytest 9.1.1)
+- `.venv/bin/python` (Python 3.12.3, pytest 9.1.1, PyYAML)
+- `scripts/run_tests.sh` (canonical runner), `HERMES_PYTHON` set to the
+  workspace venv
 - ISSUE60.md as the captured-evidence source
 
 ## DISCOVERED
 
-- `.github/scripts/` is not in the `ci_review` path list, but the broad
-  `.github/` fail-open branch in classify_changes.py sets `ci_review=True`
-  for any `.github/` change, so the gate helper stays behind the
-  `ci-reviewed` review requirement.
-- The existing `ci-review-comment.yml` already establishes the trusted
-  checkout pattern (`ref: default_branch`, `persist-credentials: false`),
-  which label-rerun now follows.
+- GitHub Actions runs `run:` steps under `bash -eo pipefail` by default, so
+  the `-e` flag alone would mask the swallow bug in live CI; the parent's
+  mock harness runs plain `bash -c` (no `-e`), which is exactly the mode
+  that exposes it. The inline script is therefore made correct under BOTH
+  modes by using explicit `exit` codes instead of relying on any shell flag.
+- Removing the checkout step also lets the `contents: read` permission be
+  dropped, narrowing the token surface beyond the minimum the parent asked
+  for.
 
 ## UNTOUCHED
 
 - `scripts/ci/assemble_review_comment.py` (comment poller rendering)
 - `scripts/ci/live_comment.py`
-- The `needs` list, concurrency groups, review-label thresholds and all other
-  jobs in ci.yaml.
 - `scripts/ci/classify_changes.py`
-- ISSUE60.md, BRIEF.md, ATLAS-ISSUE-SKILL.md (parent-supplied, left untracked)
+- The `needs` list, concurrency groups, review-label thresholds and all
+  other jobs in ci.yaml.
+- `.github/workflows/ci.yaml` (unchanged this retry)
+- ISSUE60.md, BRIEF.md, FOLLOWUP.md, ATLAS-ISSUE-SKILL.md (parent-supplied,
+  left untracked)
 
 ## MISSING
 
-- A live re-run of the original workflow scripts against a mock `gh` (parent
-  owns this).
+- A live re-run of the workflow against the real GitHub API (parent owns
+  this).
 - Rendering cancelled jobs as error items in the PR review comment.
 - Ruff, which is not installed in this `.venv`; the parent runs it.
 
 ## FRICTION
 
-- The inline gate in ci.yaml uses `python3 -c "..."` with escaped quotes and
-  emoji, so the extraction to a helper was done with a targeted patch rather
-  than a text rewrite.
+- The gate helper is consumed by `echo "$NEEDS" | python3
+  .github/scripts/evaluate_gate.py`, so the workflow-level gate test must
+  run the extracted step with `cwd` at the repo root or `python3` cannot
+  resolve the relative helper path; this is baked into the test as an
+  explicit `cwd=ROOT`.
 - The terminal sandbox blocks `python3 -c` and pipe-to-interpreter, so
-  standalone helper verification used a `.sh` script with input redirected
-  from files instead.
+  standalone helper checks used a `.sh` script with heredoc input instead.
