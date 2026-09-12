@@ -1,240 +1,295 @@
-"""Tests for the CI stale-head rerun and aggregate-gate helpers.
+"""Workflow-level tests for the CI stale-head rerun and the aggregate gate.
 
 Two defects captured in ISSUE60.md:
 
 1. ``label-rerun`` captured the PR head when ``ci-reviewed`` landed, waited
    for the run, then reran the old SHA even after a new commit arrived —
-   cancelling CI for the newer commit. The rerun helper re-reads the live
-   head and refuses to rerun a stale one.
+   cancelling CI for the newer commit. The fix re-reads the live PR head
+   immediately before the rerun and refuses to rerun a stale one.
 
 2. The ``all-checks-pass`` aggregate gate only failed on ``failure``. A
    ``cancelled`` required job read as success, so a merge could be
-   authorised on work that never ran. The gate helper treats ``cancelled``
-   as blocking while still passing ``success`` and ``skipped``.
+   authorised on work that never ran. The gate now treats ``cancelled`` as
+   blocking while still passing ``success`` and ``skipped``.
 
-The helpers live under ``.github/scripts/`` and are imported directly, so
-these tests exercise the exact modules the workflows run — not a copy of
-their logic. ``_mock_gh`` fakes the ``gh`` command boundary; every call the
-helper makes is recorded so a test can assert what really ran.
+These tests extract the EXACT ``run`` scripts from the final workflow YAML
+and execute them as subprocesses. The rerun script is driven against a mock
+``gh`` command boundary, so the assertions see the real commands the
+workflow issues, not a string search or an uncalled duplicate of the logic.
+The gate script runs the real ``.github/scripts/evaluate_gate.py`` through
+the real ``echo "$NEEDS" | python3 ...`` step.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
-_ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load(name: str, rel: str):
-    path = _ROOT / rel
-    spec = importlib.util.spec_from_file_location(name, path)
+# ─── YAML + helper loading ──────────────────────────────────────────────
+
+
+def _yaml(rel: str) -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load((ROOT / rel).read_text(encoding="utf-8"))
+
+
+def _load_gate_helper():
+    path = ROOT / ".github/scripts/evaluate_gate.py"
+    spec = importlib.util.spec_from_file_location("evaluate_gate", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Failed to load {path}")
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
+    sys.modules["evaluate_gate"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-_rerun = _load("rerun_current_head", ".github/scripts/rerun_current_head.py")
-_gate = _load("evaluate_gate", ".github/scripts/evaluate_gate.py")
+_gate = _load_gate_helper()
 
 
-def _mock_gh(
-    monkeypatch,
-    head_stdout: str | None = None,
-    head_raises: bool = False,
-    rerun_raises: bool = False,
-):
-    """Fake ``subprocess.run`` at the ``gh`` command boundary.
+# ─── Mock `gh` at the command boundary ───────────────────────────────────
 
-    Routes ``gh pr view`` to the configured head read and ``gh run rerun``
-    to a success (or failure). Records every call in the returned list so
-    tests assert on the exact commands the helper issued.
+
+_MOCK_GH = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import os, sys
+    argv = sys.argv[1:]
+    calls_file = os.environ.get("CALLS_FILE", "")
+    if argv[:2] == ["run", "list"]:
+        print(os.environ.get("MOCK_RUN_INFO", "42 completed"))
+    elif argv[:2] == ["pr", "view"]:
+        if os.environ.get("MOCK_PR_VIEW_FAIL"):
+            print("mock gh: pr view failed", file=sys.stderr)
+            sys.exit(1)
+        print(os.environ.get("MOCK_LIVE_HEAD", os.environ.get("HEAD_SHA", "")))
+    elif argv[:2] == ["run", "rerun"]:
+        if calls_file:
+            with open(calls_file, "a") as f:
+                f.write("rerun %s\\n" % (argv[2] if len(argv) > 2 else ""))
+        if os.environ.get("MOCK_RERUN_FAIL"):
+            print("mock gh: rerun failed", file=sys.stderr)
+            sys.exit(1)
+    elif argv[:2] == ["run", "view"]:
+        print("completed")
+    elif argv[:2] == ["run", "watch"]:
+        sys.exit(0)
+    else:
+        print("mock gh: unexpected call: %s" % argv, file=sys.stderr)
+        sys.exit(99)
     """
-    calls: list[list[str]] = []
-
-    def fake_run(args, **kwargs):
-        calls.append(list(args))
-        if args[1] == "pr" and args[2] == "view":
-            if head_raises:
-                raise _rerun.subprocess.CalledProcessError(1, args)
-            stdout = (head_stdout or "").rstrip("\n") + "\n"
-            return _rerun.subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
-        if args[1] == "run" and args[2] == "rerun":
-            if rerun_raises:
-                raise _rerun.subprocess.CalledProcessError(1, args)
-            return _rerun.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        raise AssertionError(f"unexpected gh call: {args}")
-
-    monkeypatch.setattr(_rerun.subprocess, "run", fake_run)
-    return calls
+)
 
 
-def _ran_rerun(calls) -> bool:
-    return any(c[1] == "run" and c[2] == "rerun" for c in calls)
+def _label_rerun_run_script() -> str:
+    doc = _yaml(".github/workflows/label-rerun.yml")
+    steps = doc["jobs"]["rerun-review-labels"]["steps"]
+    runs = [s["run"] for s in steps if isinstance(s.get("run"), str)]
+    assert len(runs) == 1, "label-rerun should have exactly one run step"
+    return runs[0]
 
 
-# ─── Rerun helper ────────────────────────────────────────────────────────
-
-
-def test_same_head_reruns_failed_jobs(monkeypatch):
-    """The positive control: an unchanged head permits the rerun."""
-    calls = _mock_gh(monkeypatch, head_stdout="abc123")
-
-    outcome, live = _rerun.rerun_if_head_unchanged("owner/repo", "5", "abc123", "42")
-
-    assert outcome == "rerun"
-    assert live == "abc123"
-    assert _ran_rerun(calls), "a completed run for the same head is rerun"
-
-
-def test_changed_head_makes_no_rerun_call(monkeypatch):
-    """A new commit during the wait must not rerun the stale SHA (the defect)."""
-    calls = _mock_gh(monkeypatch, head_stdout="newsha")
-
-    outcome, live = _rerun.rerun_if_head_unchanged("owner/repo", "5", "oldsha", "42")
-
-    assert outcome == "superseded"
-    assert live == "newsha"
-    assert not _ran_rerun(calls), "changed head: zero rerun calls"
-
-
-def test_api_failure_never_reruns(monkeypatch):
-    """When the live head cannot be read, refuse to rerun blind (the defect)."""
-    calls = _mock_gh(monkeypatch, head_raises=True)
-
-    outcome, live = _rerun.rerun_if_head_unchanged("owner/repo", "5", "oldsha", "42")
-
-    assert outcome == "api-error"
-    assert live is None
-    assert not _ran_rerun(calls), "API failure: zero rerun calls"
-
-
-def test_rerun_failure_is_explicit(monkeypatch):
-    """A failed rerun call is reported, never swallowed."""
-    calls = _mock_gh(monkeypatch, head_stdout="abc123", rerun_raises=True)
-
-    outcome, live = _rerun.rerun_if_head_unchanged("owner/repo", "5", "abc123", "42")
-
-    assert outcome == "rerun-failed"
-    assert live == "abc123"
-    assert _ran_rerun(calls)
-
-
-def test_rerun_main_exit_codes(monkeypatch):
-    """superseded → 2, api-error → 1, rerun-failed → 1, success → 0."""
-    codes = {
-        "rerun": 0,
-        "superseded": 2,
-        "api-error": 1,
-        "rerun-failed": 1,
+def _run_label_rerun(tmp_path: Path, env: dict) -> subprocess.CompletedProcess:
+    mock = tmp_path / "gh"
+    mock.write_text(_MOCK_GH, encoding="utf-8")
+    mock.chmod(0o755)
+    calls = tmp_path / "calls"
+    full_env = {
+        "PATH": f"{tmp_path}:/usr/bin:/bin",
+        "REPO": "owner/test-repo",
+        "PR": "5",
+        "HEAD_SHA": "a" * 40,
+        "CALLS_FILE": str(calls),
     }
-    for outcome, code in codes.items():
-        monkeypatch.setattr(
-            _rerun,
-            "rerun_if_head_unchanged",
-            lambda *a, _o=outcome: (_o, "sha"),
-        )
-        assert _rerun.main(
-            ["--repo", "r", "--pr", "5", "--captured-head", "c", "--run-id", "42"]
-        ) == code
+    full_env.update(env)
+    return subprocess.run(
+        ["bash", "-c", _label_rerun_run_script()],
+        env=full_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(ROOT),
+    )
 
 
-# ─── Aggregate gate helper ───────────────────────────────────────────────
+def _rerun_calls(tmp_path: Path) -> str:
+    calls = tmp_path / "calls"
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+# ─── Rerun workflow: the extracted run script ────────────────────────────
+
+
+def test_label_rerun_same_head_reruns_failed_jobs(tmp_path):
+    """Positive control: an unchanged head permits the rerun (exit 0)."""
+    result = _run_label_rerun(tmp_path, {"MOCK_LIVE_HEAD": "a" * 40})
+
+    assert result.returncode == 0, result.stderr
+    assert "rerun 42" in _rerun_calls(tmp_path), "the completed run is rerun"
+
+
+def test_label_rerun_changed_head_is_a_successful_noop(tmp_path):
+    """A new commit during the wait: superseded is a no-op, not a rerun (the defect)."""
+    result = _run_label_rerun(tmp_path, {"MOCK_LIVE_HEAD": "b" * 40})
+
+    assert result.returncode == 0, result.stderr
+    assert _rerun_calls(tmp_path) == "", "changed head: zero rerun calls"
+    assert "changed while waiting" in result.stdout
+
+
+def test_label_rerun_unreadable_head_fails_closed(tmp_path):
+    """An unreadable live head must fail the step, never rerun blind."""
+    result = _run_label_rerun(tmp_path, {"MOCK_PR_VIEW_FAIL": "1"})
+
+    assert result.returncode != 0, "API failure must propagate as a non-zero exit"
+    assert _rerun_calls(tmp_path) == "", "API failure: zero rerun calls"
+
+
+def test_label_rerun_rerun_call_failure_propagates(tmp_path):
+    """A failed ``gh run rerun`` call must fail the step, not be swallowed."""
+    result = _run_label_rerun(
+        tmp_path, {"MOCK_LIVE_HEAD": "a" * 40, "MOCK_RERUN_FAIL": "1"}
+    )
+
+    assert result.returncode != 0, "rerun failure must propagate as a non-zero exit"
+
+
+def test_label_rerun_no_run_is_a_noop(tmp_path):
+    """No CI run for the head: nothing to rerun, a clean no-op."""
+    result = _run_label_rerun(tmp_path, {"MOCK_RUN_INFO": ""})
+
+    assert result.returncode == 0, result.stderr
+    assert _rerun_calls(tmp_path) == ""
+    assert "nothing to rerun" in result.stdout
+
+
+# ─── Rerun workflow: wiring (the helper is gone) ────────────────────────
+
+
+def test_label_rerun_has_no_checkout_and_no_helper_reference():
+    """The fresh-head guard is inline; no helper bootstrap, no PR checkout."""
+    doc = _yaml(".github/workflows/label-rerun.yml")
+    job = doc["jobs"]["rerun-review-labels"]
+    steps = job["steps"]
+
+    assert all("uses" not in s for s in steps), (
+        "label-rerun must not check out anything (trusted inline script only)"
+    )
+    run = _label_rerun_run_script()
+    assert "rerun_current_head.py" not in run
+    assert "gh pr view" in run, "the live head recheck must be inline"
+    assert "gh run rerun" in run, "the rerun must be inline"
+
+
+def test_label_rerun_rerun_preceded_by_head_recheck():
+    """The stale-head recheck is immediately before the rerun, every time."""
+    run = _label_rerun_run_script()
+    # The live-head read and the rerun are the actual command lines, not the
+    # comments that mention "gh run rerun only works on completed runs".
+    pr_view = run.index('gh pr view "$PR"')
+    rerun = run.index('gh run rerun "$RUN_ID"')
+    assert pr_view < rerun
+    assert "exit 0" in run[pr_view:rerun], "superseded path exits before rerun"
+
+
+# ─── Aggregate gate: the extracted run script (real helper) ─────────────
+
+
+def _gate_run_script() -> str:
+    doc = _yaml(".github/workflows/ci.yaml")
+    steps = doc["jobs"]["all-checks-pass"]["steps"]
+    runs = [s["run"] for s in steps if isinstance(s.get("run"), str)]
+    gate = next(r for r in runs if "evaluate_gate.py" in r)
+    return gate
+
+
+def _run_gate(tmp_path: Path, results: dict) -> subprocess.CompletedProcess:
+    needs = json.dumps({name: {"result": r} for name, r in results.items()})
+    return subprocess.run(
+        ["bash", "-c", _gate_run_script()],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "NEEDS": needs,
+            "GITHUB_OUTPUT": str(tmp_path / "output"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(ROOT),
+    )
+
+
+def test_gate_workflow_cancelled_blocks(tmp_path):
+    """A cancelled required job must block the merge (ISSUE60 hard half)."""
+    result = _run_gate(tmp_path, {"detect": "success", "tests": "cancelled"})
+    assert result.returncode != 0, result.stdout
+
+
+def test_gate_workflow_failure_blocks(tmp_path):
+    result = _run_gate(tmp_path, {"detect": "success", "tests": "failure"})
+    assert result.returncode != 0, result.stdout
+
+
+def test_gate_workflow_success_passes(tmp_path):
+    result = _run_gate(tmp_path, {"detect": "success", "tests": "success"})
+    assert result.returncode == 0, result.stderr
+
+
+def test_gate_workflow_skipped_is_permitted(tmp_path):
+    """An intentional path-filter skip is not a defect."""
+    result = _run_gate(tmp_path, {"detect": "success", "e2e": "skipped"})
+    assert result.returncode == 0, result.stderr
+
+
+def test_gate_workflow_success_and_skips_pass(tmp_path):
+    result = _run_gate(
+        tmp_path, {"detect": "success", "tests": "success", "e2e": "skipped"}
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# ─── Aggregate gate: direct helper units (fast, precise) ────────────────
 
 
 def _needs(**results) -> dict:
     return {name: {"result": result} for name, result in results.items()}
 
 
-def test_gate_all_success_passes():
+def test_gate_evaluate_all_success_passes():
     compact, blocking = _gate.evaluate(_needs(detect="success", tests="success"))
     assert blocking == []
     assert compact == {"detect": "success", "tests": "success"}
 
 
-def test_gate_failure_blocks():
+def test_gate_evaluate_failure_blocks():
     compact, blocking = _gate.evaluate(_needs(detect="success", tests="failure"))
     assert blocking == ["tests"]
 
 
-def test_gate_cancelled_blocks():
-    """A cancelled required job must block the merge (ISSUE60 hard half)."""
+def test_gate_evaluate_cancelled_blocks():
     compact, blocking = _gate.evaluate(_needs(detect="success", tests="cancelled"))
     assert blocking == ["tests"]
 
 
-def test_gate_skipped_is_not_blocking():
-    """An intentional path-filter skip is not a defect."""
+def test_gate_evaluate_skipped_is_not_blocking():
     compact, blocking = _gate.evaluate(_needs(detect="success", e2e="skipped"))
     assert blocking == []
 
 
-def test_gate_cancelled_blocks_while_skips_and_success_pass():
-    needs = _needs(
-        detect="success",
-        tests="cancelled",
-        e2e="skipped",
-        lint="success",
-    )
-    compact, blocking = _gate.evaluate(needs)
-    assert blocking == ["tests"]
-    assert "e2e" not in blocking
-    assert "lint" not in blocking
-    assert "detect" not in blocking
-
-
-def test_gate_main_exit_nonzero_on_cancelled(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_needs(tests="cancelled"))))
-    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    assert _gate.main([]) == 1
-    assert "cancelled" in capsys.readouterr().out
-
-
-def test_gate_main_exit_zero_on_success_and_skips(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "stdin",
-        io.StringIO(json.dumps(_needs(detect="success", e2e="skipped"))),
-    )
-    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    assert _gate.main([]) == 0
-
-
-# ─── Wiring: the workflows run these helpers, not a copy ────────────────
-
-
-def _yaml(rel: str) -> dict:
-    yaml = pytest.importorskip("yaml")
-    return yaml.safe_load((_ROOT / rel).read_text(encoding="utf-8"))
-
-
-def test_label_rerun_workflow_calls_the_rerun_helper():
-    doc = _yaml(".github/workflows/label-rerun.yml")
-    step = next(
-        s for job in doc["jobs"].values() for s in job["steps"]
-        if isinstance(s.get("run"), str) and "rerun_current_head.py" in s["run"]
-    )
-    # The helper owns the head recheck + rerun; the workflow no longer
-    # issues the direct `gh run rerun --failed` command on its own.
-    assert "gh run rerun --failed" not in step["run"]
-    assert "--captured-head" in step["run"]
-    assert "--run-id" in step["run"]
+# ─── Gate wiring: ci.yaml calls the helper ──────────────────────────────
 
 
 def test_ci_gate_workflow_calls_the_evaluate_helper():
-    doc = _yaml(".github/workflows/ci.yaml")
-    run = next(
-        s["run"] for s in doc["jobs"]["all-checks-pass"]["steps"]
-        if isinstance(s.get("run"), str) and "evaluate_gate.py" in s["run"]
-    )
+    run = _gate_run_script()
     assert "evaluate_gate.py" in run
-    # The aggregate logic moved out of the YAML into the helper.
+    # The aggregate logic lives in the helper, not inline python in YAML.
     assert "sys.exit(1)" not in run
