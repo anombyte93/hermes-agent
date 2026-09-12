@@ -46,7 +46,6 @@ import {
 } from './api'
 import { DrawerEvidence, useResolvedBoardSlug } from './drawer-evidence'
 import { useEvidenceContext, WorkerEvidenceSection } from './evidence'
-import { CardWorkflowPanel } from './workflow'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -74,6 +73,7 @@ import {
   useDefaultAssignee,
   useKanban
 } from './ui'
+import { CardWorkflowPanel } from './workflow'
 
 /**
  * Turn a task_events row into an operator-readable line. The backend logs
