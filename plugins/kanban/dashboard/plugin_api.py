@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -3167,11 +3168,79 @@ _EVIDENCE_PASS_SHAPES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _evidence_pass_shape_error(tool: str, data: Any) -> Optional[str]:
-    """Validate the required per-tool structure of PASS ``data``.
+def _evidence_list_of_dicts(value: Any) -> bool:
+    """True when *value* is a list whose entries are all dicts."""
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
 
-    Returns None when the shape is acceptable, else a short reason. No
-    fields are required that the adapter does not emit.
+
+def _evidence_finite_number(value: Any) -> bool:
+    """True when *value* is a finite numeric (int/float), never a bool.
+
+    NaN and +/-Infinity are rejected here so a bad timestamp never reaches
+    FastAPI's JSON serialiser (which would emit non-standard ``NaN`` /
+    ``Infinity`` tokens).
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _evidence_pass_type_error(tool: str, data: dict[str, Any]) -> Optional[str]:
+    """Validate the CONSUMED field types of PASS ``data`` per tool.
+
+    Never coerces: a wrong type is a hard UNKNOWN, not a repair. Optional
+    forward-compatible fields are ignored — their presence is preserved and
+    their types are not second-guessed.
+    """
+    def bad(field: str, expected: str) -> str:
+        return f"PASS receipt for {tool} field {field!r} is not {expected}"
+
+    if tool == "kanban_snapshot":
+        if not _evidence_list_of_dicts(data["cards"]):
+            return bad("cards", "a list of objects")
+        if not isinstance(data["counts"], dict):
+            return bad("counts", "an object of per-status counts")
+        if not _evidence_finite_number(data["observed_at"]):
+            return bad("observed_at", "a finite number (never a boolean)")
+    elif tool == "kanban_page":
+        if not _evidence_list_of_dicts(data["items"]):
+            return bad("items", "a list of objects")
+        returned = data["returned"]
+        if isinstance(returned, bool) or not isinstance(returned, int) or returned < 0:
+            return bad("returned", "a non-negative integer")
+        if returned != len(data["items"]):
+            return (
+                f"PASS receipt for {tool} returned {returned!r} but carried "
+                f"{len(data['items'])} items"
+            )
+        if not isinstance(data["has_more"], bool):
+            return bad("has_more", "a boolean")
+        for cursor_key in ("cursor", "next_cursor"):
+            cursor = data.get(cursor_key)
+            if cursor is not None and not isinstance(cursor, str):
+                return bad(cursor_key, "absent, null, or a string")
+    elif tool == "kanban_worker":
+        if not _evidence_list_of_dicts(data["observations"]):
+            return bad("observations", "a list of objects")
+    elif tool == "kanban_card":
+        for field in ("runs", "comments", "events"):
+            if not _evidence_list_of_dicts(data[field]):
+                return bad(field, "a list of objects")
+        task = data.get("task")
+        if not isinstance(task, dict) or task.get("id") is None:
+            return bad("task", "an object carrying its id")
+    return None
+
+
+def _evidence_pass_shape_error(tool: str, data: Any) -> Optional[str]:
+    """Validate the required per-tool structure AND consumed field types of
+    PASS ``data``.
+
+    Returns None when the shape and types are acceptable, else a short
+    reason. No fields are required that the adapter does not emit, and no
+    consumed value is ever coerced — a wrong type is a hard UNKNOWN.
     """
     if not isinstance(data, dict) or not data:
         return f"PASS receipt for {tool} carried no data object"
@@ -3181,7 +3250,7 @@ def _evidence_pass_shape_error(tool: str, data: Any) -> Optional[str]:
             f"PASS receipt for {tool} was missing data fields "
             f"{sorted(missing)} required by the helper contract"
         )
-    return None
+    return _evidence_pass_type_error(tool, data)
 
 
 def _evidence_scope_error(
@@ -3360,13 +3429,10 @@ def _evidence_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                     timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
                 )
             observed_at = receipt.get("observed_at")
-            if (
-                not isinstance(observed_at, (int, float))
-                or isinstance(observed_at, bool)
-            ):
+            if not _evidence_finite_number(observed_at):
                 return _evidence_envelope(
                     state="UNKNOWN",
-                    reason=f"{_EAND}PASS receipt is missing a numeric observed_at",
+                    reason=f"{_EAND}PASS receipt is missing a finite numeric observed_at",
                     timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
                 )
             data = receipt.get("data")
