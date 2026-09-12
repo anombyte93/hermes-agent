@@ -12,6 +12,11 @@ name: Label rerun
 # The review comment updates without help. The poller in
 # ci-review-comment.yml watches the CI run through the API. It gets the
 # rerun results.
+#
+# Trust: this workflow runs no PR-controlled code. It checks out nothing
+# and executes only the inline script below, which is part of this
+# repository's own reviewed workflow file. The ``actions: write`` token is
+# therefore never exposed to anything a fork can edit.
 
 on:
   pull_request:
@@ -36,6 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
@@ -82,6 +88,43 @@ jobs:
             fi
           fi
 
-          echo "Run completed. Rerunning all failed jobs..."
-          gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
+          # A completed successful run has no failed jobs. GitHub rejects
+          # --failed on that run, so read the conclusion before attempting it.
+          CONCLUSION=$(gh run view "$RUN_ID" --repo "$REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)
+          case "$CONCLUSION" in
+            success|neutral|skipped)
+              echo "Run already passed; no failed jobs to rerun."
+              exit 0
+              ;;
+            failure|cancelled|timed_out|action_required|startup_failure) ;;
+            *)
+              echo "::error::Could not establish the completed run conclusion; refusing to rerun blind."
+              exit 1
+              ;;
+          esac
+
+          echo "Run completed. Rechecking the live PR head before rerunning..."
+
+          # Re-read the live PR head. A commit that landed during the wait
+          # supersedes this rerun: nothing to do, which is a successful
+          # no-op (exit 0), not a failure. An unreadable head is an explicit
+          # failure (exit 1), never a blind rerun.
+          LIVE_HEAD=$(gh pr view "$PR" --repo "$REPO" \
+            --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+          if [ -z "$LIVE_HEAD" ]; then
+            echo "::error::Could not read the live PR head; refusing to rerun blind."
+            exit 1
+          fi
+          if [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
+            echo "PR head changed while waiting: captured $HEAD_SHA, now $LIVE_HEAD. Not rerunning stale run $RUN_ID."
+            exit 0
+          fi
+
+          # Head still matches: rerun the failed jobs. A failed rerun call
+          # must propagate as a workflow failure, not be swallowed.
+          if ! gh run rerun "$RUN_ID" --repo "$REPO" --failed; then
+            echo "::error::Rerun call for run $RUN_ID failed; the stale run was not rerun."
+            exit 1
+          fi
+
           echo "Done. GitHub will rerun review-labels and all dependent jobs."
