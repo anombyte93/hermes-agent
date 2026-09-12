@@ -45,18 +45,22 @@ and 2 passing controls; this report does not reimplement that RED.
   the ACTUAL `run` scripts from the final YAML at a mock `gh` command
   boundary, plus the gate cases against the real `evaluate_gate.py` helper.
 
-## Trust model (stated accurately)
+## Trust model and parent correction
 
-The `label-rerun` workflow checks out nothing. It executes only the inline
-script in its own workflow file, which is part of this repository's reviewed
-workflow. Because no PR-controlled code is checked out, the `actions: write`
-token is never exposed to anything a fork can edit. The `ci-reviewed` label
-is a review signal added by a human; it does not mechanically contain or
-authorise arbitrary source. The `all-checks-pass` gate helper
-`evaluate_gate.py` is sourced from the PR merge ref, matching the existing
-`detect` job; any `.github/` change (which includes the helper) triggers the
-fail-open `ci_review` lane and therefore the `ci-reviewed` label and human
-review, so a fork cannot silently substitute it.
+The label workflow checks out no separate helper. It remains triggered by
+`pull_request`, whose revision is the PR merge ref. Therefore the workflow
+itself can be changed by a PR; absence of a checkout is not proof that source
+is trusted. GitHub's configured token policy and review of workflow changes
+remain the authority boundary. This repair does not change that policy.
+The aggregate helper is checked out from the same merge revision as the
+existing detect job. Review labels are a review signal, not structural
+containment or proof that arbitrary source is safe.
+
+Source: [GitHub event reference](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
+Parent corrected the worker's stronger trust claim during acceptance. Parent
+reran the exact final workflow regression suite on physical EVO: 17 passed.
+Original baseline reproduction: 2 failing defects, 2 passing controls.
+This proves the bounded subprocess behaviour, not a new live GitHub rerun race.
 
 ## RED / GREEN
 

@@ -13,10 +13,9 @@ name: Label rerun
 # ci-review-comment.yml watches the CI run through the API. It gets the
 # rerun results.
 #
-# Trust: this workflow runs no PR-controlled code. It checks out nothing
-# and executes only the inline script below, which is part of this
-# repository's own reviewed workflow file. The ``actions: write`` token is
-# therefore never exposed to anything a fork can edit.
+# No separate helper checkout is needed. This remains a pull_request workflow:
+# its reviewed workflow source is part of the PR merge revision, not a
+# containment boundary. Existing GitHub token permissions remain unchanged.
 
 on:
   pull_request:
