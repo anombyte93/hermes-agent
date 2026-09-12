@@ -30,6 +30,7 @@ from hermes_cli import kanban_db as kb
 
 
 _PLUGIN_MODULE_CACHE: dict[str, object] = {}
+_FIXTURE_EVO_WORKSPACE = "/home/hayden/workflow-api-test-workspace"
 
 
 def _load_plugin_module():
@@ -317,7 +318,7 @@ def _get(client, path):
 
 
 @pytest.fixture
-def aligned_evo(evidence_home, monkeypatch):
+def aligned_evo(client, evidence_home, monkeypatch):
     """Hostname evo + a real default-board DB + a task, so the workflow routes
     can resolve the aligned local task."""
     import socket as _socket
@@ -325,9 +326,20 @@ def aligned_evo(evidence_home, monkeypatch):
     monkeypatch.setattr(_socket, "gethostname", lambda: "evo")
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    # The test may run under /home/runner or /tmp. Model the EVO filesystem
+    # boundary explicitly rather than assuming the CI checkout is an EVO home.
+    # Git still runs against a real checkout; production path validation stays
+    # untouched and sees the provisioned remote path stored on the card.
+    real_git_head = client._evidence_module._git_head
+
+    def fixture_git_head(workspace):
+        assert workspace == _FIXTURE_EVO_WORKSPACE
+        return real_git_head(str(Path(__file__).resolve().parents[2]))
+
+    monkeypatch.setattr(client._evidence_module, "_git_head", fixture_git_head)
     conn = kb.connect(board="default")
     try:
-        workspace = str(Path(__file__).resolve().parents[2])  # repo root, under /home/hayden/
+        workspace = _FIXTURE_EVO_WORKSPACE
         tid = kb.create_task(
             conn,
             title="Workflow test card",
@@ -468,7 +480,7 @@ def test_readiness_pass_resolves_task_and_git_head(client, helper_bin, aligned_e
     assert stdin["provider"] == "deepseek"
     assert stdin["model"] == "deepseek-v4-pro"
     assert stdin["expected_revision"] == _task_workspace_head()
-    workspace = str(Path(__file__).resolve().parents[2])
+    workspace = _FIXTURE_EVO_WORKSPACE
     assert stdin["workspace"] == workspace
     assert stdin["python"] == os.path.join(workspace, ".venv", "bin", "python")
     assert stdin["check_model"] is True
@@ -505,6 +517,23 @@ def test_readiness_incomplete_config_is_unknown(client, helper_bin, aligned_evo,
     assert body["state"] == "UNKNOWN"
     assert "workspace" in body["reason"]
     assert body.get("remedy")
+    assert _invocations(helper_bin.record_path) == []
+
+
+def test_readiness_rejects_non_evo_workspace_before_helper(client, helper_bin, aligned_evo):
+    helper_bin("pass")
+    conn = kb.connect(board="default")
+    try:
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", ("/tmp/not-evo", aligned_evo))
+        conn.commit()
+    finally:
+        conn.close()
+    response = client.post(
+        "/api/plugins/kanban/workflow/readiness?board=default",
+        json={"card": aligned_evo, "check_model": True},
+    )
+    assert response.json()["state"] == "UNKNOWN", response.json()
+    assert "not a provisioned EVO home" in response.json()["reason"]
     assert _invocations(helper_bin.record_path) == []
 
 
@@ -583,7 +612,7 @@ def test_draft_derives_commission_from_task(client, helper_bin, aligned_evo):
     assert inv["argv"][1:] == ["kanban_continuation_draft", "-"]
     stdin = inv["stdin"]
     # Commission fields derived from the aligned local task when omitted.
-    assert stdin["workspace"] == str(Path(__file__).resolve().parents[2])
+    assert stdin["workspace"] == _FIXTURE_EVO_WORKSPACE
     assert stdin["profile"] == "evo"
     assert stdin["provider"] == "deepseek"
     assert stdin["model"] == "deepseek-v4-pro"
