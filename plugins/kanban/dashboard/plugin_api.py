@@ -42,6 +42,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -3658,3 +3659,81 @@ async def evidence_card(
         board=board,
         request_echo={"board": board, "card": card},
     )
+
+
+@router.get("/evidence/context")
+async def evidence_context(
+    board: Optional[str] = Query(None, description="Board slug (blank = server's current board)"),
+):
+    """Read-only identity alignment: whether THIS server's kanban DB for
+    *board* is the same physical database the EVO evidence bridge reads.
+
+    The EVO bridge always reads the physical EVO host's ``~/.hermes/...``
+    database. The desktop can be pointed at a DIFFERENT local server (e.g.
+    the local Archie primary) whose board happens to share a slug — evidence
+    must never attach EVO worker badges to those cards. This endpoint lets
+    the UI decide per-request whether evidence is legitimate for the current
+    board, without ever returning raw filesystem paths.
+
+    Alignment requires ALL of:
+
+      * the actual hostname is ``evo`` (``socket.gethostname()``),
+      * ``kanban_db.kanban_db_path(board)`` resolves to the OS account's
+        ``~/.hermes/kanban.db`` (default board) or
+        ``~/.hermes/kanban/boards/<board>/kanban.db`` (named board),
+      * both paths are existing regular files (not symlinks — a symlink
+        could alias a local DB onto the EVO location, or vice versa).
+
+    ``HERMES_KANBAN_DB`` / ``HERMES_HOME`` overrides can divert the local
+    server's DB elsewhere, which is exactly why hostname alone is
+    insufficient. A blank ``board`` resolves through the server's existing
+    current-board chain (``get_current_board``), never by switching the
+    global pointer. Read-only: no DB connection is opened and no file is
+    written.
+    """
+    if board is None or not board.strip():
+        # Resolve a blank selection from the server's current-board chain.
+        slug = kanban_db.get_current_board()
+    else:
+        slug = _evidence_board_slug(board)
+
+    hostname = socket.gethostname()
+    aligned = True
+    reason = "aligned"
+
+    # The EVO location is anchored to the OS account home, independent of
+    # HERMES_HOME / HERMES_KANBAN_HOME / HERMES_KANBAN_DB overrides.
+    home = Path.home()
+    if slug == kanban_db.DEFAULT_BOARD:
+        expected = home / ".hermes" / "kanban.db"
+    else:
+        expected = home / ".hermes" / "kanban" / "boards" / slug / "kanban.db"
+
+    actual = kanban_db.kanban_db_path(slug)
+
+    if hostname != _EVIDENCE_EXECUTION_HOST:
+        aligned = False
+        reason = "this server is not the EVO host"
+    elif not (actual.is_file() and expected.is_file()):
+        aligned = False
+        reason = "kanban database file is missing on this server"
+    elif actual.is_symlink() or expected.is_symlink():
+        aligned = False
+        reason = "kanban database path resolves through a symlink"
+    else:
+        try:
+            if actual.resolve() != expected.resolve():
+                aligned = False
+                reason = "kanban database path does not match the EVO location"
+        except OSError:
+            aligned = False
+            reason = "kanban database path could not be resolved"
+
+    return {
+        "aligned": aligned,
+        "board": slug,
+        "hostname": hostname,
+        "reason": reason,
+        "observed_at": time.time(),
+    }
+

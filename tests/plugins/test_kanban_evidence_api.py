@@ -932,6 +932,117 @@ def test_helper_stdout_bound_is_read_bound_not_write_cap(client, helper_bin):
     assert "exceeded" in body["reason"]
 
 
+# ---------------------------------------------------------------------------
+# /evidence/context — identity alignment (is this server's DB the EVO DB?)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def evo_aligned(evidence_home, monkeypatch):
+    """Hostname ``evo`` + a real ``~/.hermes/kanban.db`` at the OS account
+    home, so the server's local DB for the default board IS the EVO DB.
+
+    ``evidence_home`` sets ``HERMES_HOME=<tmp>/.hermes`` and monkeypatches
+    ``Path.home`` to ``<tmp>``; with ``HERMES_KANBAN_DB``/``_HOME`` unset,
+    ``kanban_db.kanban_db_path("default")`` lands on ``<tmp>/.hermes/kanban.db``
+    — the same file the expected EVO path names."""
+    import socket as _socket
+
+    monkeypatch.setattr(_socket, "gethostname", lambda: "evo")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    db = Path.home() / ".hermes" / "kanban.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_bytes(b"")
+    return db
+
+
+def test_context_aligned(client, evo_aligned):
+    r = _get(client, "/evidence/context?board=default")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["aligned"] is True
+    assert body["board"] == "default"
+    assert body["hostname"] == "evo"
+    assert body["reason"] == "aligned"
+    # Read-only identity: never surface raw filesystem paths to the user.
+    assert ".hermes" not in json.dumps(body)
+
+
+def test_context_blank_board_resolves_current(client, evo_aligned, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    r = _get(client, "/evidence/context")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["aligned"] is True
+    assert body["board"] == "default"
+
+
+def test_context_wrong_hostname_not_aligned(client, evo_aligned, monkeypatch):
+    import socket as _socket
+
+    monkeypatch.setattr(_socket, "gethostname", lambda: "archie")
+    r = _get(client, "/evidence/context?board=default")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["aligned"] is False
+    assert "not the EVO host" in body["reason"]
+
+
+def test_context_db_override_diverges_not_aligned(client, evo_aligned, monkeypatch):
+    # HERMES_KANBAN_DB points the local server at a DIFFERENT file than the
+    # OS-account home EVO path — hostname evo alone is not sufficient.
+    elsewhere = Path.home() / "elsewhere.db"
+    elsewhere.write_bytes(b"")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(elsewhere))
+    r = _get(client, "/evidence/context?board=default")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["aligned"] is False
+    assert "does not match the EVO location" in body["reason"]
+
+
+def test_context_missing_db_not_aligned(client, monkeypatch, evidence_home):
+    import socket as _socket
+
+    monkeypatch.setattr(_socket, "gethostname", lambda: "evo")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    r = _get(client, "/evidence/context?board=default")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["aligned"] is False
+    assert "missing" in body["reason"]
+
+
+def test_context_symlink_not_aligned(client, monkeypatch, evidence_home):
+    import socket as _socket
+
+    monkeypatch.setattr(_socket, "gethostname", lambda: "evo")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    home = Path.home()
+    real = home / ".hermes" / "real.db"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_bytes(b"")
+    link = home / ".hermes" / "kanban.db"
+    link.symlink_to(real)
+    r = _get(client, "/evidence/context?board=default")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["aligned"] is False
+    assert "symlink" in body["reason"]
+
+
+def test_context_named_board_expected_path(client, evo_aligned):
+    # A named board's EVO location is ~/.hermes/kanban/boards/<slug>/kanban.db.
+    # Without that file present, alignment is False (missing), proving the
+    # named-board branch resolves the nested path rather than the default one.
+    r = _get(client, "/evidence/context?board=evo-alpha")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["aligned"] is False
+    assert "missing" in body["reason"]
+
+
 @pytest.mark.skipif(
     not Path(
         "/home/hayden/atlas/work/trajectory-20260912/ui-helper-candidate/.venv/bin/atlas-kanban-call"
