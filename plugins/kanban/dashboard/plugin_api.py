@@ -4165,6 +4165,15 @@ def _workflow_shape_error(
             names.append(entry["name"])
         if len(names) != len(set(names)):
             return "readiness check names are duplicated"
+        # Every readiness dimension must be present. A short all-green subset
+        # is not evidence that the omitted dependency or runtime check passed.
+        required = {
+            "board_permission", "profile_exists", "workspace_exists",
+            "expected_revision", "python_interpreter", "required_modules",
+            "context_files", "ram_available", "parents", "model",
+        }
+        if not required.issubset(names):
+            return "readiness required checks are missing"
         if not isinstance(receipt.get("ready_to_release"), bool):
             return "readiness receipt ready_to_release is not a boolean"
         freshness = receipt.get("freshness")
@@ -4180,6 +4189,12 @@ def _workflow_shape_error(
         # the cast is only to satisfy the type checker.
         if float(stale_after) <= float(checked_at):  # type: ignore[arg-type]
             return "readiness receipt freshness horizon is inverted or empty"
+        # A receipt is useful only during its own declared validity window.
+        # The helper executes on this host; five seconds tolerates scheduling
+        # skew but never turns a future or expired observation into readiness.
+        now = time.time()
+        if float(checked_at) > now + 5 or float(stale_after) <= now:
+            return "readiness receipt is future-dated or expired"
         states = {entry.get("state") for entry in checks}
         if receipt["ready_to_release"] and states != {"PASS"}:
             return "readiness ready_to_release is true with a failed or missing check"
@@ -4536,6 +4551,10 @@ async def workflow_readiness(
         "workspace": workspace,
         "expected_revision": head,
         "python": os.path.join(workspace, ".venv", "bin", "python"),
+        # This checks the Hermes worker interpreter. Hermes pyproject.toml
+        # requires >=3.11; the generic adapter default (3.12) would reject
+        # supported EVO workers. Project-specific build tests remain separate.
+        "minimum_python": "3.11",
         "parents": parents,
         "check_model": bool(payload.check_model),
     }

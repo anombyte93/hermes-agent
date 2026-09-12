@@ -73,7 +73,8 @@ def client(evidence_home):
 
 def _write_fake_helper(directory: Path, behavior: str) -> Path:
     script = '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
+NOW = time.time()
 
 behavior = {behavior!r}
 record_path = os.environ["FAKE_HELPER_RECORD"]
@@ -95,9 +96,9 @@ def projection():
     if tool == "kanban_attention":
         return {{
             "board": args.get("board"),
-            "read_at": 1789216932.8,
-            "observed_at": 1789216932.8,
-            "freshness": {{"read_at": 1789216932.8, "note": "one bounded read"}},
+            "read_at": NOW,
+            "observed_at": NOW,
+            "freshness": {{"read_at": NOW, "note": "one bounded read"}},
             "cards": [{{"id": "t_00000001", "status": "blocked"}}],
             "returned": 1,
             "has_more": False,
@@ -108,9 +109,9 @@ def projection():
     if tool == "kanban_changes":
         return {{
             "board": args.get("board"),
-            "read_at": 1789216932.8,
-            "observed_at": 1789216932.8,
-            "freshness": {{"read_at": 1789216932.8, "note": "poll"}},
+            "read_at": NOW,
+            "observed_at": NOW,
+            "freshness": {{"read_at": NOW, "note": "poll"}},
             "first_read_policy": "baseline-now",
             "events": [{{"id": 1, "kind": "commented"}}],
             "returned": 1,
@@ -126,10 +127,10 @@ def projection():
             "board": args.get("board"),
             "card": args.get("card"),
             "card_status": "blocked",
-            "read_at": 1789216932.8,
-            "observed_at": 1789216932.8,
-            "freshness": {{"read_at": 1789216932.8, "note": "bounded"}},
-            "boundary": {{"read_at": 1789216932.8, "clamped_at": 1789216932.8, "note": "n"}},
+            "read_at": NOW,
+            "observed_at": NOW,
+            "freshness": {{"read_at": NOW, "note": "bounded"}},
+            "boundary": {{"read_at": NOW, "clamped_at": NOW, "note": "n"}},
             "intervals": [{{"kind": "blocked", "start": 1.0, "end": 2.0, "duration_seconds": 1, "source_runs": [], "source_events": []}}],
             "returned": 1,
             "has_more": False,
@@ -144,16 +145,17 @@ def workflow():
     if tool == "kanban_readiness":
         check_model = bool(args.get("check_model"))
         checks = [{{"name": "board_permission", "state": "PASS", "reason": "board exists and may mutate"}}]
+        checks.extend([{{"name": name, "state": "PASS", "reason": "fixture verified"}} for name in ("profile_exists", "workspace_exists", "expected_revision", "python_interpreter", "required_modules", "context_files", "ram_available", "parents")])
         if check_model:
-            checks.append({{"name": "model", "state": "PASS", "reason": "model proof verified", "resolved_model": args.get("model"), "response_model": args.get("model"), "ready": True, "observed_at": 1789216932.8}})
+            checks.append({{"name": "model", "state": "PASS", "reason": "model proof verified", "resolved_model": args.get("model"), "response_model": args.get("model"), "ready": True, "observed_at": NOW}})
         else:
             checks.append({{"name": "model", "state": "UNKNOWN", "reason": "model proof skipped"}})
         ready = all(c.get("state") == "PASS" for c in checks)
         return {{
             "state": "PASS" if ready else "UNKNOWN",
             "requested": {{"board": args.get("board"), "profile": args.get("profile"), "provider": args.get("provider"), "model": args.get("model"), "workspace": args.get("workspace"), "expected_revision": args.get("expected_revision"), "parents": args.get("parents") or [], "check_model": check_model, "python": args.get("python")}},
-            "observed_at": 1789216932.8,
-            "freshness": {{"checked_at": 1789216932.8, "stale_after": 1789216932.8 + 300, "note": "n"}},
+            "observed_at": NOW,
+            "freshness": {{"checked_at": NOW, "stale_after": NOW + 300, "note": "n"}},
             "ready_to_release": ready,
             "checks": checks,
             "execution_host": "evo",
@@ -171,7 +173,7 @@ def workflow():
             "remaining_checks": list(args.get("remaining_checks") or []),
             "verification_note": args.get("verification_note") or "",
             "commission": {{"workspace": args.get("workspace"), "profile": args.get("profile"), "provider": args.get("provider"), "model": args.get("model"), "max_runtime_minutes": args.get("max_runtime_minutes"), "creator": args.get("creator"), "title": args.get("title")}},
-            "read_at": {{"original": 1789216932.8, "worker": 1789216932.9, "note": "n"}},
+            "read_at": {{"original": NOW, "worker": NOW, "note": "n"}},
             "mutation_authorized": True,
             "limitation": "optimistic concurrency check",
             "no_mutation_performed": True,
@@ -229,12 +231,12 @@ if behavior == "noshape":
     if tool in ("kanban_readiness", "kanban_continuation_draft", "kanban_continue", "kanban_hold"):
         emit({{"state": "PASS"}})
     else:
-        emit({{"state": "PASS", "data": {{}}, "observed_at": 1789216932.8, "execution_host": "evo"}})
+        emit({{"state": "PASS", "data": {{}}, "observed_at": NOW, "execution_host": "evo"}})
     sys.exit(0)
 
 if behavior == "wrongscope":
     if tool in ("kanban_attention", "kanban_changes", "kanban_timeline"):
-        r = {{"state": "PASS", "data": projection(), "observed_at": 1789216932.8, "execution_host": "evo"}}
+        r = {{"state": "PASS", "data": projection(), "observed_at": NOW, "execution_host": "evo"}}
         r["data"]["board"] = "a-different-board"
         if tool == "kanban_timeline":
             r["data"]["card"] = "t_ffffffff"
@@ -247,16 +249,16 @@ if behavior == "wrongscope":
 
 if behavior == "fail":
     if tool in ("kanban_attention", "kanban_changes", "kanban_timeline"):
-        emit({{"state": "FAIL", "reason": "Board database is absent or invalid", "observed_at": 1789216932.8, "execution_host": "evo"}})
+        emit({{"state": "FAIL", "reason": "Board database is absent or invalid", "observed_at": NOW, "execution_host": "evo"}})
         sys.exit(1)
     elif tool == "kanban_readiness":
         emit({{
             "state": "FAIL",
             "requested": {{"board": args.get("board"), "profile": args.get("profile"), "provider": args.get("provider"), "model": args.get("model"), "workspace": args.get("workspace"), "expected_revision": args.get("expected_revision"), "parents": args.get("parents") or [], "check_model": bool(args.get("check_model")), "python": args.get("python")}},
-            "observed_at": 1789216932.8,
-            "freshness": {{"checked_at": 1789216932.8, "stale_after": 1789216932.8 + 300, "note": "n"}},
+            "observed_at": NOW,
+            "freshness": {{"checked_at": NOW, "stale_after": NOW + 300, "note": "n"}},
             "ready_to_release": False,
-            "checks": [{{"name": "board_permission", "state": "FAIL", "reason": "read-only for the board"}}],
+            "checks": [{{"name": "board_permission", "state": "FAIL", "reason": "read-only for the board"}}] + [c for c in workflow()["checks"] if c["name"] != "board_permission"],
             "execution_host": "evo",
         }})
         sys.exit(1)
@@ -272,7 +274,7 @@ if behavior == "unknown":
 if tool in ("kanban_readiness", "kanban_continuation_draft", "kanban_continue", "kanban_hold"):
     emit(workflow())
 else:
-    emit({{"state": "PASS", "data": projection(), "observed_at": 1789216932.8, "execution_host": "evo"}})
+    emit({{"state": "PASS", "data": projection(), "observed_at": NOW, "execution_host": "evo"}})
 sys.exit(0)
 '''.format(behavior=behavior)
     exe = directory / "atlas-kanban-call"
@@ -826,3 +828,25 @@ def test_parent_refuses_contradictory_pass(client, helper_bin, aligned_evo, monk
     response = client.post("/api/plugins/kanban/workflow/" + route + "?board=default", json=payload)
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "UNKNOWN", response.json()
+
+
+@pytest.mark.parametrize("mutation", [
+    "obj['checks'] = [c for c in obj['checks'] if c['name'] != 'parents']",
+    "obj['freshness']['checked_at'] -= 3600; obj['freshness']['stale_after'] -= 3600",
+    "obj['freshness']['checked_at'] += 3600; obj['freshness']['stale_after'] += 3600",
+])
+def test_parent_rejects_incomplete_or_expired_ready(client, helper_bin, aligned_evo, monkeypatch, mutation):
+    monkeypatch.setenv("ATLAS_KANBAN_WRITE_BOARDS", "default")
+    exe = helper_bin("pass")
+    script = exe.read_text().replace("def emit(obj):", "def emit(obj):\n    " + mutation)
+    exe.write_text(script)
+    response = client.post("/api/plugins/kanban/workflow/readiness?board=default", json={"card": aligned_evo, "check_model": True})
+    assert response.status_code == 200
+    assert response.json()["state"] == "UNKNOWN", response.json()
+
+
+def test_parent_readiness_uses_hermes_supported_worker_python(client, helper_bin, aligned_evo):
+    helper_bin("pass")
+    response = client.post("/api/plugins/kanban/workflow/readiness?board=default", json={"card": aligned_evo, "check_model": True})
+    assert response.json()["state"] == "PASS"
+    assert _invocations(helper_bin.record_path)[0]["stdin"]["minimum_python"] == "3.11"
