@@ -129,6 +129,15 @@ def attach_run_harvest(
             return
         workspace_path = row["workspace_path"]
         if not workspace_path or not str(workspace_path).strip():
+            # No workspace at all (scratch never resolved, spawn failed
+            # early): still stamp the key so every closed run carries a
+            # harvest record, visibly empty rather than absent.
+            _merge_harvest_into_run_metadata(
+                conn, run_id,
+                {"workspace": "none", "commits": [], "diffstat": {},
+                 "dirty": 0, "head_sha": None, "branch": None, "test_counts": {}},
+                {},
+            )
             return
         base_sha = _attempt_base_head(conn, task_id, run_id, stamped=attempt_base)
         log_path = _kb.worker_log_path(task_id, board=board)
