@@ -200,3 +200,115 @@ def test_rejudge_idempotent_retry_after_done(hermes_home, monkeypatch, capsys):
     assert second_code == 0
     assert "already" in out.lower()
     judge.assert_not_called()
+
+
+# ── gates × dry-run + persisted transitions: CLI controls ────────────
+
+
+def _raw_goal_row(sid: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        return db.get_meta(f"goal:{sid}")
+    finally:
+        db.close()
+
+
+def test_cli_dry_run_with_gate_executes_nothing_and_writes_nothing(
+    hermes_home, tmp_path, monkeypatch, capsys
+):
+    """Permanent CLI control (parent-mandated): ``--dry-run`` on a gated
+    goal must not execute the gate command (marker stays absent), must
+    leave the stored row byte-identical across repeated invocations, and
+    must report gates_pending — an honest preview, not a certified done."""
+    from hermes_cli.goals import GoalManager, load_goal
+
+    sid = _rand_sid("clidrygate")
+    marker = tmp_path / "cli-gate-ran"
+    _seed(sid, status="active", evidence="I think the deploy finished.")
+    GoalManager(session_id=sid).add_gate(
+        f"touch {marker} && exit 7", max_retries=3
+    )
+    before = _raw_goal_row(sid)
+
+    for _ in range(4):
+        with _judge_patch(DONE_REPLY) as judge:
+            code, out = _run_cli(monkeypatch, capsys, ["rejudge", sid, "--dry-run"])
+        assert code == 0
+        assert "gates_pending" in out
+        assert "not evaluated" in out.lower() or "not run" in out.lower()
+        judge.assert_called_once()  # the judge ran on evidence; gates did not
+        assert _raw_goal_row(sid) == before
+
+    assert not marker.exists(), "CLI dry-run must not execute gate commands"
+    reloaded = load_goal(sid)
+    assert reloaded is not None
+    assert reloaded.status == "active", "CLI dry-runs must never pause the goal"
+    assert reloaded.gates[0].attempts == 0
+
+
+def test_cli_gate_exhaustion_pause_is_visible_and_persisted(
+    hermes_home, monkeypatch, capsys
+):
+    """CLI control: exhausting gate retries on a real run pauses the goal
+    (persisted in state.db) and the operator SEES the pause."""
+    from hermes_cli.goals import GoalManager, load_goal
+
+    sid = _rand_sid("clipause")
+    _seed(sid, status="active", evidence="Believe it's done; suite still red.")
+    GoalManager(session_id=sid).add_gate("exit 7", max_retries=1)
+
+    with _judge_patch(DONE_REPLY) as judge, patch(
+        "hermes_cli.goals.workspace_fingerprint", return_value=""
+    ):
+        code, _ = _run_cli(monkeypatch, capsys, ["rejudge", sid])
+        code2, out2 = _run_cli(monkeypatch, capsys, ["rejudge", sid])
+
+    assert code == 1 and code2 == 1
+    judge.assert_not_called()
+    reloaded = load_goal(sid)
+    assert reloaded is not None
+    assert reloaded.status == "paused"
+    assert reloaded.paused_reason
+    # The operator is told the goal was paused — not a silent no-op.
+    assert "paused" in out2.lower()
+
+
+def test_cli_stale_evidence_refusal_is_visible(
+    hermes_home, monkeypatch, capsys
+):
+    """CLI control: evidence predating the goal is refused visibly with
+    exit 1 and the judge is never called."""
+    from hermes_state import SessionDB
+
+    from hermes_cli.goals import GoalState, save_goal
+
+    sid = _rand_sid("clistale")
+    old_ts = 1_700_000_000.0
+    db = SessionDB()
+    try:
+        db.create_session(session_id=sid, source="cli")
+        db.append_message(
+            sid, role="assistant", content="Old goal's final report.",
+            timestamp=old_ts,
+        )
+    finally:
+        db.close()
+    save_goal(
+        sid,
+        GoalState(
+            goal="Brand new goal",
+            status="paused",
+            turns_used=6,
+            max_turns=20,
+            created_at=old_ts + 3_600.0,
+        ),
+    )
+
+    with _judge_patch(DONE_REPLY) as judge:
+        code, out = _run_cli(monkeypatch, capsys, ["rejudge", sid])
+
+    assert code == 1
+    assert "stale" in out.lower()
+    judge.assert_not_called()

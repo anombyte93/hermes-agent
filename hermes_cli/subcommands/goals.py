@@ -49,7 +49,11 @@ def build_goals_parser(subparsers, *, cmd_goals: Optional[Callable]) -> None:
     rejudge.add_argument(
         "--dry-run",
         action="store_true",
-        help="Judge and report, but don't write the done transition",
+        help=(
+            "Judge the stored evidence and report, but run nothing and "
+            "write nothing: no done transition, and quality gates are "
+            "deferred entirely (not executed)"
+        ),
     )
     rejudge.set_defaults(goals_command="rejudge")
 
@@ -99,22 +103,37 @@ def cmd_goals(args) -> int:
         else:
             print(f"  ✓ Goal achieved: {result['reason']}")
             print("  Goal transitioned to done.")
+    elif outcome == "gates_pending":
+        print(f"  ◑ Preview (outcome=gates_pending) — judge says done: {result['reason']}")
+        print(
+            "  Quality gates were NOT evaluated under --dry-run: no gate\n"
+            "  command was run and nothing was written. Re-run without\n"
+            "  --dry-run to execute the gates and transition."
+        )
     elif outcome == "already_done":
         print(f"  ✓ {result['reason']}")
     elif outcome == "incomplete":
         print(f"  ✗ Incomplete — judge verdict: {result.get('verdict')}")
         print(f"    {result['reason']}")
+        if result.get("changed") and result.get("status_after") == "paused":
+            print(
+                "    ⏸ Goal paused — the failing quality gate exhausted its\n"
+                "    retries. Fix it or /goal gate remove it, then /goal resume."
+            )
     elif outcome == "unreachable":
         print(f"  ✗ Judge unreachable — {result['reason']}")
         print("    Fix the goal_judge provider/key, then re-run this command.")
     elif outcome == "unparseable":
         print(f"  ✗ Judge reply unusable — {result['reason']}")
         print("    Route the judge to a stricter model (auxiliary.goal_judge.model).")
-    elif outcome in ("no_session", "no_goal"):
-        print(f"  ✗ {result['reason']}")
-    elif outcome == "cleared":
-        print(f"  ✗ {result['reason']}")
-    elif outcome == "no_evidence":
+    elif outcome in (
+        "no_session",
+        "no_goal",
+        "cleared",
+        "no_evidence",
+        "stale_evidence",
+        "goal_changed",
+    ):
         print(f"  ✗ {result['reason']}")
 
     return int(result.get("exit_code", 0))
