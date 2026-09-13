@@ -12,6 +12,7 @@ partial harvest; the functions never raise for a bad workspace.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -83,22 +84,29 @@ _FILES_ROW_LEFT = re.compile(r"Files\s+$")
 # Trailing statuses that disqualify (pytest's own mixed line is handled by its
 # structured rule; this guards narration).
 _DISQUALIFY_RIGHT = re.compile(r"^\s*,?\s*\d+\s+(?:failed|error)", re.I)
+# Any "N ... failed" AFTER the matched count: a passing-run summary never
+# carries a later failure clause ("256 passed, 66 unrelated tests failed" is
+# narration about a partial run, not a green summary).
+_FAILURE_TAIL = re.compile(r"\b\d+\s+(?:\w+\s+){0,3}(?:failed|errors?)\b", re.I)
 
 _UNIT_WORDS = re.compile(r"\b(unit|units)\b", re.I)
-_E2E_WORDS = re.compile(r"\b(e2e|e2e:|chromium|playwright|isolated|native-weekly|native_weekly|lane|acceptance)\b", re.I)
+_E2E_WORDS = re.compile(r"\b(e2e|chromium|playwright|isolated|lane|acceptance)\b", re.I)
 _NATIVE_WORDS = re.compile(r"\b(native(?:-weekly|_weekly)?|signing)\b", re.I)
 
 
 def _classify_bucket(line: str, rule_bucket: str) -> str:
-    """Refine a rule's bucket with the line's own vocabulary."""
+    """Refine a rule's bucket with the line's own vocabulary.
+
+    Runner-identity buckets (``pytest``/``vitest``/``jest``) are kept unless
+    the line's own words clearly say otherwise — the runner name is the more
+    precise fact than a generic ``unit`` guess.
+    """
     if rule_bucket in ("pytest", "vitest", "jest"):
-        if _UNIT_WORDS.search(line):
-            return "unit"
         if _E2E_WORDS.search(line):
             return "e2e"
         if _NATIVE_WORDS.search(line):
             return "native"
-        return "unit" if rule_bucket in ("vitest", "jest") else rule_bucket
+        return rule_bucket
     if rule_bucket == "playwright":
         if _NATIVE_WORDS.search(line):
             return "native"
@@ -128,20 +136,25 @@ def parse_test_counts(text: str) -> dict[str, int]:
         if "passed" not in line:
             continue
         for rule_bucket, pattern in _TEST_SUMMARY_RULES:
+            matched_line = False
             for m in pattern.finditer(line):
                 if m.start() > 0 and _NON_SUMMARY_LEFT.search(line[: m.start()][-14:]):
                     continue
+                if _FILES_ROW_LEFT.search(line[max(0, m.start() - 14):m.start()]):
+                    continue
                 tail = line[m.end():]
-                if _DISQUALIFY_RIGHT.match(tail):
+                if _DISQUALIFY_RIGHT.match(tail) or _FAILURE_TAIL.search(tail):
                     continue
                 # e2e fraction: passed numerator must equal denominator (a
                 # "2/5 passed" partial run is not a green summary).
                 groups = m.groups()
                 if rule_bucket == "e2e" and groups and groups[0] != groups[1]:
                     continue
-                # pytest rule group(1) is the full status list; count "passed".
+                # pytest rule group(1) is the full status list; total = every
+                # status count summed (a "12 passed, 1 failed" line reports
+                # 13 tests, not 12 green ones).
                 if rule_bucket == "pytest":
-                    count = _passed_from_status_list(groups[0] or "")
+                    count = _total_from_status_list(groups[0] or "")
                     if count is None:
                         continue
                 else:
@@ -152,27 +165,49 @@ def parse_test_counts(text: str) -> dict[str, int]:
                 prev = buckets.get(bucket)
                 if prev is None or count > prev[0]:
                     buckets[bucket] = (count, line_no)
+                matched_line = True
+            if matched_line:
+                # First matching rule wins for the WHOLE line: a pytest
+                # summary must not also feed the generic rule.
+                break
     return {bucket: count for bucket, (count, _line_no) in sorted(buckets.items())}
 
 
-def _passed_from_status_list(status_list: str) -> "int | None":
-    """``passed`` count from pytest's ``N passed, M failed, ...`` fragment."""
-    m = re.search(r"(\d+)\s+passed", status_list)
-    return int(m.group(1)) if m else None
+def _total_from_status_list(status_list: str) -> "int | None":
+    """Test total from pytest's status fragment: ``passed + failed + errors``
+    (skips/deselected/xfailed are not run outcomes; a "12 passed, 1 failed,
+    2 skipped" line reports 13 run tests)."""
+    total = 0
+    seen = False
+    for m in re.finditer(r"(\d+)\s+(passed|failed|errors?)", status_list):
+        total += int(m.group(1))
+        seen = True
+    return total if seen else None
 
 
 # --- self-report comparison ---------------------------------------------------
 
 def _digits_in(text: str) -> "int | None":
-    m = re.search(r"\d+", str(text))
-    return int(m.group(0)) if m else None
+    """Best passed-count from free text: prefer the number beside the word
+    ``passed``; else the LAST integer after dropping failure-count fragments
+    (``executed 320, passed 320, failed 0`` -> 320; ``53 files, 483 tests``
+    -> 483). Never the first, which is usually a file or attempt number."""
+    text = str(text)
+    beside = re.findall(r"(\d+)(?=\s*(?:tests?\s+)?passed)", text, re.I)
+    if beside:
+        return int(beside[-1])
+    cleaned = re.sub(r"\b(?:failed|errors?)\s*:?\s*\d+", " ", text, flags=re.I)
+    cleaned = re.sub(r"\b\d+\s*(?:failed|errors?)\b", " ", cleaned, flags=re.I)
+    numbers = re.findall(r"\d+", cleaned)
+    return int(numbers[-1]) if numbers else None
 
 
 def _self_report_counts(self_report: "dict | None") -> "dict[str, int] | None":
     """Normalize a worker's ``tests_run`` metadata into ``{bucket: passed}``.
 
     Accepts the shapes actually seen on boards: ``{"unit": 483}``,
-    ``{"unit": "53 files, 483 tests passed"}``, or a bare ``483``.
+    ``{"unit": "53 files, 483 tests passed"}``, nested per-bucket dicts
+    (``{"e2e": {"passed": 320, "failed": 0}}``), or a bare ``483``.
     """
     if not self_report:
         return None
@@ -183,7 +218,24 @@ def _self_report_counts(self_report: "dict | None") -> "dict[str, int] | None":
                 continue
             if key in ("typecheck", "build", "typecheck_status", "build_status"):
                 continue  # status strings, not counts
-            n = _digits_in(value) if not isinstance(value, bool) else None
+            if isinstance(value, bool):
+                continue
+            n: "int | None"
+            if isinstance(value, dict):
+                # Nested runner report: prefer an explicit passed/total field.
+                n = None
+                for field in ("passed", "total", "numPassedTests"):
+                    if isinstance(value.get(field), int):
+                        n = int(value[field])
+                        break
+                if n is None:
+                    n = _digits_in(json.dumps(value))
+            elif isinstance(value, int):
+                n = int(value)
+            elif isinstance(value, str):
+                n = _digits_in(value)
+            else:
+                n = None
             if n is not None:
                 counts[key.lower()] = n
     else:
@@ -202,7 +254,16 @@ def compare_harvest_to_self_report(
     one (equality, not reachability: a worker listing the same sha it stands
     on). ``tests_run`` compares per-bucket passed counts extracted from the
     worker's own ``tests_run`` metadata against the harvested log counts.
+
+    Verdicts per field: ``match`` / ``mismatch`` when both sides have the
+    fact; ``worker_silent`` when the worker gave no self-report at all (the
+    Lane A shape — died before reporting, harvest is the only evidence), or
+    for ``head_sha`` when the report omits it (a required handoff fact whose
+    absence is itself notable). ``tests_run`` is optional, so a report that
+    never mentions tests simply omits the field.
     """
+    if not self_report:
+        return {"head_sha": "worker_silent", "tests_run": "worker_silent"}
     agreement: dict[str, str] = {}
     for field in ("head_sha", "tests_run"):
         harvested = harvest.get("head_sha") if field == "head_sha" else harvest.get("test_counts")
@@ -210,10 +271,15 @@ def compare_harvest_to_self_report(
         if field == "tests_run":
             reported = _self_report_counts(reported)
             harvested = harvested or None
+            if reported in (None, {}, ""):
+                continue  # optional field the worker never mentioned
         if reported in (None, {}, ""):
             agreement[field] = "worker_silent"
         elif harvested in (None, {}, ""):
-            agreement[field] = "worker_silent"
+            agreement[field] = (
+                "worker_silent" if field == "tests_run"
+                else "mismatch"  # git is ground truth; the claimed head is wrong
+            )
         elif field == "head_sha":
             agreement[field] = "match" if str(reported).strip() == str(harvested).strip() else "mismatch"
         else:
@@ -222,9 +288,16 @@ def compare_harvest_to_self_report(
 
 
 def _counts_agree(reported: dict, harvested: dict) -> bool:
-    """True when every reported bucket count appears in the harvest counts."""
-    harvested_counts = set(harvested.values())
-    return all(count in harvested_counts for count in reported.values())
+    """True when every reported bucket count is confirmed by the harvest.
+
+    Subset semantics: the log's LAST-occurrence extraction may see MORE
+    buckets than a worker listed (the worker reports what it ran; the log
+    carries every runner it invoked), so only fields the worker actually
+    claimed are checked. A claimed count that appears nowhere in the harvest
+    is a mismatch.
+    """
+    harvested_counts = {int(v) for v in harvested.values()}
+    return all(int(count) in harvested_counts for count in reported.values())
 
 
 def mismatch_fields(agreement: dict) -> list[str]:
@@ -295,16 +368,24 @@ def harvest_workspace(
             out["commits"] = commits
             numstat = _git(ws, "diff", "--numstat", range_arg)
             if numstat is not None and numstat.returncode == 0:
-                files = insertions = deletions = 0
+                # Aggregate PER PATH across the range: a file touched by 3
+                # commits counts once in "files changed" (git's own
+                # --shortstat semantics) even though numstat lists it 3 times.
+                per_path: dict[str, tuple[int, int]] = {}
                 for line in (numstat.stdout or "").splitlines():
                     parts = line.split("\t")
                     if len(parts) < 3:
                         continue
-                    add, delete = parts[0], parts[1]
-                    files += 1
-                    insertions += 0 if add == "-" else int(add)
-                    deletions += 0 if delete == "-" else int(delete)
-                out["diffstat"] = {"files": files, "insertions": insertions, "deletions": deletions}
+                    add, delete, path = parts[0], parts[1], parts[-1]
+                    ins = 0 if add == "-" else int(add)
+                    dels = 0 if delete == "-" else int(delete)
+                    prev_ins, prev_dels = per_path.get(path, (0, 0))
+                    per_path[path] = (prev_ins + ins, prev_dels + dels)
+                out["diffstat"] = {
+                    "files": len(per_path),
+                    "insertions": sum(v[0] for v in per_path.values()),
+                    "deletions": sum(v[1] for v in per_path.values()),
+                }
         status = _git(ws, "status", "--porcelain")
         if status is not None and status.returncode == 0:
             out["dirty"] = sum(1 for line in (status.stdout or "").splitlines() if line.strip())

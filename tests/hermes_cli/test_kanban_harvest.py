@@ -111,6 +111,11 @@ def repo(tmp_path: Path) -> Path:
     (r / "lane.txt").write_text("one\ntwo\n")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "feat: second lane commit")
+    # A second lane file so the range diffstat genuinely spans 2 files
+    # (numstat lists lane.txt once for the whole range, not once per commit).
+    (r / "other.txt").write_text("a\nb\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "feat: third lane commit")
     (r / "dirty.txt").write_text("uncommitted\n")
     (r / "untracked.txt").write_text("never added\n")
     (r / ".git").joinpath("base_marker").write_text(base_sha + "\n")
@@ -128,12 +133,13 @@ def test_harvest_workspace_full_git(repo: Path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert [c["subject"] for c in h["commits"]] == [
-        "feat: second lane commit", "feat: first lane commit",
+        "feat: third lane commit", "feat: second lane commit", "feat: first lane commit",
     ]
     assert all(len(c["sha"]) == 40 for c in h["commits"])
-    # Two commits, each adding lane.txt: 2 files changed, +3 lines.
+    # Range diffstat: lane.txt (+2 across two commits) and other.txt (+2),
+    # aggregated per path = 2 files, +4 lines.
     assert h["diffstat"]["files"] == 2
-    assert h["diffstat"]["insertions"] == 3
+    assert h["diffstat"]["insertions"] == 4
     assert h["diffstat"]["deletions"] == 0
     # dirty.txt modified + untracked.txt untracked.
     assert h["dirty"] == 2
