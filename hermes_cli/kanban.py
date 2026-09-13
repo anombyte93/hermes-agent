@@ -494,6 +494,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Completion-contract verdict from the newest completed run's stamp.
+        completed_runs = [r for r in runs if r.outcome == "completed"]
+        completed_runs.sort(key=lambda r: r.started_at, reverse=True)
+        evidence = kb.completion_evidence_status(
+            completed_runs[0].metadata if completed_runs else None)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
@@ -553,6 +558,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("started", _fmt_ts(task.started_at))
     if task.completed_at:
         field("completed", _fmt_ts(task.completed_at))
+    # Completion-contract verdict from the closing run's stamp — one line so a
+    # human can tell a verified handoff from a warned or unverifiable one.
+    if evidence:
+        field("evidence", evidence)
     if parents:
         field("parents", ", ".join(parents))
     if children:
@@ -927,8 +936,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            try:
+                return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                        expected_run_id=_worker_run_id_for(tid))
+            except kb.CompletionContractError as refused:
+                # strict completion contract: the task stays running; the message
+                # lists every problem and tells the worker what to fix.
+                fail_msg[tid] = f"kanban: {refused}"
+                return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 

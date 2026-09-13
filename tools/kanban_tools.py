@@ -608,6 +608,14 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except kb.CompletionContractError as contract_err:
+            # kanban.completion_contract: strict — the handoff's verifiable
+            # claims failed validation. Task NOT mutated (gate runs before the
+            # write txn): fix the metadata and retry the same completion.
+            return tool_error(
+                f"kanban_complete {contract_err} Your task is still in-flight (no state "
+                f"change) — fix the metadata (real head_sha/commits/changed_files/"
+                f"tests_run counts) and retry kanban_complete.")
         task = kb.get_task(conn, tid)
         _check(ok, (task.last_failure_error if task else None) or
                f"could not complete {tid} (unknown id, stale run, or already terminal)")

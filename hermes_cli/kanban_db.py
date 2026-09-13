@@ -2780,15 +2780,19 @@ def _problem_dict(problem) -> dict:
 def _stamp_completion_contract(metadata: Optional[dict], problems: list) -> dict:
     """Attach the evidence stamp + warning list the board renders later.
 
-    ``verified`` when no warning-severity problems; otherwise every warning is
-    kept verbatim so ``kanban show`` and the next worker see the exact claims
-    that could not be verified.
+    ``warnings`` when any warning-severity problem exists (every warning kept
+    verbatim so ``kanban show`` and the next worker see the exact claims that
+    could not be verified); ``verified`` when the git checks ran and found
+    nothing; ``unverified`` when the workspace was non-git so there was nothing
+    to check against (recorded, not silently ``verified``).
     """
     md = dict(metadata) if isinstance(metadata, dict) else {}
     warning_dicts = [_problem_dict(p) for p in problems if getattr(p, "severity", "") == "warning"]
     if warning_dicts:
         md["completion_evidence"] = "warnings"
         md["completion_warnings"] = warning_dicts
+    elif any(getattr(p, "code", "") == "non_git_workspace" for p in problems):
+        md["completion_evidence"] = "unverified"
     else:
         md["completion_evidence"] = "verified"
     return md

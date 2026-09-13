@@ -130,7 +130,8 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        # Scratch workspace (no git): contract runs but stamps unverified, nothing else added.
+        assert run.metadata == {"files": 2, "completion_evidence": "unverified"}
     finally:
         conn.close()
 
@@ -162,6 +163,65 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
         assert kb.get_task(conn, worker_env).status == "done"
     finally:
         conn.close()
+
+
+def _tool_git_repo(tmp_path, name: str) -> tuple[str, str]:
+    """One-commit git repo under tmp_path; returns (repo_path, head_sha)."""
+    import subprocess as _sp
+
+    repo = tmp_path / name
+    repo.mkdir(parents=True, exist_ok=True)
+    _sp.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    _sp.run(["git", "-C", str(repo), "config", "user.email", "w@example.com"], check=True, capture_output=True)
+    _sp.run(["git", "-C", str(repo), "config", "user.name", "W"], check=True, capture_output=True)
+    (repo / "README.md").write_text("hi\n", encoding="utf-8")
+    _sp.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    _sp.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+    head = _sp.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                   check=True, capture_output=True, text=True).stdout.strip()
+    return str(repo), head
+
+
+def test_complete_strict_refusal_is_tool_error(worker_env, tmp_path, monkeypatch):
+    """kanban_complete under kanban.completion_contract: strict — a forged
+    head_sha is refused as a tool_error that names every problem and says the
+    task stays in-flight (same contract as the ArtifactPreservationError gate)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace
+    from tools import kanban_tools as kt
+
+    repo, head = _tool_git_repo(tmp_path, "strict-repo")
+    monkeypatch.setattr(kb, "_kanban_config", lambda: {"completion_contract": "strict"})
+    with kbc.connect_closing() as conn:
+        kanban_db_workspace.set_workspace_path(conn, worker_env, repo)
+    d = json.loads(kt._handle_complete({
+        "summary": "done", "metadata": {"head_sha": "f" * 40}}))
+    assert d.get("error")
+    assert "completion refused" in d["error"]
+    assert "still in-flight" in d["error"]
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_complete_warn_accepts_and_records_evidence(worker_env, tmp_path, monkeypatch):
+    """Default warn through the real tool path: a truthful git handoff completes
+    and stamps completion_evidence=verified on the run."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace
+    from tools import kanban_tools as kt
+
+    repo, head = _tool_git_repo(tmp_path, "warn-repo")
+    monkeypatch.setattr(kb, "_kanban_config", lambda: {"completion_contract": "warn"})
+    with kbc.connect_closing() as conn:
+        kanban_db_workspace.set_workspace_path(conn, worker_env, repo)
+    d = json.loads(kt._handle_complete({
+        "summary": "done", "metadata": {"head_sha": head, "changed_files": ["README.md"]}}))
+    assert d.get("ok") is True
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, worker_env).status == "done"
+        assert kb.latest_run(conn, worker_env).metadata["completion_evidence"] == "verified"
 
 
 def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
@@ -617,7 +677,8 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert run.metadata == {"child_task": child_out["task_id"],
+                                "completion_evidence": "unverified"}  # scratch workspace
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])

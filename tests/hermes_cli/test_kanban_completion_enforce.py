@@ -82,7 +82,8 @@ def _comments(tid):
 def _run_metadata(tid):
     conn = kbc.connect()
     try:
-        return kb.latest_run(conn, tid).metadata
+        run = kb.latest_run(conn, tid)
+        return dict(run.metadata) if run and run.metadata else {}
     finally:
         conn.close()
 
@@ -226,3 +227,70 @@ def test_config_level_resolution(kanban_home, tmp_path, monkeypatch):
                           metadata={"head_sha": "f" * 40})
     assert ok is True  # default warn: accepted with warnings
     assert _run_metadata(tid).get("completion_evidence") == "warnings"
+
+
+# ---------------------------------------------------------------------------
+# kanban_show renders `evidence:` from the stored stamp
+# ---------------------------------------------------------------------------
+
+
+def test_show_renders_evidence_line(kanban_home, tmp_path, monkeypatch, capsys):
+    """`hermes kanban show` (and worker context) surface the one-line evidence
+    verdict so a human can tell a verified handoff from a warned one."""
+    from hermes_cli import kanban as kc
+
+    monkeypatch.setattr(kb, "_kanban_config", lambda: {"completion_contract": "warn"})
+    tid, head, repo = _git_task(kanban_home, tmp_path, monkeypatch, "show verified")
+    ok = kb.complete_task(conn=kbc.connect(), task_id=tid, summary="done", metadata={
+        "head_sha": head, "changed_files": ["README.md"], "tests_run": {"unit": "pytest — 3 passed"},
+    })
+    assert ok is True
+    out = kc.run_slash(f"show {tid}")
+    assert "evidence:  verified" in out
+
+    tid2, _, _ = _git_task(kanban_home, tmp_path, monkeypatch, "show warned")
+    ok = kb.complete_task(conn=kbc.connect(), task_id=tid2, summary="done",
+                          metadata={"head_sha": "f" * 40})
+    assert ok is True
+    out = kc.run_slash(f"show {tid2}")
+    assert "evidence:  warnings(1)" in out
+
+    # Pre-contract completion (no stamp) shows nothing — renderers fall back cleanly.
+    tid3, _, _ = _git_task(kanban_home, tmp_path, monkeypatch, "show legacy")
+    conn = kbc.connect()
+    try:
+        kb.complete_task(conn, tid3, summary="legacy done", metadata=None)
+        # Simulate a pre-contract run: strip the stamp the completer just added.
+        run = kb.latest_run(conn, tid3)
+        md = dict(run.metadata or {})
+        md.pop("completion_evidence", None)
+        md.pop("completion_warnings", None)
+        assert kb.edit_completed_task_result(
+            conn, tid3, result="legacy done", summary="legacy done", metadata=md)
+    finally:
+        conn.close()
+    kc.run_slash(f"show {tid3}")
+    out = capsys.readouterr().out
+    assert "evidence:" not in out
+
+
+# ---------------------------------------------------------------------------
+# CLI + tool surfaces under strict: refusal reaches the caller, task stays running
+# ---------------------------------------------------------------------------
+
+
+def test_cli_complete_strict_refusal_is_actionable(kanban_home, tmp_path, monkeypatch):
+    """`hermes kanban complete` under strict: the refusal (problem list + retry
+    hint) reaches the caller, and the task stays running so the worker can fix
+    its metadata and retry."""
+    import json as _json
+
+    from hermes_cli import kanban as kc
+
+    tid, head, repo = _git_task(kanban_home, tmp_path, monkeypatch, "cli strict", "strict")
+    md = _json.dumps({"head_sha": "f" * 40})
+    out = kc.run_slash(f"complete {tid} --summary done --metadata {md!r}")
+    assert "completion refused" in out
+    assert "fix the metadata" in out
+    assert "f" * 40 in out
+    assert _status(tid) == "running"
