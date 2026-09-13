@@ -23,14 +23,17 @@ import { useEffect, useRef, useState } from 'react'
 
 import {
   $boardSlug,
+  attachmentProvenanceKey,
   BOARDS_KEY,
   evidencePageKey,
   fetchAttachmentDownload,
+  fetchAttachmentProvenance,
   fetchBoards,
   fetchEvidencePage
 } from './api'
 import type { EvidenceEnvelope } from './types'
 import { Callout, errText, Section, useKanban } from './ui'
+import type { AttachmentProvenanceData } from './workflow-api'
 
 type EvidenceResource = 'runs' | 'events' | 'attachments'
 
@@ -193,7 +196,38 @@ function EventRow({ item }: { item: Record<string, unknown> }) {
   )
 }
 
-function AttachmentRow({ slug, item }: { slug: string; item: Record<string, unknown> }) {
+/** R8 — reverse-link an attachment to its accepted run (or explicit unknown).
+ *  One bounded /evidence/attachment-provenance read per row; an attachment
+ *  existing beside a done card is never presented as acceptance. */
+function AttachmentProvenanceLine({ card, id, slug }: { card: string; id: number | string; slug: string }) {
+  const { data: envelope } = useQuery({
+    queryKey: attachmentProvenanceKey(slug, card, id),
+    queryFn: () => fetchAttachmentProvenance(slug, card, id),
+    enabled: !!slug && !!card,
+    retry: false
+  })
+
+  const provenance = envelope as EvidenceEnvelope<AttachmentProvenanceData> | undefined
+  const data = provenance?.state === 'PASS' ? provenance.evidence : null
+  const acceptedRunId = data?.accepted_run_id
+  const accepted = data?.acceptance_state === 'PASS' && acceptedRunId != null
+
+  return (
+    <span className="text-[0.625rem] text-(--ui-text-quaternary)">
+      card <span className="font-mono">{card.replace(/^t_/, '').slice(0, 6)}</span>
+      {' · '}
+      {accepted ? (
+        <span className="text-(--ui-text-tertiary)">accepted run {acceptedRunId}</span>
+      ) : provenance?.state === 'PASS' ? (
+        <span className="text-amber-500">acceptance unknown</span>
+      ) : (
+        <span className="text-amber-500">acceptance unknown</span>
+      )}
+    </span>
+  )
+}
+
+function AttachmentRow({ card, slug, item }: { card: string; slug: string; item: Record<string, unknown> }) {
   const id = item.id as number | string
   const filename = String(item.filename ?? 'attachment')
   const size = typeof item.size === 'number' ? item.size : null
@@ -231,6 +265,7 @@ function AttachmentRow({ slug, item }: { slug: string; item: Record<string, unkn
           Download
         </Button>
       </div>
+      <AttachmentProvenanceLine card={card} id={id} slug={slug} />
       {error && (
         <p className="text-[0.6875rem] text-destructive">
           {error} — the attachment may have been removed. Re-upload to restore it.
@@ -301,7 +336,7 @@ function EvidenceSection({ card, resource, slug }: { card: string; resource: Evi
           ) : resource === 'events' ? (
             <EventRow item={item} key={String(item.id ?? index)} />
           ) : (
-            <AttachmentRow item={item} key={String(item.id ?? index)} slug={slug} />
+            <AttachmentRow card={card} item={item} key={String(item.id ?? index)} slug={slug} />
           )
         )}
       </ul>
@@ -390,7 +425,7 @@ function EvidenceAttachmentsSection({
         <>
           <ul className="flex flex-col gap-1">
             {rows.map((item, index) => (
-              <AttachmentRow item={item} key={String(item.id ?? index)} slug={slug} />
+              <AttachmentRow card={card} item={item} key={String(item.id ?? index)} slug={slug} />
             ))}
           </ul>
           {typeof pageData?.omitted === 'number' && pageData.omitted > 0 && (
