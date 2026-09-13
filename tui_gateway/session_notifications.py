@@ -117,7 +117,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+# signaled/protocol_violation/output_limit_reached mirror the gateway notifier's precise-exit kinds.
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked")
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0  # /loop and /heartbeat share one idle-poll cadence
 
 
@@ -268,6 +269,19 @@ _KANBAN_EVENT_FORMATTERS = {
     "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
                 + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
+    "signaled": (
+        "✖",
+        lambda t, p, title: f" worker killed by signal {p.get('exit_code') or '?'}; dispatcher will retry",
+    ),
+    "protocol_violation": (
+        "✖",
+        lambda t, p, title: " worker exited without reporting (rc=0, no kanban_complete); dispatcher will retry",
+    ),
+    "output_limit_reached": (
+        "✂",
+        lambda t, p, title: " worker hit the output length limit after doing work; "
+        "retry asked to commit and complete",
+    ),
     "timed_out": ("⏱", _kb_timed_out),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
 }

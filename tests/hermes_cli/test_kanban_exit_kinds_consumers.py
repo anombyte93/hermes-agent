@@ -149,7 +149,9 @@ def _diag_task(**overrides):
         "title": "sigbus diag",
         "assignee": "worker",
         "status": "ready",
-        "consecutive_failures": 2,
+        # 1 keeps the unified repeated_failures rule (threshold 2) out of the
+        # way so the crash-specific early heads-up is the rule under test.
+        "consecutive_failures": 1,
         "last_failure_error": "pid 999 killed by signal 7",
     }
     base.update(overrides)

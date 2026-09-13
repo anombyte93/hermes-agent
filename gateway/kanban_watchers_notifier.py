@@ -31,10 +31,14 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+# The precise-exit kinds (signaled / protocol_violation /
+# output_limit_reached) join the claim set so a dead worker's real cause
+# reaches the creator; only ``signaled`` wakes (the other two are
+# failure-free or self-correcting requeues, not decisions for the creator).
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "signaled", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -352,6 +356,19 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
         f"✖ {n.head} gave up after repeated spawn failures{_clip(ev, 'error', _NL, 200)}", None, None,
     ),
     "crashed": lambda ev, n: (f"✖ {n.head} worker crashed (pid gone); dispatcher will retry", None, None),
+    "signaled": lambda ev, n: (
+        f"✖ {n.head} worker killed by signal {_payload(ev, 'exit_code') or '?'} — dispatcher will retry",
+        None, None,
+    ),
+    "protocol_violation": lambda ev, n: (
+        f"✖ {n.head} worker exited without reporting (rc=0, no kanban_complete); dispatcher will retry",
+        None, None,
+    ),
+    "output_limit_reached": lambda ev, n: (
+        f"✂ {n.head} worker hit the output length limit after doing work — "
+        "finished work could not be reported; retry asked to commit and complete",
+        None, None,
+    ),
     "timed_out": lambda ev, n: (
         f"⏱ {n.head} timed out (max_runtime={int(_payload(ev, 'limit_seconds') or 0)}s); will retry", None, None,
     ),

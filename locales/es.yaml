@@ -175,6 +175,7 @@ gateway:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"
       crashed:             "crashed (worker exited); dispatcher will retry"
+      signaled:            "muerto por una señal (el worker terminó); el dispatcher reintentará"
       timed_out:           "timed out; dispatcher will retry"
       blocked:             "blocked; needs attention"
       review_requested:    "handed off for review; the implementation is done"

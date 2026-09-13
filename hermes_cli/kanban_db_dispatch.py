@@ -138,9 +138,14 @@ class DispatchResult:
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
-    """Task ids whose workers bailed on a provider rate-limit / quota wall
+    """``Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    output_limit: list[str] = field(default_factory=list)
+    """Task ids whose workers hit the output length limit after doing work
+    (end-of-session truncation banner in the worker log) and were released to
+    ``ready`` WITHOUT counting a failure — the work is likely already done;
+    the retry is briefed to commit, verify, and complete tersely."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1803,6 +1808,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.output_limit.extend(getattr(detect_crashed_workers, "_last_output_limit", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

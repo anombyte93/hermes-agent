@@ -352,7 +352,20 @@ def _failure_threshold(cfg: dict) -> Any:
     return cfg.get("failure_threshold", cfg.get("spawn_failure_threshold", 3))
 
 
-_OUTCOME_LABELS = {"spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash"}
+def _is_crash_outcome(outcome: Any) -> bool:
+    """A run outcome that means "the worker died": plain ``crashed`` or the
+    precise ``signaled:<n>`` classification (a real crash — counts against
+    the breaker exactly like ``crashed``). Failure-free requeues
+    (``rate_limited`` / ``output_limit_reached``) and ``protocol_violation``
+    are NOT crash outcomes."""
+    return outcome == "crashed" or (
+        isinstance(outcome, str) and outcome.startswith("signaled:")
+    )
+
+
+_OUTCOME_LABELS = {
+    "spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash",
+}
 
 
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
@@ -375,9 +388,11 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     assignee = _task_field(task, "assignee")
 
     # Most recent failure outcome makes the title/action specific.
+    # ``signaled:<n>`` outcomes are precise crash outcomes — map them onto the
+    # same label/action path as plain ``crashed``.
     most_recent_outcome = next(
         (oc for oc in (_task_field(r, "outcome") for r in _runs_newest_first(runs))
-         if oc in {"spawn_failed", "timed_out", "crashed"}),
+         if oc in {"spawn_failed", "timed_out", "crashed"} or _is_crash_outcome(oc)),
         None,
     )
 
@@ -387,7 +402,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
         doctor, auth = f"hermes -p {assignee} doctor", f"hermes -p {assignee} auth"
         actions.append(_cli_hint(f"Verify profile: {doctor}", doctor, suggested=True))
         actions.append(_cli_hint(f"Fix profile auth: {auth}", auth))
-    elif most_recent_outcome in {"timed_out", "crashed"}:
+    elif most_recent_outcome in {"timed_out", "crashed"} or _is_crash_outcome(most_recent_outcome):
         # Worker got off the ground but died: logs diagnose, reclaim/reassign recover.
         task_id = _task_field(task, "id")
         if task_id:
@@ -396,7 +411,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
 
     severity = "critical" if failures >= threshold * 2 else "error"
     err_snippet = _error_snippet(last_err)
-    outcome_label = _OUTCOME_LABELS.get(most_recent_outcome or "", "failure")
+    outcome_label = _OUTCOME_LABELS.get(most_recent_outcome or "", "crash" if _is_crash_outcome(most_recent_outcome) else "failure")
     if err_snippet:
         title = f"Agent {outcome_label} x{failures}: {err_snippet.splitlines()[0][:160]}"
         detail = (
@@ -441,13 +456,14 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     threshold = int(cfg.get("crash_threshold", 2))
-    # Count trailing consecutive 'crashed' outcomes; a success (or manual
+    # Count trailing consecutive crash outcomes; a success (or manual
     # reclaim) breaks the streak, other outcomes neither count nor break it.
+    # ``signaled:<n>`` IS a crash outcome (only the precision changed).
     consecutive = 0
     last_err = None
     for r in _runs_newest_first(runs):
         outcome = _task_field(r, "outcome")
-        if outcome == "crashed":
+        if _is_crash_outcome(outcome):
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")

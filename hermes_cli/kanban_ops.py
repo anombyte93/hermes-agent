@@ -95,6 +95,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _print_json({
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted")},
+            "rate_limited": res.rate_limited,
+            "output_limit": res.output_limit,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],

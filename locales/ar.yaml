@@ -198,6 +198,7 @@ gateway:
       completed:           "اكتملت"
       gave_up:             "استسلم (نفدت المحاولات)"
       crashed:             "تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة"
+      signaled:            "killed by a signal (worker died); dispatcher will retry"
       timed_out:           "انتهت المهلة؛ سيعيد المُوزّع المحاولة"
       blocked:             "محجوبة؛ تحتاج إلى انتباه"
       review_requested:    "أُحيلت للمراجعة؛ اكتمل التنفيذ"
