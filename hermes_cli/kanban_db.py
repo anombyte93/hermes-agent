@@ -2718,6 +2718,96 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _kanban_config() -> dict:
+    """``config.yaml`` ``kanban:`` section, or ``{}`` when config can't be loaded.
+
+    Kept lazy so importing ``kanban_db`` never reads config; ``complete_task``
+    resolves the completion-contract level through it (``kanban.completion_contract``).
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        return (cfg.get("kanban", {}) if isinstance(cfg, dict) else {}) or {}
+    except Exception:
+        return {}
+
+
+class CompletionContractError(ValueError):
+    """``complete_task`` refused under ``kanban.completion_contract: strict``:
+    the handoff metadata fails verification against the workspace. A
+    ``ValueError`` so tool/CLI error handlers treat it as recoverable; the task
+    is left ``running`` so the worker can fix its metadata and retry."""
+
+    def __init__(self, problems: list, task_id: str):
+        self.problems = [p for p in problems if getattr(p, "severity", "warning") == "warning"]
+        self.task_id = task_id
+        lines = [f"{p.field}: {p.message}" for p in self.problems]
+        super().__init__(
+            "completion refused (kanban.completion_contract: strict) — fix the "
+            f"metadata and retry kanban_complete; task {task_id} stays running. "
+            "Problems: " + "; ".join(lines)
+        )
+
+
+def completion_evidence_status(run_metadata: Optional[dict]) -> Optional[str]:
+    """Stored run metadata → ``verified | warnings(N) | unverified`` for board views.
+
+    ``None`` when the completing run carries no evidence stamp (contract off,
+    older completions) so renderers can fall back cleanly.
+    """
+    if not isinstance(run_metadata, dict):
+        return None
+    if run_metadata.get("completion_evidence") == "verified":
+        return "verified"
+    warnings = run_metadata.get("completion_warnings")
+    if isinstance(warnings, list) and warnings:
+        return f"warnings({len(warnings)})"
+    if run_metadata.get("completion_evidence") == "unverified":
+        return "unverified"
+    return None
+
+
+def _problem_dict(problem) -> dict:
+    """One ``Problem`` → JSON-safe dict for event payloads / run metadata."""
+    return {
+        "code": getattr(problem, "code", "unknown"),
+        "severity": getattr(problem, "severity", "warning"),
+        "field": getattr(problem, "field", "?"),
+        "message": getattr(problem, "message", ""),
+    }
+
+
+def _stamp_completion_contract(metadata: Optional[dict], problems: list) -> dict:
+    """Attach the evidence stamp + warning list the board renders later.
+
+    ``verified`` when no warning-severity problems; otherwise every warning is
+    kept verbatim so ``kanban show`` and the next worker see the exact claims
+    that could not be verified.
+    """
+    md = dict(metadata) if isinstance(metadata, dict) else {}
+    warning_dicts = [_problem_dict(p) for p in problems if getattr(p, "severity", "") == "warning"]
+    if warning_dicts:
+        md["completion_evidence"] = "warnings"
+        md["completion_warnings"] = warning_dicts
+    else:
+        md["completion_evidence"] = "verified"
+    return md
+
+
+def _completion_warnings_comment(warnings: list, contract: str) -> str:
+    """Human-readable card comment for a warn-level completion.
+
+    Prose only — machine codes live in the run metadata ``completion_warnings``
+    list so downstream tooling never has to parse the comment.
+    """
+    lines = [f"completion_warnings (kanban.completion_contract: {contract}):"]
+    lines += [f"- {w.field}: {w.message}" for w in warnings]
+    lines.append(
+        "The handoff was accepted, but the claims above could not be verified "
+        "against the workspace — evaluate them before trusting this card.")
+    return "\n".join(lines)
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2744,6 +2834,28 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # Completion contract (kanban.completion_contract): verify the handoff
+    # against the workspace BEFORE the board records the task done — a worker
+    # report is evidence to evaluate, not truth. strict refuses (task stays
+    # running); warn (default) accepts but records every unverified claim.
+    from hermes_cli.kanban_completion import (
+        resolve_completion_contract, validate_completion, warnings_from,
+    )
+    contract = resolve_completion_contract(_kanban_config())
+    contract_warnings: list = []
+    if contract != "off":
+        _task_row = get_task(conn, task_id)
+        _workspace = _task_row.workspace_path if _task_row else None
+        contract_problems = validate_completion(metadata, _workspace, contract)
+        contract_warnings = warnings_from(contract_problems)
+        if contract_warnings and contract == "strict":
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_contract_refused", {
+                    "contract": contract,
+                    "problems": [_problem_dict(p) for p in contract_warnings],
+                })
+            raise CompletionContractError(contract_warnings, task_id)
+        metadata = _stamp_completion_contract(metadata, contract_problems)
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2780,6 +2892,15 @@ def complete_task(
             conn, task_id, outcome="completed", status="done", summary=handoff_summary,
             metadata=metadata,
         )
+        if contract_warnings:
+            # warn level (strict raised before the txn): the completion lands,
+            # but every unverified claim is durably visible on the card.
+            _insert_comment(conn, task_id, "completion-contract",
+                            _completion_warnings_comment(contract_warnings, contract), now)
+            _append_event(conn, task_id, "completion_warnings", {
+                "contract": contract,
+                "problems": [_problem_dict(p) for p in contract_warnings],
+            }, run_id=run_id)
         # Never-claimed task: synthesize a run so the handoff fields survive.
         if run_id is None and (summary or metadata or result or prior_status == "review"):
             synth_summary, synth_metadata = handoff_summary, metadata

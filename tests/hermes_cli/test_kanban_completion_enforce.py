@@ -210,12 +210,15 @@ def test_summary_only_handoff_warns_under_warn(kanban_home, tmp_path, monkeypatc
 
 def test_config_level_resolution(kanban_home, tmp_path, monkeypatch):
     """complete_task reads kanban.completion_contract through kb._kanban_config
-    (default warn when key absent)."""
+    (default warn when key absent) — a forged head_sha on a REAL git workspace
+    warns under the default, where off would stamp nothing."""
     monkeypatch.setattr(kb, "_kanban_config", lambda: {})
+    repo = tmp_path / "cfg-repo"
+    _init_git_repo(repo)
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cfg", assignee="worker",
-                             workspace_kind="dir", workspace_path=str(tmp_path))
+                             workspace_kind="dir", workspace_path=str(repo))
         kb.claim_task(conn, tid)
     finally:
         conn.close()
