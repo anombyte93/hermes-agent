@@ -16951,7 +16951,17 @@ ipcMain.handle('hermes:version', async () => {
     platform: process.platform,
     hermesRoot: resolveUpdateRoot(),
     bundleOutOfSync: skew.outOfSync,
-    bundleCommitsBehind: skew.desktopCommitsBehind
+    bundleCommitsBehind: skew.desktopCommitsBehind,
+    // R1 — the actual renderer build identity, from the packaged
+    // install-stamp.json read ONCE at process startup (INSTALL_STAMP). This is
+    // the loaded renderer bundle's own build commit, distinct from appVersion
+    // (the backend tree's version resolved from the update root) and never
+    // derivable from bundleCommitsBehind. An absent stamp (dev run, non-git
+    // build) is null → the renderer shows UNKNOWN, never invented.
+    rendererCommit: INSTALL_STAMP?.commit ?? null,
+    rendererStampSource: INSTALL_STAMP?.source ?? null,
+    rendererBuiltAt: INSTALL_STAMP?.builtAt ?? null,
+    rendererDirty: INSTALL_STAMP?.dirty ?? null
   }
 })
 

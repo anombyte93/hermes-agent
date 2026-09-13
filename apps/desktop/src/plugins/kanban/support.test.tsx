@@ -117,7 +117,14 @@ beforeEach(() => {
   )
   // @ts-expect-error installing a minimal bridge for the frontend-stamp read
   window.hermesDesktop = { getVersion: versionMock.getVersion }
-  versionMock.getVersion.mockResolvedValue({ appVersion: '0.17.0', bundleOutOfSync: false })
+  versionMock.getVersion.mockResolvedValue({
+    appVersion: '0.17.0',
+    bundleOutOfSync: false,
+    rendererCommit: 'abc123def4567890',
+    rendererStampSource: 'ci',
+    rendererBuiltAt: '2026-09-13T00:00:00Z',
+    rendererDirty: false
+  })
   vi.clearAllMocks()
 })
 
@@ -126,7 +133,7 @@ afterEach(() => {
 })
 
 describe('R1 — release identity', () => {
-  it('shows frontend, backend and adapter identity together', async () => {
+  it('shows the renderer build commit, backend and adapter identity together — renderer commit is its own identity, never appVersion', async () => {
     apiMock.fetchEvidenceReleases.mockResolvedValue(
       envelope('PASS', {
         board: 'evo',
@@ -138,21 +145,38 @@ describe('R1 — release identity', () => {
 
     renderPanel()
 
-    expect(await screen.findByText('Frontend')).toBeTruthy()
-    await waitFor(() => expect(screen.getByText('0.17.0')).toBeTruthy())
+    // The renderer build row shows the LOADED bundle's commit (the stamp), not
+    // the backend appVersion and never bundleCommitsBehind.
+    expect(await screen.findByText('Renderer build')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('abc123def4567890')).toBeTruthy())
     expect(screen.getByText('Backend')).toBeTruthy()
     expect(screen.getByText('Adapter')).toBeTruthy()
     expect(screen.getByText('adapter-abc123')).toBeTruthy()
     expect(screen.getByText('backend-def456')).toBeTruthy()
+    // The backend appVersion (0.17.0) is NOT the renderer identity and is not
+    // painted as such.
+    expect(screen.queryByText('0.17.0')).toBeNull()
   })
 
-  it('the frontend stamp is UNKNOWN when the build metadata is absent (never hardcoded)', async () => {
-    versionMock.getVersion.mockResolvedValue({ appVersion: undefined })
-    apiMock.fetchEvidenceReleases.mockResolvedValue(envelope('PASS', { board: 'evo', observed_at: 1 }))
+  it('the renderer build is UNKNOWN when the stamp is absent (never hardcoded), while backend identity still shows', async () => {
+    versionMock.getVersion.mockResolvedValue({ appVersion: '0.17.0', bundleOutOfSync: false, rendererCommit: null })
+    apiMock.fetchEvidenceReleases.mockResolvedValue(
+      envelope('PASS', {
+        board: 'evo',
+        adapter: { state: 'PASS', revision: 'adapter-abc123', source: 'git' },
+        backend: { state: 'PASS', revision: 'backend-def456', source: 'pip' },
+        observed_at: 1
+      })
+    )
 
     renderPanel()
 
+    await waitFor(() => expect(screen.getByText('Renderer build')).toBeTruthy())
+    // Missing renderer stamp → UNKNOWN (the row has no invented SHA), while
+    // the backend/adapter identities remain.
     await waitFor(() => expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0))
+    expect(screen.getByText('backend-def456')).toBeTruthy()
+    expect(screen.getByText('adapter-abc123')).toBeTruthy()
   })
 
   it('an absent/invalid adapter identity is UNKNOWN, not invented', async () => {
@@ -191,10 +215,38 @@ describe('R2 — browser readiness (separate from reachability)', () => {
     expect(await screen.findByText(/auth boundary could not be reached/)).toBeTruthy()
     expect(screen.queryByText('Reachable')).toBeNull()
   })
+
+  it('classifies a 401 transport failure as authentication (distinct remedy), never an inferred pass', async () => {
+    apiMock.fetchBrowserReadiness.mockRejectedValue(new Error('401: {"detail":"not authenticated"}'))
+
+    renderPanel()
+
+    expect(await screen.findByText(/Browser readiness — unauthorized/)).toBeTruthy()
+    expect(screen.getByText(/Authentication required — sign in to the EVO gateway/)).toBeTruthy()
+    expect(screen.queryByText('Reachable')).toBeNull()
+  })
+
+  it('classifies a 403 transport failure as forbidden (distinct remedy)', async () => {
+    apiMock.fetchBrowserReadiness.mockRejectedValue(new Error('403: {"detail":"forbidden"}'))
+
+    renderPanel()
+
+    expect(await screen.findByText(/Browser readiness — forbidden/)).toBeTruthy()
+    expect(screen.getByText(/check board access, not reachability/)).toBeTruthy()
+  })
+
+  it('classifies a login-HTML envelope reason as unauthenticated (distinct from reachability)', async () => {
+    apiMock.fetchBrowserReadiness.mockResolvedValue(envelope('FAIL', null, 'reachable but returned a login page'))
+
+    renderPanel()
+
+    expect(await screen.findByText(/Browser readiness — login/)).toBeTruthy()
+    expect(screen.getByText(/not authenticated/)).toBeTruthy()
+  })
 })
 
 describe('R7 — refresh timing + checked/skipped process checks', () => {
-  it('shows real timing and checked-vs-skipped counters from the shared snapshot', async () => {
+  it('shows the ACTUAL evidence timing (query_seconds/collection_seconds) and checked-vs-skipped counters', async () => {
     apiMock.fetchEvidenceSnapshot.mockResolvedValue(
       envelope('PASS', {
         board: 'evo',
@@ -206,15 +258,57 @@ describe('R7 — refresh timing + checked/skipped process checks', () => {
           { task_id: 't_2', state: 'PASS', process_present: true }
         ],
         worker_observation_cap: 20,
-        worker_observations_capped: 3
+        worker_observations_capped: 3,
+        // The adapter reports measured page/collection timing here, NOT the
+        // envelope's helper_roundtrip_ms / collection_ms.
+        timing: { query_seconds: 0.042, collection_seconds: 0.007 }
       })
     )
 
     renderPanel()
 
     expect(await screen.findByText('Refresh & coverage')).toBeTruthy()
-    expect(await screen.findByText(/helper 42 ms/)).toBeTruthy()
-    expect(screen.getByText(/collection 7 ms/)).toBeTruthy()
+    expect(await screen.findByText(/query 0.042 s/)).toBeTruthy()
+    expect(screen.getByText(/collection 0.007 s/)).toBeTruthy()
     expect(screen.getByText(/2 checked · 3 skipped \(cap 20\)/)).toBeTruthy()
+    // The invented envelope timing is never rendered.
+    expect(screen.queryByText(/helper 42 ms/)).toBeNull()
+  })
+
+  it('a valid measured zero (present empty worker_observations) renders zero, never UNKNOWN', async () => {
+    apiMock.fetchEvidenceSnapshot.mockResolvedValue(
+      envelope('PASS', {
+        board: 'evo',
+        cards: [],
+        counts: { by_status: {}, total: 0 },
+        observed_at: 1789216932.8,
+        worker_observations: [],
+        worker_observation_cap: 20,
+        worker_observations_capped: 0
+      })
+    )
+
+    renderPanel()
+
+    expect(await screen.findByText(/0 checked · 0 skipped \(cap 20\)/)).toBeTruthy()
+  })
+
+  it('MISSING worker_observations is UNKNOWN (never coerced to zero)', async () => {
+    apiMock.fetchEvidenceSnapshot.mockResolvedValue(
+      envelope('PASS', {
+        board: 'evo',
+        cards: [],
+        counts: { by_status: {}, total: 0 },
+        observed_at: 1789216932.8
+        // no worker_observations, no cap, no capped — all absent
+      })
+    )
+
+    renderPanel()
+
+    // checked renders "unknown", and no "0 checked" / "0 skipped" is invented.
+    expect(await screen.findByText(/checked unknown/)).toBeTruthy()
+    expect(screen.queryByText(/0 checked/)).toBeNull()
+    expect(screen.getByText(/Worker observations were not reported by this snapshot/)).toBeTruthy()
   })
 })

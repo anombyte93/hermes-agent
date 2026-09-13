@@ -307,6 +307,11 @@ export interface EvidenceSnapshotData {
   has_more?: boolean
   next_cursor?: null | string
   omitted?: null | number | Record<string, unknown>
+  /** Actual adapter query/collection timings (seconds), measured around the
+   *  database view and the sequential worker-evidence collection. This is the
+   *  real R7 timing source; the envelope's helper_roundtrip_ms is a transport
+   *  artefact, not the measured page/collection cost. */
+  timing?: { query_seconds?: number; collection_seconds?: number }
 }
 
 /** Shared /evidence/* envelope: state PASS/FAIL/UNKNOWN + evidence payload. */
