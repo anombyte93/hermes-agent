@@ -1081,6 +1081,104 @@ def _host_prefix() -> str:
     return f"{_claimer_id().split(':', 1)[0]}:"
 
 
+def _conn_board_scope(conn: sqlite3.Connection) -> Optional[str]:
+    """``realpath`` of the DB file this connection is actually on (None when
+    unresolvable, e.g. ``:memory:``). Truth from the connection itself, never
+    from env — a process whose ``HERMES_KANBAN_DB`` points elsewhere must not
+    mint or judge scopes by it."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        path = row[2] if row else None
+        if path and path != ":memory:":
+            return os.path.realpath(path)
+    except Exception:
+        pass
+    return None
+
+
+def _claim_lock_for_conn(conn: sqlite3.Connection) -> str:
+    """Claim lock minted for THIS connection's board: ``host:pid@<board-db>``.
+
+    Scoped so a dispatcher for one board can never be mistaken for the owner
+    of a claim minted by another board's dispatcher (see
+    :func:`claim_authorizes_host_action`). Falls back to the legacy unscoped
+    form when the board file cannot be resolved."""
+    base = _claimer_id()
+    scope = _conn_board_scope(conn)
+    return f"{base}@{scope}" if scope else base
+
+
+def _parse_claim_lock(lock: Optional[str]) -> tuple[str, Optional[str]]:
+    """``(host_pid, board_scope)`` — scope is None for legacy unscoped locks."""
+    if not lock:
+        return "", None
+    if "@" in lock:
+        host_pid, scope = lock.rsplit("@", 1)
+        return host_pid, scope or None
+    return lock, None
+
+
+# Reclaim-defer reasons: the row has a live owner elsewhere; this tick must
+# not signal it, release it, or extend it — the owner's own tick manages it.
+_DEFER_REASONS = frozenset({"claimer_alive", "other_board"})
+
+
+def claim_authorizes_host_action(
+    conn: sqlite3.Connection, claim_lock: Optional[str],
+    *, operator: bool = False, pid_alive_fn=None,
+) -> tuple[bool, str]:
+    """May THIS connection's process signal/reclaim the row holding ``claim_lock``?
+
+    The hostname prefix alone must never authorize a kill: on 2026-09-13 a
+    worker's in-process dispatcher tick (its inherited ``HERMES_KANBAN_DB``
+    env pointed its connection at the parent board) reclaimed and SIGKILLed
+    all seven workers of that board in one second, three times in one night.
+    Authorization now requires, in order:
+
+    1. same host (``claim_lock``'s host prefix matches this host);
+    2. when the lock carries a board scope, that scope names THIS
+       connection's own DB file (``realpath``-compared) — a claim minted for
+       another board is never ours to manage;
+    3. the claimer is THIS process or no longer exists. A live foreign
+       dispatcher's claim is deferred (its own tick reclaims the row);
+       a dead claimer's row is fair game — authorization defers, it never
+       wedges the board.
+
+    ``operator=True`` (explicit human action — ``reclaim_task``,
+    ``archive_task``) skips the liveness and scope gates and keeps only the
+    same-host rule: an operator may reclaim anything on a board they hold a
+    connection to, but still never signals a foreign host's worker.
+
+    Legacy unscoped locks (pre-upgrade boards) keep the hostname rule with a
+    liveness check on a numeric claimer suffix.
+
+    Returns ``(authorized, reason)`` with reason one of ``self`` /
+    ``claimer_dead`` / ``legacy_lock`` / ``foreign_host`` / ``other_board`` /
+    ``claimer_alive`` / ``no_lock``.
+    """
+    host_pid, scope = _parse_claim_lock(claim_lock)
+    if not host_pid:
+        return False, "no_lock"
+    if not host_pid.startswith(_host_prefix()):
+        return False, "foreign_host"
+    if not operator:
+        if scope is not None:
+            if scope != _conn_board_scope(conn):
+                return False, "other_board"
+        suffix = host_pid[len(_host_prefix()):]
+        if suffix == str(os.getpid()):
+            return True, "self"
+        if suffix.isdigit():
+            alive_fn = pid_alive_fn or _pid_alive
+            try:
+                if alive_fn(int(suffix)):
+                    return False, "claimer_alive"
+            except Exception:
+                pass
+            return True, "claimer_dead"
+    return True, "legacy_lock" if "@" not in (claim_lock or "") else "operator"
+
+
 # --- Task creation / mutation ---
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -2163,7 +2261,7 @@ def claim_task(
     already claimed (or is not in ``ready`` status).
     """
     now = int(time.time())
-    lock = claimer or _claimer_id()
+    lock = claimer or _claim_lock_for_conn(conn)
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Single enforcement point: never ready -> running with an undone
@@ -2196,7 +2294,7 @@ def claim_review_task(
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
     separately from the implementer."""
     now = int(time.time())
-    lock = claimer or _claimer_id()
+    lock = claimer or _claim_lock_for_conn(conn)
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
@@ -2279,7 +2377,7 @@ def heartbeat_claim(
 ) -> bool:
     """Extend a running claim; True if we still own it."""
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
-    lock = claimer or _claimer_id()
+    lock = claimer or _claim_lock_for_conn(conn)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
@@ -2332,6 +2430,19 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
     ).fetchall()
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
+        if host_local:
+            # Authorization gate: hostname prefix alone must never let this
+            # process reclaim a row whose claim was minted by a LIVE foreign
+            # dispatcher (same or other board) — the 2026-09-13 mass-kill
+            # class. Defer to the owner's own tick.
+            ok, why = claim_authorizes_host_action(conn, row["claim_lock"])
+            if not ok:
+                _log.debug(
+                    "kanban release_stale_claims: deferring task %s "
+                    "(claim %r not authorizable here: %s)",
+                    row["id"], row["claim_lock"], why,
+                )
+                continue
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
@@ -2446,7 +2557,11 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
+    # Operator force-path: explicit human intent authorizes same-host signal
+    # regardless of which dispatcher minted the claim.
+    termination = _terminate_reclaimed_worker(
+        row["worker_pid"], prev_lock, signal_fn=signal_fn, operator=True,
+    )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -3568,7 +3683,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn)
+        # Operator action: archive authorizes the same-host signal explicitly.
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, operator=True,
+        )
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.

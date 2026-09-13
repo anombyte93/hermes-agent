@@ -307,20 +307,46 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    conn: Optional[sqlite3.Connection] = None,
+    operator: bool = False,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    Authorization (see :func:`kanban_db.claim_authorizes_host_action`): the
+    hostname prefix alone never authorizes a signal. When ``conn`` is given,
+    a claim minted by a live foreign dispatcher — or for another board — is
+    never signalled (``authorized: False, reason`` in the result dict); the
+    caller must then leave the row alone. ``operator=True`` marks explicit
+    human force-paths (``reclaim_task``, ``archive_task``) which keep the
+    plain same-host rule. Without ``conn`` (legacy call sites) behaviour is
+    unchanged: hostname + prefix rule only.
+    """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "authorized": True,
+        "defer_reason": None,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+    if conn is not None:
+        ok, why = _kb.claim_authorizes_host_action(
+            conn, claim_lock, operator=operator,
+        )
+        if not ok:
+            info["authorized"] = False
+            info["defer_reason"] = why
+            return info
+    elif operator:
+        # No conn to authorize against: an operator force-path without a
+        # connection cannot verify scope; keep the old hostname rule.
+        pass
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -355,7 +381,13 @@ def _worker_survived_termination(termination: dict) -> bool:
     first still runs — the duplication loop. Only host-local workers we actually
     signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
     through to the normal release path since we cannot manage that worker anyway.
+    An UNAUTHORIZED termination (foreign live claimer / other board) also counts:
+    the row is not ours to release either.
     """
+    if termination.get("authorized") is False and not termination.get(
+        "termination_attempted"
+    ):
+        return True
     return bool(
         termination.get("termination_attempted")
         and termination.get("host_local")
@@ -459,6 +491,16 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     for row in rows:
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
+            continue
+        # Authorization gate: hostname prefix alone must never authorize a
+        # timeout kill — a live foreign dispatcher's (or another board's)
+        # row is deferred to its owner's tick.
+        ok, why = _kb.claim_authorizes_host_action(conn, lock)
+        if not ok:
+            _kb._log.debug(
+                "kanban enforce_max_runtime: deferring task %s (claim %r: %s)",
+                row["id"], lock, why,
+            )
             continue
         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
         # so retries must be measured from the active task_runs row.
@@ -575,6 +617,16 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        # Authorization gate: never signal/release a row whose claim was
+        # minted by a live foreign dispatcher or for another board.
+        ok, why = _kb.claim_authorizes_host_action(conn, lock)
+        if not ok:
+            _kb._log.debug(
+                "kanban detect_stale_running: deferring task %s (claim %r: %s)",
+                tid, lock, why,
+            )
+            continue
 
         termination = _kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
 
@@ -948,6 +1000,16 @@ def _reclaim_dead_workers(
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
+                continue
+            # Authorization gate: a claim minted by a live foreign dispatcher
+            # or for another board is not ours to reclaim, even when the
+            # worker pid is dead on this host.
+            ok, why = _kb.claim_authorizes_host_action(conn, lock)
+            if not ok:
+                _kb._log.debug(
+                    "kanban detect_crashed_workers: deferring task %s (claim %r: %s)",
+                    row["id"], lock, why,
+                )
                 continue
             # Launch-window grace so a freshly-spawned worker isn't reclaimed
             # before its PID is visible on /proc.
@@ -1686,6 +1748,13 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+class BoardDispatchLockedError(RuntimeError):
+    """Another dispatcher holds this board's dispatch lock; the tick was
+    refused without any writes. One-shot callers (CLI ``dispatch``) raise this
+    instead of silently racing the board's daemon."""
+    pass
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1700,6 +1769,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    on_locked: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1708,6 +1778,12 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    ``on_locked="raise"`` makes the losing case raise
+    :class:`BoardDispatchLockedError` instead — for one-shot callers (the CLI
+    ``dispatch`` command) a silent no-op tick is indistinguishable from
+    success and invites exactly the stray-tick races the lock exists to
+    prevent; failing loudly points the operator at the running daemon.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -1734,6 +1810,12 @@ def dispatch_once(
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
         if not held:
+            if on_locked == "raise":
+                raise BoardDispatchLockedError(
+                    f"another dispatcher holds the dispatch lock for {db_path} "
+                    "(is the kanban daemon or gateway watcher running for this "
+                    "board?); this one-shot tick was refused without any writes"
+                )
             result = DispatchResult(skipped_locked=True)
         else:
             result = _locked_tick()
