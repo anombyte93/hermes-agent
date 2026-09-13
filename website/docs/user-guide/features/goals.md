@@ -274,6 +274,49 @@ You: _
 
 Four turns, one `/goal` invocation, zero "keep going" prompts from you.
 
+## Re-judging a paused goal from the terminal: `hermes goals rejudge`
+
+The judge is a network call, and networks fail. When the judge API is unreachable for enough turns in a row (expired key, provider outage), the goal loop **auto-pauses** rather than burning the budget on a dead judge — the work itself may already have been complete when that happened.
+
+`hermes goals rejudge` is the recovery path that doesn't require re-running the agent:
+
+```bash
+hermes goals rejudge <session_id>           # judge the stored evidence
+hermes goals rejudge <session_id> --dry-run # judge, but don't transition
+```
+
+It is scoped to exactly one session. The command:
+
+1. Loads the goal bound to that session and shows it (text, status, turns used).
+2. Shows the **evidence** — the session's last stored assistant response, read from the transcript (trailing tool output is never used as evidence).
+3. Runs the same judge the loop uses, with the same subgoals/completion-contract context, against that evidence. Quality gates run first, exactly as in the loop.
+4. Either performs a genuine done transition, or reports an explicit outcome.
+
+Outcomes and exit codes:
+
+| Outcome | Meaning | Exit |
+|---|---|---|
+| `done` | Judge said done and all gates passed; goal transitioned (or would, with `--dry-run`) | 0 |
+| `already_done` | Goal was already done — nothing judged, nothing changed | 0 |
+| `incomplete` | Judged: the goal is genuinely not done (or a quality gate failed) | 1 |
+| `no_session` / `no_goal` | No such session, or it has no goal — nothing judged | 2 |
+| `unreachable` | The judge API still can't be reached | 3 |
+| `unparseable` | The judge replied, but not with a usable verdict | 4 |
+
+Safety properties: no agent turns are run, the turn budget is never reset, tools are never replayed, and every state change goes through the same persistence path the goal loop uses. A goal on a *different* session is never touched — if you name the wrong session you get `no_goal`, not a surprising transition. Re-running after a done transition is idempotent (`already_done`, no judge call).
+
+Typical recovery flow after fixing the judge key in `config.yaml`:
+
+```
+$ hermes goals rejudge 8f3a…
+Goal rejudge — session 8f3a…
+  Goal: Deploy v1.2.3 and verify health
+  Status: paused (4/20 turns)
+  Evidence (last assistant response): Deployed v1.2.3. /healthz returns 200 on all 3 replicas; rollout complete.
+  ✓ Goal achieved: deploy verified: /healthz green on all replicas
+  Goal transitioned to done.
+```
+
 ## When the judge gets it wrong
 
 No judge is perfect. Two failure modes to watch for:

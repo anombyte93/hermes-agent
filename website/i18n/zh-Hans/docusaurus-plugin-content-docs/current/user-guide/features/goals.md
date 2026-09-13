@@ -165,6 +165,49 @@ You: _
 
 四轮，一次 `/goal` 调用，你零次"继续"提示。
 
+## 从终端重新裁判已暂停的目标：`hermes goals rejudge`
+
+裁判是一次网络调用，而网络会故障。当裁判 API 连续多轮不可达（密钥过期、服务中断）时，目标循环会**自动暂停**，而不是把预算浪费在一个失联的裁判上——而工作本身当时可能已经完成。
+
+`hermes goals rejudge` 是无需重新运行 agent 的恢复路径：
+
+```bash
+hermes goals rejudge <session_id>           # 依据已存储的证据进行裁判
+hermes goals rejudge <session_id> --dry-run # 只裁判，不执行状态转换
+```
+
+该命令严格限定于单个会话：
+
+1. 加载绑定到该会话的目标并显示（文本、状态、已用轮次）。
+2. 显示**证据**——该会话最后一条已存储的助手回复，直接从转录中读取（末尾的工具输出绝不会被当作证据）。
+3. 用循环使用的同一个裁判、同样的子目标/完成契约上下文，对该证据进行裁判。质量门禁先行，与循环中的顺序一致。
+4. 要么执行一次真正的完成转换，要么报告明确的结果。
+
+结果与退出码：
+
+| 结果 | 含义 | 退出码 |
+|---|---|---|
+| `done` | 裁判判定完成且所有门禁通过；目标已转换（或使用 `--dry-run` 时本应转换） | 0 |
+| `already_done` | 目标已完成——未裁判、未更改 | 0 |
+| `incomplete` | 已裁判：目标确实未完成（或某个质量门禁失败） | 1 |
+| `no_session` / `no_goal` | 会话不存在，或该会话没有目标——未裁判 | 2 |
+| `unreachable` | 裁判 API 仍然无法访问 | 3 |
+| `unparseable` | 裁判有回复，但不是可用的判定 | 4 |
+
+安全属性：不运行任何 agent 轮次、绝不重置轮次预算、绝不重放工具，所有状态更改都走目标循环使用的同一条持久化路径。**其他**会话的目标绝不会被触碰——命名了错误的会话只会得到 `no_goal`，而不是意外的状态转换。完成转换后重复执行是幂等的（`already_done`，不调用裁判）。
+
+在 `config.yaml` 中修好裁判密钥后的典型恢复流程：
+
+```
+$ hermes goals rejudge 8f3a…
+Goal rejudge — session 8f3a…
+  Goal: Deploy v1.2.3 and verify health
+  Status: paused (4/20 turns)
+  Evidence (last assistant response): Deployed v1.2.3. /healthz returns 200 on all 3 replicas; rollout complete.
+  ✓ Goal achieved: deploy verified: /healthz green on all replicas
+  Goal transitioned to done.
+```
+
 ## 裁判判断有误时
 
 没有裁判是完美的。需注意两种失败模式：
