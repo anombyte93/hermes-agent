@@ -337,13 +337,21 @@ model:
 # worktree_sync: false  # Branch from local HEAD (offline / pinned base)
 
 # =============================================================================
-# Kanban Review Dispatch
+# Kanban Completion Contract
 # =============================================================================
-# First-class review tasks are dispatched automatically by default. The worker
-# is spawned with the bundled sdlc-review skill and can approve, request changes
-# back to the original implementer, or escalate a genuine external blocker.
-# Disable this only when every review is performed manually from the dashboard.
+# How `kanban_complete` treats a worker's handoff metadata (head_sha, commits,
+# changed_files, tests_run): evidence to verify, not truth. warn (default)
+# accepts the completion but records every unverifiable claim as a card comment
+# + run stamp; strict refuses the completion until the metadata is fixed (task
+# stays running); off disables verification. Invalid values fall back to warn.
+#
+# Kanban Review Dispatch: first-class review tasks are dispatched automatically
+# by default. The worker is spawned with the bundled sdlc-review skill and can
+# approve, request changes back to the original implementer, or escalate a
+# genuine external blocker. Disable this only when every review is performed
+# manually from the dashboard.
 kanban:
+  completion_contract: warn
   review_dispatch: true
 
 # =============================================================================

@@ -82,6 +82,43 @@ guard, not OS isolation against arbitrary direct database writes. GitHub Enterpr
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
 
+## Handoff evidence contract (`kanban.completion_contract`)
+
+A worker's completion metadata is a claim, not truth. `complete_task` verifies the
+handoff against the workspace before the board records the task `done`:
+
+- `head_sha` must exist in the repo and be reachable from the workspace HEAD;
+- each `commits` entry must exist (`"<sha> subject"` entries accepted);
+- each `changed_files` entry must exist in the tree at `head_sha` — or be declared
+  deleted (`deleted_files` key or an inline `"(deleted)"` marker);
+- `tests_run` values that name a command (`pytest …`, `pnpm run test …`) must carry
+  a number (a count) or an explicit `passed`/`failed` verdict — "ran the tests" is
+  not evidence.
+
+Levels, via the `kanban:` section of `config.yaml`:
+
+```yaml
+kanban:
+  completion_contract: warn   # off | warn (default) | strict
+```
+
+- **off** — no validation.
+- **warn** (default) — the completion lands, but a `completion-contract` comment
+  and `completion_warnings` event record every unverifiable claim.
+- **strict** — the completion is refused with the problem list; the task stays
+  `running` so the worker can fix its metadata and retry. Invalid values fall
+  back to `warn` — never silently escalate to strict.
+
+Non-git workspaces (scratch cards) skip the git checks; the handoff is stamped
+`unverified` rather than silently passing. Every completion is stamped on the
+run — `completion_evidence: verified | warnings | unverified` (+ the verbatim
+warning list) — and `hermes kanban show` renders it as a one-line
+`evidence: verified | warnings(N) | unverified` verdict so a human or the next
+worker can tell a verified handoff from a bare claim at a glance. Workers on git
+workspaces should pass real `head_sha` / `commits` / `changed_files` /
+`tests_run` counts; see "Handing context to follow-up cards" for the metadata
+shape.
+
 ## Kanban vs. `delegate_task`
 
 They look similar; they are not the same primitive.
@@ -1269,6 +1306,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
+| `completion_contract_refused` | `{contract, problems}` | `complete_task` refused the handoff under `kanban.completion_contract: strict`: metadata claims (e.g. a forged `head_sha`) failed verification against the workspace. The task stays `running`; `problems` lists each unverified claim. The worker fixes its metadata and retries. |
+| `completion_warnings` | `{contract, problems}` | The handoff was accepted under `warn` (or the default) but some claims could not be verified. `problems` lists each one; the same list is stored verbatim on the run (`completion_warnings` metadata) and rendered as a `completion-contract` comment. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
