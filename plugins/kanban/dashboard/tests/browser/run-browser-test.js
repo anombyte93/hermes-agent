@@ -43,6 +43,7 @@ const state = {
   timelineDelayCard: null,
   eventsBaseline: null, // null | "fail" | "unknown" | "malformed" | "wrongboard"
   evoSameCountSwap: false, // R10: swap t_run2 for t_swap9 on the NEXT evo page-0 refresh (same totals)
+  nextTenPartial: null, // null | "unknown" | "fail" | "error-only" for next-ten FAIL/UNKNOWN partial-evidence mode
 };
 
 function resetState() {
@@ -56,6 +57,7 @@ function resetState() {
   state.timelineDelayCard = null;
   state.eventsBaseline = null;
   state.evoSameCountSwap = false;
+  state.nextTenPartial = null;
 }
 
 function json(res, code, obj) {
@@ -775,6 +777,21 @@ function handleRoutes(req, res, reqBody) {
   }
   if (p === `${API}/evidence/acceptance-compare`) {
     state.hits.push("acceptance-compare:" + q.get("card"));
+    if (state.nextTenPartial === "unknown") {
+      return json(res, 200, envelope("UNKNOWN", {
+        board: board, card: q.get("card"),
+        current: { run_id: Number(q.get("current_run_id")), state: "PASS", release: { revision: "a84a2b2c0d1e", source: "served" }, checks: { worker_stopped: { state: "PASS", source: "machine" } } },
+        previous: { run_id: Number(q.get("previous_run_id")), state: "UNKNOWN", release: null, checks: {} },
+        checks: [
+          { name: "worker_stopped", source: "machine", current: "PASS", previous: null, change: "unproved" },
+        ],
+        limitations: ["previous run receipt absent"],
+        observed_at: NOW_NT,
+      }, "previous run receipt absent; comparison unproved"));
+    }
+    if (state.nextTenPartial === "error-only") {
+      return json(res, 200, envelope("UNKNOWN", null, "helper reported UNKNOWN"));
+    }
     return json(res, 200, envelope("PASS", {
       board: board, card: q.get("card"),
       current: { run_id: Number(q.get("current_run_id")), state: "PASS", release: { revision: "a84a2b2c0d1e", source: "served" }, checks: { worker_stopped: { state: "PASS", source: "machine" } } },
@@ -807,6 +824,17 @@ function handleRoutes(req, res, reqBody) {
   if (p === `${API}/evidence/attachment-provenance`) {
     state.hits.push("provenance:" + q.get("attachment_id"));
     const attId = Number(q.get("attachment_id"));
+    if (state.nextTenPartial === "unknown") {
+      return json(res, 200, envelope("UNKNOWN", {
+        board: board, card: q.get("card"), attachment_id: attId,
+        accepted_run_id: null, acceptance_state: "UNKNOWN",
+        reason: "no guarded acceptance receipt names this attachment; an attachment beside a done card is not acceptance",
+        observed_at: NOW_NT,
+      }, "provenance not established"));
+    }
+    if (state.nextTenPartial === "error-only") {
+      return json(res, 200, envelope("UNKNOWN", null, "helper reported UNKNOWN"));
+    }
     const data = attId === 7
       ? { board: board, card: q.get("card"), attachment_id: 7, accepted_run_id: 3, acceptance_state: "PASS", reason: "guarded receipt", observed_at: NOW_NT }
       : { board: board, card: q.get("card"), attachment_id: attId, accepted_run_id: null, acceptance_state: "UNKNOWN", reason: "no guarded acceptance receipt names this attachment; an attachment beside a done card is not acceptance", observed_at: NOW_NT };
@@ -840,11 +868,24 @@ function handleRoutes(req, res, reqBody) {
         repair_preview: [{ check: "python_interpreter", state: "FAIL", action: "Provision the workspace .venv (python -m venv .venv) with a supported interpreter.", reason: "workspace .venv missing" }],
       };
     });
-    return json(res, 200, wfEnvelope("PASS", board, null, {
+    const batchEvidence = {
       board: board, items: items,
       requested: (body.cards || []).length, returned: items.length, omitted: 0,
       no_mutation_performed: true, observed_at: NOW_NT,
-    }, null, null, "kanban_readiness_batch"));
+    };
+    if (state.nextTenPartial === "unknown") {
+      return json(res, 200, wfEnvelope("UNKNOWN", board, null, batchEvidence,
+        "incomplete commission; see per-item advice", null, "kanban_readiness_batch"));
+    }
+    if (state.nextTenPartial === "fail") {
+      return json(res, 200, wfEnvelope("FAIL", board, null, batchEvidence,
+        "a measured readiness check failed", null, "kanban_readiness_batch"));
+    }
+    if (state.nextTenPartial === "error-only") {
+      return json(res, 200, wfEnvelope("UNKNOWN", board, null, null,
+        "helper reported UNKNOWN", null, "kanban_readiness_batch"));
+    }
+    return json(res, 200, wfEnvelope("PASS", board, null, batchEvidence, null, null, "kanban_readiness_batch"));
   }
 
   json(res, 404, { detail: "not found: " + p });
@@ -1010,6 +1051,7 @@ async function main() {
     await scenarioNextTenSupport(base);
     await scenarioNextTenDrawer(base);
     await scenarioNextTenBatch(base);
+    await scenarioNextTenPartialEvidence(base);
     await scenarioNextTenNotices(base);
     await scenarioNextTenRepair(base);
     await scenarioNextTenPhone(base);
@@ -1805,6 +1847,75 @@ async function scenarioNextTenBatch(base) {
     (await page.locator("[data-readiness-batch-repair]").first().textContent()).includes(".venv"));
   check("batch: no dispatch call", !state.hits.includes("dispatch"), state.hits.join(","));
 
+  await page.close();
+}
+
+// R3/R4/R8/R9 partial-evidence rendering: a known FAIL/UNKNOWN envelope that
+// still carries valid bounded evidence is rendered (repair previews, unproved
+// checks, provenance) alongside its retained UNKNOWN/FAIL reason, never
+// promoted to PASS. An error-only envelope renders only its reason.
+async function scenarioNextTenPartialEvidence(base) {
+  // R9 batch: UNKNOWN with valid items + per-card repair previews.
+  resetState();
+  state.nextTenPartial = "unknown";
+  let page = await (await newPage(base, "held"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-readiness-batch-card='t_hold1']", { timeout: 5000 });
+  await page.click("[data-readiness-batch-card='t_hold1'] input, [data-readiness-batch-card='t_hold1']");
+  await page.waitForTimeout(200);
+  await page.click("[data-readiness-batch-run]");
+  await page.waitForSelector("[data-readiness-batch-result]", { timeout: 5000 });
+  const batchText = await page.locator("[data-readiness-batch]").textContent();
+  check("partial-batch: UNKNOWN reason retained", /incomplete commission/.test(batchText), batchText);
+  check("partial-batch: item row visible", await page.locator("[data-readiness-batch-item='t_hold1']").count() === 1);
+  check("partial-batch: repair preview text visible", batchText.includes(".venv"), batchText);
+  await page.close();
+
+  // R4 compare: UNKNOWN with unproved checks + limitations, reason retained.
+  resetState();
+  state.nextTenPartial = "unknown";
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-task-id='t_run1']", { timeout: 5000 });
+  await page.locator("[data-task-id='t_run1']").first().click();
+  await page.waitForSelector("[data-next-ten-drawer]", { timeout: 5000 });
+  await page.waitForSelector("[data-acceptance-compare-btn]", { timeout: 5000 });
+  await page.click("[data-acceptance-compare-btn]");
+  await page.waitForSelector("[data-acceptance-compare-result]", { timeout: 5000 });
+  const cmpResult = await page.locator("[data-acceptance-compare-result]").textContent();
+  check("partial-compare: unproved check rendered", cmpResult.includes("unproved"), cmpResult);
+  const cmpSection = await page.locator("[data-acceptance-compare]").textContent();
+  check("partial-compare: limitation rendered", cmpSection.includes("previous run receipt absent"), cmpSection);
+  check("partial-compare: UNKNOWN reason retained", cmpSection.includes("comparison unproved"), cmpSection);
+  await page.close();
+
+  // R8 provenance: UNKNOWN provenance rendered honestly (accepted run unknown).
+  resetState();
+  state.nextTenPartial = "unknown";
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-task-id='t_run1']", { timeout: 5000 });
+  await page.locator("[data-task-id='t_run1']").first().click();
+  await page.waitForSelector("[data-next-ten-drawer]", { timeout: 5000 });
+  await page.waitForSelector("[data-attachment-provenance-line]", { timeout: 5000 });
+  const provText = await page.locator("[data-attachment-provenance-line]").textContent();
+  check("partial-provenance: accepted run unknown rendered", /accepted run unknown/.test(provText), provText);
+  await page.close();
+
+  // Error-only control: no evidence, only the reason, never fabricated rows.
+  resetState();
+  state.nextTenPartial = "error-only";
+  page = await (await newPage(base, "held"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-readiness-batch-card='t_hold1']", { timeout: 5000 });
+  await page.click("[data-readiness-batch-card='t_hold1'] input, [data-readiness-batch-card='t_hold1']");
+  await page.waitForTimeout(200);
+  await page.click("[data-readiness-batch-run]");
+  await page.waitForTimeout(600);
+  const errText = await page.locator("[data-readiness-batch]").textContent();
+  check("partial-error-only: reason shown", /helper reported UNKNOWN/.test(errText), errText);
+  check("partial-error-only: no repair preview fabricated", !errText.includes(".venv"), errText);
+  check("partial-error-only: no item rows", await page.locator("[data-readiness-batch-item]").count() === 0);
   await page.close();
 }
 

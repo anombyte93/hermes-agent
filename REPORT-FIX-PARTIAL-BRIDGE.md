@@ -1,9 +1,9 @@
 # REPORT-FIX-PARTIAL-BRIDGE
 
-Status: FINAL. Committed worker report, not a parent acceptance claim. Canonical
-runner verification completed: `scripts/run_tests.sh
-tests/plugins/test_kanban_next_ten_api.py tests/plugins/test_kanban_next_ten_auth.py`
-= 2 files, 68 tests passed, 0 failed.
+Status: FINAL. Committed worker report, not a parent acceptance claim. Backend
+bridge verified (canonical runner, 2 files, 68 tests, 0 failed) and the UI slice
+(scope-extended by the parent) verified against the real IIFE in headless
+Chromium (150/150 checks, 0 failed).
 
 ## What was broken (live, parent-confirmed)
 
@@ -110,19 +110,30 @@ same RED direction as the others.
   serve as a fixture but was not re-driven. The FastAPI route and the subprocess
   boundary are exercised; the actual rendered React/browser readback remains the
   parent's integration step.
-- DISCOVERED (frontend, out of scope): the shipped browser bundle's readiness
-  batch consumer (`plugins/kanban/dashboard/dist/index.js`, line ~1749) extracts
-  `evidence` only when `envelope.state === "PASS"`, so a preserved FAIL/UNKNOWN
-  `evidence.items[].repair_preview` is still not rendered until the UI relaxes
-  that gate. This card's scope is the backend bridge only; the frontend readback
-  relaxation is a parent-owned UI change. The backend fix is the necessary first
-  half and feeds exactly the field the consumer already reads
-  (`evidence.items[].repair_preview`).
 - The helper is faked at the subprocess boundary (the shipped suite's own seam),
   not a live `atlas-kanban-call`. The receipt shapes mirror the adapter's contract
   and the supplied REAL-BATCH-RECEIPT.json.
 - The evidence bridge (`_evidence_run_helper`) has the same discard shape but is
   OUT OF SCOPE here (R3/R4/R8/R9 are all next-ten tools). Flagged, not widened.
+
+## UI slice (scope extended by the parent)
+
+The parent extended scope to the browser bundle and its IIFE test so the
+preserved partial evidence actually renders. Three PASS-only gates in
+`plugins/kanban/dashboard/dist/index.js` (batch readiness ~1749, acceptance
+compare ~5774, attachment provenance ~5851) now extract a valid `evidence` object
+for FAIL/UNKNOWN envelopes too, while the retained UNKNOWN/FAIL state label and
+reason still render. Never promoted to PASS. The error-only path (no evidence)
+still renders only the reason.
+
+`plugins/kanban/dashboard/tests/browser/run-browser-test.js` gains a
+`state.nextTenPartial` fixture mode (`unknown` | `fail` | `error-only`) for the
+three next-ten fixture doors and a `scenarioNextTenPartialEvidence` mounted
+real-IIFE scenario with 10 checks: UNKNOWN batch with visible per-card repair
+previews and retained reason, UNKNOWN compare with unproved checks and
+limitations, UNKNOWN provenance rendered as "accepted run unknown", and an
+error-only control that fabricates nothing. Headless Chromium (provisioned
+cached binary + read-only node_modules): 150/150 checks passed, 0 failed.
 
 ## ACTUALLY_USED / DISCOVERED / UNTOUCHED / MISSING / FRICTION
 

@@ -1746,7 +1746,11 @@
       });
     }
 
-    const ev = (envelope && envelope.state === "PASS" && envelope.evidence
+    // Partial-evidence rendering: a known FAIL/UNKNOWN envelope that still
+    // carries a valid bounded evidence object is rendered (per-card repair
+    // previews) alongside its retained UNKNOWN/FAIL reason. Never promoted
+    // to PASS; the state label stays whatever the backend reported.
+    const ev = (envelope && envelope.evidence
       && typeof envelope.evidence === "object") ? envelope.evidence : null;
     const items = ev && Array.isArray(ev.items) ? ev.items : [];
 
@@ -5771,7 +5775,10 @@
       return function () { alive = false; };
     }, [board, card, attachmentId]);
 
-    const cmpEv = (compare && compare.state === "PASS" && compare.evidence) ? compare.evidence : null;
+    // Partial-evidence rendering: a known FAIL/UNKNOWN compare that still
+    // carries a valid evidence object (unproved checks + limitations) is
+    // rendered alongside its retained UNKNOWN/FAIL reason. Never promoted.
+    const cmpEv = (compare && compare.evidence && typeof compare.evidence === "object") ? compare.evidence : null;
     // R4: the adapter labels each check's provenance with a `source` field
     // ("parent" = parent attestation, "machine" = machine validation);
     // anything else is an honest UNKNOWN origin, never guessed.
@@ -5848,7 +5855,7 @@
         attachmentId != null
           ? h("div", { className: "text-xs" },
               "Attachment " + attachmentId + ": ",
-              provenance && provenance.state === "PASS" && provenance.evidence
+              provenance && provenance.evidence && typeof provenance.evidence === "object"
                 ? h("span", { "data-attachment-provenance-line": "true" },
                     provenance.evidence.acceptance_state === "PASS"
                       ? "accepted by run " + provenance.evidence.accepted_run_id
