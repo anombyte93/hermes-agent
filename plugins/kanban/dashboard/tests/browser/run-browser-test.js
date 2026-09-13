@@ -42,6 +42,7 @@ const state = {
   timelineDelayMs: 0, // delay the NEXT /evidence/timeline for timelineDelayCard
   timelineDelayCard: null,
   eventsBaseline: null, // null | "fail" | "unknown" | "malformed" | "wrongboard"
+  evoSameCountSwap: false, // R10: swap t_run2 for t_swap9 on the NEXT evo page-0 refresh (same totals)
 };
 
 function resetState() {
@@ -54,6 +55,7 @@ function resetState() {
   state.timelineDelayMs = 0;
   state.timelineDelayCard = null;
   state.eventsBaseline = null;
+  state.evoSameCountSwap = false;
 }
 
 function json(res, code, obj) {
@@ -86,17 +88,21 @@ function snapshotFor(board, cursor) {
     }
     state.evoSnapshotCalls += 1;
     const updated = state.evoSnapshotCalls >= 2;
+    const swapped = state.evoSameCountSwap && updated;
     const cards = [
       { id: "t_run1", title: updated ? "Run card one UPDATED" : "Run card one", assignee: "evo", status: updated ? "done" : "running", created_at: obs - 10 },
-      { id: "t_run2", title: "Run card two", assignee: "evo", status: "running", created_at: obs - 10 },
+      swapped
+        ? { id: "t_swap9", title: "Swapped card nine", assignee: "evo", status: "running", created_at: obs - 9 }
+        : { id: "t_run2", title: "Run card two", assignee: "evo", status: "running", created_at: obs - 10 },
     ];
     const obs_list = updated ? [] : [{ task_id: "t_run1", run_id: 10, classification: "live", state: "PASS", process_present: true, workspace_matches: true, run_start_matches: true, reason: "worker process present and matching" }];
     return envelope("PASS", {
       board: "evo", status_filter: "all", cards, returned: 2, has_more: true, next_cursor: "evo:p2", omitted: 1,
       counts: { by_status: { running: updated ? 1 : 2, done: updated ? 2 : 1 }, total: 3, matching_filter: 3, in_page: 2, omitted: 1 },
-      worker_observations: obs_list, worker_observation_cap: 20, worker_observations_capped: 0,
+      worker_observations: obs_list, worker_observation_cap: 20, worker_observations_capped: updated ? 1 : 0,
       worker_evidence_scope: "running records only", bounded: { card_limit: 100, max_card_limit: 200, worker_check_cap: 20 },
       incomplete: true, observed_at: obs,
+      timing: { query_seconds: 0.012, collection_seconds: 0.034 },
     });
   }
   if (board === "held") {
@@ -142,6 +148,19 @@ function snapshotFor(board, cursor) {
       worker_observations: [], worker_observation_cap: 20, worker_observations_capped: 0,
       worker_evidence_scope: "running records only", bounded: { card_limit: 100, max_card_limit: 200, worker_check_cap: 20 },
       incomplete: false, observed_at: oldObs,
+    });
+  }
+  if (board === "norel") {
+    // Adapter identity absent (UNKNOWN) but the board itself is readable.
+    return envelope("PASS", {
+      board: "norel", status_filter: "all",
+      cards: [{ id: "t_norel1", title: "No release card", assignee: "evo", status: "running", created_at: obs - 10 }],
+      returned: 1, has_more: false, next_cursor: null, omitted: 0,
+      counts: { by_status: { running: 1 }, total: 1, matching_filter: 1, in_page: 1, omitted: 0 },
+      worker_observations: [], worker_observation_cap: 20, worker_observations_capped: 0,
+      worker_evidence_scope: "running records only", bounded: { card_limit: 100, max_card_limit: 200, worker_check_cap: 20 },
+      incomplete: false, observed_at: obs,
+      timing: { query_seconds: 0.008, collection_seconds: 0.021 },
     });
   }
   return envelope("UNKNOWN", null, "board not found");
@@ -525,6 +544,7 @@ function handleRoutes(req, res, reqBody) {
       { slug: "stale", name: "Stale", total: 1 },
       { slug: "denied", name: "Denied", total: 1 },
       { slug: "held", name: "Held", total: 3 },
+      { slug: "norel", name: "No Release", total: 1 },
     ],
     current: "evo",
   });
@@ -717,8 +737,17 @@ function handleRoutes(req, res, reqBody) {
       return json(res, 200, envelope("PASS", {
         board: "evo",
         adapter: { state: "PASS", revision: "a84a2b2c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a", source: "atlas-kanban installed release", version: "1.4.0" },
+        backend: { state: "PASS", revision: "hermes-0.20.6", source: "hermes-cli release metadata (version 0.20.6, release date 2026.8.27)" },
         observed_at: NOW_NT,
       }));
+    }
+    if (board === "norel") {
+      // Adapter absent but the backend identity still carries honestly.
+      return json(res, 200, envelope("UNKNOWN", {
+        board: "norel",
+        backend: { state: "PASS", revision: "hermes-0.20.6", source: "hermes-cli release metadata (version 0.20.6)" },
+        observed_at: NOW_NT,
+      }, "helper unavailable"));
     }
     return json(res, 200, envelope("UNKNOWN", null, "helper unavailable"));
   }
@@ -748,11 +777,12 @@ function handleRoutes(req, res, reqBody) {
     state.hits.push("acceptance-compare:" + q.get("card"));
     return json(res, 200, envelope("PASS", {
       board: board, card: q.get("card"),
-      current: { run_id: Number(q.get("current_run_id")), state: "PASS", release: { revision: "a84a2b2c0d1e", source: "served" }, kind: "machine validation" },
-      previous: { run_id: Number(q.get("previous_run_id")), state: "UNKNOWN", release: null, kind: "parent attestation" },
+      current: { run_id: Number(q.get("current_run_id")), state: "PASS", release: { revision: "a84a2b2c0d1e", source: "served" }, checks: { worker_stopped: { state: "PASS", source: "machine" } } },
+      previous: { run_id: Number(q.get("previous_run_id")), state: "UNKNOWN", release: null, checks: { parent_source_review: { state: "PASS", source: "parent" } } },
       checks: [
-        { name: "worker_stopped", current: "PASS", previous: "UNKNOWN", change: "reverified", kind: "machine validation" },
-        { name: "parent_source_review", current: null, previous: "PASS", change: "unproved", kind: "parent attestation" },
+        { name: "worker_stopped", source: "machine", current: "PASS", previous: null, change: "new" },
+        { name: "parent_source_review", source: "parent", current: null, previous: "PASS", change: "unproved" },
+        { name: "mystery_check", source: "elsewhere", current: null, previous: null, change: "unproved" },
       ],
       limitations: ["prior receipts absent before capture began"],
       observed_at: NOW_NT,
@@ -786,6 +816,14 @@ function handleRoutes(req, res, reqBody) {
     let body = {};
     try { body = reqBody ? JSON.parse(reqBody) : {}; } catch (_e) { body = {}; }
     state.hits.push("readiness-batch:" + (body.cards || []).join(","));
+    // R9: duplicate selections are rejected with 422, never silently deduped.
+    const seen = {};
+    for (const c of (body.cards || [])) {
+      if (seen[c]) {
+        return json(res, 422, { detail: "cards must be distinct; " + c + " selected more than once" });
+      }
+      seen[c] = true;
+    }
     const items = (body.cards || []).map(function (card) {
       if (card === "t_attn3") {
         return {
@@ -973,6 +1011,7 @@ async function main() {
     await scenarioNextTenDrawer(base);
     await scenarioNextTenBatch(base);
     await scenarioNextTenNotices(base);
+    await scenarioNextTenRepair(base);
     await scenarioNextTenPhone(base);
   } finally {
     await browser.close();
@@ -1633,8 +1672,15 @@ async function scenarioNextTenSupport(base) {
   check("support: adapter identity fetched on expand", state.hits.includes("releases:evo"), state.hits.join(","));
   const adapterText = await page.locator("[data-support-adapter]").textContent();
   check("support: adapter revision shown", /a84a2b2c0d1e/.test(adapterText), adapterText);
-  check("support: frontend build stamp shown locally",
-    await page.locator("[data-support-releases]").locator("text=frontend build:").count() > 0);
+  // R1: the backend identity from the same /evidence/releases envelope.
+  await page.waitForSelector("[data-support-backend]", { timeout: 5000 });
+  const backendText = await page.locator("[data-support-backend]").textContent();
+  check("support: backend identity shown", /backend: PASS @ hermes-/.test(backendText), backendText);
+  // R1: the loaded frontend asset identity (UNKNOWN here: the fixture serves
+  // the bundle directly, so no digest wrapper exists — honest UNKNOWN).
+  const frontendText = await page.locator("[data-support-frontend]").textContent();
+  check("support: frontend asset identity honest when no digest wrapper",
+    /frontend \(this asset\): UNKNOWN/.test(frontendText) && /digest unavailable/.test(frontendText), frontendText);
 
   // R2: readiness line with three separate facts.
   await page.waitForSelector("[data-support-readiness-line]", { timeout: 5000 });
@@ -1643,11 +1689,16 @@ async function scenarioNextTenSupport(base) {
     /reachable: yes/.test(readyText) && /authenticated: yes/.test(readyText) && /board readable: yes/.test(readyText), readyText);
   check("support: browser-readiness endpoint used", state.hits.includes("browser-readiness:evo"), state.hits.join(","));
 
-  // R7: refresh timing + process checks.
+  // R7: refresh timing + actual worker-observation coverage.
   const refreshText = await page.locator("[data-support-refresh]").textContent();
+  check("support: snapshot query/collection timing shown",
+    /snapshot query: 12ms/.test(refreshText) && /collection: 34ms/.test(refreshText), refreshText);
   check("support: refresh interval shown", /refresh interval: 15s/.test(refreshText), refreshText);
-  check("support: process checks line present",
-    await page.locator("[data-support-process-checks]").count() === 1);
+  const procText = await page.locator("[data-support-process-checks]").textContent();
+  check("support: worker observations use actual snapshot fields",
+    /0 examined \(cap 20\)/.test(procText), procText);
+  check("support: capped observations never assumed healthy",
+    !/healthy/.test(procText), procText);
 
   await page.close();
 }
@@ -1675,10 +1726,15 @@ async function scenarioNextTenDrawer(base) {
   check("drawer: acceptance compare fetched", state.hits.some((h) => h.startsWith("acceptance-compare:")), state.hits.join(","));
   const cmpText = await page.locator("[data-acceptance-compare-result]").textContent();
   check("drawer: compare shows run transition", /run 1/.test(cmpText) && /run 2/.test(cmpText), cmpText);
-  check("drawer: parent attestation stays labelled",
-    await page.locator("[data-acceptance-check='parent_source_review']").locator("text=parent attestation").count() > 0);
-  check("drawer: reverified change shown",
-    (await page.locator("[data-acceptance-check='worker_stopped']").textContent()).includes("reverified"));
+  // R4: provenance labels derive from the adapter's `source` field.
+  check("drawer: parent attestation labelled from source",
+    (await page.locator("[data-acceptance-check='parent_source_review']").textContent()).includes("parent attestation"));
+  check("drawer: machine validation labelled from source",
+    (await page.locator("[data-acceptance-check='worker_stopped']").textContent()).includes("machine validation"));
+  check("drawer: unknown origin rejected as unknown",
+    (await page.locator("[data-acceptance-check='mystery_check']").textContent()).includes("origin unknown"));
+  check("drawer: new change shown",
+    (await page.locator("[data-acceptance-check='worker_stopped']").textContent()).includes("new"));
 
   // R6: reviewer packet download actually lands as a file.
   const dlPromise = page.waitForEvent("download");
@@ -1787,7 +1843,66 @@ async function scenarioNextTenNotices(base) {
   await page.close();
 }
 
-// 390px phone: support panel and drawer next-ten section render.
+// R9 duplicate rejection through the real fetch path, and R10 same-count
+// swap detection under paging, and R1 adapter-absent board identity.
+async function scenarioNextTenRepair(base) {
+  // R9: a duplicate selection POST must surface the 422 reason, never a
+  // silently deduped success.
+  resetState();
+  let page = await (await newPage(base, "held"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-readiness-batch-card='t_hold1']", { timeout: 5000 });
+  await page.evaluate(function () {
+    // Drive the IIFE's own fetcher path with a duplicate body through the
+    // page's real fetch (network boundary only).
+    return fetch("/api/plugins/kanban/workflow/readiness-batch?board=held", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cards: ["t_hold1", "t_hold1"], check_model: false }),
+    }).then(function (r) { return r.status; });
+  }).then(function (status) {
+    check("repair: duplicate batch POST rejected 422", status === 422, "status=" + status);
+  });
+  await page.close();
+
+  // R10: same-count swap between pages (t_run2 disappears, t_swap9 appears,
+  // totals identical) must trip the drift banner with restart.
+  resetState();
+  state.evoSameCountSwap = true;
+  page = await (await newPage(base, "evo"));
+  await page.goto(base + "/");
+  await page.waitForSelector("text=Run card two", { timeout: 5000 });
+  await page.click("text=Load more");
+  await page.waitForSelector("text=Done card", { timeout: 5000 });
+  // Force the page-0 refresh that reveals the swap (updated snapshot).
+  await page.click("button:has-text('Refresh')");
+  await page.waitForSelector("[data-evidence-paging-drift]", { timeout: 5000 });
+  const driftAttr = await page.locator("[data-evidence-paging-drift]").getAttribute("data-paging-drift-same-count");
+  check("repair: same-count swap detected as drift", driftAttr === "true", "attr=" + driftAttr);
+  const driftText = await page.locator("[data-evidence-paging-drift]").textContent();
+  check("repair: same-count drift names the total", /same total \(3\)/.test(driftText), driftText);
+  await page.click("[data-evidence-paging-restart]");
+  await page.waitForSelector("text=Swapped card nine", { timeout: 5000 });
+  check("repair: restart paging lands on the new generation",
+    await page.locator("[data-evidence-paging-drift]").count() === 0);
+  await page.close();
+
+  // R1: adapter identity absent (UNKNOWN) still shows backend + honest
+  // adapter line, never a borrowed identity.
+  resetState();
+  page = await (await newPage(base, "norel"));
+  await page.goto(base + "/");
+  await page.waitForSelector("[data-support-panel]", { timeout: 5000 });
+  await page.click("[data-support-panel-toggle]");
+  await page.waitForSelector("[data-support-adapter]", { timeout: 5000 });
+  await page.waitForTimeout(200);
+  const norelAdapter = await page.locator("[data-support-adapter]").textContent();
+  check("repair: absent adapter identity stays honest",
+    /adapter: UNKNOWN|helper unavailable/.test(norelAdapter), norelAdapter);
+  const norelBackend = await page.locator("[data-support-backend]").textContent();
+  check("repair: backend identity present without adapter", /backend: PASS @ hermes-/.test(norelBackend), norelBackend);
+  await page.close();
+}
 async function scenarioNextTenPhone(base) {
   resetState();
   const page = await (await newPage(base, "evo", { width: 390, height: 844 }));

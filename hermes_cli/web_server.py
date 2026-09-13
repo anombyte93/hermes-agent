@@ -18986,6 +18986,42 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
             detail="File not found",
         )
     media_type = content_types[suffix]
+    # R1 (kanban next-ten): for JavaScript assets, embed a SHA-256 digest of
+    # the EXACT bytes in this same response, bound to that script's own
+    # execution. The digest is prepended as a self-contained statement that
+    # publishes it on a per-script global registry keyed by the served path,
+    # so concurrent/interleaved script loads can never borrow another
+    # response's identity (each response carries its own value lexically;
+    # no cookie, no shared mutable slot written by a different response).
+    # Path/suffix/auth/cache rules above are unchanged; non-JS assets and
+    # missing files keep the plain FileResponse path.
+    if suffix in (".js", ".mjs"):
+        try:
+            data = target.read_bytes()
+        except OSError:
+            data = None
+        if data is not None:
+            digest = hashlib.sha256(data).hexdigest()
+            script_name = f"{plugin_name}/{file_path}"
+            wrapper = (
+                "(function(){var m={plugin:" + json.dumps(plugin_name)
+                + ",path:" + json.dumps(file_path)
+                + ",sha256:" + json.dumps(digest)
+                + ",bytes:" + str(len(data))
+                + "};"
+                + "(globalThis.__HERMES_PLUGIN_ASSET_ID__"
+                + "=globalThis.__HERMES_PLUGIN_ASSET_ID__||{})"
+                + "[" + json.dumps(script_name) + "]=m;})();"
+            ).encode("utf-8")
+            body = wrapper + b"\n" + data
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "X-Hermes-Asset-SHA256": digest,
+                },
+            )
     return FileResponse(
         target,
         media_type=media_type,

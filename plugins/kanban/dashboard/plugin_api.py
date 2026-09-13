@@ -5234,21 +5234,64 @@ def _attachment_ids_for_card(conn: sqlite3.Connection, card: str) -> list[int]:
     return [int(r[0]) for r in rows]
 
 
+def _hermes_backend_release_identity() -> dict[str, Any]:
+    """R1: the served Hermes backend's own release identity.
+
+    Derived from the immutable release metadata loaded with this module
+    (``hermes_cli.__version__`` / ``__release_date__``) — never from a
+    mutable checkout HEAD and never a hardcoded string. Missing metadata
+    degrades to an honest UNKNOWN, never a fabricated identity.
+    """
+    from hermes_cli import __release_date__, __version__
+
+    version = __version__ if isinstance(__version__, str) else ""
+    release_date = __release_date__ if isinstance(__release_date__, str) else ""
+    if not version:
+        return {
+            "state": "UNKNOWN",
+            "revision": None,
+            "source": "hermes_cli release metadata absent; backend identity not established",
+        }
+    source = f"hermes-cli release metadata (version {version}"
+    if release_date:
+        source += f", release date {release_date}"
+    source += ")"
+    return {
+        "state": "PASS",
+        "revision": f"hermes-{version}",
+        "source": source,
+    }
+
+
 @router.get("/evidence/releases")
 async def evidence_releases(
     board: str = Query(..., description="Shared board slug"),
 ):
-    """R1: release identity of the ACTUAL served adapter, read through the
-    helper (never live main HEAD). The frontend adds its own build stamp
-    locally; this door carries only the served adapter identity."""
+    """R1: release identities of the ACTUAL served adapter AND the Hermes
+    backend hosting this API, read through the helper (never live main
+    HEAD). The frontend adds its own served asset identity locally; this
+    door carries the adapter identity plus the backend identity derived
+    from immutable release metadata."""
     slug = _evidence_board_slug(board)
     args: dict[str, Any] = {"board": slug}
-    return await _next_ten_call_async(
+    envelope = await _next_ten_call_async(
         "kanban_release_identity",
         args,
         board=slug,
         request_echo={"board": slug},
     )
+    # Attach this backend's own served identity (immutable release metadata
+    # loaded with the module; UNKNOWN when the metadata is absent, never
+    # guessed). An adapter FAIL/UNKNOWN envelope still carries the backend
+    # line so the panel can render both honestly.
+    if isinstance(envelope.get("evidence"), dict):
+        envelope["evidence"]["backend"] = _hermes_backend_release_identity()
+    else:
+        envelope["evidence"] = {
+            "board": slug,
+            "backend": _hermes_backend_release_identity(),
+        }
+    return envelope
 
 
 @router.get("/evidence/acceptance-compare")
@@ -5350,8 +5393,15 @@ async def workflow_readiness_batch(
     cards: list[str] = []
     for raw in payload.cards:
         card = _evidence_card_id(raw)
-        if card not in cards:
-            cards.append(card)
+        if card in cards:
+            # R9: reject duplicate selections explicitly — a silent dedup
+            # would hide a real selection error and diverge from the
+            # adapter's own distinct-cards contract.
+            raise HTTPException(
+                status_code=422,
+                detail=f"cards must be distinct; {card} selected more than once",
+            )
+        cards.append(card)
     if not cards:
         raise HTTPException(status_code=422, detail="cards must not be empty")
     if len(cards) > _READINESS_BATCH_MAX_CARDS:

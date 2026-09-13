@@ -350,9 +350,33 @@
   const EVIDENCE_STALE_AMBER_S = 60;
   const EVIDENCE_STALE_RED_S = 300;
   const EVIDENCE_POLL_MS = 15000;
-  // R1: this frontend's own build stamp, added LOCALLY by the plugin bundle
-  // (the served adapter identity comes from /evidence/releases separately).
-  const FRONTEND_BUILD_STAMP = "kanban-dashboard-1.1.0+nextten";
+  // R1: identity of the EXACT JS bytes this IIFE was served in. The Hermes
+  // asset door prepends a wrapper statement to the served response that
+  // publishes {sha256, bytes} on the per-script registry BEFORE this code
+  // runs; capturing it here (at IIFE execution, not later) binds the
+  // identity to the response that actually executed. No wrapper (older
+  // backend, plain file serving) means honest UNKNOWN — never a hardcoded
+  // stamp and never a re-read of mutable current bytes.
+  const LOADED_ASSET_IDENTITY = (function () {
+    try {
+      const reg = globalThis.__HERMES_PLUGIN_ASSET_ID__;
+      const m = reg && reg["kanban/dist/index.js"];
+      if (m && typeof m.sha256 === "string" && /^[a-f0-9]{64}$/.test(m.sha256)) {
+        return {
+          state: "PASS",
+          revision: m.sha256.slice(0, 12),
+          source: "served asset bytes (sha256 of the original dist/index.js payload; wrapper bytes excluded)",
+          bytes: typeof m.bytes === "number" ? m.bytes : null,
+        };
+      }
+    } catch (_e) { /* registry absent — UNKNOWN below */ }
+    return {
+      state: "UNKNOWN",
+      revision: null,
+      source: "served asset digest unavailable (older backend or direct file load); upgrade the Hermes dashboard server to expose the loaded asset identity",
+      bytes: null,
+    };
+  })();
   // R3: repair preview actions, text only, keyed by readiness check name.
   // Mirrors the plugin backend's fixed table; never executable shell.
   const REPAIR_PREVIEW_ACTIONS = {
@@ -544,6 +568,7 @@
     const cardsRef = useRef([]);      // mirrors the `cards` state (for dedupe)
     const firstPageLenRef = useRef(0); // page-0 slice length (poll replaces it)
     const pagingTotalRef = useRef(null); // R10: total the appended pages were loaded under
+    const pagingFirstIdsRef = useRef(null); // R10: first-page card ids of the load generation
 
     const aligned = !!(context && context.aligned === true);
     // R10: stable evolving pagination. Appended pages carry the generation
@@ -566,6 +591,8 @@
       setHasMore(false);
       setOmitted(null);
       setPagingDrift(null);
+      pagingTotalRef.current = null;
+      pagingFirstIdsRef.current = null;
     }, []);
 
     // Apply a snapshot envelope. page 0 (append=false) seeds cards only when
@@ -618,23 +645,45 @@
           if (data.next_cursor != null) setCursor(data.next_cursor);
           else if (!data.has_more) setCursor(null);
           setOmitted(omitNum);
+          pagingFirstIdsRef.current = pageCards.map(function (c) { return c && c.id; });
         } else if (appended.length > 0) {
           // R10: a refresh under appended pages. The loaded list is a
-          // mixture of generations whenever the fresh total differs from the
-          // total the appended pages were loaded under; say so and offer a
-          // restart instead of blending silently.
+          // mixture of generations whenever the board changed under paging:
+          // a different total, OR the same total with different card ids
+          // (an insert+delete swap keeps the count constant). In both cases
+          // say so and offer a restart instead of blending silently.
           const total = (data.counts && typeof data.counts.total === "number")
             ? data.counts.total : null;
           const loaded = pageCards.length + appended.length;
-          if (total != null && total !== loaded && pagingTotalRef.current != null
-              && total !== pagingTotalRef.current) {
+          const countChanged = total != null && total !== loaded && pagingTotalRef.current != null
+            && total !== pagingTotalRef.current;
+          const knownIds = {};
+          let k = cardsRef.current.length;
+          while (k--) knownIds[cardsRef.current[k] && cardsRef.current[k].id] = true;
+          let compositionChanged = false;
+          if (pagingFirstIdsRef.current) {
+            // The first page's previous id set vs the fresh one: any id
+            // appearing or disappearing with the SAME total is a swap.
+            const prevIds = pagingFirstIdsRef.current;
+            if (pageCards.length === prevIds.length) {
+              const prevSet = {};
+              for (let j = 0; j < prevIds.length; j++) prevSet[prevIds[j]] = true;
+              for (let j = 0; j < pageCards.length; j++) {
+                const id = pageCards[j] && pageCards[j].id;
+                if (!prevSet[id]) { compositionChanged = true; break; }
+              }
+            }
+          }
+          if (countChanged || compositionChanged) {
             setPagingDrift({
               loaded: loaded,
               total: total,
               previousTotal: pagingTotalRef.current,
+              sameCount: compositionChanged && !countChanged,
             });
           }
           pagingTotalRef.current = total;
+          pagingFirstIdsRef.current = pageCards.map(function (c) { return c && c.id; });
         }
       }
     }, []);
@@ -708,6 +757,8 @@
       setHasMore(false);
       setOmitted(null);
       setPagingDrift(null);
+      pagingTotalRef.current = null;
+      pagingFirstIdsRef.current = null;
       return refresh();
     }, [refresh]);
 
@@ -992,11 +1043,15 @@
         ? h("div", {
             className: "hermes-kanban-evidence-drift",
             "data-evidence-paging-drift": "true",
+            "data-paging-drift-same-count": ev.pagingDrift.sameCount ? "true" : undefined,
             style: { color: EVIDENCE_STATE_TONE.unknown },
           },
-          "Board changed under paging (loaded " + ev.pagingDrift.loaded +
-          " of a new total " + ev.pagingDrift.total + "; previous total " +
-          ev.pagingDrift.previousTotal + "). The list may mix generations.",
+          ev.pagingDrift.sameCount
+            ? "Board changed under paging with the same total (" + ev.pagingDrift.total +
+              "; the list may now mix card generations from a swap)."
+            : "Board changed under paging (loaded " + ev.pagingDrift.loaded +
+              " of a new total " + ev.pagingDrift.total + "; previous total " +
+              ev.pagingDrift.previousTotal + "). The list may mix generations.",
           h("button", {
             type: "button",
             className: "hermes-kanban-edit-link",
@@ -1755,34 +1810,58 @@
         : null);
   }
 
-  // R1/R2/R7 — concise expandable support panel: release identities (adapter
-  // served identity + this frontend's build stamp), browser readiness shown
-  // VISIBLY SEPARATE from reachability, and refresh timing with
-  // checked-vs-skipped process-check counts. Collapsed by default so it
-  // never competes with the board; every fetch happens only on expand.
+  // R1/R2/R7 — concise expandable support panel: release identities (the
+  // LOADED frontend asset captured at execution, the adapter's served
+  // identity and this Hermes backend's release metadata), browser readiness
+  // shown VISIBLY SEPARATE from reachability, and refresh timing with the
+  // snapshot's actual worker-observation coverage. Collapsed by default so
+  // it never competes with the board; every fetch happens only on expand.
   function SupportPanel(props) {
     const [open, setOpen] = useState(false);
     const [releases, setReleases] = useState(null);
     const [readiness, setReadiness] = useState(null);
-    const loadedForRef = useRef(null);
+    // Board+request generation: a fetch that starts for one board can never
+    // publish another board's identity, and a FAILED/absent fetch never
+    // marks the board loaded — reopening retries instead of stranding.
+    const loadedGenRef = useRef(0);
+    const [reloadTick, setReloadTick] = useState(0);
 
     const board = props.boardSlug;
     useEffect(function () {
-      if (!open || loadedForRef.current === board) return undefined;
-      loadedForRef.current = board;
+      if (!open) return undefined;
+      loadedGenRef.current += 1;
+      const gen = loadedGenRef.current;
       let alive = true;
-      fetchReleases(board).then(function (env) { if (alive) setReleases(env); });
-      fetchBrowserReadiness(board).then(function (env) { if (alive) setReadiness(env); });
+      setReleases(null);
+      setReadiness(null);
+      fetchReleases(board).then(function (env) { if (alive && gen === loadedGenRef.current) setReleases(env); });
+      fetchBrowserReadiness(board).then(function (env) { if (alive && gen === loadedGenRef.current) setReadiness(env); });
       return function () { alive = false; };
-    }, [open, board]);
+    }, [open, board, reloadTick]);
 
     const rel = (releases && releases.state === "PASS" && releases.evidence) ? releases.evidence : null;
     const adapter = (rel && rel.adapter) ? rel.adapter : null;
+    const backend = (rel && rel.backend) ? rel.backend : null;
     const ready = (readiness && readiness.evidence) ? readiness.evidence : null;
+    // R7: the snapshot's OWN measured timing, not the bridge subprocess
+    // round-trip alone.
+    const snapEv = (props.snapshot && props.snapshot.evidence && typeof props.snapshot.evidence === "object")
+      ? props.snapshot.evidence : {};
+    const snapTiming = (snapEv.timing && typeof snapEv.timing === "object") ? snapEv.timing : {};
     const timing = (props.snapshot && props.snapshot.timing) ? props.snapshot.timing : {};
     const roundtrip = typeof timing.helper_roundtrip_ms === "number"
       ? Math.round(timing.helper_roundtrip_ms) + "ms" : "unknown";
-    const procChecks = props.processChecks || {};
+    const querySeconds = typeof snapTiming.query_seconds === "number" ? snapTiming.query_seconds : null;
+    const collectionSeconds = typeof snapTiming.collection_seconds === "number" ? snapTiming.collection_seconds : null;
+    // R7: actual snapshot facts. The adapter emits worker_observations (a
+    // bounded list), worker_observation_cap and worker_observations_capped —
+    // there is no process_checks field, so counts derive only from what was
+    // actually examined; capped-away observations are shown as the omission
+    // they are, never as healthy.
+    const obsList = Array.isArray(snapEv.worker_observations) ? snapEv.worker_observations : null;
+    const obsCap = typeof snapEv.worker_observation_cap === "number" ? snapEv.worker_observation_cap : null;
+    const obsCapped = typeof snapEv.worker_observations_capped === "number" ? snapEv.worker_observations_capped : null;
+    const pending = releases == null || readiness == null;
 
     return h("div", { className: "hermes-kanban-section", "data-support-panel": "true" },
       h("button", {
@@ -1792,21 +1871,44 @@
         onClick: function () { setOpen(!open); },
       }, (open ? "▾ " : "▸ ") + "Support info"),
       open ? h("div", { className: "hermes-kanban-support-body", "data-support-panel-body": "true" },
-        // R1: release identities, frontend build stamp added LOCALLY.
+        // R1: all three identities — loaded asset, adapter, backend.
         h("div", { className: "text-xs", "data-support-releases": "true" },
           h("div", { style: { fontWeight: "600" } }, "Releases"),
-          h("div", null, "frontend build: " + (String(FRONTEND_BUILD_STAMP || "unknown"))),
+          h("div", { "data-support-frontend": "true" },
+            "frontend (this asset): " + (LOADED_ASSET_IDENTITY.state === "PASS"
+              ? LOADED_ASSET_IDENTITY.revision +
+                (LOADED_ASSET_IDENTITY.bytes != null ? " (" + LOADED_ASSET_IDENTITY.bytes + " bytes)" : "") +
+                " — " + LOADED_ASSET_IDENTITY.source
+              : "UNKNOWN — " + LOADED_ASSET_IDENTITY.source)),
           adapter
             ? h("div", { "data-support-adapter": "true" },
                 "adapter: " + (adapter.state || "UNKNOWN") +
                 (adapter.revision ? " @ " + String(adapter.revision).slice(0, 12) : "") +
                 (adapter.version ? " (" + adapter.version + ")" : "") +
                 (adapter.source ? " — " + adapter.source : ""))
-            : h("div", { style: { color: EVIDENCE_STATE_TONE.unknown } },
+            : h("div", { style: { color: EVIDENCE_STATE_TONE.unknown }, "data-support-adapter": "true" },
                 "adapter: " + ((releases && releases.reason) || "identity unavailable")),
+          backend
+            ? h("div", { "data-support-backend": "true", style: backend.state !== "PASS" ? { color: EVIDENCE_STATE_TONE.unknown } : undefined },
+                "backend: " + (backend.state || "UNKNOWN") +
+                (backend.revision ? " @ " + backend.revision : "") +
+                (backend.source ? " — " + backend.source : ""))
+            : h("div", { style: { color: EVIDENCE_STATE_TONE.unknown }, "data-support-backend": "true" },
+                "backend: UNKNOWN — this server does not report its release identity"),
           rel && rel.adapter && rel.adapter.state !== "PASS"
             ? h("div", { style: { color: EVIDENCE_STATE_TONE.unknown } },
                 "adapter identity " + rel.adapter.state + (rel.adapter.state === "UNKNOWN" ? " — absent or invalid identity is UNKNOWN, never assumed" : ""))
+            : null,
+          pending
+            ? h("div", { className: "text-xs text-muted-foreground", "data-support-pending": "true" }, "loading identities…")
+            : null,
+          releases && releases.state !== "PASS"
+            ? h("button", {
+                type: "button",
+                className: "hermes-kanban-edit-link",
+                "data-support-retry": "true",
+                onClick: function () { setReloadTick(function (n) { return n + 1; }); },
+              }, "retry identity read")
             : null),
         // R2: browser readiness separate from reachability.
         h("div", { className: "text-xs", "data-support-readiness": "true", style: { marginTop: "6px" } },
@@ -1825,18 +1927,23 @@
             : null,
           h("div", { style: { color: "var(--muted-foreground, #6b7280)" } },
             "A reachable login page never implies board access; these are separate facts.")),
-        // R7: refresh timing + checked-vs-skipped process checks.
+        // R7: refresh timing + actual worker-observation coverage.
         h("div", { className: "text-xs", "data-support-refresh": "true", style: { marginTop: "6px" } },
           h("div", { style: { fontWeight: "600" } }, "Refresh"),
           h("div", null,
-            "snapshot round-trip: " + roundtrip +
+            "snapshot query: " + (querySeconds != null ? (Math.round(querySeconds * 1000) + "ms") : "unknown") +
+            " · collection: " + (collectionSeconds != null ? (Math.round(collectionSeconds * 1000) + "ms") : "unknown") +
+            " · bridge round-trip: " + roundtrip +
             " · refresh interval: " + Math.round(EVIDENCE_POLL_MS / 1000) + "s"),
           h("div", { "data-support-process-checks": "true" },
-            "process checks: " +
-            (typeof procChecks.checked === "number" ? procChecks.checked + " checked" : "checked unknown") +
-            " · " +
-            (typeof procChecks.skipped === "number" ? procChecks.skipped + " skipped" : "skipped unknown") +
-            (procChecks.note ? " — " + procChecks.note : "")),
+            "worker observations: " +
+            (obsList != null
+              ? obsList.length + " examined" +
+                (obsCap != null ? " (cap " + obsCap + ")" : "")
+              : "count unknown — snapshot carried no observation list") +
+            (obsCapped != null && obsCapped > 0
+              ? " · " + obsCapped + " capped away (not examined, never assumed healthy)"
+              : "")),
           h("div", { style: { color: "var(--muted-foreground, #6b7280)" } },
             "A slow refresh is transport delay or intentionally limited coverage, never hidden work.")))
       : null);
@@ -3469,7 +3576,6 @@
         h(SupportPanel, {
           boardSlug: board,
           snapshot: evidence.snapshot,
-          processChecks: (evidence.snapshot && evidence.snapshot.evidence && evidence.snapshot.evidence.process_checks) || {},
         }),
         evidenceAligned ? h(WorkflowNoticeRegion, {
           notices: workflowNotices,
@@ -5661,6 +5767,14 @@
     }, [board, card, attachmentId]);
 
     const cmpEv = (compare && compare.state === "PASS" && compare.evidence) ? compare.evidence : null;
+    // R4: the adapter labels each check's provenance with a `source` field
+    // ("parent" = parent attestation, "machine" = machine validation);
+    // anything else is an honest UNKNOWN origin, never guessed.
+    function checkOriginLabel(c) {
+      if (c && c.source === "parent") return "parent attestation";
+      if (c && c.source === "machine") return "machine validation";
+      return "origin unknown";
+    }
     const cmpRows = cmpEv && Array.isArray(cmpEv.checks)
       ? cmpEv.checks.map(function (c, i) {
           return h("div", {
@@ -5670,9 +5784,7 @@
           },
             h("span", { className: "hermes-kanban-workflow-check-name" }, c.name || ""),
             h("span", { className: "hermes-kanban-workflow-check-state", style: { color: workflowStateTone(c.change === "reverified" ? "PASS" : c.change === "regressed" ? "FAIL" : "UNKNOWN") } }, c.change || "unproved"),
-            c.kind
-              ? h("span", { className: "hermes-kanban-workflow-check-reason" }, c.kind)
-              : null);
+            h("span", { className: "hermes-kanban-workflow-check-reason" }, checkOriginLabel(c)));
         })
       : [];
 

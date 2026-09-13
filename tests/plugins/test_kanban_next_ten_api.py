@@ -128,19 +128,23 @@ def next_ten_data(tool, args):
                 "run_id": args.get("current_run_id"),
                 "state": "PASS",
                 "release": {{"revision": "a84a2b2c0" * 4, "source": "served"}},
-                "kind": "machine validation",
+                "checks": {{
+                    "worker_stopped": {{"state": "PASS", "source": "machine"}},
+                }},
             }},
             "previous": {{
                 "run_id": args.get("previous_run_id"),
                 "state": "UNKNOWN",
                 "release": None,
-                "kind": "parent attestation",
+                "checks": {{
+                    "parent_source_review": {{"state": "PASS", "source": "parent"}},
+                }},
             }},
             "checks": [
-                {{"name": "worker_stopped", "current": "PASS", "previous": "UNKNOWN",
-                 "change": "reverified", "kind": "machine validation"}},
-                {{"name": "parent_source_review", "current": None, "previous": "PASS",
-                 "change": "unproved", "kind": "parent attestation"}},
+                {{"name": "worker_stopped", "source": "machine", "current": "PASS",
+                  "previous": None, "change": "new"}},
+                {{"name": "parent_source_review", "source": "parent", "current": None,
+                  "previous": "PASS", "change": "unproved"}},
             ],
             "limitations": ["prior receipts absent before capture began"],
             "observed_at": NOW,
@@ -359,6 +363,44 @@ def test_releases_child_write_authority_stripped(client, helper_bin, monkeypatch
     assert r.status_code == 200
 
 
+def test_releases_carries_backend_identity(client, helper_bin):
+    """R1: /evidence/releases must attach the served Hermes backend identity
+    (immutable release metadata loaded with the module), not only the
+    adapter's own identity."""
+    helper_bin("pass")
+    r = _get(client, "/evidence/releases?board=evo-alpha")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "PASS"
+    backend = body["evidence"]["backend"]
+    assert backend["state"] == "PASS"
+    assert backend["revision"], "backend revision must identify the served release"
+    assert isinstance(backend["source"], str) and backend["source"]
+    # The backend identity is derived from the module's immutable release
+    # metadata, not from a mutable checkout HEAD.
+    from hermes_cli import __release_date__ as rel_date, __version__ as ver
+
+    assert ver in backend["revision"] or backend["revision"].startswith("hermes-")
+    assert rel_date in backend["source"]
+
+
+def test_releases_backend_identity_missing_metadata_unknown(client, helper_bin, monkeypatch):
+    """Missing release metadata must degrade to an honest UNKNOWN backend
+    identity, never a fabricated one."""
+    import hermes_cli
+
+    helper_bin("pass")
+    monkeypatch.setattr(hermes_cli, "__version__", "", raising=False)
+    monkeypatch.setattr(hermes_cli, "__release_date__", "", raising=False)
+    r = _get(client, "/evidence/releases?board=evo-alpha")
+    body = r.json()
+    assert body["state"] == "PASS"
+    backend = body["evidence"]["backend"]
+    assert backend["state"] == "UNKNOWN"
+    assert backend["revision"] is None
+    assert backend["source"]
+
+
 # ---------------------------------------------------------------------------
 # R4 acceptance compare
 # ---------------------------------------------------------------------------
@@ -375,12 +417,15 @@ def test_acceptance_compare_pass(client, helper_bin):
     body = r.json()
     assert body["state"] == "PASS"
     ev = body["evidence"]
-    # Parent attestation stays labelled, never machine validation.
-    kinds = {c["name"]: c["kind"] for c in ev["checks"]}
-    assert kinds["parent_source_review"] == "parent attestation"
-    assert kinds["worker_stopped"] == "machine validation"
+    # Attestation origin comes from the adapter's `source` field
+    # (parent|machine), never an invented `kind` field.
+    sources = {c["name"]: c["source"] for c in ev["checks"]}
+    assert sources["parent_source_review"] == "parent"
+    assert sources["worker_stopped"] == "machine"
+    for c in ev["checks"]:
+        assert "kind" not in c
     changes = {c["name"]: c["change"] for c in ev["checks"]}
-    assert changes["worker_stopped"] == "reverified"
+    assert changes["worker_stopped"] == "new"
     assert changes["parent_source_review"] == "unproved"
     assert isinstance(ev["limitations"], list)
 
@@ -548,17 +593,19 @@ def test_readiness_batch_pass_with_repair_previews(client, helper_bin, evo_align
     assert invocation["stdin"]["check_model"] is False
 
 
-def test_readiness_batch_deduplicates_and_bounds(client, helper_bin, evo_aligned):
+def test_readiness_batch_rejects_duplicate_cards(client, helper_bin, evo_aligned):
+    """R9: duplicate selections are REJECTED (422), not silently deduped —
+    the adapter's own contract fails on non-distinct cards, and a quiet
+    dedup would hide a real selection error from the user."""
     helper_bin("pass")
     r = _post(
         client,
         "/workflow/readiness-batch?board=default",
         {"cards": ["t_00000001", "t_00000001"]},
     )
-    assert r.status_code == 200
-    invocation = _invocations(helper_bin.record_path)[0]
-    assert invocation["stdin"]["cards"] == ["t_00000001"]
-    # 11 distinct cards exceed the bound.
+    assert r.status_code == 422
+    assert _invocations(helper_bin.record_path) == []
+    # 11 distinct cards still exceed the bound.
     eleven = [f"t_{i:08x}" for i in range(11)]
     r2 = _post(
         client, "/workflow/readiness-batch?board=default", {"cards": eleven}
