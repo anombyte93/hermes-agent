@@ -1365,15 +1365,13 @@ def _write_resume_note(
         )
         # Plain INSERT (not add_comment): caller holds the reclaim txn and
         # add_comment would open a nested write_txn + emit a duplicate
-        # ``commented`` event per reclaim.
+        # ``commented`` event per reclaim. No event append either: consumers
+        # (tests, ``watch``) treat the closing outcome event as the last
+        # transition event; the note is a comment, not a transition.
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
             (task_id, _kb.RESUME_NOTE_AUTHOR, body, int(time.time())),
-        )
-        _kb._append_event(
-            conn, task_id, "resume_note",
-            {"run_id": run_id, "outcome": outcome}, run_id=run_id,
         )
     except Exception:
         # Best-effort by contract; a note failure must never abort a reclaim.

@@ -23,6 +23,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -42,7 +43,11 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _seed_repo(repo: Path) -> str:
-    """Init a git repo with one commit on main; returns the base sha."""
+    """Init a git repo: one commit on ``main`` (returns its sha = base), then
+    a ``work`` branch checked out for the card's commits. The branch matters:
+    a card commits on a side branch, so ``merge-base HEAD main`` (the base the
+    note derives when no explicit base is recorded) lands below the card's
+    commits instead of on HEAD itself."""
     repo.mkdir(parents=True, exist_ok=True)
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "kanban@example.com")
@@ -50,7 +55,9 @@ def _seed_repo(repo: Path) -> str:
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "init")
-    return _git(repo, "rev-parse", "HEAD")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-b", "work")
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +170,7 @@ def test_crash_reclaim_writes_dispatcher_resume_note(kanban_home, monkeypatch):
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="crash note", assignee="a")
-        kb.set_workspace_path(conn, tid, str(repo))
+        kbw.set_workspace_path(conn, tid, str(repo))
         _claim_with_dead_worker(conn, tid, 70001)
         kbd.detect_crashed_workers(conn)
 
@@ -185,7 +192,7 @@ def test_rate_limited_reclaim_also_writes_resume_note(kanban_home, monkeypatch):
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="rl note", assignee="a")
-        kb.set_workspace_path(conn, tid, str(repo))
+        kbw.set_workspace_path(conn, tid, str(repo))
         _claim_with_dead_worker(conn, tid, 70002)
         kbd._record_worker_exit(70002, 75 << 8)  # KANBAN_RATE_LIMIT_EXIT_CODE
         kbd.detect_crashed_workers(conn)
@@ -202,13 +209,20 @@ def test_timeout_reclaim_writes_dispatcher_resume_note(kanban_home, monkeypatch)
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="timeout note", assignee="a", max_runtime_seconds=1)
-        kb.set_workspace_path(conn, tid, str(repo))
+        kbw.set_workspace_path(conn, tid, str(repo))
         _claim_with_dead_worker(conn, tid, 70003)
+        # Runtime is per attempt: the active task_runs row's started_at is
+        # what enforce_max_runtime measures (tasks.started_at records the
+        # FIRST start), so age the run, not the task.
         conn.execute(
-            "UPDATE tasks SET started_at=? WHERE id=?", (int(time.time()) - 60, tid)
+            "UPDATE task_runs SET started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (int(time.time()) - 60, tid),
         )
         conn.commit()
-        kbd.enforce_max_runtime(conn)
+        # signal_fn must be faked: the real path SIGTERMs/SIGKILLs host pids —
+        # never risk signal delivery from a test (2026-09-13 board incident).
+        kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None)
 
         notes = [c for c in kb.list_comments(conn, tid) if c.author == "dispatcher"]
         assert len(notes) == 1
@@ -225,7 +239,7 @@ def test_rate_limited_reclaim_does_not_count_failure(kanban_home, monkeypatch):
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="rl no count", assignee="a")
-        kb.set_workspace_path(conn, tid, str(repo))
+        kbw.set_workspace_path(conn, tid, str(repo))
         _claim_with_dead_worker(conn, tid, 70004)
         kbd._record_worker_exit(70004, 75 << 8)
         kbd.detect_crashed_workers(conn)
@@ -246,6 +260,11 @@ def test_worker_context_hoists_newest_dispatcher_note(kanban_home):
         tid = kb.create_task(conn, title="ctx note", assignee="a")
         kb.add_comment(conn, tid, "dispatcher", "note one from run 1")
         kb.add_comment(conn, tid, "dispatcher", "note two from run 2")
+        # A closed prior run: the hoisted note must sit above the attempt
+        # history it belongs to, and ``_ctx_prior_attempts`` renders nothing
+        # without at least one ended run.
+        kb.claim_task(conn, tid, claimer="h:w")
+        kb._end_run(conn, tid, outcome="crashed", error="pid 70005 not alive")
 
         ctx = kb.build_worker_context(conn, tid)
 
