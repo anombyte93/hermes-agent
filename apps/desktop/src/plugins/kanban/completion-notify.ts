@@ -46,6 +46,10 @@ export interface CompletionEvent {
   task_id?: string
   kind?: string
   payload?: Record<string, unknown> | null
+  /** The run that produced this event (present on terminal kinds from the
+   *  /events socket). A re-block under a NEW run id is a new intervention,
+   *  even when the reason text is identical. */
+  run_id?: null | number
 }
 
 /** Exact card open request, carried by a terminal toast's action and consumed
@@ -196,10 +200,18 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
   return ''
 }
 
-/** R5 fingerprint for an intervention kind: the kind plus its reason/remedy
- *  payload. Two events with the same fingerprint are the same intervention. */
+/** R5 fingerprint for an intervention kind: the kind, its reason/remedy
+ *  payload, AND the run it came from. Two events with the same fingerprint are
+ *  the same intervention. Including the run id means a worker that re-blocks
+ *  with an identical reason under a NEW run id (with no claim/spawn frame
+ *  reaching the renderer in between — a socket gap) is a NEW intervention and
+ *  notifies, closing the quiet-window the kind+reason-only fingerprint had. */
 function interventionFingerprint(kind: string, ev: CompletionEvent): string {
-  return `${kind}\u0000${bodyFor(kind, ev)}`
+  const payload = ev.payload ?? {}
+  const remedy = typeof payload.remedy === 'string' ? payload.remedy.trim() : ''
+  const runId = typeof ev.run_id === 'number' && Number.isFinite(ev.run_id) ? String(ev.run_id) : ''
+
+  return `${kind}\u0000${bodyFor(kind, ev)}\u0000${remedy}\u0000${runId}`
 }
 
 /** Map key for one (board, task) intervention slot — board-isolated. */

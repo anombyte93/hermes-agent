@@ -837,11 +837,13 @@ describe('R5 — meaningful-intervention dedup', () => {
       ['a', 100],
       ['b', 200]
     ])
+
     const m = await loadModule()
 
     const rest = vi.fn(async (path: string) => {
       if (path.startsWith('/events/baseline')) {
         const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
+
         return { state: 'PASS', board: slug, evidence: { baseline_id: latest.get(slug) ?? 0 } }
       }
 
@@ -859,6 +861,30 @@ describe('R5 — meaningful-intervention dedup', () => {
     // fingerprint map is keyed by board+task.
     const refired = await m.onKanbanEventsFrame('b', [ev(201, 'blocked', { reason: 'needs input' }, 't_x')])
     expect(refired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('a re-block under a NEW run id (missed claim frame) notifies — run_id is part of the fingerprint', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // First block under run 7.
+    const block1 = { id: 101, kind: 'blocked', task_id: 't_x', run_id: 7, payload: { reason: 'needs input' } } as CompletionEvent
+    await m.onKanbanEventsFrame('smoke', [block1])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Same reason, NEW run id (8), with no claim/spawn frame reaching the
+    // renderer in between (socket gap). This is a NEW intervention: the
+    // fingerprint includes run_id, so it notifies instead of staying quiet.
+    const block2 = { id: 102, kind: 'blocked', task_id: 't_x', run_id: 8, payload: { reason: 'needs input' } } as CompletionEvent
+    const refired = await m.onKanbanEventsFrame('smoke', [block2])
+    expect(refired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+
+    // Same run id (8) + same reason again → still quiet (unchanged intervention).
+    const block3 = { id: 103, kind: 'blocked', task_id: 't_x', run_id: 8, payload: { reason: 'needs input' } } as CompletionEvent
+    const quiet = await m.onKanbanEventsFrame('smoke', [block3])
+    expect(quiet).toBe(false)
     expect(hostMock.notify).toHaveBeenCalledTimes(2)
   })
 })
