@@ -4771,3 +4771,682 @@ async def workflow_hold(
     return await _workflow_call(
         "kanban_hold", args, board=slug, card=card, request_echo=echo
     )
+
+
+# ---------------------------------------------------------------------------
+# Next-ten extension (R1-R10): release identity, acceptance compare,
+# reviewer packet, attachment provenance, batch readiness preview and
+# browser readiness. Read-only projections beside the evidence/workflow
+# bridges above; every door reuses the same envelope discipline (state /
+# evidence / reason / remedy / board binding / validated request echo) and
+# the helper allowlist pattern (fixed tool literals, flat stdin args).
+# ---------------------------------------------------------------------------
+
+_NAND = "next-ten bridge: "
+
+# Fixed allowlist of the NEW read tools this section may ever invoke. As with
+# EVIDENCE_READ_TOOLS: the tool name is a literal at each call site; no
+# request field can select a tool, an executable, argv or a shell. Kept in a
+# SEPARATE frozenset so the existing constants stay byte-stable (tests
+# assert them) while the runner still only ever invokes these literals.
+NEXT_TEN_READ_TOOLS = frozenset(
+    {
+        "kanban_release_identity",
+        "kanban_acceptance_compare",
+        "kanban_reviewer_packet",
+        "kanban_attachment_provenance",
+        "kanban_readiness_batch",
+    }
+)
+
+# The existing readiness tool gains only a derived preview inside the batch
+# envelope; kanban_readiness stays in WORKFLOW_READ_TOOLS and is never
+# invoked from this section.
+
+_NEXT_TEN_TIMEOUT_SECONDS = 75.0
+_NEXT_TEN_STDOUT_CAP = 1 * 1024 * 1024
+_NEXT_TEN_STDERR_CAP = 16 * 1024
+
+# Parent-attestation marker for acceptance compare: a check the parent
+# attested is never relabelled machine validation.
+_PARENT_ATTESTATION = "parent attestation"
+_MACHINE_VALIDATION = "machine validation"
+
+# Repair preview text table: each readiness check name maps to a bounded,
+# non-executable preview string. Derived ONLY from failed/unknown checks;
+# passing checks are omitted. These are text, never shell.
+_REPAIR_PREVIEW_ACTIONS: dict[str, str] = {
+    "board_permission": "Add the board to the server's ATLAS_KANBAN_WRITE_BOARDS and restart the dashboard process.",
+    "profile_exists": "Create the missing profile with `hermes profile add` before releasing this card.",
+    "workspace_exists": "Recreate or re-provision the card's workspace directory; readiness never invents a path.",
+    "expected_revision": "Commit or reset the card workspace so git HEAD matches the commissioned revision.",
+    "python_interpreter": "Provision the workspace .venv (python -m venv .venv) with a supported interpreter.",
+    "required_modules": "Install the workspace's declared dependencies into its .venv.",
+    "context_files": "Restore the missing brief/context files named by the card's commission.",
+    "ram_available": "Free memory on the EVO host before releasing; readiness reports the real available figure.",
+    "parents": "Complete or rework the card's incomplete parent dependencies before release.",
+    "model": "Resolve the model/provider configuration on the card (check_model was requested).",
+}
+_REPAIR_PREVIEW_DEFAULT = (
+    "Inspect the failed readiness check on the EVO host; no automatic repair exists for it."
+)
+
+
+def _next_ten_pass_shape_error(tool: str, data: Any) -> Optional[str]:
+    """Validate the required per-tool structure of a NEW tool's PASS data.
+
+    Mirrors _evidence_pass_shape_error: no field the adapter does not emit
+    is required, and no consumed value is ever coerced. A wrong type is a
+    hard UNKNOWN.
+    """
+    if not isinstance(data, dict) or not data:
+        return f"PASS receipt for {tool} carried no data object"
+
+    def _need_str(field: str) -> Optional[str]:
+        if not isinstance(data.get(field), str):
+            return f"PASS receipt for {tool} field {field!r} is not a string"
+        return None
+
+    def _need_observed_at() -> Optional[str]:
+        if not _evidence_finite_number(data.get("observed_at")):
+            return (
+                f"PASS receipt for {tool} observed_at is not a finite number"
+            )
+        return None
+
+    if tool == "kanban_release_identity":
+        err = _need_str("board")
+        if err:
+            return err
+        adapter = data.get("adapter")
+        if not isinstance(adapter, dict):
+            return "PASS receipt for kanban_release_identity adapter is not an object"
+        if adapter.get("state") not in ("PASS", "FAIL", "UNKNOWN"):
+            return "PASS receipt adapter state is not PASS/FAIL/UNKNOWN"
+        # A PASS release_identity means the identity was READ successfully;
+        # the adapter's own sub-state may still be FAIL/UNKNOWN (helper
+        # present but stamp absent) and is forwarded as-is, never coerced.
+    elif tool == "kanban_acceptance_compare":
+        for field in ("board", "card"):
+            err = _need_str(field)
+            if err:
+                return err
+        for field in ("current", "previous"):
+            side = data.get(field)
+            if not isinstance(side, dict):
+                return (
+                    f"PASS receipt for kanban_acceptance_compare field "
+                    f"{field!r} is not an object"
+                )
+            if side.get("state") not in ("PASS", "FAIL", "UNKNOWN"):
+                return (
+                    f"PASS receipt compare side {field!r} state is not "
+                    "PASS/FAIL/UNKNOWN"
+                )
+        checks = data.get("checks")
+        if not isinstance(checks, list) or not all(
+            isinstance(c, dict) for c in checks
+        ):
+            return "PASS receipt for kanban_acceptance_compare checks is not a list of objects"
+        for check in checks:
+            if check.get("change") not in (
+                "reverified",
+                "regressed",
+                "new",
+                "unproved",
+            ):
+                return "PASS receipt compare check change is not reverified|regressed|new|unproved"
+        if not isinstance(data.get("limitations"), list):
+            return "PASS receipt for kanban_acceptance_compare limitations is not a list"
+    elif tool == "kanban_reviewer_packet":
+        if data.get("schema_version") != 1:
+            return "PASS receipt for kanban_reviewer_packet schema_version is not 1"
+        for field in ("board", "card"):
+            err = _need_str(field)
+            if err:
+                return err
+        packet = data.get("packet")
+        if not isinstance(packet, dict):
+            return "PASS receipt for kanban_reviewer_packet packet is not an object"
+        bounds = data.get("bounds")
+        if not isinstance(bounds, dict):
+            return "PASS receipt for kanban_reviewer_packet bounds is not an object"
+        if not isinstance(data.get("limitations"), list):
+            return "PASS receipt for kanban_reviewer_packet limitations is not a list"
+    elif tool == "kanban_attachment_provenance":
+        for field in ("board", "card"):
+            err = _need_str(field)
+            if err:
+                return err
+        attachment_id = data.get("attachment_id")
+        if isinstance(attachment_id, bool) or not isinstance(attachment_id, int):
+            return "PASS receipt attachment_id is not an integer"
+        if data.get("acceptance_state") not in ("PASS", "FAIL", "UNKNOWN"):
+            return "PASS receipt acceptance_state is not PASS/FAIL/UNKNOWN"
+        if data.get("accepted_run_id") is not None and (
+            isinstance(data.get("accepted_run_id"), bool)
+            or not isinstance(data.get("accepted_run_id"), int)
+        ):
+            return "PASS receipt accepted_run_id is not an integer or null"
+    elif tool == "kanban_readiness_batch":
+        err = _need_str("board")
+        if err:
+            return err
+        items = data.get("items")
+        if not _evidence_list_of_dicts(items):
+            return "PASS receipt for kanban_readiness_batch items is not a list of objects"
+        for field in ("requested", "returned", "omitted"):
+            value = data.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return (
+                    f"PASS receipt for kanban_readiness_batch field "
+                    f"{field!r} is not a non-negative integer"
+                )
+        if data.get("requested") != len(items) and data.get("returned") != len(items):
+            # One of the two must account for the carried items (omitted
+            # cards may be absent from items but counted in requested).
+            if data.get("returned") != len(items):
+                return (
+                    f"PASS receipt returned {data.get('returned')!r} does not "
+                    f"account for {len(items)} items"
+                )
+        if data.get("no_mutation_performed") is not True:
+            return "PASS receipt for kanban_readiness_batch claims a mutation was performed"
+    err = _need_observed_at()
+    return err
+
+
+def _next_ten_scope_error(
+    tool: str, receipt: dict[str, Any], args: dict[str, Any]
+) -> Optional[str]:
+    """Scope-echo validation for the NEW tools: wherever the PASS receipt
+    echoes the requested board/card/attachment, it must match; mismatch is
+    UNKNOWN."""
+    data = receipt.get("data")
+    if not isinstance(data, dict):
+        return None  # shape validation reports this first
+    board = args.get("board")
+    card = args.get("card")
+    if tool in (
+        "kanban_release_identity",
+        "kanban_readiness_batch",
+    ):
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not match "
+                f"requested board {board!r}"
+            )
+    elif tool in ("kanban_acceptance_compare", "kanban_reviewer_packet"):
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not match "
+                f"requested board {board!r}"
+            )
+        if data.get("card") != card:
+            return (
+                f"PASS receipt card {data.get('card')!r} does not match "
+                f"requested card {card!r}"
+            )
+        if tool == "kanban_acceptance_compare":
+            for side_field, arg_field in (
+                ("current", "current_run_id"),
+                ("previous", "previous_run_id"),
+            ):
+                side = data.get(side_field)
+                if isinstance(side, dict) and side.get("run_id") is not None:
+                    if side.get("run_id") != args.get(arg_field):
+                        return (
+                            f"PASS receipt compare {side_field} run_id does "
+                            "not match the requested run"
+                        )
+    elif tool == "kanban_attachment_provenance":
+        if data.get("board") != board:
+            return (
+                f"PASS receipt board {data.get('board')!r} does not match "
+                f"requested board {board!r}"
+            )
+        if data.get("card") != card:
+            return (
+                f"PASS receipt card {data.get('card')!r} does not match "
+                f"requested card {card!r}"
+            )
+        if data.get("attachment_id") != args.get("attachment_id"):
+            return "PASS receipt attachment_id does not match the requested attachment"
+    return None
+
+
+def _next_ten_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Invoke the released helper ONCE for a next-ten read tool and
+    normalise its receipt. Same discipline as _evidence_run_helper: every
+    subprocess failure mode maps to UNKNOWN, stdout is capped and parsed,
+    stderr is never surfaced, PASS receipts are shape/scope validated."""
+    if tool not in NEXT_TEN_READ_TOOLS:
+        # Defensive: unreachable via the routes (literals only).
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_NAND}internal tool {tool!r} not in next-ten allowlist",
+        )
+    helper = shutil.which("atlas-kanban-call")
+    if not helper:
+        return _evidence_envelope(
+            state="UNKNOWN",
+            reason=f"{_NAND}atlas-kanban-call is not installed on this host",
+            remedy="The parent integration installs the released helper on the "
+                   "EVO UI host; next-ten reads stay UNKNOWN until then.",
+        )
+    stdin_bytes = json.dumps(args, separators=(",", ":")).encode("utf-8")
+    out_tmp = tempfile.TemporaryFile()
+    err_tmp = tempfile.TemporaryFile()
+    try:
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                [helper, tool, "-"],
+                input=stdin_bytes,
+                stdout=out_tmp,
+                stderr=err_tmp,
+                stdin=None,
+                env=_evidence_env(),
+                timeout=_NEXT_TEN_TIMEOUT_SECONDS,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_NAND}helper timed out after {_NEXT_TEN_TIMEOUT_SECONDS:.0f}s",
+                remedy="Retry; if it persists the EVO host's remote query cap "
+                       "may be exceeded.",
+            )
+        except OSError as exc:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_NAND}helper could not be executed ({exc.__class__.__name__})",
+            )
+        helper_ms = (time.monotonic() - started) * 1000.0
+        out_tmp.seek(0)
+        raw_stdout = out_tmp.read(_NEXT_TEN_STDOUT_CAP + 1)
+        err_tmp.seek(0)
+        err_tmp.read(_NEXT_TEN_STDERR_CAP)
+        err_tmp.truncate(_NEXT_TEN_STDERR_CAP)
+        if len(raw_stdout) > _NEXT_TEN_STDOUT_CAP:
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_NAND}helper stdout exceeded {_NEXT_TEN_STDOUT_CAP} bytes",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        try:
+            receipt = json.loads(raw_stdout.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_NAND}helper stdout was not valid JSON",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if not isinstance(receipt, dict):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_NAND}helper receipt was not a JSON object",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        state = receipt.get("state")
+        if state not in ("PASS", "FAIL", "UNKNOWN"):
+            return _evidence_envelope(
+                state="UNKNOWN",
+                reason=f"{_NAND}helper receipt state {state!r} is not PASS/FAIL/UNKNOWN",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if proc.returncode != 0:
+            # Same convention as the evidence bridge: a structured FAIL from
+            # a nonzero exit keeps its reason; only claimed-PASS is rejected.
+            if state == "PASS":
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_NAND}helper exited {proc.returncode} while claiming PASS",
+                    remedy="Retry; if it persists, inspect the helper installation "
+                           "on the EVO host (its stderr is not surfaced here).",
+                    evidence=None,
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            reason = str(receipt.get("reason") or f"helper reported {state}")
+            return _evidence_envelope(
+                state=state,
+                reason=f"{reason} (helper exited {proc.returncode})",
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+            )
+        if state == "PASS":
+            host = receipt.get("execution_host")
+            if host != _EVIDENCE_EXECUTION_HOST:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_NAND}receipt execution_host {host!r} is not "
+                           f"{_EVIDENCE_EXECUTION_HOST!r}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            observed_at = receipt.get("observed_at")
+            if not _evidence_finite_number(observed_at):
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_NAND}PASS receipt is missing a finite numeric observed_at",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            data = receipt.get("data")
+            shape_error = _next_ten_pass_shape_error(tool, data)
+            if shape_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_NAND}{shape_error}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            scope_error = _next_ten_scope_error(tool, receipt, args)
+            if scope_error:
+                return _evidence_envelope(
+                    state="UNKNOWN",
+                    reason=f"{_NAND}{scope_error}",
+                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                )
+            limitations = receipt.get("bounded")
+            if limitations is None and isinstance(data, dict):
+                limitations = data.get("omitted")
+            envelope = _evidence_envelope(
+                state="PASS",
+                evidence=data,
+                reason=(str(receipt["reason"]) if receipt.get("reason") else None),
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                observed_at=observed_at,
+                limitations=limitations,
+            )
+            envelope["_verified_execution_host"] = host
+            return envelope
+        # FAIL / UNKNOWN receipts pass through with their reason.
+        return _evidence_envelope(
+            state=state,
+            reason=str(receipt.get("reason") or f"helper reported {state}"),
+            timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+        )
+    finally:
+        for fh in (out_tmp, err_tmp):
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _repair_preview_from_checks(
+    checks: Optional[list[dict[str, Any]]],
+) -> list[dict[str, str]]:
+    """Derive the NEXT repair previews from a readiness receipt's checks.
+
+    Only failed/unknown checks produce a preview; passing checks are
+    omitted (R3: the panel shows the next repair, never triggers one).
+    Actions are bounded text from the fixed table, never shell from
+    untrusted data. A malformed checks list yields an honest empty preview.
+    """
+    if not isinstance(checks, list):
+        return []
+    previews: list[dict[str, str]] = []
+    for entry in checks:
+        if not isinstance(entry, dict):
+            continue
+        state = entry.get("state")
+        if state not in ("FAIL", "UNKNOWN"):
+            continue
+        name = entry.get("name")
+        reason = entry.get("reason")
+        previews.append(
+            {
+                "check": str(name) if isinstance(name, str) else "unknown-check",
+                "state": state,
+                "action": _REPAIR_PREVIEW_ACTIONS.get(
+                    str(name) if isinstance(name, str) else "",
+                    _REPAIR_PREVIEW_DEFAULT,
+                ),
+                "reason": str(reason)[:300] if isinstance(reason, str) else "",
+            }
+        )
+    return previews
+
+
+async def _next_ten_call_async(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    board: str,
+    request_echo: dict[str, Any],
+) -> dict[str, Any]:
+    envelope = await asyncio.to_thread(_next_ten_run_helper, tool, args)
+    return _evidence_respond(
+        envelope, board=board, tool=tool, request_echo=request_echo
+    )
+
+
+def _attachment_ids_for_card(conn: sqlite3.Connection, card: str) -> list[int]:
+    """Bounded read of the card's attachment ids from the local board DB.
+
+    Used only for LOCAL attachment scope validation (wrong-board/wrong-card
+    rejection before the helper runs); acceptance linkage itself comes
+    exclusively from the adapter's guarded receipts through the helper.
+    """
+    rows = conn.execute(
+        "SELECT id FROM task_attachments WHERE task_id = ? ORDER BY id",
+        (card,),
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+@router.get("/evidence/releases")
+async def evidence_releases(
+    board: str = Query(..., description="Shared board slug"),
+):
+    """R1: release identity of the ACTUAL served adapter, read through the
+    helper (never live main HEAD). The frontend adds its own build stamp
+    locally; this door carries only the served adapter identity."""
+    slug = _evidence_board_slug(board)
+    args: dict[str, Any] = {"board": slug}
+    return await _next_ten_call_async(
+        "kanban_release_identity",
+        args,
+        board=slug,
+        request_echo={"board": slug},
+    )
+
+
+@router.get("/evidence/acceptance-compare")
+async def evidence_acceptance_compare(
+    board: str = Query(...),
+    card: str = Query(...),
+    current_run_id: int = Query(..., ge=1),
+    previous_run_id: int = Query(..., ge=1),
+):
+    """R4: current/previous run acceptance comparison. Missing historical
+    receipts stay UNKNOWN, never invented."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    if current_run_id == previous_run_id:
+        raise HTTPException(
+            status_code=422,
+            detail="current_run_id and previous_run_id must differ",
+        )
+    args: dict[str, Any] = {
+        "board": slug,
+        "card": card,
+        "current_run_id": current_run_id,
+        "previous_run_id": previous_run_id,
+    }
+    return await _next_ten_call_async(
+        "kanban_acceptance_compare",
+        args,
+        board=slug,
+        request_echo={
+            "board": slug,
+            "card": card,
+            "current_run_id": current_run_id,
+            "previous_run_id": previous_run_id,
+        },
+    )
+
+
+@router.get("/evidence/reviewer-packet")
+async def evidence_reviewer_packet(
+    board: str = Query(...),
+    card: str = Query(...),
+):
+    """R6: compact bounded reviewer packet export. No raw bodies, results,
+    logs, comments, argv, env or stored_path ever leave through this door."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    return await _next_ten_call_async(
+        "kanban_reviewer_packet",
+        {"board": slug, "card": card},
+        board=slug,
+        request_echo={"board": slug, "card": card},
+    )
+
+
+@router.get("/evidence/attachment-provenance")
+async def evidence_attachment_provenance(
+    board: str = Query(...),
+    card: str = Query(...),
+    attachment_id: int = Query(..., ge=1),
+):
+    """R8: link an attachment to its accepted run ONLY through the guarded
+    receipt association. An attachment beside a done card is not acceptance."""
+    slug = _evidence_board_slug(board)
+    card = _evidence_card_id(card)
+    return await _next_ten_call_async(
+        "kanban_attachment_provenance",
+        {
+            "board": slug,
+            "card": card,
+            "attachment_id": attachment_id,
+        },
+        board=slug,
+        request_echo={"board": slug, "card": card, "attachment_id": attachment_id},
+    )
+
+
+class ReadinessBatchBody(BaseModel):
+    """R9: selected held-card batch readiness PREVIEW. 1..10 distinct cards,
+    check_model explicit; the batch never releases, dispatches or mutates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cards: list[str] = Field(min_length=1, max_length=10)
+    check_model: bool = False
+
+
+_READINESS_BATCH_MAX_CARDS = 10
+
+
+@router.post("/workflow/readiness-batch")
+async def workflow_readiness_batch(
+    payload: ReadinessBatchBody,
+    board: str = Query(..., description="Aligned EVO board slug"),
+):
+    """R9: readiness preview for a selected group of held cards. Zero
+    release/dispatch/config writes; each per-card failure stays visible; no
+    all-clear from partial results."""
+    slug = _evidence_board_slug(board)
+    cards: list[str] = []
+    for raw in payload.cards:
+        card = _evidence_card_id(raw)
+        if card not in cards:
+            cards.append(card)
+    if not cards:
+        raise HTTPException(status_code=422, detail="cards must not be empty")
+    if len(cards) > _READINESS_BATCH_MAX_CARDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"at most {_READINESS_BATCH_MAX_CARDS} distinct cards per batch",
+        )
+    check_model = bool(payload.check_model)
+    echo: dict[str, Any] = {
+        "board": slug,
+        "cards": cards,
+        "check_model": check_model,
+    }
+    guard = _workflow_alignment_guard(slug)
+    if guard is not None:
+        return _evidence_respond(
+            guard, board=slug, tool="kanban_readiness_batch", request_echo=echo
+        )
+
+    # The helper derives every readiness field from each card's stored
+    # commission on the aligned board; a card absent there surfaces as the
+    # helper's own per-card failure/omission, never an invented result.
+    # This route performs zero release/dispatch/config writes.
+    batch_args: dict[str, Any] = {
+        "board": slug,
+        "cards": cards,
+        "check_model": check_model,
+    }
+    envelope = await _next_ten_call_async(
+        "kanban_readiness_batch",
+        batch_args,
+        board=slug,
+        request_echo=echo,
+    )
+    # Attach repair previews derived from each item's readiness checks when
+    # the helper carried them; absent checks leave the preview empty (an
+    # honest no-preview, never a guessed repair).
+    if isinstance(envelope.get("evidence"), dict):
+        evidence_items = envelope["evidence"].get("items")
+        if isinstance(evidence_items, list):
+            for item in evidence_items:
+                if isinstance(item, dict) and "repair_preview" not in item:
+                    checks = item.get("receipt", {}).get("checks") if isinstance(
+                        item.get("receipt"), dict
+                    ) else item.get("checks")
+                    if isinstance(item, dict):
+                        item["repair_preview"] = _repair_preview_from_checks(checks)
+    return envelope
+
+
+@router.get("/evidence/browser-readiness")
+async def evidence_browser_readiness(
+    board: str = Query(..., description="Shared board slug"),
+):
+    """R2: authenticated browser readiness, visibly separate from public
+    reachability. This route itself is a post-auth probe: it is reached only
+    through the dashboard's auth middleware (see module docstring and the
+    auth-gate tests), so a 200 here means an authenticated session read a
+    real board fact. The board evidence read goes through the SAME helper
+    boundary as every other evidence read; a login page reachable over the
+    network can never make this PASS."""
+    slug = _evidence_board_slug(board)
+    echo: dict[str, Any] = {"board": slug}
+    # Board readability through the shared evidence service (aligned
+    # discipline: local DB identity matters only for workflow tools; the
+    # browser-readiness evidence read is the helper's own snapshot scope).
+    envelope = await _next_ten_call_async(
+        "kanban_release_identity",
+        {"board": slug},
+        board=slug,
+        request_echo=echo,
+    )
+    board_readable: Optional[bool]
+    if envelope.get("state") == "PASS":
+        board_readable = True
+    elif envelope.get("state") == "FAIL":
+        board_readable = False
+    else:
+        board_readable = None
+    result: dict[str, Any] = {
+        "state": "PASS" if board_readable is True else (
+            "FAIL" if board_readable is False else "UNKNOWN"
+        ),
+        "board": slug,
+        "evidence": {
+            "reachable": True,
+            "authenticated": True,
+            "board_readable": board_readable,
+            "observed_at": time.time(),
+        },
+        "observed_at": time.time(),
+    }
+    if board_readable is not True:
+        result["reason"] = envelope.get("reason") or "board could not be read"
+        result["remedy"] = envelope.get("remedy") or (
+            "Check the board slug and the helper installation on the EVO host."
+        )
+    return result
