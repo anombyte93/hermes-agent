@@ -350,6 +350,48 @@
   const EVIDENCE_STALE_AMBER_S = 60;
   const EVIDENCE_STALE_RED_S = 300;
   const EVIDENCE_POLL_MS = 15000;
+  // R1: identity of the EXACT JS bytes this IIFE was served in. The Hermes
+  // asset door prepends a wrapper statement to the served response that
+  // publishes {sha256, bytes} on the per-script registry BEFORE this code
+  // runs; capturing it here (at IIFE execution, not later) binds the
+  // identity to the response that actually executed. No wrapper (older
+  // backend, plain file serving) means honest UNKNOWN — never a hardcoded
+  // stamp and never a re-read of mutable current bytes.
+  const LOADED_ASSET_IDENTITY = (function () {
+    try {
+      const reg = globalThis.__HERMES_PLUGIN_ASSET_ID__;
+      const m = reg && reg["kanban/dist/index.js"];
+      if (m && typeof m.sha256 === "string" && /^[a-f0-9]{64}$/.test(m.sha256)) {
+        return {
+          state: "PASS",
+          revision: m.sha256.slice(0, 12),
+          source: "served asset bytes (sha256 of the original dist/index.js payload; wrapper bytes excluded)",
+          bytes: typeof m.bytes === "number" ? m.bytes : null,
+        };
+      }
+    } catch (_e) { /* registry absent — UNKNOWN below */ }
+    return {
+      state: "UNKNOWN",
+      revision: null,
+      source: "served asset digest unavailable (older backend or direct file load); upgrade the Hermes dashboard server to expose the loaded asset identity",
+      bytes: null,
+    };
+  })();
+  // R3: repair preview actions, text only, keyed by readiness check name.
+  // Mirrors the plugin backend's fixed table; never executable shell.
+  const REPAIR_PREVIEW_ACTIONS = {
+    board_permission: "Add the board to the server's ATLAS_KANBAN_WRITE_BOARDS and restart the dashboard process.",
+    profile_exists: "Create the missing profile with `hermes profile add` before releasing this card.",
+    workspace_exists: "Recreate or re-provision the card's workspace directory; readiness never invents a path.",
+    expected_revision: "Commit or reset the card workspace so git HEAD matches the commissioned revision.",
+    python_interpreter: "Provision the workspace .venv (python -m venv .venv) with a supported interpreter.",
+    required_modules: "Install the workspace's declared dependencies into its .venv.",
+    context_files: "Restore the missing brief/context files named by the card's commission.",
+    ram_available: "Free memory on the EVO host before releasing; readiness reports the real available figure.",
+    parents: "Complete or rework the card's incomplete parent dependencies before release.",
+    model: "Resolve the model/provider configuration on the card (check_model was requested).",
+  };
+  const REPAIR_PREVIEW_DEFAULT = "Inspect the failed readiness check on the EVO host; no automatic repair exists for it.";
   const EVIDENCE_PAGE_CARD_LIMIT = 100;
   // Per-resource page size for the drawer's bounded RUNS/EVENTS/ATTACHMENTS
   // reads through /evidence/page (K10). Kept well under the 200 max.
@@ -525,8 +567,16 @@
     const pollRef = useRef(null);
     const cardsRef = useRef([]);      // mirrors the `cards` state (for dedupe)
     const firstPageLenRef = useRef(0); // page-0 slice length (poll replaces it)
+    const pagingTotalRef = useRef(null); // R10: total the appended pages were loaded under
+    const pagingFirstIdsRef = useRef(null); // R10: first-page card ids of the load generation
 
     const aligned = !!(context && context.aligned === true);
+    // R10: stable evolving pagination. Appended pages carry the generation
+    // (observed_at + total) they were loaded under; when a page-0 refresh
+    // shows a changed total while appended pages exist, the loaded list is a
+    // mixture of generations and the UI offers RESTART rather than blending
+    // stale cards silently.
+    const [pagingDrift, setPagingDrift] = useState(null);
 
     const reset = useCallback(function () {
       genRef.current += 1;
@@ -540,6 +590,9 @@
       setCursor(null);
       setHasMore(false);
       setOmitted(null);
+      setPagingDrift(null);
+      pagingTotalRef.current = null;
+      pagingFirstIdsRef.current = null;
     }, []);
 
     // Apply a snapshot envelope. page 0 (append=false) seeds cards only when
@@ -592,6 +645,45 @@
           if (data.next_cursor != null) setCursor(data.next_cursor);
           else if (!data.has_more) setCursor(null);
           setOmitted(omitNum);
+          pagingFirstIdsRef.current = pageCards.map(function (c) { return c && c.id; });
+        } else if (appended.length > 0) {
+          // R10: a refresh under appended pages. The loaded list is a
+          // mixture of generations whenever the board changed under paging:
+          // a different total, OR the same total with different card ids
+          // (an insert+delete swap keeps the count constant). In both cases
+          // say so and offer a restart instead of blending silently.
+          const total = (data.counts && typeof data.counts.total === "number")
+            ? data.counts.total : null;
+          const loaded = pageCards.length + appended.length;
+          const countChanged = total != null && total !== loaded && pagingTotalRef.current != null
+            && total !== pagingTotalRef.current;
+          const knownIds = {};
+          let k = cardsRef.current.length;
+          while (k--) knownIds[cardsRef.current[k] && cardsRef.current[k].id] = true;
+          let compositionChanged = false;
+          if (pagingFirstIdsRef.current) {
+            // The first page's previous id set vs the fresh one: any id
+            // appearing or disappearing with the SAME total is a swap.
+            const prevIds = pagingFirstIdsRef.current;
+            if (pageCards.length === prevIds.length) {
+              const prevSet = {};
+              for (let j = 0; j < prevIds.length; j++) prevSet[prevIds[j]] = true;
+              for (let j = 0; j < pageCards.length; j++) {
+                const id = pageCards[j] && pageCards[j].id;
+                if (!prevSet[id]) { compositionChanged = true; break; }
+              }
+            }
+          }
+          if (countChanged || compositionChanged) {
+            setPagingDrift({
+              loaded: loaded,
+              total: total,
+              previousTotal: pagingTotalRef.current,
+              sameCount: compositionChanged && !countChanged,
+            });
+          }
+          pagingTotalRef.current = total;
+          pagingFirstIdsRef.current = pageCards.map(function (c) { return c && c.id; });
         }
       }
     }, []);
@@ -653,6 +745,23 @@
       });
     }, [loadingMore, aligned, hasMore, cursor, board, applySnapshot]);
 
+    // R10: restart paging — drop appended pages, return to a clean page-0
+    // view of the CURRENT generation. Explicit, never automatic, because
+    // silently dropping cards the user can see is worse than offering the
+    // restart.
+    const restartPaging = useCallback(function () {
+      cardsRef.current = [];
+      firstPageLenRef.current = 0;
+      setCards([]);
+      setCursor(null);
+      setHasMore(false);
+      setOmitted(null);
+      setPagingDrift(null);
+      pagingTotalRef.current = null;
+      pagingFirstIdsRef.current = null;
+      return refresh();
+    }, [refresh]);
+
     return {
       aligned: aligned,
       context: context,
@@ -668,6 +777,8 @@
       loadingMore: loadingMore,
       loadMore: loadMore,
       refresh: refresh,
+      pagingDrift: pagingDrift,
+      restartPaging: restartPaging,
     };
   }
 
@@ -927,7 +1038,28 @@
               style: { marginLeft: "12px" },
               onClick: function () { ev.loadMore(); },
             }, ev.loadingMore ? "Loading\u2026" : "Load more (" + (omitted != null ? omitted : "") + " omitted)")
-          : null));
+          : null),
+      ev.pagingDrift
+        ? h("div", {
+            className: "hermes-kanban-evidence-drift",
+            "data-evidence-paging-drift": "true",
+            "data-paging-drift-same-count": ev.pagingDrift.sameCount ? "true" : undefined,
+            style: { color: EVIDENCE_STATE_TONE.unknown },
+          },
+          ev.pagingDrift.sameCount
+            ? "Board changed under paging with the same total (" + ev.pagingDrift.total +
+              "; the list may now mix card generations from a swap)."
+            : "Board changed under paging (loaded " + ev.pagingDrift.loaded +
+              " of a new total " + ev.pagingDrift.total + "; previous total " +
+              ev.pagingDrift.previousTotal + "). The list may mix generations.",
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-edit-link",
+            "data-evidence-paging-restart": "true",
+            style: { marginLeft: "8px" },
+            onClick: function () { if (ev.restartPaging) ev.restartPaging(); },
+          }, "Restart paging"))
+        : null);
   }
 
   // Drawer worker-evidence panel (K9): reads /evidence/worker for the open
@@ -1031,6 +1163,21 @@
     timed_out: "Timed out",
   };
   const NOTICE_MAX = 20;
+  // R5: which notice kinds are "interventions" (a human/operator action is
+  // needed on the task) versus "recoveries" (the task left its held state).
+  // An unchanged repeated intervention is quiet; a recovery clears the
+  // stored fingerprint so a later recurrence notifies again.
+  const NOTICE_INTERVENTION_KINDS = {
+    blocked: true,
+    gave_up: true,
+    crashed: true,
+    timed_out: true,
+  };
+  const NOTICE_RECOVERY_KINDS = {
+    completed: true,
+    review_requested: true,
+    changes_requested: true,
+  };
 
   // Workflow responses use the standard evidence envelope; the helper's own
   // receipt (readiness / draft / continue / hold) lives under ``evidence``.
@@ -1075,6 +1222,84 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }));
+  }
+
+  // -------------------------------------------------------------------------
+  // Next-ten fetchers (R1/R2/R4/R6/R8/R9). All read the same /api boundary;
+  // every one resolves to the standard envelope shape (never throws).
+  // -------------------------------------------------------------------------
+  function fetchReleases(board) {
+    return evidenceEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/releases`, board)));
+  }
+  function fetchBrowserReadiness(board) {
+    return evidenceEnvelope(SDK.fetchJSON(withBoard(`${API}/evidence/browser-readiness`, board)));
+  }
+  function fetchAcceptanceCompare(board, card, currentRunId, previousRunId) {
+    const qs = evQuery({
+      card: card,
+      current_run_id: currentRunId,
+      previous_run_id: previousRunId,
+    });
+    return evidenceEnvelope(SDK.fetchJSON(
+      withBoard(`${API}/evidence/acceptance-compare?${qs}`, board)));
+  }
+  function fetchReviewerPacket(board, card) {
+    return evidenceEnvelope(SDK.fetchJSON(
+      withBoard(`${API}/evidence/reviewer-packet?card=${encodeURIComponent(card)}`, board)));
+  }
+  function fetchAttachmentProvenance(board, card, attachmentId) {
+    const qs = evQuery({ card: card, attachment_id: attachmentId });
+    return evidenceEnvelope(SDK.fetchJSON(
+      withBoard(`${API}/evidence/attachment-provenance?${qs}`, board)));
+  }
+  function postReadinessBatch(board, cards, checkModel) {
+    return workflowEnvelope(SDK.fetchJSON(withBoard(`${API}/workflow/readiness-batch`, board), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cards: cards, check_model: !!checkModel }),
+    }));
+  }
+
+  // R6: download the bounded reviewer packet as a real JSON file via a blob
+  // URL link click (the plugin has no file channel; the browser download IS
+  // the user path).
+  function downloadReviewerPacket(board, card) {
+    return fetchReviewerPacket(board, card).then(function (env) {
+      if (!env || env.state !== "PASS" || !env.evidence) {
+        return { ok: false, envelope: env };
+      }
+      const payload = JSON.stringify(env.evidence, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "reviewer-packet-" + card + ".json";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+      return { ok: true, envelope: env };
+    });
+  }
+
+  // R5: one fingerprint per (task, intervention) so an UNCHANGED repeated
+  // intervention stays quiet while a changed reason/remedy or a new run id
+  // notifies again. Recovery (status leaving the held/blocked set) clears
+  // the stored fingerprint so a recurrence is fresh again.
+  function interventionFingerprint(evt) {
+    const reason = typeof evt.reason === "string" ? evt.reason : "";
+    const remedy = typeof evt.remedy === "string" ? evt.remedy : "";
+    const run = evt.run_id != null ? String(evt.run_id) : "";
+    return [evt.task_id || "", evt.kind || "", reason, remedy, run].join("|");
+  }
+  function noticeFingerprint(n) {
+    return interventionFingerprint({
+      task_id: n.task_id,
+      kind: n.kind,
+      reason: n.reason,
+      remedy: n.remedy,
+      run_id: n.run_id,
+    });
   }
 
   function workflowStateTone(state) {
@@ -1489,6 +1714,246 @@
       h(WorkflowStateLine, { envelope: envelope }));
   }
 
+  // R9 — selected held-card batch readiness PREVIEW. Selecting held cards
+  // enables a preview-only readiness check through POST /workflow/
+  // readiness-batch; per-card failures, omissions and repair previews are
+  // each visible, and there is NO bulk release affordance anywhere here.
+  function ReadinessBatchSection(props) {
+    const board = props.boardSlug;
+    const pool = props.heldCards || [];
+    const [selected, setSelected] = useState(() => ({}));
+    const [envelope, setEnvelope] = useState(null);
+    const [running, setRunning] = useState(false);
+
+    const selectedIds = Object.keys(selected).filter(function (id) { return selected[id]; });
+    const canRun = selectedIds.length >= 1 && selectedIds.length <= 10 && !running;
+
+    function toggle(id) {
+      setSelected(function (prev) {
+        const next = Object.assign({}, prev);
+        next[id] = !prev[id];
+        return next;
+      });
+    }
+
+    function runPreview() {
+      if (!canRun) return;
+      setRunning(true);
+      setEnvelope(null);
+      postReadinessBatch(board, selectedIds, false).then(function (env) {
+        setRunning(false);
+        setEnvelope(env);
+      });
+    }
+
+    const ev = (envelope && envelope.state === "PASS" && envelope.evidence
+      && typeof envelope.evidence === "object") ? envelope.evidence : null;
+    const items = ev && Array.isArray(ev.items) ? ev.items : [];
+
+    return h("div", { className: "hermes-kanban-section", "data-readiness-batch": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Batch readiness (preview only)"),
+      h("div", { className: "text-xs text-muted-foreground" },
+        "Select held cards for a readiness preview. This never releases, dispatches or mutates anything."),
+      pool.length === 0
+        ? h("div", { className: "text-xs text-muted-foreground" }, "No held (blocked/triage) cards on the current page.")
+        : h("div", { className: "hermes-kanban-workflow-list", "data-readiness-batch-pool": "true" },
+            pool.map(function (c) {
+              return h("label", {
+                key: c.id,
+                className: "hermes-kanban-workflow-check",
+                "data-readiness-batch-card": c.id,
+              },
+                h(Checkbox, {
+                  checked: !!selected[c.id],
+                  onCheckedChange: function (v) { toggle(c.id); },
+                }),
+                h("span", { className: "hermes-kanban-workflow-check-name" }, c.title),
+                h("span", { className: "hermes-kanban-workflow-check-reason" }, c.status));
+            })),
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-workflow-btn",
+        "data-readiness-batch-run": "true",
+        disabled: !canRun,
+        onClick: runPreview,
+      }, running ? "Previewing\u2026" : "Preview readiness (" + selectedIds.length + " selected)"),
+      envelope && envelope.state !== "PASS"
+        ? h("div", { className: "text-xs", style: { color: workflowStateTone(envelope.state) } },
+            envelope.reason || ("batch " + envelope.state))
+        : null,
+      items.length > 0
+        ? h("div", { className: "hermes-kanban-workflow-list", "data-readiness-batch-result": "true" },
+            items.map(function (item) {
+              const previews = Array.isArray(item.repair_preview) ? item.repair_preview : [];
+              return h("div", {
+                key: item.card,
+                className: "hermes-kanban-workflow-check",
+                "data-readiness-batch-item": item.card,
+              },
+                h("span", { className: "hermes-kanban-workflow-check-name" }, item.card),
+                h("span", {
+                  className: "hermes-kanban-workflow-check-state",
+                  style: { color: workflowStateTone(item.state) },
+                }, item.state || "UNKNOWN"),
+                previews.slice(0, 1).map(function (p, i) {
+                  return h("span", {
+                    key: i,
+                    className: "hermes-kanban-workflow-check-reason",
+                    "data-readiness-batch-repair": "true",
+                  }, p.action);
+                }));
+            }),
+            ev && typeof ev.omitted === "number" && ev.omitted > 0
+              ? h("div", { className: "text-xs text-muted-foreground" },
+                  ev.omitted + " requested card(s) omitted — check each card id.")
+              : null)
+        : null);
+  }
+
+  // R1/R2/R7 — concise expandable support panel: release identities (the
+  // LOADED frontend asset captured at execution, the adapter's served
+  // identity and this Hermes backend's release metadata), browser readiness
+  // shown VISIBLY SEPARATE from reachability, and refresh timing with the
+  // snapshot's actual worker-observation coverage. Collapsed by default so
+  // it never competes with the board; every fetch happens only on expand.
+  function SupportPanel(props) {
+    const [open, setOpen] = useState(false);
+    const [releases, setReleases] = useState(null);
+    const [readiness, setReadiness] = useState(null);
+    // Board+request generation: a fetch that starts for one board can never
+    // publish another board's identity, and a FAILED/absent fetch never
+    // marks the board loaded — reopening retries instead of stranding.
+    const loadedGenRef = useRef(0);
+    const [reloadTick, setReloadTick] = useState(0);
+
+    const board = props.boardSlug;
+    useEffect(function () {
+      if (!open) return undefined;
+      loadedGenRef.current += 1;
+      const gen = loadedGenRef.current;
+      let alive = true;
+      setReleases(null);
+      setReadiness(null);
+      fetchReleases(board).then(function (env) { if (alive && gen === loadedGenRef.current) setReleases(env); });
+      fetchBrowserReadiness(board).then(function (env) { if (alive && gen === loadedGenRef.current) setReadiness(env); });
+      return function () { alive = false; };
+    }, [open, board, reloadTick]);
+
+    // The identity lines read whatever evidence the envelope carried, even
+    // when the overall state is FAIL/UNKNOWN (the backend identity is still
+    // real); only a missing evidence object falls back to honest UNKNOWN.
+    const relData = (releases && releases.evidence && typeof releases.evidence === "object")
+      ? releases.evidence : null;
+    const rel = (releases && releases.state === "PASS" && relData) ? relData : null;
+    const adapter = (relData && relData.adapter) ? relData.adapter : null;
+    const backend = (relData && relData.backend) ? relData.backend : null;
+    const ready = (readiness && readiness.evidence) ? readiness.evidence : null;
+    // R7: the snapshot's OWN measured timing, not the bridge subprocess
+    // round-trip alone.
+    const snapEv = (props.snapshot && props.snapshot.evidence && typeof props.snapshot.evidence === "object")
+      ? props.snapshot.evidence : {};
+    const snapTiming = (snapEv.timing && typeof snapEv.timing === "object") ? snapEv.timing : {};
+    const timing = (props.snapshot && props.snapshot.timing) ? props.snapshot.timing : {};
+    const roundtrip = typeof timing.helper_roundtrip_ms === "number"
+      ? Math.round(timing.helper_roundtrip_ms) + "ms" : "unknown";
+    const querySeconds = typeof snapTiming.query_seconds === "number" ? snapTiming.query_seconds : null;
+    const collectionSeconds = typeof snapTiming.collection_seconds === "number" ? snapTiming.collection_seconds : null;
+    // R7: actual snapshot facts. The adapter emits worker_observations (a
+    // bounded list), worker_observation_cap and worker_observations_capped —
+    // there is no process_checks field, so counts derive only from what was
+    // actually examined; capped-away observations are shown as the omission
+    // they are, never as healthy.
+    const obsList = Array.isArray(snapEv.worker_observations) ? snapEv.worker_observations : null;
+    const obsCap = typeof snapEv.worker_observation_cap === "number" ? snapEv.worker_observation_cap : null;
+    const obsCapped = typeof snapEv.worker_observations_capped === "number" ? snapEv.worker_observations_capped : null;
+    const pending = releases == null || readiness == null;
+
+    return h("div", { className: "hermes-kanban-section", "data-support-panel": "true" },
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-section-head hermes-kanban-support-toggle",
+        "data-support-panel-toggle": "true",
+        onClick: function () { setOpen(!open); },
+      }, (open ? "▾ " : "▸ ") + "Support info"),
+      open ? h("div", { className: "hermes-kanban-support-body", "data-support-panel-body": "true" },
+        // R1: all three identities — loaded asset, adapter, backend.
+        h("div", { className: "text-xs", "data-support-releases": "true" },
+          h("div", { style: { fontWeight: "600" } }, "Releases"),
+          h("div", { "data-support-frontend": "true" },
+            "frontend (this asset): " + (LOADED_ASSET_IDENTITY.state === "PASS"
+              ? LOADED_ASSET_IDENTITY.revision +
+                (LOADED_ASSET_IDENTITY.bytes != null ? " (" + LOADED_ASSET_IDENTITY.bytes + " bytes)" : "") +
+                " — " + LOADED_ASSET_IDENTITY.source
+              : "UNKNOWN — " + LOADED_ASSET_IDENTITY.source)),
+          adapter
+            ? h("div", { "data-support-adapter": "true" },
+                "adapter: " + (adapter.state || "UNKNOWN") +
+                (adapter.revision ? " @ " + String(adapter.revision).slice(0, 12) : "") +
+                (adapter.version ? " (" + adapter.version + ")" : "") +
+                (adapter.source ? " — " + adapter.source : ""))
+            : h("div", { style: { color: EVIDENCE_STATE_TONE.unknown }, "data-support-adapter": "true" },
+                "adapter: " + ((releases && releases.reason) || "identity unavailable")),
+          backend
+            ? h("div", { "data-support-backend": "true", style: backend.state !== "PASS" ? { color: EVIDENCE_STATE_TONE.unknown } : undefined },
+                "backend: " + (backend.state || "UNKNOWN") +
+                (backend.revision ? " @ " + backend.revision : "") +
+                (backend.source ? " — " + backend.source : ""))
+            : h("div", { style: { color: EVIDENCE_STATE_TONE.unknown }, "data-support-backend": "true" },
+                "backend: UNKNOWN — this server does not report its release identity"),
+          rel && rel.adapter && rel.adapter.state !== "PASS"
+            ? h("div", { style: { color: EVIDENCE_STATE_TONE.unknown } },
+                "adapter identity " + rel.adapter.state + (rel.adapter.state === "UNKNOWN" ? " — absent or invalid identity is UNKNOWN, never assumed" : ""))
+            : null,
+          pending
+            ? h("div", { className: "text-xs text-muted-foreground", "data-support-pending": "true" }, "loading identities…")
+            : null,
+          releases && releases.state !== "PASS"
+            ? h("button", {
+                type: "button",
+                className: "hermes-kanban-edit-link",
+                "data-support-retry": "true",
+                onClick: function () { setReloadTick(function (n) { return n + 1; }); },
+              }, "retry identity read")
+            : null),
+        // R2: browser readiness separate from reachability.
+        h("div", { className: "text-xs", "data-support-readiness": "true", style: { marginTop: "6px" } },
+          h("div", { style: { fontWeight: "600" } }, "Browser readiness"),
+          ready
+            ? h("div", { "data-support-readiness-line": "true" },
+                "reachable: " + (ready.reachable ? "yes" : "no") +
+                " · authenticated: " + (ready.authenticated ? "yes" : "no") +
+                " · board readable: " + (ready.board_readable === true ? "yes"
+                  : ready.board_readable === false ? "no"
+                  : "unknown"))
+            : h("div", { style: { color: EVIDENCE_STATE_TONE.unknown } },
+                "readiness: " + ((readiness && readiness.reason) || "unknown")),
+          readiness && readiness.state !== "PASS" && readiness.remedy
+            ? h("div", { style: { color: "var(--muted-foreground, #6b7280)" } }, readiness.remedy)
+            : null,
+          h("div", { style: { color: "var(--muted-foreground, #6b7280)" } },
+            "A reachable login page never implies board access; these are separate facts.")),
+        // R7: refresh timing + actual worker-observation coverage.
+        h("div", { className: "text-xs", "data-support-refresh": "true", style: { marginTop: "6px" } },
+          h("div", { style: { fontWeight: "600" } }, "Refresh"),
+          h("div", null,
+            "snapshot query: " + (querySeconds != null ? (Math.round(querySeconds * 1000) + "ms") : "unknown") +
+            " · collection: " + (collectionSeconds != null ? (Math.round(collectionSeconds * 1000) + "ms") : "unknown") +
+            " · bridge round-trip: " + roundtrip +
+            " · refresh interval: " + Math.round(EVIDENCE_POLL_MS / 1000) + "s"),
+          h("div", { "data-support-process-checks": "true" },
+            "worker observations: " +
+            (obsList != null
+              ? obsList.length + " examined" +
+                (obsCap != null ? " (cap " + obsCap + ")" : "")
+              : "count unknown — snapshot carried no observation list") +
+            (obsCapped != null && obsCapped > 0
+              ? " · " + obsCapped + " capped away (not examined, never assumed healthy)"
+              : "")),
+          h("div", { style: { color: "var(--muted-foreground, #6b7280)" } },
+            "A slow refresh is transport delay or intentionally limited coverage, never hidden work.")))
+      : null);
+  }
+
   // K5 — explicit readiness: POST only on click; separate permission check.
   function WorkflowReadinessSection(props) {
     const [receipt, setReceipt] = useState(null);
@@ -1508,6 +1973,15 @@
 
     const ev = (receipt && receipt.evidence && typeof receipt.evidence === "object") ? receipt.evidence : null;
     const checks = (ev && Array.isArray(ev.checks)) ? ev.checks : [];
+    // R3: the NEXT repair preview, derived only from failed/unknown checks.
+    // Actions are bounded text previews; this panel never triggers repairs.
+    const repairPreviews = [];
+    checks.forEach(function (c) {
+      if (c.state !== "FAIL" && c.state !== "UNKNOWN") return;
+      const action = REPAIR_PREVIEW_ACTIONS[c.name] || REPAIR_PREVIEW_DEFAULT;
+      repairPreviews.push({ check: c.name, state: c.state, action: action, reason: c.reason || "" });
+    });
+    const nextRepair = repairPreviews.length > 0 ? repairPreviews[0] : null;
     const checkRows = checks.map(function (c) {
       const isPermission = c.name === "board_permission";
       return h("div", {
@@ -1542,6 +2016,23 @@
         onClick: doCheck,
       }, loading ? "Checking\u2026" : "Check readiness"),
       checkRows.length > 0 ? h("div", { className: "hermes-kanban-workflow-list" }, checkRows) : null,
+      nextRepair
+        ? h("div", {
+            className: "hermes-kanban-workflow-repair-preview",
+            "data-workflow-repair-preview": "true",
+            "data-workflow-repair-check": nextRepair.check,
+          },
+          h("div", { className: "text-xs", style: { fontWeight: "600" } }, "Next repair (preview only)"),
+          h("div", { className: "text-xs" },
+            h("span", { style: { color: workflowStateTone(nextRepair.state) } },
+              nextRepair.check + ": " + nextRepair.state),
+            nextRepair.reason
+              ? h("span", { style: { color: "var(--muted-foreground, #6b7280)", marginLeft: "6px" } }, nextRepair.reason)
+              : null),
+          h("div", { className: "text-xs", "data-workflow-repair-action": "true" }, nextRepair.action),
+          h("div", { className: "text-xs", style: { color: "var(--muted-foreground, #6b7280)" } },
+            "Previews suggest the next manual step; they never trigger repairs."))
+        : null,
       ev && typeof ev.ready_to_release === "boolean"
         ? h("div", {
             className: "hermes-kanban-workflow-verdict text-xs",
@@ -2197,6 +2688,16 @@
       };
     }, [evidenceAligned, evidence.cards]);
 
+    // R9: held cards (blocked/triage) currently visible in the snapshot,
+    // offered as the batch-readiness selection pool. Preview only — never
+    // bulk release.
+    const heldCards = useMemo(function () {
+      if (!evidenceAligned) return [];
+      return (evidence.cards || []).filter(function (c) {
+        return c && (c.status === "blocked" || c.status === "triage");
+      }).map(function (c) { return { id: c.id, title: c.title || c.id, status: c.status }; });
+    }, [evidenceAligned, evidence.cards]);
+
     // Alias so the rest of the function can keep using `board` semantically
     // for the grid data (card columns + tenants + assignees) without
     // colliding with the selected-board slug above. History: the old
@@ -2234,12 +2735,12 @@
     // switching boards isolates notifications and duplicate frames collapse.
     const [workflowNotices, setWorkflowNotices] = useState([]);
     const [noticeBaselineState, setNoticeBaselineState] = useState(null); // null | "unknown" | number
-    const noticeRef = useRef({ board: null, baseline: null, seen: {} });
+    const noticeRef = useRef({ board: null, baseline: null, seen: {}, interventions: {} });
     const noticeGenRef = useRef(0);
 
     const resetNotices = useCallback(function (slug) {
       noticeGenRef.current += 1;
-      noticeRef.current = { board: slug || null, baseline: null, seen: {} };
+      noticeRef.current = { board: slug || null, baseline: null, seen: {}, interventions: {} };
       setWorkflowNotices([]);
       setNoticeBaselineState(null);
     }, []);
@@ -2253,7 +2754,7 @@
     const establishNoticeBaseline = useCallback(function (slug) {
       noticeGenRef.current += 1;
       const gen = noticeGenRef.current;
-      noticeRef.current = { board: slug, baseline: null, seen: {} };
+      noticeRef.current = { board: slug, baseline: null, seen: {}, interventions: {} };
       setWorkflowNotices([]);
       setNoticeBaselineState(null);
       return fetchEventsBaseline(slug).then(function (env) {
@@ -2281,6 +2782,10 @@
     // Feed WS events into the notice region. Only events for the current board,
     // after a valid baseline, of a notification-worthy kind, and not already
     // seen, are surfaced. Replayed/historical and duplicate ids are dropped.
+    // R5: an UNCHANGED repeated intervention (same task+kind+reason+remedy+
+    // run) stays quiet; a changed reason/remedy or a new run notifies again.
+    // Recovery events (status changes away from held states) clear the stored
+    // fingerprint so a recurrence is fresh again.
     const ingestNoticeEvents = useCallback(function (slug, events) {
       const nr = noticeRef.current;
       if (!nr || nr.board !== slug) return;      // late frame from another board
@@ -2295,7 +2800,18 @@
         if (e.id <= baseline) continue;          // historical / replay
         if (nr.seen[e.id]) continue;             // duplicate frame
         nr.seen[e.id] = true;
-        fresh.push({ id: e.id, kind: e.kind, task_id: e.task_id, created_at: e.created_at });
+        // R5 fingerprint gate: quiet on unchanged repeat, notify on change.
+        if (Object.prototype.hasOwnProperty.call(NOTICE_KINDS, e.kind) && NOTICE_INTERVENTION_KINDS[e.kind]) {
+          const fp = interventionFingerprint(e);
+          const prevFp = nr.interventions && nr.interventions[e.task_id || ""];
+          if (nr.interventions) nr.interventions[e.task_id || ""] = fp;
+          if (prevFp === fp) continue;           // unchanged repeat: quiet
+        } else if (nr.interventions && e.task_id && NOTICE_RECOVERY_KINDS[e.kind]) {
+          // Recovery clears the stored fingerprint for that task.
+          delete nr.interventions[e.task_id];
+        }
+        fresh.push({ id: e.id, kind: e.kind, task_id: e.task_id, created_at: e.created_at,
+                     reason: e.reason, remedy: e.remedy, run_id: e.run_id });
       }
       if (fresh.length === 0) return;
       setWorkflowNotices(function (prev) {
@@ -3062,6 +3578,10 @@
           dialogState: kanbanDialogs.dialogState,
         }),
         h(EvidenceBanner, { evidence: evidence }),
+        h(SupportPanel, {
+          boardSlug: board,
+          snapshot: evidence.snapshot,
+        }),
         evidenceAligned ? h(WorkflowNoticeRegion, {
           notices: workflowNotices,
           baselineState: noticeBaselineState,
@@ -3072,6 +3592,7 @@
         }) : null,
         evidenceAligned ? h(WorkflowAttentionSection, { boardSlug: board, onOpen: setSelectedTaskId }) : null,
         evidenceAligned ? h(WorkflowChangesSection, { boardSlug: board }) : null,
+        evidenceAligned ? h(ReadinessBatchSection, { boardSlug: board, heldCards: heldCards }) : null,
         h(BoardColumns, {
           board: filteredBoard,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
@@ -5196,6 +5717,150 @@
   }
 
   // -------------------------------------------------------------------------
+  // Next-ten drawer section: R4 acceptance compare, R6 reviewer packet
+  // download, R8 attachment provenance. All read through the same /api
+  // boundary; every state but PASS renders its reason visibly.
+  // -------------------------------------------------------------------------
+  function DrawerNextTenSection(props) {
+    const board = props.boardSlug;
+    const card = props.cardId;
+    // R4: pick the two most recent DISTINCT run ids from the bounded runs
+    // page for the compare affordance; fewer than two runs disables it
+    // honestly (an absent historical receipt is UNKNOWN, never invented).
+    const runs = (props.runs && Array.isArray(props.runs.items)) ? props.runs.items : [];
+    const runIds = runs.map(function (r) { return r && typeof r.id === "number" ? r.id : null; })
+      .filter(function (id) { return id != null; });
+    const currentRunId = runIds.length > 0 ? runIds[runIds.length - 1] : null;
+    const previousRunId = runIds.length > 1 ? runIds[runIds.length - 2] : null;
+
+    const [compare, setCompare] = useState(null);
+    const [comparing, setComparing] = useState(false);
+    const [packet, setPacket] = useState(null);
+    const [downloading, setDownloading] = useState(false);
+    const [provenance, setProvenance] = useState(null);
+
+    function doCompare() {
+      if (currentRunId == null || previousRunId == null) return;
+      setComparing(true);
+      setCompare(null);
+      fetchAcceptanceCompare(board, card, currentRunId, previousRunId).then(function (env) {
+        setComparing(false);
+        setCompare(env);
+      });
+    }
+
+    function doDownload() {
+      setDownloading(true);
+      setPacket(null);
+      downloadReviewerPacket(board, card).then(function (res) {
+        setDownloading(false);
+        setPacket(res);
+      });
+    }
+
+    // R8: provenance for the first loaded attachment (bounded; the drawer's
+    // attachment list itself stays the full inventory).
+    const attachmentId = (props.attachments && props.attachments.length > 0 && props.attachments[0].id != null)
+      ? props.attachments[0].id : null;
+    useEffect(function () {
+      if (attachmentId == null) return undefined;
+      let alive = true;
+      fetchAttachmentProvenance(board, card, attachmentId).then(function (env) {
+        if (alive) setProvenance(env);
+      });
+      return function () { alive = false; };
+    }, [board, card, attachmentId]);
+
+    const cmpEv = (compare && compare.state === "PASS" && compare.evidence) ? compare.evidence : null;
+    // R4: the adapter labels each check's provenance with a `source` field
+    // ("parent" = parent attestation, "machine" = machine validation);
+    // anything else is an honest UNKNOWN origin, never guessed.
+    function checkOriginLabel(c) {
+      if (c && c.source === "parent") return "parent attestation";
+      if (c && c.source === "machine") return "machine validation";
+      return "origin unknown";
+    }
+    const cmpRows = cmpEv && Array.isArray(cmpEv.checks)
+      ? cmpEv.checks.map(function (c, i) {
+          return h("div", {
+            key: (c.name || "check") + ":" + i,
+            className: "hermes-kanban-workflow-check",
+            "data-acceptance-check": c.name || "",
+          },
+            h("span", { className: "hermes-kanban-workflow-check-name" }, c.name || ""),
+            h("span", { className: "hermes-kanban-workflow-check-state", style: { color: workflowStateTone(c.change === "reverified" ? "PASS" : c.change === "regressed" ? "FAIL" : "UNKNOWN") } }, c.change || "unproved"),
+            h("span", { className: "hermes-kanban-workflow-check-reason" }, checkOriginLabel(c)));
+        })
+      : [];
+
+    return h("div", { className: "hermes-kanban-section", "data-next-ten-drawer": "true" },
+      h("div", { className: "hermes-kanban-section-head" }, "Release evidence"),
+      // R4 acceptance compare.
+      h("div", { "data-acceptance-compare": "true" },
+        h("div", { className: "text-xs text-muted-foreground" },
+          currentRunId != null && previousRunId != null
+            ? "Compare acceptance between run " + previousRunId + " and run " + currentRunId + "."
+            : "Acceptance compare needs two recorded runs; fewer is honest UNKNOWN, never invented."),
+        currentRunId != null && previousRunId != null
+          ? h("button", {
+              type: "button",
+              className: "hermes-kanban-workflow-btn",
+              "data-acceptance-compare-btn": "true",
+              disabled: comparing,
+              onClick: doCompare,
+            }, comparing ? "Comparing\u2026" : "Compare acceptance")
+          : null,
+        compare && compare.state !== "PASS"
+          ? h("div", { className: "text-xs", style: { color: workflowStateTone(compare.state) } },
+              compare.reason || ("compare " + compare.state))
+          : null,
+        cmpEv
+          ? h("div", { className: "hermes-kanban-workflow-list", "data-acceptance-compare-result": "true" },
+              h("div", { className: "text-xs" },
+                "run " + (cmpEv.previous && cmpEv.previous.run_id) + " \u2192 run " + (cmpEv.current && cmpEv.current.run_id) +
+                " \u00b7 previous " + ((cmpEv.previous && cmpEv.previous.state) || "UNKNOWN")),
+              cmpRows)
+          : null,
+        cmpEv && Array.isArray(cmpEv.limitations) && cmpEv.limitations.length > 0
+          ? h("div", { className: "text-xs text-muted-foreground" },
+              "limitations: " + cmpEv.limitations.join("; "))
+          : null),
+      // R6 reviewer packet download.
+      h("div", { "data-reviewer-packet": "true", style: { marginTop: "6px" } },
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-workflow-btn",
+          "data-reviewer-packet-btn": "true",
+          disabled: downloading,
+          onClick: doDownload,
+        }, downloading ? "Preparing\u2026" : "Download reviewer packet"),
+        packet
+          ? h("div", {
+              className: "text-xs",
+              "data-reviewer-packet-result": "true",
+              style: { color: packet.ok ? EVIDENCE_STATE_TONE.running : workflowStateTone(packet.envelope && packet.envelope.state) },
+            }, packet.ok
+              ? "Downloaded bounded reviewer packet JSON."
+              : ((packet.envelope && packet.envelope.reason) || "packet unavailable"))
+          : null),
+      // R8 attachment provenance.
+      h("div", { "data-attachment-provenance": "true", style: { marginTop: "6px" } },
+        attachmentId != null
+          ? h("div", { className: "text-xs" },
+              "Attachment " + attachmentId + ": ",
+              provenance && provenance.state === "PASS" && provenance.evidence
+                ? h("span", { "data-attachment-provenance-line": "true" },
+                    provenance.evidence.acceptance_state === "PASS"
+                      ? "accepted by run " + provenance.evidence.accepted_run_id
+                      : provenance.evidence.acceptance_state === "FAIL"
+                        ? "explicitly not accepted"
+                        : "accepted run unknown")
+                : h("span", { style: { color: EVIDENCE_STATE_TONE.unknown } },
+                    (provenance && provenance.reason) || "acceptance unknown"))
+          : h("div", { className: "text-xs text-muted-foreground" }, "No attachments on this card.")));
+  }
+
+  // -------------------------------------------------------------------------
   // Task drawer
   // -------------------------------------------------------------------------
 
@@ -5948,6 +6613,7 @@
       }),
       evidenceAligned ? h(WorkflowTimelineSection, { boardSlug: props.boardSlug, cardId: t.id }) : null,
       evidenceAligned ? h(WorkflowReadinessSection, { boardSlug: props.boardSlug, cardId: t.id, task: t }) : null,
+      evidenceAligned ? h(DrawerNextTenSection, { boardSlug: props.boardSlug, cardId: t.id, task: t, runs: runsPage, attachments: attachmentsPage.items }) : null,
       evidenceAligned ? h(WorkflowContinuationSection, { boardSlug: props.boardSlug, cardId: t.id, task: t, onOpenTask: props.onOpenTask }) : null,
       evidenceAligned ? h(WorkflowHoldSection, { boardSlug: props.boardSlug, cardId: t.id, task: t }) : null,
     );

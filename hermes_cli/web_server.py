@@ -18986,6 +18986,45 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
             detail="File not found",
         )
     media_type = content_types[suffix]
+    # R1 (kanban next-ten): ONLY the kanban plugin's dashboard bundle gets the
+    # identity wrapper — the single consumer that captures it at execution.
+    # Every other asset (any plugin, any JS) keeps its original bytes through
+    # the unchanged FileResponse path. The kanban bundle opens with a block
+    # comment and an IIFE whose "use strict" is FUNCTION-scoped inside it,
+    # so prepending a statement before the IIFE does not affect its strict
+    # semantics. The digest covers the ORIGINAL asset bytes (the wrapper
+    # itself is excluded and labelled as such by the consumer).
+    if (
+        suffix in (".js", ".mjs")
+        and plugin_name == "kanban"
+        and file_path == "dist/index.js"
+    ):
+        try:
+            data = target.read_bytes()
+        except OSError:
+            data = None
+        if data is not None:
+            digest = hashlib.sha256(data).hexdigest()
+            script_name = f"{plugin_name}/{file_path}"
+            wrapper = (
+                "(function(){var m={plugin:" + json.dumps(plugin_name)
+                + ",path:" + json.dumps(file_path)
+                + ",sha256:" + json.dumps(digest)
+                + ",bytes:" + str(len(data))
+                + "};"
+                + "(globalThis.__HERMES_PLUGIN_ASSET_ID__"
+                + "=globalThis.__HERMES_PLUGIN_ASSET_ID__||{})"
+                + "[" + json.dumps(script_name) + "]=m;})();"
+            ).encode("utf-8")
+            body = wrapper + b"\n" + data
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "X-Hermes-Asset-SHA256": digest,
+                },
+            )
     return FileResponse(
         target,
         media_type=media_type,
