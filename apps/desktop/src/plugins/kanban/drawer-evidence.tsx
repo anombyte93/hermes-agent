@@ -182,7 +182,9 @@ function RunRow({ item }: { item: Record<string, unknown> }) {
         {item.profile ? <span className="text-(--ui-text-tertiary)">{String(item.profile)}</span> : null}
       </div>
       {Boolean(item.summary || item.error) && (
-        <p className="line-clamp-2 whitespace-pre-wrap text-(--ui-text-quaternary)">{String(item.summary ?? item.error)}</p>
+        <p className="line-clamp-2 whitespace-pre-wrap text-(--ui-text-quaternary)">
+          {String(item.summary ?? item.error)}
+        </p>
       )}
     </li>
   )
@@ -228,11 +230,7 @@ function AttachmentProvenanceLine({ card, id, slug }: { card: string; id: number
     label = `provenance lookup failed${provenance.reason ? `: ${provenance.reason}` : ''}`
     toneClass = 'text-destructive'
   } else if (accepted) {
-    label = (
-      <span className="text-(--ui-text-tertiary)">
-        accepted run {acceptedRunId}
-      </span>
-    )
+    label = <span className="text-(--ui-text-tertiary)">accepted run {acceptedRunId}</span>
     toneClass = ''
   } else if (rejected) {
     // PASS transport but the guarded receipt's verdict is FAIL: acceptance was
@@ -287,13 +285,7 @@ function AttachmentRow({ card, slug, item }: { card: string; slug: string; item:
         <Codicon name="file" size="0.75rem" />
         <span className="min-w-0 truncate">{filename}</span>
         {size != null && <span className="text-(--ui-text-quaternary)">{size} B</span>}
-        <Button
-          className="ml-auto"
-          disabled={pending}
-          onClick={() => void download()}
-          size="xs"
-          variant="outline"
-        >
+        <Button className="ml-auto" disabled={pending} onClick={() => void download()} size="xs" variant="outline">
           <Codicon name={pending ? 'sync' : 'download'} size="0.75rem" spinning={pending} />
           Download
         </Button>
@@ -313,7 +305,11 @@ function EvidenceSection({ card, resource, slug }: { card: string; resource: Evi
   const { hasMore, loadMore, pageData, query, rows } = usePagedResource(slug, card, resource)
 
   const label =
-    resource === 'runs' ? k.runs(rows.length) : resource === 'events' ? k.activity(rows.length) : k.attachments(rows.length)
+    resource === 'runs'
+      ? k.runs(rows.length)
+      : resource === 'events'
+        ? k.activity(rows.length)
+        : k.attachments(rows.length)
 
   const name = resource === 'runs' ? 'runs' : resource === 'events' ? 'events' : 'attachments'
 
@@ -377,7 +373,13 @@ function EvidenceSection({ card, resource, slug }: { card: string; resource: Evi
         <p className="text-[0.625rem] text-(--ui-text-quaternary)">+{pageData.omitted} omitted by the bounded page</p>
       )}
       {hasMore ? (
-        <Button aria-label={`Load more ${name}`} disabled={query.isFetching} onClick={loadMore} size="xs" variant="outline">
+        <Button
+          aria-label={`Load more ${name}`}
+          disabled={query.isFetching}
+          onClick={loadMore}
+          size="xs"
+          variant="outline"
+        >
           Load more
         </Button>
       ) : (
@@ -462,10 +464,18 @@ function EvidenceAttachmentsSection({
             ))}
           </ul>
           {typeof pageData?.omitted === 'number' && pageData.omitted > 0 && (
-            <p className="text-[0.625rem] text-(--ui-text-quaternary)">+{pageData.omitted} omitted by the bounded page</p>
+            <p className="text-[0.625rem] text-(--ui-text-quaternary)">
+              +{pageData.omitted} omitted by the bounded page
+            </p>
           )}
           {hasMore ? (
-            <Button aria-label="Load more attachments" disabled={query.isFetching} onClick={loadMore} size="xs" variant="outline">
+            <Button
+              aria-label="Load more attachments"
+              disabled={query.isFetching}
+              onClick={loadMore}
+              size="xs"
+              variant="outline"
+            >
               Load more
             </Button>
           ) : (

@@ -260,7 +260,12 @@ export function useBoardEvidence(): BoardEvidence {
   // has_more of the LAST page loaded. Stamped with the first page's observed_at
   // so a refresh (or a board switch) advances the stamp and the stale pages are
   // ignored, a refresh can never mix old worker claims under a new timestamp.
-  const [extra, setExtra] = useState<{ observedAt: null | number; cards: KanbanTask[]; cursor: null | string; hasMore: boolean }>({
+  const [extra, setExtra] = useState<{
+    observedAt: null | number
+    cards: KanbanTask[]
+    cursor: null | string
+    hasMore: boolean
+  }>({
     observedAt: null,
     cards: [],
     cursor: null,
@@ -463,10 +468,15 @@ function ObservationLine({ observation }: { observation: WorkerObservation }) {
         className="inline-flex items-center gap-1 font-medium"
         style={{ color: running ? STATE_TONE.running : STATE_TONE.unknown }}
       >
-        <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: running ? STATE_TONE.running : STATE_TONE.unknown }} />
+        <span
+          className="size-1.5 shrink-0 rounded-full"
+          style={{ backgroundColor: running ? STATE_TONE.running : STATE_TONE.unknown }}
+        />
         {observation.state ?? 'unknown'}
       </span>
-      {observation.reason && <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">{observation.reason}</span>}
+      {observation.reason && (
+        <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">{observation.reason}</span>
+      )}
     </li>
   )
 }
@@ -483,7 +493,11 @@ export function WorkerEvidenceSection({ id }: { id: string }) {
   const contextQuery = useEvidenceContext(slug)
   const context = contextQuery.data
 
-  const { data: envelope, isFetching, isError } = useQuery({
+  const {
+    data: envelope,
+    isFetching,
+    isError
+  } = useQuery({
     queryKey: evidenceWorkerKey(slug, id),
     queryFn: () => fetchEvidenceWorker(slug, id),
     enabled: context?.aligned === true,
@@ -497,8 +511,8 @@ export function WorkerEvidenceSection({ id }: { id: string }) {
       <Section label="Worker evidence">
         <Callout title="Choose the EVO connection" tone={STATE_TONE.unavailable}>
           <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
-            Worker evidence could not be checked — the EVO identity check failed. Select the EVO
-            connection to see worker state for this card.
+            Worker evidence could not be checked — the EVO identity check failed. Select the EVO connection to see
+            worker state for this card.
           </p>
         </Callout>
       </Section>
@@ -517,8 +531,8 @@ export function WorkerEvidenceSection({ id }: { id: string }) {
       <Section label="Worker evidence">
         <Callout title="Choose the EVO connection" tone={STATE_TONE.unavailable}>
           <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
-            This board is not the EVO database, so worker evidence is unavailable here. Select the
-            EVO connection to see live worker state for this card.
+            This board is not the EVO database, so worker evidence is unavailable here. Select the EVO connection to see
+            live worker state for this card.
           </p>
         </Callout>
       </Section>
@@ -617,10 +631,7 @@ export function WorkerEvidenceSection({ id }: { id: string }) {
 /** Compact evidence badge for a card (board/column level). */
 export function EvidenceStateBadge({ state }: { state: WorkerState }) {
   return (
-    <span
-      className="inline-flex items-center gap-1 text-[0.625rem] font-medium"
-      style={{ color: STATE_TONE[state] }}
-    >
+    <span className="inline-flex items-center gap-1 text-[0.625rem] font-medium" style={{ color: STATE_TONE[state] }}>
       <span className="size-1.5 rounded-full" style={{ backgroundColor: STATE_TONE[state] }} />
       {STATE_LABEL[state]}
     </span>

@@ -161,8 +161,20 @@ describe('resolveWorkerState', () => {
 // ---------------------------------------------------------------------------
 
 describe('snapshot worker-state rollup', () => {
-  const runningObs = { task_id: 't_1', state: 'PASS', process_present: true, workspace_matches: true, run_start_matches: true }
-  const weakObs = { task_id: 't_2', state: 'PASS', process_present: true, workspace_matches: true, run_start_matches: false }
+  const runningObs = {
+    task_id: 't_1',
+    state: 'PASS',
+    process_present: true,
+    workspace_matches: true,
+    run_start_matches: true
+  }
+  const weakObs = {
+    task_id: 't_2',
+    state: 'PASS',
+    process_present: true,
+    workspace_matches: true,
+    run_start_matches: false
+  }
   const nonPass = { task_id: 't_3', state: 'FAIL', process_present: false }
 
   it('counts running vs unknown from worker_observations', () => {
@@ -211,7 +223,13 @@ async function renderSection(id: string) {
   )
 }
 
-const context = (aligned: boolean) => ({ aligned, board: 'default', hostname: 'evo', reason: aligned ? 'aligned' : 'no', observed_at: 1 })
+const context = (aligned: boolean) => ({
+  aligned,
+  board: 'default',
+  hostname: 'evo',
+  reason: aligned ? 'aligned' : 'no',
+  observed_at: 1
+})
 
 const envelope = (state: 'PASS' | 'FAIL' | 'UNKNOWN', evidence?: unknown, reason?: string) => ({
   state,

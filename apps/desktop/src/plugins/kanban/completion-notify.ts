@@ -219,7 +219,12 @@ function interventionKey(slug: string, taskId: string): string {
   return `${slug}\u0000${taskId}`
 }
 
-function notifyOne(slug: string, kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
+function notifyOne(
+  slug: string,
+  kind: string,
+  spec: { titleKey: string; toast: ToastKind },
+  ev: CompletionEvent
+): void {
   const taskId = (ev.task_id ?? '').trim()
   const body = bodyFor(kind, ev)
 

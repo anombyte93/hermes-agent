@@ -70,7 +70,8 @@ function useFrontendStamp(): FrontendStamp {
   useEffect(() => {
     let alive = true
 
-    const bridge = (window as unknown as { hermesDesktop?: { getVersion?: () => Promise<Record<string, unknown>> } }).hermesDesktop
+    const bridge = (window as unknown as { hermesDesktop?: { getVersion?: () => Promise<Record<string, unknown>> } })
+      .hermesDesktop
 
     if (!bridge?.getVersion) {
       return
@@ -89,8 +90,10 @@ function useFrontendStamp(): FrontendStamp {
           // derived from appVersion or bundleCommitsBehind; only the stamp's
           // commit field names the loaded bundle. Absent → UNKNOWN.
           rendererCommit: typeof info?.rendererCommit === 'string' && info.rendererCommit ? info.rendererCommit : null,
-          rendererStampSource: typeof info?.rendererStampSource === 'string' && info.rendererStampSource ? info.rendererStampSource : null,
-          rendererBuiltAt: typeof info?.rendererBuiltAt === 'string' && info.rendererBuiltAt ? info.rendererBuiltAt : null,
+          rendererStampSource:
+            typeof info?.rendererStampSource === 'string' && info.rendererStampSource ? info.rendererStampSource : null,
+          rendererBuiltAt:
+            typeof info?.rendererBuiltAt === 'string' && info.rendererBuiltAt ? info.rendererBuiltAt : null,
           rendererDirty: typeof info?.rendererDirty === 'boolean' ? info.rendererDirty : null,
           bundleOutOfSync: typeof info?.bundleOutOfSync === 'boolean' ? info.bundleOutOfSync : null
         })
@@ -116,7 +119,17 @@ function useSupportSlug(): string {
 }
 
 /** One identity line: label + state + revision + source. */
-function IdentityRow({ label, state, revision, source }: { label: string; state?: string; revision?: null | string; source?: null | string }) {
+function IdentityRow({
+  label,
+  state,
+  revision,
+  source
+}: {
+  label: string
+  state?: string
+  revision?: null | string
+  source?: null | string
+}) {
   const s = state === 'PASS' ? 'PASS' : state === 'FAIL' ? 'FAIL' : 'UNKNOWN'
 
   return (
@@ -126,7 +139,9 @@ function IdentityRow({ label, state, revision, source }: { label: string; state?
         <span className="size-1.5 rounded-full" style={{ backgroundColor: tone(s) }} />
         {s}
       </span>
-      {revision && <span className="min-w-0 truncate font-mono text-[0.625rem] text-(--ui-text-quaternary)">{revision}</span>}
+      {revision && (
+        <span className="min-w-0 truncate font-mono text-[0.625rem] text-(--ui-text-quaternary)">{revision}</span>
+      )}
       {source && <span className="shrink-0 text-[0.625rem] text-(--ui-text-quaternary)">{source}</span>}
     </div>
   )
@@ -137,7 +152,10 @@ function IdentityRow({ label, state, revision, source }: { label: string; state?
  *  generic). Pure: never invents a success, never bypasses auth. */
 type ReadinessFailureKind = 'unauthorized' | 'forbidden' | 'login' | 'malformed' | 'unreachable' | 'unknown'
 
-function classifyReadinessFailure(err: unknown, reason: string | null | undefined): { kind: ReadinessFailureKind; remedy: string } {
+function classifyReadinessFailure(
+  err: unknown,
+  reason: string | null | undefined
+): { kind: ReadinessFailureKind; remedy: string } {
   // The electron REST bridge rejects HTTP errors as `Error("401: {...}")`.
   const raw = err instanceof Error ? err.message : err ? String(err) : ''
   const statusMatch = raw.match(/\b(40[13])\b/)
@@ -145,7 +163,10 @@ function classifyReadinessFailure(err: unknown, reason: string | null | undefine
   if (statusMatch) {
     return statusMatch[1] === '401'
       ? { kind: 'unauthorized', remedy: 'Authentication required — sign in to the EVO gateway, then retry.' }
-      : { kind: 'forbidden', remedy: 'This board is not readable for the current session — check board access, not reachability.' }
+      : {
+          kind: 'forbidden',
+          remedy: 'This board is not readable for the current session — check board access, not reachability.'
+        }
   }
 
   const lower = (reason ?? raw).toLowerCase()
@@ -155,11 +176,22 @@ function classifyReadinessFailure(err: unknown, reason: string | null | undefine
   }
 
   if (lower.includes('malformed') || lower.includes('parse') || lower.includes('json')) {
-    return { kind: 'malformed', remedy: 'The readiness response was malformed — the backend returned an unreadable payload.' }
+    return {
+      kind: 'malformed',
+      remedy: 'The readiness response was malformed — the backend returned an unreadable payload.'
+    }
   }
 
-  if (lower.includes('reachable') || lower.includes('unreachable') || lower.includes('connect') || lower.includes('timeout')) {
-    return { kind: 'unreachable', remedy: 'The EVO gateway could not be reached — check the connection, not the board.' }
+  if (
+    lower.includes('reachable') ||
+    lower.includes('unreachable') ||
+    lower.includes('connect') ||
+    lower.includes('timeout')
+  ) {
+    return {
+      kind: 'unreachable',
+      remedy: 'The EVO gateway could not be reached — check the connection, not the board.'
+    }
   }
 
   return { kind: 'unknown', remedy: 'Browser readiness could not be established.' }
@@ -215,7 +247,9 @@ function RefreshCoverageSection({ slug, aligned }: { slug: string; aligned: bool
           {observedAt ? (
             <div className="flex items-baseline gap-2 text-[0.71rem] text-(--ui-text-secondary)">
               <span>Snapshot</span>
-              <span className="text-(--ui-text-quaternary)">observed {new Date(observedAt * 1000).toLocaleTimeString()}</span>
+              <span className="text-(--ui-text-quaternary)">
+                observed {new Date(observedAt * 1000).toLocaleTimeString()}
+              </span>
             </div>
           ) : null}
           {(querySeconds != null || collectionSeconds != null) && (
@@ -238,7 +272,9 @@ function RefreshCoverageSection({ slug, aligned }: { slug: string; aligned: bool
             </span>
           </div>
           {!hasObservations && (
-            <span className="text-[0.625rem] text-(--ui-text-quaternary)">Worker observations were not reported by this snapshot.</span>
+            <span className="text-[0.625rem] text-(--ui-text-quaternary)">
+              Worker observations were not reported by this snapshot.
+            </span>
           )}
         </>
       )}
@@ -264,7 +300,11 @@ export function SupportPanel() {
     retry: false
   })
 
-  const { data: readinessEnvelope, isError: readinessError, error: readinessErr } = useQuery({
+  const {
+    data: readinessEnvelope,
+    isError: readinessError,
+    error: readinessErr
+  } = useQuery({
     queryKey: browserReadinessKey(slug),
     queryFn: () => fetchBrowserReadiness(slug),
     enabled: slug !== '',
@@ -274,8 +314,12 @@ export function SupportPanel() {
 
   const stamp = useFrontendStamp()
 
-  const releases = releasesEnvelope?.state === 'PASS' ? (releasesEnvelope.evidence as ReleasesData | null | undefined) : null
-  const readiness = readinessEnvelope?.state === 'PASS' ? (readinessEnvelope.evidence as BrowserReadinessEvidence | null | undefined) : null
+  const releases =
+    releasesEnvelope?.state === 'PASS' ? (releasesEnvelope.evidence as ReleasesData | null | undefined) : null
+  const readiness =
+    readinessEnvelope?.state === 'PASS'
+      ? (readinessEnvelope.evidence as BrowserReadinessEvidence | null | undefined)
+      : null
 
   return (
     <div className="flex flex-col gap-4 border-t border-(--ui-stroke-secondary) px-4 py-3 text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
@@ -287,7 +331,11 @@ export function SupportPanel() {
           revision={stamp.rendererCommit}
           source={
             stamp.rendererCommit
-              ? [stamp.rendererDirty ? 'dirty' : null, stamp.bundleOutOfSync ? 'bundle out of sync' : null, 'renderer build']
+              ? [
+                  stamp.rendererDirty ? 'dirty' : null,
+                  stamp.bundleOutOfSync ? 'bundle out of sync' : null,
+                  'renderer build'
+                ]
                   .filter(Boolean)
                   .join(' · ')
               : undefined
@@ -300,7 +348,9 @@ export function SupportPanel() {
           <span className="text-[0.625rem] text-(--ui-text-quaternary)">Checking release identity…</span>
         ) : releasesEnvelope.state !== 'PASS' ? (
           <Callout title="Release identity unavailable" tone={STATE_TONE.UNKNOWN}>
-            <p className="text-[0.71rem]">{releasesEnvelope.reason ?? 'The served adapter/backend identity is unavailable.'}</p>
+            <p className="text-[0.71rem]">
+              {releasesEnvelope.reason ?? 'The served adapter/backend identity is unavailable.'}
+            </p>
           </Callout>
         ) : (
           <>

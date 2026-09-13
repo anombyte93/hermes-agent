@@ -217,7 +217,13 @@ function snapshotPage(
       board: 'evo',
       status_filter: 'all',
       cards,
-      counts: { by_status: byStatus, total: cards.length, matching_filter: cards.length, in_page: cards.length, omitted: opts.omitted ?? 0 },
+      counts: {
+        by_status: byStatus,
+        total: cards.length,
+        matching_filter: cards.length,
+        in_page: cards.length,
+        omitted: opts.omitted ?? 0
+      },
       observed_at: observedAt,
       has_more: opts.hasMore ?? false,
       next_cursor: opts.nextCursor ?? null,
@@ -270,9 +276,20 @@ describe('R10 — long-board paging under concurrent updates', () => {
   it('deduplicates overlapping page-2 ids (a concurrent insert) without dropping either card', async () => {
     h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
     h.fetch.fetchEvidenceSnapshot
-      .mockResolvedValueOnce(snapshotPage([card('t_a', 'Card A', 'running'), card('t_b', 'Card B', 'done')], { hasMore: true, nextCursor: 'p2', omitted: 1 }))
+      .mockResolvedValueOnce(
+        snapshotPage([card('t_a', 'Card A', 'running'), card('t_b', 'Card B', 'done')], {
+          hasMore: true,
+          nextCursor: 'p2',
+          omitted: 1
+        })
+      )
       // Page 2 re-reads t_b (still under the high-water bound) plus a new card.
-      .mockResolvedValueOnce(snapshotPage([card('t_b', 'Card B', 'done'), card('t_c', 'Card C', 'done')], { hasMore: false, nextCursor: null }))
+      .mockResolvedValueOnce(
+        snapshotPage([card('t_b', 'Card B', 'done'), card('t_c', 'Card C', 'done')], {
+          hasMore: false,
+          nextCursor: null
+        })
+      )
 
     renderBoard()
 
@@ -290,9 +307,16 @@ describe('R10 — long-board paging under concurrent updates', () => {
   it('reports an evolving snapshot: a card that changed status between pages keeps one identity', async () => {
     h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
     h.fetch.fetchEvidenceSnapshot
-      .mockResolvedValueOnce(snapshotPage([card('t_a', 'Card A', 'running')], { hasMore: true, nextCursor: 'p2', omitted: 1 }))
+      .mockResolvedValueOnce(
+        snapshotPage([card('t_a', 'Card A', 'running')], { hasMore: true, nextCursor: 'p2', omitted: 1 })
+      )
       // The same card re-reads as done (status changed under a concurrent update).
-      .mockResolvedValueOnce(snapshotPage([card('t_a', 'Card A', 'done'), card('t_b', 'Card B', 'done')], { hasMore: false, nextCursor: null }))
+      .mockResolvedValueOnce(
+        snapshotPage([card('t_a', 'Card A', 'done'), card('t_b', 'Card B', 'done')], {
+          hasMore: false,
+          nextCursor: null
+        })
+      )
 
     renderBoard()
 
@@ -316,13 +340,19 @@ describe('R10 — long-board paging under concurrent updates', () => {
       if (slug === 'evo') {
         return cursor
           ? evoPage2
-          : Promise.resolve(snapshotPage([card('t_evo', 'EVO card', 'running')], { hasMore: true, nextCursor: 'p2', observedAt: now }))
+          : Promise.resolve(
+              snapshotPage([card('t_evo', 'EVO card', 'running')], { hasMore: true, nextCursor: 'p2', observedAt: now })
+            )
       }
 
       // The other board's snapshot is stamped at a DIFFERENT observed_at — the
       // stamp that lets the board drop a stale evo page-2 landing after a switch.
       return Promise.resolve(
-        snapshotPage([card('t_other', 'Other card', 'running')], { hasMore: false, nextCursor: null, observedAt: now + 100 })
+        snapshotPage([card('t_other', 'Other card', 'running')], {
+          hasMore: false,
+          nextCursor: null,
+          observedAt: now + 100
+        })
       )
     })
 
@@ -362,8 +392,12 @@ describe('R10 — long-board paging under concurrent updates', () => {
   it('exposes an explicit "snapshot changed — paging restarted" note when a refresh drops loaded pages', async () => {
     h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
     h.fetch.fetchEvidenceSnapshot
-      .mockResolvedValueOnce(snapshotPage([card('t_a', 'Card A', 'running')], { hasMore: true, nextCursor: 'p2', observedAt: now }))
-      .mockResolvedValueOnce(snapshotPage([card('t_b', 'Card B', 'done')], { hasMore: false, nextCursor: null, observedAt: now }))
+      .mockResolvedValueOnce(
+        snapshotPage([card('t_a', 'Card A', 'running')], { hasMore: true, nextCursor: 'p2', observedAt: now })
+      )
+      .mockResolvedValueOnce(
+        snapshotPage([card('t_b', 'Card B', 'done')], { hasMore: false, nextCursor: null, observedAt: now })
+      )
 
     const client = renderBoard()
 

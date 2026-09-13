@@ -84,7 +84,9 @@ export function parsePassedChecks(text: string): string[] {
 }
 
 function SectionLabel({ children }: { children: string }) {
-  return <h3 className="text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">{children}</h3>
+  return (
+    <h3 className="text-[0.6875rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">{children}</h3>
+  )
 }
 
 function StateDot({ state }: { state: string | undefined }) {
@@ -117,7 +119,9 @@ function AlignmentGate({ slug, children }: { slug: string; children: React.React
   }
 
   if (!context.aligned) {
-    return <p className="text-[0.75rem] text-(--ui-text-secondary)">Choose the EVO connection to see workflow evidence.</p>
+    return (
+      <p className="text-[0.75rem] text-(--ui-text-secondary)">Choose the EVO connection to see workflow evidence.</p>
+    )
   }
 
   return <>{children}</>
@@ -127,7 +131,11 @@ function AlignmentGate({ slug, children }: { slug: string; children: React.React
  *  commission + checks + note the fingerprint bound. Never re-derived from the
  *  current inputs, and never omits the commission (the fingerprint would not
  *  match). */
-function continueBodyFromDraft(card: string, draft: ContinuationDraft, fingerprint: string): ContinuationInput & { fingerprint: string } {
+function continueBodyFromDraft(
+  card: string,
+  draft: ContinuationDraft,
+  fingerprint: string
+): ContinuationInput & { fingerprint: string } {
   const commission = draft.commission ?? {}
   const str = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined)
   const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
@@ -268,8 +276,13 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
   const draftReceiptVal = draftReceipt(draft)
   const continuePayload = draftReceiptVal?.fingerprint
 
-  const remainingComplete = remaining.length === 0 || remaining.every(r => r.check.trim() && r.evidence.trim() && r.acceptance.trim())
-  const remainingPartial = remaining.some(r => (r.check.trim() || r.evidence.trim() || r.acceptance.trim()) && !(r.check.trim() && r.evidence.trim() && r.acceptance.trim()))
+  const remainingComplete =
+    remaining.length === 0 || remaining.every(r => r.check.trim() && r.evidence.trim() && r.acceptance.trim())
+  const remainingPartial = remaining.some(
+    r =>
+      (r.check.trim() || r.evidence.trim() || r.acceptance.trim()) &&
+      !(r.check.trim() && r.evidence.trim() && r.acceptance.trim())
+  )
 
   return (
     <div className="flex flex-col gap-4 py-1 text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
@@ -280,7 +293,12 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
           Check the exact provider and model
         </label>
         <div>
-          <Button disabled={readiness.isPending} onClick={() => readiness.mutate(genRef.current)} size="sm" variant="outline">
+          <Button
+            disabled={readiness.isPending}
+            onClick={() => readiness.mutate(genRef.current)}
+            size="sm"
+            variant="outline"
+          >
             {readiness.isPending ? 'Checking…' : 'Check readiness'}
           </Button>
         </div>
@@ -301,7 +319,11 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
       <section className="flex flex-col gap-2">
         <SectionLabel>Continuation draft</SectionLabel>
         <Field label="Passed checks (one per line)">
-          <Textarea onChange={event => setPassedAndInvalidate(event.target.value)} placeholder="Parent source validation passed" value={passedText} />
+          <Textarea
+            onChange={event => setPassedAndInvalidate(event.target.value)}
+            placeholder="Parent source validation passed"
+            value={passedText}
+          />
         </Field>
         <Field label="Remaining checks">
           {remaining.map((row, index) => (
@@ -317,7 +339,9 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
                 value={row.evidence}
               />
               <Input
-                onChange={event => setRemainingAndInvalidate(withRow(remaining, index, 'acceptance', event.target.value))}
+                onChange={event =>
+                  setRemainingAndInvalidate(withRow(remaining, index, 'acceptance', event.target.value))
+                }
                 placeholder="acceptance"
                 value={row.acceptance}
               />
@@ -331,23 +355,40 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
               </Button>
             </div>
           ))}
-          <Button onClick={() => setRemainingAndInvalidate([...remaining, { check: '', evidence: '', acceptance: '' }])} size="sm" variant="outline">
+          <Button
+            onClick={() => setRemainingAndInvalidate([...remaining, { check: '', evidence: '', acceptance: '' }])}
+            size="sm"
+            variant="outline"
+          >
             Add remaining check
           </Button>
           {remainingPartial && (
-            <span className="text-amber-500">Each remaining check needs all three fields: check, evidence, and acceptance.</span>
+            <span className="text-amber-500">
+              Each remaining check needs all three fields: check, evidence, and acceptance.
+            </span>
           )}
         </Field>
         <Field label="Verification note">
-          <Textarea onChange={event => setNoteAndInvalidate(event.target.value)} placeholder="What you verified, in your own words" value={note} />
+          <Textarea
+            onChange={event => setNoteAndInvalidate(event.target.value)}
+            placeholder="What you verified, in your own words"
+            value={note}
+          />
         </Field>
         <div>
-          <Button disabled={draftMut.isPending || !remainingComplete} onClick={() => draftMut.mutate(genRef.current)} size="sm" variant="outline">
+          <Button
+            disabled={draftMut.isPending || !remainingComplete}
+            onClick={() => draftMut.mutate(genRef.current)}
+            size="sm"
+            variant="outline"
+          >
             {draftMut.isPending ? 'Drafting…' : 'Draft continuation'}
           </Button>
         </div>
 
-        {draft && draft.state !== 'PASS' && <span className="text-destructive">Draft unavailable: {draft.reason ?? 'read failed'}</span>}
+        {draft && draft.state !== 'PASS' && (
+          <span className="text-destructive">Draft unavailable: {draft.reason ?? 'read failed'}</span>
+        )}
 
         {draftReceiptVal && (
           <div className="flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-2">
@@ -366,7 +407,9 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
               </span>
             )}
             {(draftReceiptVal.passed_checks?.length || 0) > 0 && (
-              <span className="text-[0.625rem] text-(--ui-text-tertiary)">Passed: {draftReceiptVal.passed_checks!.join(', ')}</span>
+              <span className="text-[0.625rem] text-(--ui-text-tertiary)">
+                Passed: {draftReceiptVal.passed_checks!.join(', ')}
+              </span>
             )}
             {(draftReceiptVal.remaining_checks?.length || 0) > 0 && (
               <span className="text-[0.625rem] text-(--ui-text-tertiary)">
@@ -396,18 +439,31 @@ export function CardWorkflowPanel({ card, slug }: { card: string; slug: string }
         <div className="flex items-end gap-2">
           <div className="flex-1">
             <Field label="Reason">
-              <Input onChange={event => setHoldReason(event.target.value)} placeholder="Why this card needs review" value={holdReason} />
+              <Input
+                onChange={event => setHoldReason(event.target.value)}
+                placeholder="Why this card needs review"
+                value={holdReason}
+              />
             </Field>
           </div>
-          <Button disabled={holdMut.isPending} onClick={() => holdMut.mutate(genRef.current)} size="sm" variant="outline">
+          <Button
+            disabled={holdMut.isPending}
+            onClick={() => holdMut.mutate(genRef.current)}
+            size="sm"
+            variant="outline"
+          >
             {holdMut.isPending ? 'Holding…' : 'Hold'}
           </Button>
         </div>
         {holdResult && holdResult.state === 'PASS' && (
-          <span className="text-(--ui-text-tertiary)">Card held for review. History preserved; a live worker is not stopped.</span>
+          <span className="text-(--ui-text-tertiary)">
+            Card held for review. History preserved; a live worker is not stopped.
+          </span>
         )}
         {holdResult && holdResult.state !== 'PASS' && (
-          <span className="text-destructive">{holdResult.reason ?? holdResult.evidence?.reason ?? 'Hold unavailable'}</span>
+          <span className="text-destructive">
+            {holdResult.reason ?? holdResult.evidence?.reason ?? 'Hold unavailable'}
+          </span>
         )}
       </section>
     </div>
@@ -435,7 +491,9 @@ function ReadinessChecks({ receipt }: { receipt: ReadinessReceipt }) {
     <div className="flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-2">
       <div className="flex items-center gap-2">
         <StateDot state={receipt.state} />
-        <span className="font-medium text-foreground">{receipt.ready_to_release ? 'Ready to release' : 'Not ready to release'}</span>
+        <span className="font-medium text-foreground">
+          {receipt.ready_to_release ? 'Ready to release' : 'Not ready to release'}
+        </span>
       </div>
       {checks.map(check => (
         <div className="flex items-baseline gap-2" key={check.name}>
@@ -444,12 +502,16 @@ function ReadinessChecks({ receipt }: { receipt: ReadinessReceipt }) {
             {check.name}
             {check.mutation_authorized === false ? ' (read-only)' : ''}
           </span>
-          {check.reason && <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">{check.reason}</span>}
+          {check.reason && (
+            <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">{check.reason}</span>
+          )}
         </div>
       ))}
       {repairPreviews.length > 0 && (
         <div className="mt-0.5 flex flex-col gap-1 border-t border-(--ui-stroke-tertiary) pt-1.5">
-          <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)">Next repair (preview)</span>
+          <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)">
+            Next repair (preview)
+          </span>
           {repairPreviews.map((repair, index) => (
             <RepairPreviewLine key={`${repair.check}-${index}`} repair={repair} />
           ))}
@@ -494,8 +556,8 @@ function ContinueResult({ result }: { result: EvidenceEnvelope<ContinueReceipt> 
   if (result.state === 'PASS' && receipt?.new_card) {
     return (
       <span className="text-(--ui-text-secondary)">
-        New held card <span className="font-mono">{receipt.new_card}</span> ({receipt.new_card_status ?? 'blocked'}, assignee{' '}
-        {receipt.new_card_assignee ?? 'none'}). Held, not dispatched. Open it to review.
+        New held card <span className="font-mono">{receipt.new_card}</span> ({receipt.new_card_status ?? 'blocked'},
+        assignee {receipt.new_card_assignee ?? 'none'}). Held, not dispatched. Open it to review.
       </span>
     )
   }
@@ -569,7 +631,10 @@ function ReadinessBatchSection({ slug }: { slug: string }) {
   const heldPageCards = heldEnvelope?.state === 'PASS' ? (heldEnvelope.evidence?.cards ?? []) : []
   const heldCards = [...heldPages.flat(), ...heldPageCards]
   const heldHasMore = heldEnvelope?.state === 'PASS' && heldEnvelope.evidence?.has_more === true
-  const heldOmitted = heldEnvelope?.state === 'PASS' && typeof heldEnvelope.evidence?.omitted === 'number' ? heldEnvelope.evidence.omitted : null
+  const heldOmitted =
+    heldEnvelope?.state === 'PASS' && typeof heldEnvelope.evidence?.omitted === 'number'
+      ? heldEnvelope.evidence.omitted
+      : null
   const heldNextCursor = heldEnvelope?.state === 'PASS' ? (heldEnvelope.evidence?.next_cursor ?? null) : null
 
   const loadMoreHeld = () => {
@@ -658,7 +723,9 @@ function ReadinessBatchSection({ slug }: { slug: string }) {
       {/* The 100-card held snapshot omits the tail; expose it honestly and offer
           a path to the rest via the snapshot's own cursor. */}
       {heldOmitted != null && heldOmitted > 0 && (
-        <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">+{heldOmitted} held cards omitted by the bounded list</span>
+        <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">
+          +{heldOmitted} held cards omitted by the bounded list
+        </span>
       )}
       {heldHasMore && (
         <Button disabled={heldQuery.isFetching} onClick={loadMoreHeld} size="xs" variant="outline">
@@ -666,7 +733,9 @@ function ReadinessBatchSection({ slug }: { slug: string }) {
         </Button>
       )}
       {heldCards.length > READINESS_BATCH_MAX && (
-        <span className="text-[0.625rem] text-(--ui-text-quaternary)">Select up to {READINESS_BATCH_MAX} held cards.</span>
+        <span className="text-[0.625rem] text-(--ui-text-quaternary)">
+          Select up to {READINESS_BATCH_MAX} held cards.
+        </span>
       )}
       <label className="flex cursor-pointer items-center gap-2 text-[0.6875rem]">
         <input checked={checkModel} onChange={event => setCheckModel(event.target.checked)} type="checkbox" />
@@ -766,8 +835,14 @@ function AttentionSection({ slug }: { slug: string }) {
     <section className="flex flex-col gap-2">
       <SectionLabel>Attention</SectionLabel>
       {isFetching && <Loader type="lemniscate-bloom" />}
-      {isError && <span className="text-destructive">Attention queue unavailable: {(error as Error)?.message ?? 'read failed'}</span>}
-      {data && data.state !== 'PASS' && <span className="text-destructive">Attention unavailable: {data.reason ?? 'read failed'}</span>}
+      {isError && (
+        <span className="text-destructive">
+          Attention queue unavailable: {(error as Error)?.message ?? 'read failed'}
+        </span>
+      )}
+      {data && data.state !== 'PASS' && (
+        <span className="text-destructive">Attention unavailable: {data.reason ?? 'read failed'}</span>
+      )}
       {allCards.length > 0 && (
         <ul className="flex flex-col gap-1.5">
           {allCards.map(card => (
@@ -778,13 +853,18 @@ function AttentionSection({ slug }: { slug: string }) {
                 type="button"
               >
                 <span className="flex items-center gap-2 text-[0.75rem] font-medium text-foreground">
-                  <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: stateTone(card.status) }} />
+                  <span
+                    className="size-1.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: stateTone(card.status) }}
+                  />
                   <span className="truncate">{card.title || card.id}</span>
                 </span>
                 <span className="flex items-center gap-2 text-[0.625rem] text-(--ui-text-quaternary)">
                   <span className="font-mono">{card.id}</span>
                   {card.next_action && <span>{card.next_action}</span>}
-                  {card.operator_authority_needed === true && <span className="text-amber-500">operator authority needed</span>}
+                  {card.operator_authority_needed === true && (
+                    <span className="text-amber-500">operator authority needed</span>
+                  )}
                 </span>
               </button>
             </li>
@@ -837,17 +917,22 @@ function ChangesSection({ slug }: { slug: string }) {
       <SectionLabel>Changes</SectionLabel>
       {isFetching && <Loader type="lemniscate-bloom" />}
       {isError && <span className="text-destructive">Changes unavailable</span>}
-      {data && data.state !== 'PASS' && <span className="text-destructive">{data.reason ?? 'changes unavailable'}</span>}
+      {data && data.state !== 'PASS' && (
+        <span className="text-destructive">{data.reason ?? 'changes unavailable'}</span>
+      )}
       {ev && (
         <>
           <span className="text-[0.625rem] text-(--ui-text-quaternary)">
-            {ev.first_read_policy ?? 'baseline-now'} · fresh {ev.observed_at ? new Date(ev.observed_at * 1000).toLocaleTimeString() : ''}
+            {ev.first_read_policy ?? 'baseline-now'} · fresh{' '}
+            {ev.observed_at ? new Date(ev.observed_at * 1000).toLocaleTimeString() : ''}
           </span>
           <ul className="flex flex-col gap-1">
             {(ev.events ?? []).map((event, index) => (
               <li className="flex items-center gap-2 text-[0.6875rem]" key={event.id ?? index}>
                 <span className="min-w-0 truncate text-(--ui-text-secondary)">{event.kind ?? 'event'}</span>
-                {event.task_id && <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)">{event.task_id}</span>}
+                {event.task_id && (
+                  <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)">{event.task_id}</span>
+                )}
               </li>
             ))}
           </ul>
@@ -855,7 +940,12 @@ function ChangesSection({ slug }: { slug: string }) {
           {/* Retained cursor: advancing pages re-read from the returned cursor,
               never a repeated null (baseline-now) read. */}
           {ev.has_more && (
-            <Button disabled={isFetching} onClick={() => ev.next_cursor && setCursor(ev.next_cursor)} size="sm" variant="outline">
+            <Button
+              disabled={isFetching}
+              onClick={() => ev.next_cursor && setCursor(ev.next_cursor)}
+              size="sm"
+              variant="outline"
+            >
               Load more changes
             </Button>
           )}
@@ -911,16 +1001,23 @@ function TimelineSection({ slug }: { slug: string }) {
       </div>
       {isFetching && <Loader type="lemniscate-bloom" />}
       {isError && <span className="text-destructive">Timeline unavailable</span>}
-      {data && data.state !== 'PASS' && <span className="text-destructive">{data.reason ?? 'timeline unavailable'}</span>}
+      {data && data.state !== 'PASS' && (
+        <span className="text-destructive">{data.reason ?? 'timeline unavailable'}</span>
+      )}
       {ev && (
         <>
           <ul className="flex flex-col gap-1">
             {allIntervals.map((interval, index) => (
               <li className="flex items-center gap-2 text-[0.6875rem]" key={index}>
-                <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: timelineTone(interval.kind) }} />
+                <span
+                  className="size-1.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: timelineTone(interval.kind) }}
+                />
                 <span className="capitalize text-(--ui-text-secondary)">{interval.kind}</span>
                 {typeof interval.duration_seconds === 'number' && (
-                  <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{interval.duration_seconds}s wall-clock</span>
+                  <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">
+                    {interval.duration_seconds}s wall-clock
+                  </span>
                 )}
               </li>
             ))}
@@ -928,7 +1025,9 @@ function TimelineSection({ slug }: { slug: string }) {
           {Array.isArray(ev.coverage?.gaps) && ev.coverage!.gaps!.length > 0 && (
             <span className="text-[0.625rem] text-amber-500">gaps in the covered window</span>
           )}
-          {ev.incomplete && <span className="text-[0.625rem] text-(--ui-text-quaternary)">bounded window; not full card history</span>}
+          {ev.incomplete && (
+            <span className="text-[0.625rem] text-(--ui-text-quaternary)">bounded window; not full card history</span>
+          )}
           {ev.has_more && (
             <Button disabled={isFetching} onClick={loadMore} size="sm" variant="outline">
               Load more

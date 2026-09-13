@@ -82,7 +82,14 @@ const emptyPage = () => ({
 
 const page = (items: Array<Record<string, unknown>>, hasMore: boolean, nextCursor: null | string) => ({
   state: 'PASS',
-  evidence: { items, returned: items.length, has_more: hasMore, next_cursor: nextCursor, total: items.length, omitted: 0 },
+  evidence: {
+    items,
+    returned: items.length,
+    has_more: hasMore,
+    next_cursor: nextCursor,
+    total: items.length,
+    omitted: 0
+  },
   reason: null
 })
 
@@ -156,7 +163,9 @@ beforeEach(() => {
     evidence: { task_id: 't_1', observations: [], aggregate: null }
   })
   apiMock.fetchTask.mockImplementation((id: string) => Promise.resolve(detailFor(id, 'Legacy')))
-  apiMock.fetchTaskWithoutHistory.mockImplementation((_slug: string, id: string) => Promise.resolve(detailFor(id, 'Aligned')))
+  apiMock.fetchTaskWithoutHistory.mockImplementation((_slug: string, id: string) =>
+    Promise.resolve(detailFor(id, 'Aligned'))
+  )
   apiMock.fetchLog.mockResolvedValue({ exists: false, size_bytes: 0, content: '', truncated: false })
   apiMock.fetchProfiles.mockResolvedValue({ profiles: [] })
   apiMock.fetchOrchestration.mockResolvedValue({ default_assignee: '' })
@@ -301,9 +310,7 @@ describe('TaskDrawer — attachment download', () => {
 describe('TaskDrawer — evidence page errors', () => {
   it('shows a visible error remedy when a page fails (not an infinite spinner)', async () => {
     apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
-      resource === 'runs'
-        ? Promise.reject(new Error('helper unavailable'))
-        : Promise.resolve(emptyPage())
+      resource === 'runs' ? Promise.reject(new Error('helper unavailable')) : Promise.resolve(emptyPage())
     )
 
     renderDrawer()
@@ -348,12 +355,18 @@ describe('TaskDrawer — late response after card switch', () => {
   })
 })
 
-
 describe('parent acceptance controls', () => {
   it('does not use legacy detail when identity lookup fails', async () => {
     apiMock.fetchEvidenceContext.mockRejectedValue(new Error('identity unavailable'))
     const { client } = renderDrawer()
-    await waitFor(() => expect(client.getQueryCache().getAll().some(q => q.state.status === 'error')).toBe(true))
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryCache()
+          .getAll()
+          .some(q => q.state.status === 'error')
+      ).toBe(true)
+    )
     await new Promise(resolve => setTimeout(resolve, 50))
     expect(apiMock.fetchTask).not.toHaveBeenCalled()
     expect(apiMock.fetchTaskWithoutHistory).not.toHaveBeenCalled()
@@ -361,7 +374,9 @@ describe('parent acceptance controls', () => {
 
   it('does not call pending history an empty history', async () => {
     const pending = deferred<ReturnType<typeof page>>()
-    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) => resource === 'runs' ? pending.promise : Promise.resolve(emptyPage()))
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'runs' ? pending.promise : Promise.resolve(emptyPage())
+    )
     renderDrawer()
     await waitFor(() => expect(apiMock.fetchEvidencePage).toHaveBeenCalled())
     expect(screen.queryByText('No runs.')).toBeNull()
@@ -370,7 +385,13 @@ describe('parent acceptance controls', () => {
 
   it('replaces changed first-page evidence on refresh instead of retaining old rows', async () => {
     let refreshed = false
-    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) => Promise.resolve(resource === 'runs' ? page([run(1, refreshed ? 'corrected run summary' : 'old run summary')], false, null) : emptyPage()))
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      Promise.resolve(
+        resource === 'runs'
+          ? page([run(1, refreshed ? 'corrected run summary' : 'old run summary')], false, null)
+          : emptyPage()
+      )
+    )
     const { client } = renderDrawer()
     expect(await screen.findByText('old run summary')).toBeTruthy()
     refreshed = true
@@ -599,7 +620,13 @@ describe('TaskDrawer — R4 acceptance comparison', () => {
         card: 't_1',
         checks: [
           { name: 'release_identity', current: 'PASS', previous: 'PASS', change: 'reverified', source: 'machine' },
-          { name: 'parent:source_validation', current: 'PASS', previous: 'PASS', change: 'reverified', source: 'parent' },
+          {
+            name: 'parent:source_validation',
+            current: 'PASS',
+            previous: 'PASS',
+            change: 'reverified',
+            source: 'parent'
+          },
           { name: 'adapter_identity', current: 'PASS', previous: 'UNKNOWN', change: 'new' }
         ],
         limitations: [],

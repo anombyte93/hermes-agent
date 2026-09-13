@@ -107,12 +107,23 @@ vi.mock('./api', async () => {
     ORCHESTRATION_KEY: ['kanban', 'orchestration'],
     evidenceContextKey: (slug: string) => ['kanban', 'evidence', 'context', slug],
     evidenceSnapshotKey: (slug: string, status: string, cursor: null | string) => [
-      'kanban', 'evidence', 'snapshot', slug, status, cursor
+      'kanban',
+      'evidence',
+      'snapshot',
+      slug,
+      status,
+      cursor
     ],
     evidenceWorkerKey: (slug: string, id: string) => ['kanban', 'evidence', 'worker', slug, id],
     evidenceCardKey: (slug: string, id: string) => ['kanban', 'evidence', 'card', slug, id],
     evidencePageKey: (slug: string, resource: string, card: null | string, cursor: null | string) => [
-      'kanban', 'evidence', 'page', slug, resource, card, cursor
+      'kanban',
+      'evidence',
+      'page',
+      slug,
+      resource,
+      card,
+      cursor
     ],
     fetchBoard: h.fetch.fetchBoard,
     fetchBoards: h.fetch.fetchBoards,
@@ -164,7 +175,11 @@ beforeAll(() => {
 
 const now = Math.floor(Date.now() / 1000)
 
-function envelope<T>(evidence: T | null, state: 'PASS' | 'FAIL' | 'UNKNOWN' = 'PASS', extra: Record<string, unknown> = {}) {
+function envelope<T>(
+  evidence: T | null,
+  state: 'PASS' | 'FAIL' | 'UNKNOWN' = 'PASS',
+  extra: Record<string, unknown> = {}
+) {
   return { state, evidence, reason: extra.reason ?? null, remedy: extra.remedy ?? null, board: 'evo', observed_at: now }
 }
 
@@ -336,7 +351,10 @@ describe('CardWorkflowPanel continuation', () => {
   it('drafts from the entered checks, labels the original unverified, and continues on a separate click', async () => {
     h.fetch.draftContinuation.mockResolvedValue(draftFixture())
     h.fetch.continueCard.mockResolvedValue(
-      envelope({ state: 'PASS', new_card: 't_new', new_card_status: 'blocked', new_card_assignee: 'evo', held: true }, 'PASS')
+      envelope(
+        { state: 'PASS', new_card: 't_new', new_card_status: 'blocked', new_card_assignee: 'evo', held: true },
+        'PASS'
+      )
     )
     renderPanel()
 
@@ -345,7 +363,9 @@ describe('CardWorkflowPanel continuation', () => {
     fireEvent.change(screen.getByPlaceholderText('check'), { target: { value: 'acceptance check' } })
     fireEvent.change(screen.getByPlaceholderText('evidence'), { target: { value: 'real transport' } })
     fireEvent.change(screen.getByPlaceholderText('acceptance'), { target: { value: 'one held card' } })
-    fireEvent.change(screen.getByPlaceholderText('What you verified, in your own words'), { target: { value: 'verified' } })
+    fireEvent.change(screen.getByPlaceholderText('What you verified, in your own words'), {
+      target: { value: 'verified' }
+    })
 
     fireEvent.click(screen.getByText('Draft continuation'))
 
@@ -425,7 +445,9 @@ describe('CardWorkflowPanel continuation', () => {
     h.fetch.holdCard.mockResolvedValue(envelope({ state: 'PASS' }, 'PASS'))
     renderPanel()
 
-    fireEvent.change(screen.getByPlaceholderText('Why this card needs review'), { target: { value: 'needs a human look' } })
+    fireEvent.change(screen.getByPlaceholderText('Why this card needs review'), {
+      target: { value: 'needs a human look' }
+    })
     fireEvent.click(screen.getByText('Hold'))
 
     expect(await screen.findByText(/held for review/i)).toBeTruthy()
@@ -468,7 +490,16 @@ describe('BoardWorkflowPanel', () => {
         )
       )
       .mockResolvedValueOnce(
-        envelope({ board: 'evo', cards: [{ id: 't_2', title: 'Late card', status: 'blocked' }], returned: 1, has_more: false, omitted: 0 }, 'PASS')
+        envelope(
+          {
+            board: 'evo',
+            cards: [{ id: 't_2', title: 'Late card', status: 'blocked' }],
+            returned: 1,
+            has_more: false,
+            omitted: 0
+          },
+          'PASS'
+        )
       )
     renderBoardPanel()
 
@@ -626,9 +657,16 @@ describe('CardWorkflowPanel — R3 repair preview', () => {
         {
           state: 'FAIL',
           ready_to_release: false,
-          checks: [{ name: 'board_permission', state: 'FAIL', reason: 'read-only for this board', mutation_authorized: false }],
+          checks: [
+            { name: 'board_permission', state: 'FAIL', reason: 'read-only for this board', mutation_authorized: false }
+          ],
           repair_preview: [
-            { check: 'board_permission', state: 'FAIL', action: 'Set the board writable in config.yaml', reason: 'read-only' }
+            {
+              check: 'board_permission',
+              state: 'FAIL',
+              action: 'Set the board writable in config.yaml',
+              reason: 'read-only'
+            }
           ]
         },
         'PASS'
@@ -672,7 +710,9 @@ describe('BoardWorkflowPanel — R9 readiness batch', () => {
           {
             card: 't_held1',
             state: 'FAIL',
-            repair_preview: [{ check: 'profile_exists', state: 'FAIL', action: 'Assign a profile', reason: 'no assignee' }]
+            repair_preview: [
+              { check: 'profile_exists', state: 'FAIL', action: 'Assign a profile', reason: 'no assignee' }
+            ]
           }
         ],
         requested: 1,

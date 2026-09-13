@@ -89,12 +89,23 @@ vi.mock('./api', async () => {
     ORCHESTRATION_KEY: ['kanban', 'orchestration'],
     evidenceContextKey: (slug: string) => ['kanban', 'evidence', 'context', slug],
     evidenceSnapshotKey: (slug: string, status: string, cursor: null | string) => [
-      'kanban', 'evidence', 'snapshot', slug, status, cursor
+      'kanban',
+      'evidence',
+      'snapshot',
+      slug,
+      status,
+      cursor
     ],
     evidenceWorkerKey: (slug: string, id: string) => ['kanban', 'evidence', 'worker', slug, id],
     evidenceCardKey: (slug: string, id: string) => ['kanban', 'evidence', 'card', slug, id],
     evidencePageKey: (slug: string, resource: string, card: null | string, cursor: null | string) => [
-      'kanban', 'evidence', 'page', slug, resource, card, cursor
+      'kanban',
+      'evidence',
+      'page',
+      slug,
+      resource,
+      card,
+      cursor
     ],
     fetchBoard: h.fetch.fetchBoard,
     fetchBoards: h.fetch.fetchBoards,
@@ -159,12 +170,14 @@ function snapshotPage(opts: {
 }): Record<string, unknown> {
   const cards = opts.cards
 
-  const byStatus = opts.byStatus ?? cards.reduce<Record<string, number>>((acc, c) => {
-    const s = String(c.status ?? 'todo')
-    acc[s] = (acc[s] ?? 0) + 1
+  const byStatus =
+    opts.byStatus ??
+    cards.reduce<Record<string, number>>((acc, c) => {
+      const s = String(c.status ?? 'todo')
+      acc[s] = (acc[s] ?? 0) + 1
 
-    return acc
-  }, {})
+      return acc
+    }, {})
 
   return {
     state: 'PASS',
@@ -263,7 +276,9 @@ describe('KanbanBoardPage (mounted)', () => {
     await screen.findByText('Local run card')
     h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
     h.fetch.fetchEvidenceSnapshot.mockResolvedValue({ state: 'UNKNOWN', reason: 'helper unavailable', evidence: null })
-    await act(async () => { await qc.invalidateQueries({ queryKey: ['kanban', 'evidence', 'context'] }) })
+    await act(async () => {
+      await qc.invalidateQueries({ queryKey: ['kanban', 'evidence', 'context'] })
+    })
     await screen.findByText(/helper unavailable/i)
     expect(screen.queryByText('Local run card')).toBeNull()
   })
@@ -382,17 +397,13 @@ describe('KanbanBoardPage (mounted)', () => {
       releaseEvoSnapshot = resolve
     })
 
-    h.fetch.fetchEvidenceContext.mockImplementation((slug: string) =>
-      Promise.resolve(ctx(true, slug))
-    )
+    h.fetch.fetchEvidenceContext.mockImplementation((slug: string) => Promise.resolve(ctx(true, slug)))
     h.fetch.fetchEvidenceSnapshot.mockImplementation((slug: string) => {
       if (slug === 'evo') {
         return evoSnapshot
       }
 
-      return Promise.resolve(
-        snapshotPage({ cards: [card('t_other1', 'Other board card', 'running')] })
-      )
+      return Promise.resolve(snapshotPage({ cards: [card('t_other1', 'Other board card', 'running')] }))
     })
 
     renderBoard()
@@ -407,9 +418,7 @@ describe('KanbanBoardPage (mounted)', () => {
 
     // The late evo snapshot resolves AFTER the switch; it must not paint.
     await act(async () => {
-      releaseEvoSnapshot(
-        snapshotPage({ cards: [card('t_run1', 'Run card one', 'running')] })
-      )
+      releaseEvoSnapshot(snapshotPage({ cards: [card('t_run1', 'Run card one', 'running')] }))
       await Promise.resolve()
     })
 

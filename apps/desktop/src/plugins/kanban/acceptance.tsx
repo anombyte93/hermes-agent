@@ -15,11 +15,7 @@
 import { Button, Codicon, Input, Loader, useQuery } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 
-import {
-  acceptanceCompareKey,
-  fetchAcceptanceCompare,
-  fetchReviewerPacket
-} from './api'
+import { acceptanceCompareKey, fetchAcceptanceCompare, fetchReviewerPacket } from './api'
 import { triggerDownload } from './drawer-evidence'
 import type { EvidenceEnvelope } from './types'
 import { errText, Section } from './ui'
@@ -87,24 +83,39 @@ export function AcceptanceCompareSection({ card, slug }: { card: string; slug: s
           placeholder="previous run id"
           value={previous}
         />
-        <Button disabled={!current.trim() || !previous.trim() || compare.isFetching} onClick={run} size="xs" variant="outline">
+        <Button
+          disabled={!current.trim() || !previous.trim() || compare.isFetching}
+          onClick={run}
+          size="xs"
+          variant="outline"
+        >
           {compare.isFetching ? 'Comparing…' : 'Compare'}
         </Button>
       </div>
 
       {compare.isError && <span className="text-[0.6875rem] text-destructive">{errText(compare.error)}</span>}
       {envelope && envelope.state !== 'PASS' && (
-        <span className="text-[0.6875rem] text-amber-500">{envelope.reason ?? 'Acceptance comparison unavailable — a historical receipt may be missing.'}</span>
+        <span className="text-[0.6875rem] text-amber-500">
+          {envelope.reason ?? 'Acceptance comparison unavailable — a historical receipt may be missing.'}
+        </span>
       )}
 
       {data && (
         <div className="flex flex-col gap-1">
           {(data.checks ?? []).map(check => {
-            const origin = check.source === 'parent' ? 'parent attestation' : check.source === 'machine' ? 'machine validation' : 'unknown origin'
+            const origin =
+              check.source === 'parent'
+                ? 'parent attestation'
+                : check.source === 'machine'
+                  ? 'machine validation'
+                  : 'unknown origin'
 
             return (
               <div className="flex items-baseline gap-2 text-[0.6875rem]" key={check.name}>
-                <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: changeTone(check.change) }} />
+                <span
+                  className="size-1.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: changeTone(check.change) }}
+                />
                 <span className="min-w-0 font-medium text-(--ui-text-secondary)">{check.name}</span>
                 <span className="shrink-0 font-medium" style={{ color: changeTone(check.change) }}>
                   {check.change}
@@ -173,7 +184,9 @@ export function ReviewerPacketSection({ card, slug }: { card: string; slug: stri
         {busy && <Loader type="lemniscate-bloom" />}
       </div>
       {error && <span className="text-[0.6875rem] text-destructive">{error}</span>}
-      <span className="text-[0.625rem] text-(--ui-text-quaternary)">Bounded allowlisted fields — no raw body, result, log, comments, argv, env, or stored paths.</span>
+      <span className="text-[0.625rem] text-(--ui-text-quaternary)">
+        Bounded allowlisted fields — no raw body, result, log, comments, argv, env, or stored paths.
+      </span>
     </Section>
   )
 }

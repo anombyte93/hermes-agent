@@ -223,7 +223,8 @@ export const evidenceReleasesKey = (slug: string) => ['kanban', 'evidence', 'rel
 export const browserReadinessKey = (slug: string) => ['kanban', 'evidence', 'browser-readiness', slug] as const
 export const acceptanceCompareKey = (slug: string, card: string, currentRunId: number, previousRunId: number) =>
   ['kanban', 'evidence', 'acceptance-compare', slug, card, currentRunId, previousRunId] as const
-export const reviewerPacketKey = (slug: string, card: string) => ['kanban', 'evidence', 'reviewer-packet', slug, card] as const
+export const reviewerPacketKey = (slug: string, card: string) =>
+  ['kanban', 'evidence', 'reviewer-packet', slug, card] as const
 export const attachmentProvenanceKey = (slug: string, card: string, id: number | string) =>
   ['kanban', 'evidence', 'attachment-provenance', slug, card, id] as const
 export const readinessBatchKey = (slug: string, cards: string[], checkModel: boolean) =>
@@ -290,7 +291,14 @@ export const fetchEvidencePage = (
   limit = 50,
   status?: string
 ) =>
-  call<EvidenceEnvelope<{ items: Array<Record<string, unknown>>; returned: number; has_more: boolean; next_cursor?: null | string }>>(
+  call<
+    EvidenceEnvelope<{
+      items: Array<Record<string, unknown>>
+      returned: number
+      has_more: boolean
+      next_cursor?: null | string
+    }>
+  >(
     withBoardSlug('/evidence/page', slug, {
       resource,
       limit: String(limit),
@@ -366,8 +374,7 @@ export const uploadAttachment = (id: string, upload: { filename: string; content
  * uses (`/attachments/<id>?board=<slug>`), never a raw `stored_path` URL.
  * Returns the namespaced path for the caller to open/download.
  */
-export const attachmentDownloadPath = (slug: string, id: number | string) =>
-  withBoardSlug(`/attachments/${id}`, slug)
+export const attachmentDownloadPath = (slug: string, id: number | string) => withBoardSlug(`/attachments/${id}`, slug)
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {

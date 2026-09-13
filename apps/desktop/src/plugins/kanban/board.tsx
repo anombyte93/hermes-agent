@@ -80,7 +80,13 @@ import {
 import { BoardSwitcher } from './board-switcher'
 import { $openCard } from './completion-notify'
 import { TaskDrawer } from './drawer'
-import { type BoardEvidence, EvidenceStateBadge, useBoardEvidence, viewsToBoardColumns, type WorkerState } from './evidence'
+import {
+  type BoardEvidence,
+  EvidenceStateBadge,
+  useBoardEvidence,
+  viewsToBoardColumns,
+  type WorkerState
+} from './evidence'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { SupportPanel } from './support'
@@ -179,7 +185,15 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
-function CardFooter({ arc, task, workerState }: { arc: ArcState | null; task: KanbanTask; workerState?: null | WorkerState }) {
+function CardFooter({
+  arc,
+  task,
+  workerState
+}: {
+  arc: ArcState | null
+  task: KanbanTask
+  workerState?: null | WorkerState
+}) {
   const k = useKanban()
   const created = ago(task.created_at)
   const links = task.link_counts ? task.link_counts.parents + task.link_counts.children : 0

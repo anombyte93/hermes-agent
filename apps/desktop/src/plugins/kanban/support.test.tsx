@@ -91,7 +91,13 @@ function renderPanel() {
   )
 }
 
-const ctx = (aligned: boolean) => ({ aligned, board: 'evo', hostname: 'evo', reason: aligned ? 'aligned' : 'no', observed_at: 1 })
+const ctx = (aligned: boolean) => ({
+  aligned,
+  board: 'evo',
+  hostname: 'evo',
+  reason: aligned ? 'aligned' : 'no',
+  observed_at: 1
+})
 
 const envelope = (state: 'PASS' | 'FAIL' | 'UNKNOWN', evidence?: unknown, reason?: string) => ({
   state,
@@ -193,7 +199,11 @@ describe('R1 — release identity', () => {
 describe('R2 — browser readiness (separate from reachability)', () => {
   it('renders reachable / authenticated / board readable as three separate facts', async () => {
     apiMock.fetchBrowserReadiness.mockResolvedValue(
-      envelope('PASS', { reachable: true, authenticated: false, board_readable: false, observed_at: 1 }, 'login required')
+      envelope(
+        'PASS',
+        { reachable: true, authenticated: false, board_readable: false, observed_at: 1 },
+        'login required'
+      )
     )
 
     renderPanel()
