@@ -19,7 +19,7 @@
  */
 
 import { Button, Codicon, useQuery, useQueryClient, useValue } from '@hermes/plugin-sdk'
-import { useEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import {
   $boardSlug,
@@ -196,11 +196,14 @@ function EventRow({ item }: { item: Record<string, unknown> }) {
   )
 }
 
-/** R8 — reverse-link an attachment to its accepted run (or explicit unknown).
- *  One bounded /evidence/attachment-provenance read per row; an attachment
- *  existing beside a done card is never presented as acceptance. */
+/** R8 — reverse-link an attachment to its accepted run, distinguishing the
+ *  four honest outcomes: failed lookup (FAIL transport), absent receipt
+ *  (UNKNOWN: no guarded receipt exists), rejected acceptance (PASS transport
+ *  but acceptance_state FAIL — never "accepted run"), and accepted run
+ *  (PASS + acceptance_state PASS + accepted_run_id). An attachment existing
+ *  beside a done card is never presented as acceptance. */
 function AttachmentProvenanceLine({ card, id, slug }: { card: string; id: number | string; slug: string }) {
-  const { data: envelope } = useQuery({
+  const { data: envelope, isError } = useQuery({
     queryKey: attachmentProvenanceKey(slug, card, id),
     queryFn: () => fetchAttachmentProvenance(slug, card, id),
     enabled: !!slug && !!card,
@@ -211,18 +214,48 @@ function AttachmentProvenanceLine({ card, id, slug }: { card: string; id: number
   const data = provenance?.state === 'PASS' ? provenance.evidence : null
   const acceptedRunId = data?.accepted_run_id
   const accepted = data?.acceptance_state === 'PASS' && acceptedRunId != null
+  const rejected = provenance?.state === 'PASS' && data?.acceptance_state === 'FAIL'
+
+  let label: ReactNode
+  let toneClass = 'text-(--ui-text-quaternary)'
+
+  if (isError) {
+    label = 'provenance lookup failed'
+    toneClass = 'text-amber-500'
+  } else if (provenance?.state === 'FAIL') {
+    // Failed lookup: the endpoint refused (wrong board/card, or no such
+    // attachment). Distinct from "no receipt" — the lookup itself failed.
+    label = `provenance lookup failed${provenance.reason ? `: ${provenance.reason}` : ''}`
+    toneClass = 'text-destructive'
+  } else if (accepted) {
+    label = (
+      <span className="text-(--ui-text-tertiary)">
+        accepted run {acceptedRunId}
+      </span>
+    )
+    toneClass = ''
+  } else if (rejected) {
+    // PASS transport but the guarded receipt's verdict is FAIL: acceptance was
+    // REJECTED. Never labelled "accepted run".
+    label = 'acceptance rejected'
+    toneClass = 'text-destructive'
+  } else if (provenance?.state === 'UNKNOWN') {
+    // No persisted guarded receipt associates this attachment (absent receipt).
+    label = 'no acceptance receipt'
+    toneClass = 'text-amber-500'
+  } else if (provenance?.state === 'PASS' && data?.acceptance_state === 'UNKNOWN') {
+    label = 'acceptance unknown'
+    toneClass = 'text-amber-500'
+  } else {
+    label = 'acceptance unknown'
+    toneClass = 'text-amber-500'
+  }
 
   return (
     <span className="text-[0.625rem] text-(--ui-text-quaternary)">
       card <span className="font-mono">{card.replace(/^t_/, '').slice(0, 6)}</span>
       {' · '}
-      {accepted ? (
-        <span className="text-(--ui-text-tertiary)">accepted run {acceptedRunId}</span>
-      ) : provenance?.state === 'PASS' ? (
-        <span className="text-amber-500">acceptance unknown</span>
-      ) : (
-        <span className="text-amber-500">acceptance unknown</span>
-      )}
+      <span className={toneClass}>{label}</span>
     </span>
   )
 }

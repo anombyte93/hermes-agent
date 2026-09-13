@@ -215,12 +215,16 @@ export interface BrowserReadinessEvidence {
 
 /** One acceptance check compared across two runs. `change` distinguishes a
  *  parent attestation from machine validation and reports reverified /
- *  regressed / new / unproved. */
+ *  regressed / new / unproved. `source` is the check's ORIGIN as emitted by
+ *  the adapter (`parent` = the parent's attestation, `machine` = this
+ *  machine's own validation, `unknown` = no origin). */
 export interface AcceptanceCheck {
   name: string
   current: string
   previous: string
   change: 'reverified' | 'regressed' | 'new' | 'unproved'
+  /** Origin of the check: parent attestation vs machine validation. */
+  source?: 'parent' | 'machine' | 'unknown'
 }
 
 /** GET /evidence/acceptance-compare evidence payload. Missing historical

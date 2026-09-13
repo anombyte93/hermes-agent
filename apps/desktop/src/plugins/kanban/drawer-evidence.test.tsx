@@ -492,6 +492,77 @@ describe('TaskDrawer — R8 attachment provenance', () => {
     expect(await screen.findByText('report.txt')).toBeTruthy()
     expect(await screen.findByText('acceptance unknown')).toBeTruthy()
   })
+
+  it('distinguishes absent receipt (UNKNOWN transport) from acceptance-unknown', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    // The adapter's absent-receipt shape: state UNKNOWN, no guarded receipt.
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'UNKNOWN',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        attachment_id: 7,
+        accepted_run_id: null,
+        acceptance_state: 'UNKNOWN',
+        reason: 'no persisted guarded acceptance receipt',
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText('no acceptance receipt')).toBeTruthy()
+  })
+
+  it('labels rejected acceptance (PASS transport, acceptance_state FAIL) — never "accepted run"', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        attachment_id: 7,
+        accepted_run_id: 9,
+        acceptance_state: 'FAIL',
+        reason: 'guarded receipt verdict FAIL',
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText('acceptance rejected')).toBeTruthy()
+    expect(screen.queryByText(/accepted run/)).toBeNull()
+  })
+
+  it('labels a failed lookup (FAIL transport) distinctly from a missing receipt', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'FAIL',
+      evidence: null,
+      reason: 'attachment belongs to a different card',
+      observed_at: 1
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText(/provenance lookup failed: attachment belongs to a different card/)).toBeTruthy()
+  })
 })
 
 // ── R4 — current vs previous run acceptance comparison ───────────────────────
@@ -518,6 +589,33 @@ describe('TaskDrawer — R4 acceptance comparison', () => {
     expect(screen.getByText('new')).toBeTruthy()
     expect(screen.getByText(/UNKNOWN → PASS/)).toBeTruthy()
     expect(apiMock.fetchAcceptanceCompare).toHaveBeenCalledWith('evo', 't_1', 10, 9)
+  })
+
+  it('renders each check origin — parent attestation vs machine validation, unknown origin labelled', async () => {
+    apiMock.fetchAcceptanceCompare.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        checks: [
+          { name: 'release_identity', current: 'PASS', previous: 'PASS', change: 'reverified', source: 'machine' },
+          { name: 'parent:source_validation', current: 'PASS', previous: 'PASS', change: 'reverified', source: 'parent' },
+          { name: 'adapter_identity', current: 'PASS', previous: 'UNKNOWN', change: 'new' }
+        ],
+        limitations: [],
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    fireEvent.change(await screen.findByLabelText('Current run id'), { target: { value: '10' } })
+    fireEvent.change(screen.getByLabelText('Previous run id'), { target: { value: '9' } })
+    fireEvent.click(screen.getByText('Compare'))
+
+    expect(await screen.findByText('machine validation')).toBeTruthy()
+    expect(screen.getByText('parent attestation')).toBeTruthy()
+    expect(screen.getByText('unknown origin')).toBeTruthy()
   })
 })
 

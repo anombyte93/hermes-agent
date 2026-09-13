@@ -99,18 +99,29 @@ export function AcceptanceCompareSection({ card, slug }: { card: string; slug: s
 
       {data && (
         <div className="flex flex-col gap-1">
-          {(data.checks ?? []).map(check => (
-            <div className="flex items-baseline gap-2 text-[0.6875rem]" key={check.name}>
-              <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: changeTone(check.change) }} />
-              <span className="min-w-0 font-medium text-(--ui-text-secondary)">{check.name}</span>
-              <span className="shrink-0 font-medium" style={{ color: changeTone(check.change) }}>
-                {check.change}
-              </span>
-              <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">
-                {check.previous} → {check.current}
-              </span>
-            </div>
-          ))}
+          {(data.checks ?? []).map(check => {
+            const origin = check.source === 'parent' ? 'parent attestation' : check.source === 'machine' ? 'machine validation' : 'unknown origin'
+
+            return (
+              <div className="flex items-baseline gap-2 text-[0.6875rem]" key={check.name}>
+                <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: changeTone(check.change) }} />
+                <span className="min-w-0 font-medium text-(--ui-text-secondary)">{check.name}</span>
+                <span className="shrink-0 font-medium" style={{ color: changeTone(check.change) }}>
+                  {check.change}
+                </span>
+                <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">
+                  {check.previous} → {check.current}
+                </span>
+                <span
+                  className="shrink-0 text-[0.625rem]"
+                  style={{ color: check.source === 'unknown' ? '#fbbf24' : 'var(--ui-text-quaternary)' }}
+                  title={origin}
+                >
+                  {origin}
+                </span>
+              </div>
+            )
+          })}
           {(data.limitations ?? []).length > 0 && (
             <span className="text-[0.625rem] text-(--ui-text-quaternary)">{data.limitations!.join(' ')}</span>
           )}
