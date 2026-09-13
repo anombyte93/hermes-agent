@@ -720,11 +720,15 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "output_limit_reached"):
+            # Failure-free requeues (quota wall / output-limit respawn) are
+            # neutral: they say nothing about the task.
             continue
-        if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
-            or "protocol violation" in (row["error"] or "")
+        if outcome == "protocol_violation" or (
+            outcome == "crashed" and (
+                _kb._json_dict(row["metadata"]).get("protocol_violation")
+                or "protocol violation" in (row["error"] or "")
+            )
         ):
             streak += 1
             continue
@@ -746,6 +750,76 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
+# The Hermes end-of-session banner for an output-length-limited run
+# (agent/turn_truncation.py; the sibling ``First response truncated`` variant
+# shares the distinctive suffix). The worker log captures the TUI render —
+# padded and CRLF-terminated — so match on the stable phrase, not the layout.
+_OUTPUT_LIMIT_MARKER = "truncated due to output length limit"
+
+# How much of the worker log tail to scan: the banner must belong to THIS run's
+# dying breath, not an earlier attempt buried in the same append-mode file.
+_OUTPUT_LIMIT_TAIL_BYTES = 64 * 1024
+
+
+def _worker_log_tail_contains_output_limit(task_id: str, board: Optional[str] = None) -> bool:
+    """True when the worker's log tail carries the output-length-limit banner.
+
+    Deliberately failure-proof: a missing/unreadable/oversized log never turns
+    a crash into an output-limit respawn — only the banner does. When the file
+    is larger than the tail window the marker must sit inside the window;
+    history from earlier attempts must not reclassify a genuine crash.
+    """
+    try:
+        path = _kb.worker_logs_dir(board=board) / f"{task_id}.log"
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            if size > _OUTPUT_LIMIT_TAIL_BYTES:
+                fh.seek(-_OUTPUT_LIMIT_TAIL_BYTES, os.SEEK_END)
+            data = fh.read(_OUTPUT_LIMIT_TAIL_BYTES)
+        return _OUTPUT_LIMIT_MARKER.encode() in data
+    except (OSError, ValueError):
+        return False
+
+
+_OUTPUT_LIMIT_ERROR = (
+    "worker hit the output length limit before it could report — "
+    "work on disk is likely complete; retry asked to commit, verify, "
+    "and complete without re-deriving. No failure counted."
+)
+
+
+def _output_limit_dead_worker(pid: int, claimer: Optional[str], base: _DeadWorker) -> _DeadWorker:
+    """Rebook ``base`` as an output-limit death: failure-free requeue.
+
+    Keeps the underlying exit facts (kind/code — the worker WAS killed, often
+    SIGKILL from the runtime's own truncation path) but retargets outcome, run
+    error, and event kind, and flips the flags so the reclaim/accounting loops
+    treat it like a quota wall: released to ``ready``, no failure counted.
+    """
+    payload = dict(base.event_payload)
+    payload["output_limit"] = True
+    return _DeadWorker(
+        base.kind, base.code, _OUTPUT_LIMIT_ERROR, "output_limit_reached", payload,
+        output_limit=True,
+    )
+
+
+_OUTPUT_LIMIT_RESUME_NOTE = (
+    "[resume note from dispatcher] The previous run ended on the Hermes banner "
+    "`Response truncated due to output length limit` after doing real work — do NOT "
+    "re-derive it. First run `git log --oneline <base>..HEAD` and "
+    "`git status --short` in the workspace to see what the prior run committed and "
+    "left dirty; commit anything finished, run the task's documented checks once "
+    "quietly, then call kanban_complete immediately. Keep output minimal: do not "
+    "narrate, do not re-read files, do not re-run green tests."
+)
+
+
+def _output_limit_resume_note_prompt(base: str = "") -> str:
+    """Terse-complete brief prefixed to the respawn prompt (``-q`` payload)."""
+    return _OUTPUT_LIMIT_RESUME_NOTE + (f"\n{base}" if base else "")
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -757,16 +831,34 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    # Output-limit rebook (banner in the worker log tail): failure-free
+    # requeue with a terse-complete resume note, like a quota wall.
+    output_limit: bool = False
+    # Precise ``task_runs.outcome``; None falls back to the legacy buckets
+    # (``rate_limited`` / ``crashed``) so ad-hoc callers keep old behaviour.
+    outcome: Optional[str] = None
 
     @property
     def run_outcome(self) -> str:
-        # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        if self.outcome is not None:
+            return self.outcome
+        # Failure-free requeues are recorded as their own outcomes so board
+        # history doesn't show a phantom crash for a quota wall / truncation.
+        if self.rate_limited:
+            return "rate_limited"
+        if self.output_limit:
+            return "output_limit_reached"
+        return "crashed"
 
 
 def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
-    """Map a dead worker's reaped exit status to its reclaim bookkeeping."""
+    """Map a dead worker's reaped exit status to its reclaim bookkeeping.
+
+    Distinct causes stay distinct: rc=0-without-complete is
+    ``protocol_violation`` (bounded violation-only budget), a signal death is
+    ``signaled:<n>`` (a real crash — counts against the breaker), anything
+    else is ``crashed``.
+    """
     kind, code = _classify_worker_exit(pid)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
@@ -779,6 +871,7 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
             # run metadata.
             {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
             protocol_violation=True,
+            outcome="protocol_violation",
         )
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
@@ -797,10 +890,16 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
     else:
         error_text = f"pid {pid} not alive"
     event_payload = {"pid": pid, "claimer": claimer}
+    outcome: Optional[str] = None
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
-    return _DeadWorker(kind, code, error_text, "crashed", event_payload)
+        if kind == "signaled":
+            # SIGBUS/SIGKILL/... — the board must show WHICH signal killed the
+            # worker, not a generic "crashed".
+            outcome = f"signaled:{code}"
+    event_kind = "signaled" if kind == "signaled" else "crashed"
+    return _DeadWorker(kind, code, error_text, event_kind, event_payload, outcome=outcome)
 
 
 @dataclass
@@ -809,6 +908,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Output-limit requeues: failure-free, terse-complete respawn (like
+    # ``rate_limited`` — never in ``crashed``).
+    output_limit: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, protocol_violation, error_text)``: accounted
     # after the txn via ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, bool, str]] = field(default_factory=list)
@@ -817,7 +919,9 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
-def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
+def _reclaim_dead_workers(
+    conn: sqlite3.Connection, board: Optional[str] = None,
+) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
@@ -841,6 +945,16 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"])
+            if (
+                not dead.rate_limited
+                and not dead.protocol_violation
+                and dead.outcome != "output_limit_reached"
+                and _worker_log_tail_contains_output_limit(row["id"], board=board)
+            ):
+                # The worker's own log says it died on the output length limit
+                # AFTER doing work (the end-of-session banner) — failure-free
+                # requeue with a terse-complete resume note, not a crash.
+                dead = _output_limit_dead_worker(pid, row["claim_lock"], dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -869,18 +983,39 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.output_limit:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+                # board UI and retry worker need the corrective message. An
+                # output-limit requeue is the same shape: no failure, but the
+                # retry worker must see the terse-complete instruction, and
+                # ``_worker_argv`` prefixes it onto the respawn prompt.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
+            if dead.output_limit:
+                # Durable resume note on the card itself: the retry worker's
+                # context (``build_worker_context``) reads comments, so the
+                # instruction survives even if the prompt prefix is missed.
+                try:
+                    _kb.add_comment(
+                        conn, row["id"], "dispatcher",
+                        _OUTPUT_LIMIT_RESUME_NOTE,
+                    )
+                except Exception:  # pragma: no cover - best-effort
+                    _kb._log.debug(
+                        "kanban dispatch: failed to append output-limit resume note to %s",
+                        row["id"], exc_info=True,
+                    )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.output_limit:
+                # Failure-free: NOT a crash — must not count against the breaker
+                # (below) nor land in ``crashed`` (the dispatcher's return).
+                sweep.output_limit.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append(
@@ -949,7 +1084,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -959,14 +1096,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
-    sweep = _reclaim_dead_workers(conn)
+    sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # and output-limit requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_output_limit = sweep.output_limit  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1652,6 +1790,7 @@ def _run_reclaim_phase(
     stale_timeout_seconds: int,
     failure_limit: int,
     reconcile_orphans: bool,
+    board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -1659,7 +1798,7 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
@@ -1792,6 +1931,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+        board=board,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
@@ -2144,7 +2284,18 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    # An output-limit respawn must do paperwork, not exploration: when the
+    # latest failure carries the truncation marker, prefix the terse-complete
+    # resume note onto the prompt (``last_failure_error`` survives the claim;
+    # only a profile reassign or unblock clears it).
+    prompt = f"work kanban task {task.id}"
+    _lfe = (task.last_failure_error or "")
+    if (
+        _lfe.startswith("worker hit the output length limit")
+        or "output length limit" in _lfe[:120]
+    ):
+        prompt = _output_limit_resume_note_prompt(prompt)
+    cmd.extend(["chat", "-q", prompt])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the

@@ -123,12 +123,16 @@ def test_signaled_worker_hook_payload(kanban_home):
     """The exit observer still receives the facts, with the precise outcome."""
     captured = {}
     original = kb._fire_kanban_lifecycle_hook
+    original_consumed = kb._kanban_observer_consumed
 
     def spy(hook_name, *args, **kwargs):
         captured[hook_name] = kwargs
         return original(hook_name, *args, **kwargs)
 
     kb._fire_kanban_lifecycle_hook = spy
+    # The firing site short-circuits when no observer subscribes; the test
+    # environment has none, so claim one exists for the duration of the drive.
+    kb._kanban_observer_consumed = lambda event: True
     try:
         conn = kbc.connect()
         try:
@@ -138,6 +142,7 @@ def test_signaled_worker_hook_payload(kanban_home):
             conn.close()
     finally:
         kb._fire_kanban_lifecycle_hook = original
+        kb._kanban_observer_consumed = original_consumed
     kw = captured["on_kanban_worker_exited"]
     assert kw["exit_kind"] == "signaled"
     assert kw["exit_code"] == 7
