@@ -528,37 +528,72 @@ const READINESS_BATCH_MAX = 10
 
 /** Preview readiness for a selected group of held (blocked) cards. Read-only:
  *  selecting held cards only previews readiness, never bulk-releases. The held
- *  card list is a bounded snapshot read (status='blocked'); the batch itself is
- *  capped at 10 distinct cards and reports per-card state + repair preview. */
+ *  card list is a bounded snapshot read (status='blocked', cap 100) that ALSO
+ *  pages via the snapshot cursor, exposing the omitted tail rather than
+ *  silently dropping it; the batch itself is capped at 10 distinct cards and
+ *  reports per-card state + repair preview. A late batch response is discarded
+ *  when the selection or board changed after it was issued (generation guard),
+ *  so a stale result can never paint under a different selection. */
 function ReadinessBatchSection({ slug }: { slug: string }) {
   const [open, setOpen] = useState(false)
   const [selected, setSelected] = useState<string[]>([])
   const [checkModel, setCheckModel] = useState(false)
   const [result, setResult] = useState<EvidenceEnvelope<ReadinessBatchData> | null>(null)
+  const [heldCursor, setHeldCursor] = useState<null | string>(null)
+  const [heldPages, setHeldPages] = useState<Array<Array<Record<string, unknown>>>>([])
 
+  // Generation token: bumped on any selection change or board change so a late
+  // batch response (issued for a previous selection/board) is discarded, never
+  // painted under the current selection. `toggle` bumps it too.
+  const genRef = useRef(0)
+
+  // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
+    genRef.current += 1
     setOpen(false)
     setSelected([])
     setCheckModel(false)
     setResult(null)
+    setHeldCursor(null)
+    setHeldPages([])
   }, [slug])
 
   const heldQuery = useQuery({
-    queryKey: ['kanban', 'workflow', 'readiness-batch', 'held', slug],
-    queryFn: () => fetchEvidenceSnapshot(slug, 'blocked', null, 100),
+    queryKey: ['kanban', 'workflow', 'readiness-batch', 'held', slug, heldCursor],
+    queryFn: () => fetchEvidenceSnapshot(slug, 'blocked', heldCursor, 100),
     enabled: open && slug !== '',
     retry: false
   })
 
   const heldEnvelope = heldQuery.data
-  const heldCards = heldEnvelope?.state === 'PASS' ? (heldEnvelope.evidence?.cards ?? []) : []
+  const heldPageCards = heldEnvelope?.state === 'PASS' ? (heldEnvelope.evidence?.cards ?? []) : []
+  const heldCards = [...heldPages.flat(), ...heldPageCards]
+  const heldHasMore = heldEnvelope?.state === 'PASS' && heldEnvelope.evidence?.has_more === true
+  const heldOmitted = heldEnvelope?.state === 'PASS' && typeof heldEnvelope.evidence?.omitted === 'number' ? heldEnvelope.evidence.omitted : null
+  const heldNextCursor = heldEnvelope?.state === 'PASS' ? (heldEnvelope.evidence?.next_cursor ?? null) : null
+
+  const loadMoreHeld = () => {
+    if (!heldNextCursor) {
+      return
+    }
+
+    setHeldPages(prev => [...prev, heldPageCards])
+    setHeldCursor(heldNextCursor)
+  }
 
   const batchMut = useMutation({
-    mutationFn: () => fetchReadinessBatch(slug, selected, checkModel),
-    onSuccess: data => setResult(data)
+    mutationFn: (gen: number) => fetchReadinessBatch(slug, selected, checkModel),
+    onSuccess: (data, gen: number) => {
+      // Guard against the past: only a response whose generation matches the
+      // current selection/board may paint.
+      if (gen === genRef.current) {
+        setResult(data)
+      }
+    }
   })
 
   const toggle = (card: string) => {
+    genRef.current += 1
     setResult(null)
     setSelected(prev => {
       const next = new Set(prev)
@@ -620,6 +655,16 @@ function ReadinessBatchSection({ slug }: { slug: string }) {
           })}
         </ul>
       )}
+      {/* The 100-card held snapshot omits the tail; expose it honestly and offer
+          a path to the rest via the snapshot's own cursor. */}
+      {heldOmitted != null && heldOmitted > 0 && (
+        <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">+{heldOmitted} held cards omitted by the bounded list</span>
+      )}
+      {heldHasMore && (
+        <Button disabled={heldQuery.isFetching} onClick={loadMoreHeld} size="xs" variant="outline">
+          Load more held cards
+        </Button>
+      )}
       {heldCards.length > READINESS_BATCH_MAX && (
         <span className="text-[0.625rem] text-(--ui-text-quaternary)">Select up to {READINESS_BATCH_MAX} held cards.</span>
       )}
@@ -627,7 +672,12 @@ function ReadinessBatchSection({ slug }: { slug: string }) {
         <input checked={checkModel} onChange={event => setCheckModel(event.target.checked)} type="checkbox" />
         Check the exact provider and model
       </label>
-      <Button disabled={selected.length === 0 || batchMut.isPending} onClick={() => batchMut.mutate()} size="sm" variant="outline">
+      <Button
+        disabled={selected.length === 0 || batchMut.isPending}
+        onClick={() => batchMut.mutate(genRef.current)}
+        size="sm"
+        variant="outline"
+      >
         {batchMut.isPending ? 'Checking…' : 'Preview readiness'}
       </Button>
 

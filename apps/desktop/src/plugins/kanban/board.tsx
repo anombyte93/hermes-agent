@@ -1554,6 +1554,14 @@ export function KanbanBoardPage() {
               )
             })}
           </div>
+          {alignedEvidence && alignedEvidence.error === null && alignedEvidence.snapshotChanged && (
+            <div className="flex items-center justify-center gap-2 px-4 py-1">
+              <span className="inline-flex items-center gap-1 text-[0.625rem] text-amber-500">
+                <Codicon name="refresh" size="0.7rem" />
+                Snapshot changed — paging restarted
+              </span>
+            </div>
+          )}
           {alignedEvidence && alignedEvidence.error === null && alignedEvidence.hasMore && (
             <div className="flex items-center justify-center gap-2 px-4 py-1.5">
               <Button

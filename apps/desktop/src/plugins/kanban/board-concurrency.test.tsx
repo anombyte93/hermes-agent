@@ -306,6 +306,7 @@ describe('R10 — long-board paging under concurrent updates', () => {
 
   it('drops a late page from a previous board after a board switch', async () => {
     let releaseEvoPage2: (v: unknown) => void = () => undefined
+
     const evoPage2 = new Promise<unknown>(resolve => {
       releaseEvoPage2 = resolve
     })
@@ -356,5 +357,30 @@ describe('R10 — long-board paging under concurrent updates', () => {
 
     expect(await screen.findByText('Card A')).toBeTruthy()
     await waitFor(() => expect(screen.queryByText('Load more')).toBeNull())
+  })
+
+  it('exposes an explicit "snapshot changed — paging restarted" note when a refresh drops loaded pages', async () => {
+    h.fetch.fetchEvidenceContext.mockResolvedValue(ctx(true))
+    h.fetch.fetchEvidenceSnapshot
+      .mockResolvedValueOnce(snapshotPage([card('t_a', 'Card A', 'running')], { hasMore: true, nextCursor: 'p2', observedAt: now }))
+      .mockResolvedValueOnce(snapshotPage([card('t_b', 'Card B', 'done')], { hasMore: false, nextCursor: null, observedAt: now }))
+
+    const client = renderBoard()
+
+    expect(await screen.findByText('Card A')).toBeTruthy()
+    fireEvent.click(screen.getByText('Load more'))
+    expect(await screen.findByText('Card B')).toBeTruthy()
+
+    // A refresh advances the first page's observed_at — the loaded page 2 is
+    // dropped and paging restarts. The board must say so, not blend stale
+    // generations silently.
+    h.fetch.fetchEvidenceSnapshot.mockResolvedValue(
+      snapshotPage([card('t_a', 'Card A', 'done')], { hasMore: false, nextCursor: null, observedAt: now + 100 })
+    )
+    await client.invalidateQueries({ queryKey: ['kanban', 'evidence'] })
+
+    expect(await screen.findByText(/Snapshot changed — paging restarted/)).toBeTruthy()
+    // The dropped page-2 card is gone, never blended into the new snapshot.
+    expect(screen.queryByText('Card B')).toBeNull()
   })
 })
