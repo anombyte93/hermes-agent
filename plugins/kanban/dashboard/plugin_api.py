@@ -4942,14 +4942,21 @@ def _next_ten_pass_shape_error(tool: str, data: Any) -> Optional[str]:
                     f"PASS receipt for kanban_readiness_batch field "
                     f"{field!r} is not a non-negative integer"
                 )
-        if data.get("requested") != len(items) and data.get("returned") != len(items):
-            # One of the two must account for the carried items (omitted
-            # cards may be absent from items but counted in requested).
-            if data.get("returned") != len(items):
-                return (
-                    f"PASS receipt returned {data.get('returned')!r} does not "
-                    f"account for {len(items)} items"
-                )
+        returned = data.get("returned")
+        if returned != len(items):
+            # The returned count must account for exactly the carried items;
+            # omitted cards are absent from items but still counted in requested.
+            return (
+                f"PASS receipt returned {returned!r} does not equal the "
+                f"{len(items)} carried items"
+            )
+        if data.get("requested") != returned + data.get("omitted"):
+            # requested must reconcile with returned + omitted; a receipt that
+            # claims counts it did not deliver is inconsistent and untrusted.
+            return (
+                f"PASS receipt requested {data.get('requested')!r} does not equal "
+                f"returned ({returned!r}) + omitted ({data.get('omitted')!r})"
+            )
         if data.get("no_mutation_performed") is not True:
             return "PASS receipt for kanban_readiness_batch claims a mutation was performed"
     err = _need_observed_at()
@@ -4976,6 +4983,18 @@ def _next_ten_scope_error(
                 f"PASS receipt board {data.get('board')!r} does not match "
                 f"requested board {board!r}"
             )
+        if tool == "kanban_readiness_batch":
+            requested_cards = set(args.get("cards") or [])
+            if data.get("requested") != len(requested_cards):
+                return (
+                    f"PASS receipt requested {data.get('requested')!r} does not "
+                    f"match the {len(requested_cards)} unique requested cards"
+                )
+            item_error = _next_ten_batch_item_scope_error(
+                data, board, requested_cards
+            )
+            if item_error:
+                return f"PASS receipt {item_error}"
     elif tool in ("kanban_acceptance_compare", "kanban_reviewer_packet"):
         if data.get("board") != board:
             return (
@@ -5015,11 +5034,110 @@ def _next_ten_scope_error(
     return None
 
 
+def _next_ten_batch_item_scope_error(
+    data: dict[str, Any], board: str, requested_cards: set[str]
+) -> Optional[str]:
+    """Reject a readiness batch receipt whose items echo a foreign identity.
+
+    Every carried item must name a card that was actually requested, and a
+    nested ``receipt.requested`` (when present) must re-echo the request's
+    board and card. A foreign item card or a foreign nested request identity
+    is a scope violation: the data is for a different read than the one
+    requested, so it must not be trusted. Every item card must be a real
+    string identity (absent/null/unhashable cards are rejected), and a
+    duplicated card identity across items is rejected as inconsistent.
+    """
+    items = data.get("items")
+    if not isinstance(items, list):
+        return None
+    seen_cards: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_card = item.get("card")
+        if not isinstance(item_card, str) or not item_card:
+            return (
+                f"readiness item card {item_card!r} is not a string identity"
+            )
+        if item_card not in requested_cards:
+            return (
+                f"readiness item card {item_card!r} was not among the "
+                f"requested cards"
+            )
+        if item_card in seen_cards:
+            return (
+                f"readiness item card {item_card!r} is duplicated in the batch"
+            )
+        seen_cards.add(item_card)
+        nested = item.get("receipt")
+        if isinstance(nested, dict):
+            requested = nested.get("requested")
+            if isinstance(requested, dict):
+                if (
+                    requested.get("board") is not None
+                    and requested.get("board") != board
+                ):
+                    return (
+                        f"readiness item nested requested board "
+                        f"{requested.get('board')!r} does not match requested "
+                        f"board {board!r}"
+                    )
+                if (
+                    requested.get("card") is not None
+                    and requested.get("card") != item_card
+                ):
+                    return (
+                        f"readiness item nested requested card "
+                        f"{requested.get('card')!r} does not match item card "
+                        f"{item_card!r}"
+                    )
+    return None
+
+
+def _next_ten_partial_validation_error(
+    tool: str, receipt: dict[str, Any], args: dict[str, Any]
+) -> Optional[str]:
+    """Validate a FAIL/UNKNOWN receipt's partial data before it is trusted.
+
+    Partial evidence is forwarded ONLY when the receipt's data survives the
+    same identity/schema/bounds discipline as a PASS receipt: host must be
+    the expected EVO host, observed_at finite, and the per-tool required
+    shape and request scope echoes must hold. Anything else — absent data,
+    a foreign host, a malformed or wrong-scope payload — returns an error
+    string and the data is dropped (the receipt's state and reason survive,
+    but no evidence is forwarded). Never promotes a receipt to PASS.
+    """
+    data = receipt.get("data")
+    if not isinstance(data, dict) or not data:
+        return f"{_NAND}FAIL/UNKNOWN receipt carried no data object"
+    host = receipt.get("execution_host")
+    if host != _EVIDENCE_EXECUTION_HOST:
+        return (
+            f"{_NAND}receipt execution_host {host!r} is not "
+            f"{_EVIDENCE_EXECUTION_HOST!r}"
+        )
+    observed_at = receipt.get("observed_at")
+    if not _evidence_finite_number(observed_at):
+        return f"{_NAND}receipt is missing a finite numeric observed_at"
+    shape_error = _next_ten_pass_shape_error(tool, data)
+    if shape_error:
+        return f"{_NAND}{shape_error}"
+    scope_error = _next_ten_scope_error(tool, receipt, args)
+    if scope_error:
+        return f"{_NAND}{scope_error}"
+    return None
+
+
 def _next_ten_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     """Invoke the released helper ONCE for a next-ten read tool and
     normalise its receipt. Same discipline as _evidence_run_helper: every
     subprocess failure mode maps to UNKNOWN, stdout is capped and parsed,
-    stderr is never surfaced, PASS receipts are shape/scope validated."""
+    stderr is never surfaced, and any data that is trusted (PASS or a
+    partial FAIL/UNKNOWN) is host/observed_at/shape/scope validated first.
+    A known FAIL/UNKNOWN that still carries a valid bounded data payload
+    (e.g. a UNKNOWN readiness_batch with per-card items + repair_preview
+    from a helper exit 1) forwards that partial evidence — never promoted
+    to PASS; a claimed PASS from a nonzero exit stays rejected."""
     if tool not in NEXT_TEN_READ_TOOLS:
         # Defensive: unreachable via the routes (literals only).
         return _evidence_envelope(
@@ -5096,22 +5214,15 @@ def _next_ten_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
                 reason=f"{_NAND}helper receipt state {state!r} is not PASS/FAIL/UNKNOWN",
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
             )
-        if proc.returncode != 0:
-            # Same convention as the evidence bridge: a structured FAIL from
-            # a nonzero exit keeps its reason; only claimed-PASS is rejected.
-            if state == "PASS":
-                return _evidence_envelope(
-                    state="UNKNOWN",
-                    reason=f"{_NAND}helper exited {proc.returncode} while claiming PASS",
-                    remedy="Retry; if it persists, inspect the helper installation "
-                           "on the EVO host (its stderr is not surfaced here).",
-                    evidence=None,
-                    timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
-                )
-            reason = str(receipt.get("reason") or f"helper reported {state}")
+        if proc.returncode != 0 and state == "PASS":
+            # A claimed PASS from a nonzero exit is untrustworthy: the helper
+            # may have failed to complete the read it reports as successful.
             return _evidence_envelope(
-                state=state,
-                reason=f"{reason} (helper exited {proc.returncode})",
+                state="UNKNOWN",
+                reason=f"{_NAND}helper exited {proc.returncode} while claiming PASS",
+                remedy="Retry; if it persists, inspect the helper installation "
+                       "on the EVO host (its stderr is not surfaced here).",
+                evidence=None,
                 timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
             )
         if state == "PASS":
@@ -5158,10 +5269,39 @@ def _next_ten_run_helper(tool: str, args: dict[str, Any]) -> dict[str, Any]:
             )
             envelope["_verified_execution_host"] = host
             return envelope
-        # FAIL / UNKNOWN receipts pass through with their reason.
+        # FAIL / UNKNOWN receipts. A known FAIL/UNKNOWN outcome that still
+        # carries a valid bounded data payload (e.g. a UNKNOWN readiness_batch
+        # with per-card items + repair_preview from a helper exit 1) forwards
+        # that partial evidence — never promoted to PASS. A data-less or
+        # untrusted (foreign host / malformed / wrong scope) payload forwards
+        # only the retained state and reason.
+        validation_error = _next_ten_partial_validation_error(tool, receipt, args)
+        if validation_error is None:
+            host = receipt.get("execution_host")
+            observed_at = receipt.get("observed_at")
+            data = receipt.get("data")
+            limitations = receipt.get("bounded")
+            if limitations is None and isinstance(data, dict):
+                limitations = data.get("omitted")
+            reason = str(receipt.get("reason") or f"helper reported {state}")
+            if proc.returncode != 0:
+                reason = f"{reason} (helper exited {proc.returncode})"
+            envelope = _evidence_envelope(
+                state=state,
+                evidence=data,
+                reason=reason,
+                timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
+                observed_at=observed_at,
+                limitations=limitations,
+            )
+            envelope["_verified_execution_host"] = host
+            return envelope
+        reason = str(receipt.get("reason") or f"helper reported {state}")
+        if proc.returncode != 0:
+            reason = f"{reason} (helper exited {proc.returncode})"
         return _evidence_envelope(
             state=state,
-            reason=str(receipt.get("reason") or f"helper reported {state}"),
+            reason=reason,
             timing={"helper_roundtrip_ms": helper_ms, "collection_ms": 0.0},
         )
     finally:
