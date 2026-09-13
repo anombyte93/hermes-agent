@@ -403,8 +403,8 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         # with failures below the configured limit must still recover.
         t = kb.create_task(conn, title="lenient", assignee="a")
         conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=? "
-            "WHERE id=?",
+            "UPDATE tasks SET status='blocked', block_reason='engineered breaker state', "
+            "consecutive_failures=? WHERE id=?",
             (kb.DEFAULT_FAILURE_LIMIT, t),
         )
         conn.commit()
@@ -424,8 +424,8 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         # stricter limit must stay blocked even though it's below default.
         t2 = kb.create_task(conn, title="strict", assignee="a")
         conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=1 "
-            "WHERE id=?",
+            "UPDATE tasks SET status='blocked', block_reason='engineered breaker state', "
+            "consecutive_failures=1 WHERE id=?",
             (t2,),
         )
         conn.commit()

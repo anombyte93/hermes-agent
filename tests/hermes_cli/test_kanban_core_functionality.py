@@ -588,9 +588,11 @@ def test_unblock_invariant_recovery(kanban_home):
         # invariant violation erosika flagged.
         kb.claim_task(conn, tid)
         leaked_run_id = kb.latest_run(conn, tid).id
-        # Force the bad state.
+        # Force the bad state (reason included: guard triggers refuse a
+        # reasonless blocked row, the invariant this state must satisfy).
         conn.execute(
-            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,),
+            "UPDATE tasks SET status = 'blocked', block_reason = ? WHERE id = ?",
+            ("engineered leaked-run state", tid),
         )
         conn.commit()
         # current_run_id is still set; run is still open.

@@ -161,7 +161,8 @@ def test_created_with_initial_status_blocked_is_not_promoted_by_recompute_ready(
     with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="parent task")
         child_id = kb.create_task(
-            conn, title="gated child task", parents=[parent_id], initial_status="blocked"
+            conn, title="gated child task", parents=[parent_id], initial_status="blocked",
+            block_reason="R3 gate: parked for human ops at creation",
         )
         assert kb.get_task(conn, child_id).status == "blocked"
 

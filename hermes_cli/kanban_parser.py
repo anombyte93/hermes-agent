@@ -201,6 +201,9 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--block-reason", dest="block_reason",
+             help="Why the card starts blocked (required with "
+                  "--initial-status=blocked; recorded on the card)."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [

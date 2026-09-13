@@ -554,7 +554,8 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     try:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
-        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_reason='engineered parent-wait state' WHERE id=?", (child,))
         conn.commit()
     finally:
         conn.close()
