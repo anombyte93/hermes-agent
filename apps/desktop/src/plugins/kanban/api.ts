@@ -40,13 +40,19 @@ import type {
   WorkerLog
 } from './types'
 import type {
+  AcceptanceCompareData,
+  AttachmentProvenanceData,
   AttentionData,
+  BrowserReadinessEvidence,
   ChangesData,
   ContinuationDraft,
   ContinueReceipt,
   HoldReceipt,
+  ReadinessBatchData,
   ReadinessReceipt,
+  ReleasesData,
   RemainingCheck,
+  ReviewerPacketData,
   TimelineData
 } from './workflow-api'
 
@@ -211,6 +217,17 @@ export const evidenceWorkerKey = (slug: string, id: string) => ['kanban', 'evide
 export const evidenceCardKey = (slug: string, id: string) => ['kanban', 'evidence', 'card', slug, id] as const
 export const evidencePageKey = (slug: string, resource: string, card: null | string, cursor: null | string) =>
   ['kanban', 'evidence', 'page', slug, resource, card, cursor] as const
+
+// Next-ten read doors (board-scoped so a switch is a clean miss).
+export const evidenceReleasesKey = (slug: string) => ['kanban', 'evidence', 'releases', slug] as const
+export const browserReadinessKey = (slug: string) => ['kanban', 'evidence', 'browser-readiness', slug] as const
+export const acceptanceCompareKey = (slug: string, card: string, currentRunId: number, previousRunId: number) =>
+  ['kanban', 'evidence', 'acceptance-compare', slug, card, currentRunId, previousRunId] as const
+export const reviewerPacketKey = (slug: string, card: string) => ['kanban', 'evidence', 'reviewer-packet', slug, card] as const
+export const attachmentProvenanceKey = (slug: string, card: string, id: number | string) =>
+  ['kanban', 'evidence', 'attachment-provenance', slug, card, id] as const
+export const readinessBatchKey = (slug: string, cards: string[], checkModel: boolean) =>
+  ['kanban', 'workflow', 'readiness-batch', slug, [...cards].sort().join(','), checkModel] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
@@ -470,3 +487,45 @@ export const continueCard = (slug: string, input: ContinuationInput & { fingerpr
 /** Separate explicit review hold. Preserves history; never stops a live worker. */
 export const holdCard = (slug: string, card: string, reason: string) =>
   call<EvidenceEnvelope<HoldReceipt>>(withBoardSlug('/workflow/hold', slug), { method: 'POST', body: { card, reason } })
+
+// ── next-ten read doors (read-only /evidence/* + one read-only batch) ────────
+// Each takes the board slug explicitly (never the global atom) so a late
+// response from a previous board can never land under the new one. None of
+// these dispatches, releases or writes config.
+
+/** Served adapter + backend release identity. The frontend adds its own build
+ *  stamp locally (see support.tsx), never hardcoded here. */
+export const fetchEvidenceReleases = (slug: string) =>
+  call<EvidenceEnvelope<ReleasesData>>(withBoardSlug('/evidence/releases', slug))
+
+/** Browser readiness: reachable / authenticated / board_readable as separate
+ *  facts. The UI must never infer auth from reachability or a 200. */
+export const fetchBrowserReadiness = (slug: string) =>
+  call<EvidenceEnvelope<BrowserReadinessEvidence>>(withBoardSlug('/evidence/browser-readiness', slug))
+
+/** Current vs previous run acceptance comparison. */
+export const fetchAcceptanceCompare = (slug: string, card: string, currentRunId: number, previousRunId: number) =>
+  call<EvidenceEnvelope<AcceptanceCompareData>>(
+    withBoardSlug('/evidence/acceptance-compare', slug, {
+      card,
+      current_run_id: String(currentRunId),
+      previous_run_id: String(previousRunId)
+    })
+  )
+
+/** Compact, allowlisted reviewer packet (schema_version 1). */
+export const fetchReviewerPacket = (slug: string, card: string) =>
+  call<EvidenceEnvelope<ReviewerPacketData>>(withBoardSlug('/evidence/reviewer-packet', slug, { card }))
+
+/** Reverse-link an attachment to its accepted run (or explicit unknown). */
+export const fetchAttachmentProvenance = (slug: string, card: string, attachmentId: number | string) =>
+  call<EvidenceEnvelope<AttachmentProvenanceData>>(
+    withBoardSlug('/evidence/attachment-provenance', slug, { card, attachment_id: String(attachmentId) })
+  )
+
+/** Readiness preview for 1..10 held cards. Read-only; never releases. */
+export const fetchReadinessBatch = (slug: string, cards: string[], checkModel: boolean) =>
+  call<EvidenceEnvelope<ReadinessBatchData>>(withBoardSlug('/workflow/readiness-batch', slug), {
+    method: 'POST',
+    body: { board: slug, cards, check_model: checkModel }
+  })
