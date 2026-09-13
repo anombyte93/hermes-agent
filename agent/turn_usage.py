@@ -76,6 +76,14 @@ def record_response_usage(
     # Token/cost accounting below stays gated on real usage, but the request itself
     # must remain observable.
     agent.session_api_calls += 1
+    # Kanban model truth (#7): stamp the answering model on the worker's run
+    # row at the first successful call. No-op outside a dispatcher-spawned
+    # worker; best-effort by contract.
+    try:
+        from agent.kanban_model_truth import record_model_truth_once
+        record_model_truth_once(agent)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("kanban model truth bridge failed", exc_info=True)
     if not (hasattr(response, 'usage') and response.usage):
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the

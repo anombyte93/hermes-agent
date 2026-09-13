@@ -183,6 +183,14 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) ->
     return d
 
 
+def _attach_model_truth(task_d: dict[str, Any], truth: Optional[dict]) -> None:
+    """Model truth on the card (#7): ``model_truth`` names the run that
+    answered and both routes when they differ; absent when unrecorded so
+    legacy clients see no shape change."""
+    if truth and truth.get("model_used"):
+        task_d["model_truth"] = truth
+
+
 def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
     """``stored_path`` is the absolute on-disk path workers read; UI downloads by ``id``."""
     return {
@@ -297,12 +305,14 @@ def get_board(
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        truth_map = kanban_db.latest_model_truth(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            _attach_model_truth(d, truth_map.get(t.id))
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
             columns[t.status if t.status in columns else "todo"].append(d)
 
@@ -352,6 +362,7 @@ def get_task(
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
         task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        _attach_model_truth(task_d, kanban_db.latest_model_truth(conn, [task_id]).get(task_id))
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))

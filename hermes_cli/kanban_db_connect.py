@@ -825,9 +825,21 @@ _NOTIFY_SUB_COLUMNS = (
     ("chat_type", "chat_type TEXT"),
     # Platform-specific stable alt ID (Signal UUID, Feishu union_id, ...)
     # so an active-wake replay reconstructs the SAME ``build_session_key``
-    # (which prefers ``user_id_alt``). NULL is inert.
+    # (which prefers ``user_id_alt``).
     ("user_id_alt", "user_id_alt TEXT"),
     ("delivery_metadata", "delivery_metadata TEXT"),
+)
+
+# Model truth on runs (#7): which model/provider ACTUALLY answered this
+# attempt, written by the worker at its first successful API call. A board's
+# model_override is only a request — a provider fallback (missing key, quota,
+# repeated 429s) can substitute a different model entirely, and without these
+# columns nothing on the board surfaces that.
+_LATER_TASK_RUN_COLUMNS = (
+    ("model_used", "model_used TEXT"),
+    ("provider_used", "provider_used TEXT"),
+    # "orig-model (orig-provider)" the fallback replaced; NULL = no fallback.
+    ("fallback_from", "fallback_from TEXT"),
 )
 
 
@@ -904,6 +916,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     if _table_exists(conn, "task_runs"):
         _backfill_legacy_inflight_runs(conn)
+        # Model-truth columns (#7): additive on legacy boards.
+        run_cols = _column_names(conn, "task_runs")
+        for name, ddl in _LATER_TASK_RUN_COLUMNS:
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
 
     # One-shot event-kind rename: old names still worked but were awkward on
     # the wire. Fires once per DB — after the UPDATE no rows match.
@@ -1062,6 +1079,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
+        " model_used TEXT, provider_used TEXT, fallback_from TEXT,"
         " error TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",

@@ -24,8 +24,8 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
-    _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
-    _task_to_dict,
+    _fmt_counts, _fmt_model_truth_line, _fmt_route, _fmt_task_line, _fmt_ts,
+    _json_out, _obj_dict, _print_json, _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
@@ -431,6 +431,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        # Model truth (#7): the latest run's answering route, one aggregate
+        # query; feeds the [model] marker on each line below.
+        truth = kb.latest_model_truth(conn, [t.id for t in tasks])
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -446,7 +449,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        print(_fmt_task_line(t, model_truth=truth.get(t.id)))
     return 0
 
 
@@ -518,9 +521,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("branch", task.branch_name)
     if task.skills:
         field("skills", ", ".join(task.skills))
-    if task.model_override:
-        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
-        field("model", f"{task.model_override}{_prov}")
+    # Model truth (#7): prefer what the latest run ACTUALLY answered over the
+    # override-only line; ``latest_run`` is the current/last attempt.
+    _lr = runs[-1] if runs else None
+    if task.model_override or (_lr and _lr.model_used):
+        _line = _fmt_model_truth_line(
+            task.model_override, task.provider_override,
+            model_used=_lr.model_used if _lr else None,
+            provider_used=_lr.provider_used if _lr else None,
+        )
+        if _line:
+            field("model", _line)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -567,7 +578,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             elapsed = max(0, r.ended_at - r.started_at) if r.ended_at else None
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
-            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
+            route = f"  {_fmt_route(r.model_used, r.provider_used)}" if r.model_used else ""
+            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}{route}")
+            if r.fallback_from:
+                print(f"        ↳ fell back from {r.fallback_from}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:

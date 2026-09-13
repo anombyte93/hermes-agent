@@ -466,6 +466,56 @@ def heartbeat_worker(
     return True
 
 
+def notify_model_fallbacks(conn: sqlite3.Connection) -> list[str]:
+    """Comment ``model_fallback:`` on cards whose run answered on a different
+    model than the task's override (once per run).
+
+    The worker stamps ``task_runs.model_used`` at its first successful API
+    call; this pass (every dispatcher tick) turns a mismatch into a visible
+    card comment so a human or the next worker sees it without any UI.
+    Idempotence: the ``model_fallback`` event on the run scopes "already
+    notified" — ticks repeat, comments must not. Runs without model truth
+    (pre-#7, never-started) and tasks without an override are skipped.
+    Returns the task ids commented.
+    """
+    rows = conn.execute(
+        """
+        SELECT r.id AS run_id, r.task_id, r.model_used, r.provider_used, r.fallback_from,
+               t.model_override, t.provider_override
+          FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.model_used IS NOT NULL
+           AND t.model_override IS NOT NULL
+           AND t.model_override != ''
+           AND r.model_used != t.model_override
+        """
+    ).fetchall()
+    commented: list[str] = []
+    for row in rows:
+        run_id = int(row["run_id"])
+        already = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'model_fallback' LIMIT 1",
+            (row["task_id"], run_id),
+        ).fetchone()
+        if already:
+            continue
+        requested = row["model_override"] + (f" ({row['provider_override']})" if row["provider_override"] else "")
+        answered = row["model_used"] + (f" ({row['provider_used']})" if row["provider_used"] else "")
+        body = (
+            f"model_fallback: run #{run_id} was dispatched on {requested} but answered on "
+            f"{answered} (provider fallback)."
+        )
+        if row["fallback_from"]:
+            body += f" Worker-recorded fallback origin: {row['fallback_from']}."
+        with _kb.write_txn(conn, allow_nested=True):
+            _kb.add_comment(conn, row["task_id"], "dispatcher", body)
+            _kb._append_event(conn, row["task_id"], "model_fallback", {
+                "run_id": run_id, "requested": requested, "answered": answered,
+            }, run_id=run_id)
+        commented.append(row["task_id"])
+    return commented
+
+
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -2123,6 +2173,11 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    # Model truth (#7): surface override-vs-answered mismatches as card
+    # comments. Runs before any spawn/reclaim so a tick that only reconciles
+    # still notifies; idempotent per run.
+    with contextlib.suppress(Exception):
+        notify_model_fallbacks(conn)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,

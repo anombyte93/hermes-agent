@@ -26,10 +26,12 @@ _TASK_DICT_FIELDS = (
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
     "metadata", "worker_pid", "started_at", "ended_at",
+    "model_used", "provider_used", "fallback_from",
 )
 _RUNS_RUN_FIELDS = (
     "id", "profile", "status", "outcome", "started_at", "ended_at",
     "summary", "error", "metadata", "worker_pid", "step_key",
+    "model_used", "provider_used", "fallback_from",
 )
 _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "stored_path", "created_at")
 
@@ -72,11 +74,41 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, *, model_truth: Optional[dict] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    truth = model_truth or {}
+    model = _fmt_model_truth_line(
+        t.model_override, t.provider_override,
+        model_used=truth.get("model_used"), provider_used=truth.get("provider_used"),
+    )
+    marker = f" [{model}]" if model else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{marker}"
+
+
+def _fmt_route(model: str, provider: Optional[str]) -> str:
+    return f"{model} ({provider})" if provider else model
+
+
+def _fmt_model_truth_line(
+    model_override: Optional[str], provider_override: Optional[str],
+    *, model_used: Optional[str] = None, provider_used: Optional[str] = None,
+) -> Optional[str]:
+    """One-line model truth: request → answered fact.
+
+    - run answered on the override (or no truth yet): ``glm-5.3 (zai)``
+    - run answered on a DIFFERENT: ``glm-5.3 → gpt-5.6-sol (openai-codex) ⚠ fallback``
+    - no override but truth recorded: the answering route alone.
+    Returns None when there is nothing to say (no override, no truth).
+    """
+    used = _fmt_route(model_used, provider_used) if model_used else None
+    if model_override:
+        requested = _fmt_route(model_override, provider_override)
+        if model_used and model_used != model_override:
+            return f"{requested} → {used} ⚠ fallback"
+        return requested
+    return used
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

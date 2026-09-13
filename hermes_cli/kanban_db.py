@@ -779,6 +779,11 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Model truth (#7): written by the worker at its first successful API
+    # call. NULL until then (or forever on pre-#7 runs).
+    model_used: Optional[str] = None
+    provider_used: Optional[str] = None
+    fallback_from: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -787,7 +792,8 @@ class Run:
                 col: row[col] for col in (
                     "task_id", "profile", "step_key", "status", "claim_lock", "claim_expires",
                     "worker_pid", "max_runtime_seconds", "last_heartbeat_at", "outcome", "summary", "error",
-                )
+                    "model_used", "provider_used", "fallback_from",
+                ) if col in row.keys()
             },
             id=int(row["id"]),
             started_at=int(row["started_at"]),
@@ -2005,6 +2011,28 @@ def _end_run(
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
+
+
+def record_run_model_truth(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *,
+    model_used: str, provider_used: Optional[str], fallback_from: Optional[str] = None,
+) -> bool:
+    """Stamp the answering model/provider on one run row; first write wins.
+
+    ``model_used IS NULL`` is the CAS guard: the worker writes this at its
+    FIRST successful API call, and a later write (e.g. after the primary
+    runtime is restored mid-session) must not rewrite the historical fact.
+    Refuses runs that belong to a different task. Returns True when written.
+    """
+    cur = conn.execute(
+        """
+        UPDATE task_runs
+           SET model_used = ?, provider_used = ?, fallback_from = ?
+         WHERE id = ? AND task_id = ? AND model_used IS NULL
+        """,
+        (model_used, provider_used, fallback_from, int(run_id), task_id),
+    )
+    return cur.rowcount == 1
 
 
 def _first_line(text: Optional[str], limit: int) -> str:
@@ -4360,6 +4388,39 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def latest_model_truth(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict[str, Optional[str]]]:
+    """``{task_id: {model_used, provider_used, fallback_from}}`` for each task's
+    latest run, in one window-function query; tasks whose latest run has no
+    recorded truth are omitted (pre-#7 runs, never-started tasks)."""
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT task_id, model_used, provider_used, fallback_from FROM (
+            SELECT task_id, model_used, provider_used, fallback_from,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY task_id
+                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+                   ) AS rn
+              FROM task_runs
+             WHERE task_id IN ({placeholders})
+               AND model_used IS NOT NULL
+        ) WHERE rn = 1
+        """,
+        ids,
+    ).fetchall()
+    return {
+        r["task_id"]: {
+            "model_used": r["model_used"],
+            "provider_used": r["provider_used"],
+            "fallback_from": r["fallback_from"],
+        }
+        for r in rows
+    }
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
