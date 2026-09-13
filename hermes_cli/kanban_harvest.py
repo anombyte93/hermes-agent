@@ -193,7 +193,9 @@ def _digits_in(text: str) -> "int | None":
     (``executed 320, passed 320, failed 0`` -> 320; ``53 files, 483 tests``
     -> 483). Never the first, which is usually a file or attempt number."""
     text = str(text)
-    beside = re.findall(r"(\d+)(?=\s*(?:tests?\s+)?passed)", text, re.I)
+    # "N passed" with any short separator (space/comma/dash, incl. Unicode):
+    # playwright-style reports pack "expected 320, executed 320, passed 320".
+    beside = re.findall(r"(\d+)\W{0,3}passed", text, re.I)
     if beside:
         return int(beside[-1])
     cleaned = re.sub(r"\b(?:failed|errors?)\s*:?\s*\d+", " ", text, flags=re.I)
