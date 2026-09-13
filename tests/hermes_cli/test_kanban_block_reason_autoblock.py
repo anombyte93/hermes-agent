@@ -109,48 +109,35 @@ def test_db_preseeded_with_fork_column_and_triggers_reensures_cleanly(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # A legacy DB that already carries the column + triggers (the fork's
+    # shape): re-ensure must not error, must not duplicate the triggers, and
+    # must backfill a pre-guard blocked row with the unknown-cause label.
     with kbc.connect_closing() as conn:
-        # Simulate the fork's schema: additive column (fresh from fork DDL)
-        # plus its three triggers, created exactly as the fork shipped them.
-        conn.execute("ALTER TABLE tasks ADD COLUMN block_reason TEXT")
-        for ddl in (
-            """
-            CREATE TRIGGER trg_tasks_block_reason_insert
-            BEFORE INSERT ON tasks
-            WHEN NEW.status = 'blocked'
-             AND TRIM(COALESCE(NEW.block_reason, '')) = ''
-            BEGIN
-                SELECT RAISE(ABORT, 'block reason is required');
-            END
-            """,
-            """
-            CREATE TRIGGER trg_tasks_block_reason_update
-            BEFORE UPDATE ON tasks
-            WHEN NEW.status = 'blocked'
-             AND TRIM(COALESCE(NEW.block_reason, '')) = ''
-            BEGIN
-                SELECT RAISE(ABORT, 'block reason is required');
-            END
-            """,
-            """
-            CREATE TRIGGER trg_tasks_block_reason_clear
-            AFTER UPDATE OF status ON tasks
-            WHEN OLD.status = 'blocked'
-             AND NEW.status != 'blocked'
-             AND NEW.block_reason IS NOT NULL
-            BEGIN
-                UPDATE tasks SET block_reason = NULL WHERE id = NEW.id;
-            END
-            """,
-        ):
-            conn.execute(ddl)
-        # Set-up write proves the pre-seeded triggers really fire: a
-        # reasonless blocked UPDATE must abort on this very connection.
-        tid = kb.create_task(conn, title="legacy board task")
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,)
-            )
+        # A blocked row created BEFORE guards existed (reason NULL): simulate
+        # by writing it under temporarily-dropped guards.
+        for name in TRIGGER_NAMES:
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, workspace_kind, block_reason) "
+            "VALUES ('t_legacy_blocked', 'old blocked card', 'blocked', 0, 'scratch', NULL)"
+        )
+        # Reinstall the fork's triggers (no IF NOT EXISTS, fork DDL verbatim).
+        conn.execute(
+            "CREATE TRIGGER trg_tasks_block_reason_update BEFORE UPDATE ON tasks "
+            "WHEN NEW.status = 'blocked' AND TRIM(COALESCE(NEW.block_reason, '')) = '' "
+            "BEGIN SELECT RAISE(ABORT, 'block reason is required'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER trg_tasks_block_reason_insert BEFORE INSERT ON tasks "
+            "WHEN NEW.status = 'blocked' AND TRIM(COALESCE(NEW.block_reason, '')) = '' "
+            "BEGIN SELECT RAISE(ABORT, 'block reason is required'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER trg_tasks_block_reason_clear AFTER UPDATE OF status ON tasks "
+            "WHEN OLD.status = 'blocked' AND NEW.status != 'blocked' "
+            "AND NEW.block_reason IS NOT NULL "
+            "BEGIN UPDATE tasks SET block_reason = NULL WHERE id = NEW.id; END"
+        )
 
         # Re-ensure over the live fork-shaped schema must not error…
         kb.init_db()
@@ -161,7 +148,10 @@ def test_db_preseeded_with_fork_column_and_triggers_reensures_cleanly(
             TRIGGER_NAMES,
         ).fetchone()[0]
         assert n_triggers == 3, "expected exactly the three guard triggers"
+        # …must have backfilled the pre-guard blocked row…
+        assert _reason(conn, "t_legacy_blocked") == kb.LEGACY_UNKNOWN_BLOCK_REASON
         # …and blocked writes on the re-ensured DB still work end to end.
+        tid = kb.create_task(conn, title="legacy board task")
         kb.claim_task(conn, tid)
         assert kb.block_task(conn, tid, reason="still works after re-ensure")
         assert _blocked_row(conn, tid)["status"] == "blocked"

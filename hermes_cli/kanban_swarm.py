@@ -195,6 +195,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         idempotency_key=idempotency_key,
         initial_status="blocked",
+        block_reason="Swarm graph is being constructed atomically",
         **common,
     )
 

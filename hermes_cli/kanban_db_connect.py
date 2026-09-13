@@ -813,6 +813,9 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Current reason while status='blocked'; NULL otherwise. Stamped by every
+    # blocked-write path; the guard triggers below keep it non-empty in DB.
+    ("block_reason", "block_reason TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -863,6 +866,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
+    _ensure_block_reason_guards(conn)
+
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort
@@ -910,6 +915,63 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+
+
+def _ensure_block_reason_guards(conn: sqlite3.Connection) -> None:
+    """``tasks.block_reason`` invariants, enforced in the DB itself.
+
+    * a row may not be ``blocked`` with an empty/NULL ``block_reason``
+      (insert or update), and
+    * the reason is cleared when a row stops being ``blocked``.
+
+    Legacy blocked rows have no trustworthy cause, so the migration stamps an
+    explicit unknown label rather than guessing from comments or historical
+    events. ``IF NOT EXISTS`` keeps this idempotent on DBs that already carry
+    the triggers (e.g. created by a fork carrying the same change).
+    """
+    if "status" not in _column_names(conn, "tasks"):
+        return
+    if "block_reason" not in _column_names(conn, "tasks"):
+        _add_column_if_missing(conn, "tasks", "block_reason", "block_reason TEXT")
+    conn.execute(
+        "UPDATE tasks SET block_reason = ? "
+        "WHERE status = 'blocked' AND TRIM(COALESCE(block_reason, '')) = ''",
+        (_kb.LEGACY_UNKNOWN_BLOCK_REASON,),
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_insert
+        BEFORE INSERT ON tasks
+        WHEN NEW.status = 'blocked'
+         AND TRIM(COALESCE(NEW.block_reason, '')) = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'block reason is required');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_update
+        BEFORE UPDATE ON tasks
+        WHEN NEW.status = 'blocked'
+         AND TRIM(COALESCE(NEW.block_reason, '')) = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'block reason is required');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_block_reason_clear
+        AFTER UPDATE OF status ON tasks
+        WHEN OLD.status = 'blocked'
+         AND NEW.status != 'blocked'
+         AND NEW.block_reason IS NOT NULL
+        BEGIN
+            UPDATE tasks SET block_reason = NULL WHERE id = NEW.id;
+        END
+        """
+    )
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

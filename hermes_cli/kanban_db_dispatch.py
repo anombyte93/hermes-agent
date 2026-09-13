@@ -32,6 +32,21 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+
+def auto_block_reason(outcome: str, failures: int, error: Optional[str]) -> str:
+    """Reason stamped by every dispatcher auto-block, as one pure string build.
+
+    ``auto-blocked after N <outcome> failure(s): <error excerpt>`` — always
+    non-empty, at most 500 chars (``error`` contributes at most its first 200),
+    so it satisfies the trg_tasks_block_reason_* guards on every board.
+    """
+    outcome = (outcome or "failure").strip() or "failure"
+    excerpt = " ".join(str(error or "").split())[:200]
+    reason = f"auto-blocked after {int(failures)} {outcome} failure(s)"
+    if excerpt:
+        reason += f": {excerpt}"
+    return reason[:500]
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -1061,14 +1076,19 @@ def _record_task_failure(
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
+        # state; the timeout/crash path already did. Both stamp the current
+        # reason as durable task state — a reasonless blocked row would abort
+        # against the trg_tasks_block_reason_update guard on guarded boards
+        # (the 2026-09-13 dispatcher wedge).
+        block_reason = auto_block_reason(outcome, failures, error)
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "block_reason = ?, "
+            "consecutive_failures = ?, last_failure_error = ? "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            (block_reason, failures, error, task_id),
         )
         payload = {
             "failures": failures,
@@ -1077,6 +1097,7 @@ def _record_task_failure(
             "error": error,
             "trigger_outcome": outcome,
             "retry_status": retry_status,
+            "block_reason": block_reason,
         }
         run_id = None
         if end_run:

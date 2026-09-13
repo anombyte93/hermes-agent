@@ -91,7 +91,9 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
-
+# Stamped onto legacy blocked rows during migration: their true cause is not
+# recoverable, so persist an explicit unknown label rather than guessing.
+LEGACY_UNKNOWN_BLOCK_REASON = "Legacy block reason unknown"
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
@@ -714,6 +716,9 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    # Current reason while status='blocked' (NULL otherwise); stamped by every
+    # blocked-write path, cleared by the trg_tasks_block_reason_clear trigger.
+    block_reason: Optional[str] = None
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -749,6 +754,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "block_reason",
 )
 
 
@@ -941,7 +947,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Current reason the card is blocked, stamped by every blocked-write path
+    -- (block_task, the dispatcher auto-block, create_task(initial_status=
+    -- 'blocked')). NULL unless status='blocked'; guard triggers (see
+    -- _migrate_add_optional_columns) keep the two in sync at the DB level.
+    block_reason         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1228,6 +1239,7 @@ def create_task(
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
+    block_reason: Optional[str] = None,
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
@@ -1259,6 +1271,11 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    # A card born blocked must carry its reason as durable task state (the
+    # trg_tasks_block_reason_insert trigger enforces the same at the DB).
+    block_reason = (block_reason or "").strip() or None
+    if initial_status == "blocked" and block_reason is None:
+        raise ValueError("block reason is required when initial_status='blocked'")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1331,8 +1348,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        block_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1342,6 +1360,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        block_reason if task_status == "blocked" else None,
                     ),
                 )
                 for pid in parents:
@@ -2916,9 +2935,18 @@ def block_task(
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
-    so a forever-flaky task escalates. True on any transition."""
+    so a forever-flaky task escalates. True on any transition.
+
+    ``reason`` is required: a blocked card must carry its current reason as
+    durable task state (``tasks.block_reason``), so a missing or blank reason
+    raises ``ValueError`` before any SQL runs. The event payload keeps its own
+    copy as immutable history.
+    """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    reason = (reason or "").strip() or None
+    if reason is None:
+        raise ValueError("block reason is required")
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -2978,12 +3006,18 @@ def _route_block(
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+        payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+    # The blocked route stamps the current reason as durable task state; the
+    # triage/dependency routes land outside ``blocked``, where block_reason
+    # stays NULL by contract.
+    set_sql = ("block_kind    = ?,\n                       block_recurrences = ?,"
+               "\n                       block_reason  = ?")
+    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    return "blocked", "blocked", set_sql, (kind, recurrences, reason), payload
 
 
 def redact_review_value(value: Any) -> Any:
