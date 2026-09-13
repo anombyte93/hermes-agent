@@ -73,6 +73,30 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
 
+// R5 — meaningful-intervention dedup. Kinds that ask Hayden for a decision
+// (blocked / block_loop_detected / changes_requested) are fingerprint-deduped
+// per (board, task): a repeated UNCHANGED intervention is quiet, a changed
+// reason/remedy or a new run notifies. Completion notifications are NEVER
+// fingerprint-deduped — they always fire. Recovery (unblock/reclaim) or a new
+// run (claim/spawn) clears the stored fingerprint so a later identical block
+// notifies again. The cursor (seenEventIdByBoard) remains board-isolated; this
+// map is keyed by board+task so board switches never mix fingerprints.
+const INTERVENTION_KINDS = new Set(['blocked', 'block_loop_detected', 'changes_requested'])
+
+const CLEAR_INTERVENTION_KINDS = new Set([
+  'unblocked',
+  'claimed',
+  'spawned',
+  'reclaimed',
+  'completed',
+  'crashed',
+  'gave_up',
+  'timed_out',
+  'review_requested'
+])
+
+const interventionByTask = new Map<string, string>()
+
 let rest: Rest | null = null
 let translate: PluginTranslate | null = null
 let osDoor: PluginOs | null = null
@@ -172,6 +196,17 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
   return ''
 }
 
+/** R5 fingerprint for an intervention kind: the kind plus its reason/remedy
+ *  payload. Two events with the same fingerprint are the same intervention. */
+function interventionFingerprint(kind: string, ev: CompletionEvent): string {
+  return `${kind}\u0000${bodyFor(kind, ev)}`
+}
+
+/** Map key for one (board, task) intervention slot — board-isolated. */
+function interventionKey(slug: string, taskId: string): string {
+  return `${slug}\u0000${taskId}`
+}
+
 function notifyOne(slug: string, kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
   const taskId = (ev.task_id ?? '').trim()
   const body = bodyFor(kind, ev)
@@ -245,11 +280,32 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
 
     cursor = ev.id
     seenEventIdByBoard.set(slug, cursor)
-    const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
+    const kind = ev.kind ?? ''
+    const taskId = (ev.task_id ?? '').trim()
+    const slot = taskId ? interventionKey(slug, taskId) : null
+
+    // Recovery / new run clears the stored intervention fingerprint so a later
+    // identical block notifies again (never fingerprints a dead intervention).
+    if (slot && CLEAR_INTERVENTION_KINDS.has(kind)) {
+      interventionByTask.delete(slot)
+    }
+
+    const spec = TERMINAL_NOTIFY.get(kind)
 
     if (spec) {
+      // R5: unchanged intervention is quiet; changed reason or a new run fires.
+      if (slot && INTERVENTION_KINDS.has(kind)) {
+        const fingerprint = interventionFingerprint(kind, ev)
+
+        if (interventionByTask.get(slot) === fingerprint) {
+          continue
+        }
+
+        interventionByTask.set(slot, fingerprint)
+      }
+
       try {
-        notifyOne(slug, ev.kind!, spec, ev)
+        notifyOne(slug, kind, spec, ev)
         fired = true
       } catch {
         /* swallowed */

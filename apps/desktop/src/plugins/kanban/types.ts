@@ -299,6 +299,11 @@ export interface EvidenceSnapshotData {
   observed_at?: number
   status_filter?: null | string
   worker_observations?: WorkerObservation[]
+  /** Process-check budget: how many worker processes the bounded snapshot will
+   *  inspect before stopping (R7 checked-vs-skipped). */
+  worker_observation_cap?: number
+  /** How many worker observations were SKIPPED (over budget / capped). */
+  worker_observations_capped?: number
   has_more?: boolean
   next_cursor?: null | string
   omitted?: null | number | Record<string, unknown>
