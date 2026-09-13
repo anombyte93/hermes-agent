@@ -272,6 +272,83 @@ elif behavior == "nonzero":
     receipt["data"] = next_ten_data(tool, args)
     emit(receipt)
     sys.exit(3)
+elif behavior == "unknown_data":
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "incomplete commission; see per-item advice"
+    receipt["data"] = next_ten_data(tool, args)
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "fail_data":
+    receipt["state"] = "FAIL"
+    receipt["reason"] = "a measured readiness check failed"
+    receipt["data"] = next_ten_data(tool, args)
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_wronghost":
+    receipt["state"] = "UNKNOWN"
+    receipt["execution_host"] = "elsewhere"
+    receipt["reason"] = "remote unreachable"
+    receipt["data"] = next_ten_data(tool, args)
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_badshape":
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "partial"
+    receipt["data"] = {{"unrelated": True}}
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_compare":
+    # A realistic UNKNOWN acceptance comparison: the current run's receipt is
+    # present, but the previous run's receipt is absent, so every check is
+    # unproved rather than compared (never a relabelled PASS fixture).
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "previous run receipt absent; comparison unproved"
+    receipt["data"] = {{
+        "board": args.get("board", "evo-alpha"),
+        "card": args.get("card"),
+        "current": {{
+            "run_id": args.get("current_run_id"),
+            "state": "PASS",
+            "release": {{"revision": "a84a2b2c0" * 4, "source": "served"}},
+            "checks": {{"worker_stopped": {{"state": "PASS", "source": "machine"}}}},
+        }},
+        "previous": {{
+            "run_id": args.get("previous_run_id"),
+            "state": "UNKNOWN",
+            "release": None,
+            "checks": {{}},
+        }},
+        "checks": [
+            {{"name": "worker_stopped", "source": "machine", "current": "PASS",
+              "previous": None, "change": "unproved"}},
+        ],
+        "limitations": ["previous run receipt absent"],
+        "observed_at": NOW,
+    }}
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_foreign_item":
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "partial"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict) and isinstance(d.get("items"), list) and d["items"]:
+        d["items"][0]["card"] = "t_ffffffff"
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_foreign_nested":
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "partial"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict) and isinstance(d.get("items"), list):
+        for item in d["items"]:
+            if isinstance(item, dict):
+                nested = item.get("receipt")
+                if isinstance(nested, dict) and isinstance(nested.get("requested"), dict):
+                    nested["requested"]["board"] = "a-different-board"
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
 elif behavior == "oversized":
     receipt["data"] = {{"pad": "x" * 2000000}}
     emit(receipt)
@@ -677,6 +754,160 @@ def test_next_ten_negative_controls(client, helper_bin, route, behavior):
     body = r.json()
     assert body["state"] == "UNKNOWN", (route, behavior, body)
     assert body["helper"]["execution_host"] in ("unverified",)
+
+
+# ---------------------------------------------------------------------------
+# Partial-evidence preservation: a known FAIL/UNKNOWN outcome that still
+# carries a valid bounded data payload (helper exit 1) keeps its evidence;
+# a claimed PASS from a nonzero exit stays rejected; foreign/malformed data
+# is dropped to empty-evidence FAIL/UNKNOWN.
+# ---------------------------------------------------------------------------
+
+
+def test_readiness_batch_unknown_exit1_preserves_items(client, helper_bin, evo_aligned):
+    helper_bin("unknown_data")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001", "t_00000002"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "exited 1" in body["reason"]
+    ev = body["evidence"]
+    assert isinstance(ev, dict)
+    assert [i["card"] for i in ev["items"]] == ["t_00000001", "t_00000002"]
+    for item in ev["items"]:
+        assert item["repair_preview"], "partial repair preview must be preserved"
+    assert ev["no_mutation_performed"] is True
+    assert isinstance(body["observed_at"], float)
+    assert body["helper"]["execution_host"] == "evo"
+
+
+def test_readiness_batch_fail_exit1_preserves_measured_item(client, helper_bin, evo_aligned):
+    helper_bin("fail_data")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    body = r.json()
+    assert body["state"] == "FAIL"
+    assert "exited 1" in body["reason"]
+    ev = body["evidence"]
+    assert isinstance(ev, dict)
+    assert ev["items"][0]["state"] == "FAIL"
+    assert ev["items"][0]["repair_preview"]
+    assert ev["items"][0]["receipt"]["checks"]
+    assert body["helper"]["execution_host"] == "evo"
+
+
+def test_acceptance_compare_unknown_exit1_preserves_unproved(client, helper_bin):
+    helper_bin("unknown_compare")
+    r = _get(
+        client,
+        "/evidence/acceptance-compare?board=evo-alpha&card=t_00000001"
+        "&current_run_id=9&previous_run_id=8",
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    ev = body["evidence"]
+    assert isinstance(ev, dict)
+    # Realistic UNKNOWN compare: the previous receipt is absent, so every
+    # check is unproved rather than compared — never a relabelled PASS shape.
+    assert ev["current"]["state"] == "PASS"
+    assert ev["previous"]["state"] == "UNKNOWN"
+    assert ev["previous"]["release"] is None
+    assert ev["previous"]["checks"] == {}
+    changes = {c["name"]: c["change"] for c in ev["checks"]}
+    assert changes["worker_stopped"] == "unproved"
+    assert all(c["change"] == "unproved" for c in ev["checks"])
+    assert "previous run receipt absent" in ev["limitations"]
+    assert body["helper"]["execution_host"] == "evo"
+
+
+def test_attachment_provenance_unknown_exit1_preserves_missing(client, helper_bin):
+    helper_bin("unknown_data")
+    r = _get(
+        client,
+        "/evidence/attachment-provenance?board=evo-alpha&card=t_00000001"
+        "&attachment_id=4",
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    ev = body["evidence"]
+    assert isinstance(ev, dict)
+    assert ev["acceptance_state"] == "UNKNOWN"
+    assert ev["accepted_run_id"] is None
+    assert "not acceptance" in ev["reason"]
+    assert body["helper"]["execution_host"] == "evo"
+
+
+def test_unknown_exit1_wrong_host_drops_data(client, helper_bin):
+    helper_bin("unknown_data_wronghost")
+    r = _get(
+        client,
+        "/evidence/attachment-provenance?board=evo-alpha&card=t_00000001"
+        "&attachment_id=4",
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_unknown_exit1_badshape_drops_data(client, helper_bin):
+    helper_bin("unknown_data_badshape")
+    r = _get(
+        client,
+        "/evidence/attachment-provenance?board=evo-alpha&card=t_00000001"
+        "&attachment_id=4",
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_foreign_item_card_dropped(client, helper_bin, evo_aligned):
+    helper_bin("unknown_data_foreign_item")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_foreign_nested_request_dropped(client, helper_bin, evo_aligned):
+    helper_bin("unknown_data_foreign_nested")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_nonzero_claimed_pass_rejected(client, helper_bin, evo_aligned):
+    helper_bin("nonzero")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "claiming PASS" in body["reason"]
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
 
 
 def test_next_ten_allowlist_constant():
