@@ -176,6 +176,8 @@ hermes goals rejudge <session_id>           # 依据已存储的证据进行裁�
 hermes goals rejudge <session_id> --dry-run # 只裁判：门禁完全推迟，不运行、不写入任何内容
 ```
 
+不带子命令直接运行 `hermes goals` 会在 stderr 打印用法拒绝（`Usage: hermes goals {rejudge}`）并以退出码 2 退出——与 CLI 其他位置的缺失/非法子命令同属用法错误家族。不会裁判任何内容，也不会写入任何内容。
+
 该命令严格限定于单个会话：
 
 1. 加载绑定到该会话的目标并显示（文本、状态、已用轮次）。

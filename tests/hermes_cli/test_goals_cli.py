@@ -78,6 +78,18 @@ def _run_cli(monkeypatch, capsys, argv):
     return code, out
 
 
+def _run_cli_both(monkeypatch, capsys, argv):
+    """Like :func:`_run_cli` but returns combined stdout+stderr — for
+    paths whose refusal is printed to stderr (bare command)."""
+    from hermes_cli.subcommands import goals as goals_cmd
+
+    parser = _build_parser()
+    args = parser.parse_args(["goals"] + argv)
+    code = goals_cmd.cmd_goals(args)
+    captured = capsys.readouterr()
+    return code, captured.out + captured.err
+
+
 DONE_REPLY = '{"verdict": "done", "reason": "verified with evidence"}'
 CONTINUE_REPLY = '{"verdict": "continue", "reason": "still deploying"}'
 
@@ -312,3 +324,83 @@ def test_cli_stale_evidence_refusal_is_visible(
     assert code == 1
     assert "stale" in out.lower()
     judge.assert_not_called()
+
+
+# ── bare `hermes goals` (no subcommand) ──────────────────────────────
+
+
+def test_bare_goals_command_prints_usage_and_hints_help(monkeypatch, capsys):
+    """``hermes goals`` with no subcommand must never fall into the
+    rejudge path: the operator sees a specific missing-subcommand
+    refusal, the usage line, and a --help hint, with exit 2. No
+    traceback, no judge call, no goal mutation (review S1, c2aa4d5)."""
+    from hermes_cli.subcommands import goals as goals_cmd
+
+    with _judge_patch(DONE_REPLY) as judge:
+        code, out = _run_cli_both(monkeypatch, capsys, [])
+
+    assert "Traceback" not in out
+    assert "rejudge" in out, "the refusal must name the available subcommand"
+    assert "--help" in out
+    judge.assert_not_called()
+
+
+def test_bare_goals_command_handler_exits_2(monkeypatch, capsys):
+    """The documented exit status for the bare-command refusal is 2
+    (usage error, same family as argparse's missing/invalid choice)."""
+    code, _ = _run_cli(monkeypatch, capsys, [])
+    assert code == 2
+
+
+def test_bare_goals_command_never_touches_goal_state(
+    hermes_home, monkeypatch, capsys
+):
+    """No goal mutation on the bare path: with a goal seeded on a real
+    session, running bare ``hermes goals`` leaves the stored row
+    byte-identical and calls neither judge nor persistence."""
+    from hermes_cli import goals as goals_mod
+
+    sid = _rand_sid("clibare")
+    _seed(sid)
+    before = _raw_goal_row(sid)
+
+    with _judge_patch(DONE_REPLY) as judge:
+        code, out = _run_cli(monkeypatch, capsys, [])
+
+    assert code == 2
+    judge.assert_not_called()
+    assert _raw_goal_row(sid) == before
+    # The pre-transition goal view is NOT rendered on the bare path
+    # (rendering it would require loading state by empty session id).
+    assert goals_mod.load_goal("") is None
+
+
+def test_bare_goals_real_binary_exits_2_without_traceback(tmp_path):
+    """Real-CLI regression (permanent): the actual ``hermes`` entry point
+    with no subcommand prints the refusal to stderr, never a Python
+    traceback, and exits 2 — matching what the verifier drove at
+    c2aa4d5, where this exact invocation raised AttributeError."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).parents[2]
+    home = tmp_path / f"hermes-bare-goals-{uuid.uuid4().hex[:8]}"
+    home.mkdir()
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "goals"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "Traceback" not in combined, combined
+    assert "rejudge" in combined, "refusal must name the subcommand"
+    assert proc.returncode == 2, combined

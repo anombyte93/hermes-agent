@@ -285,6 +285,8 @@ hermes goals rejudge <session_id>           # judge the stored evidence
 hermes goals rejudge <session_id> --dry-run # judge only: gates deferred, nothing run or written
 ```
 
+Running `hermes goals` with no subcommand prints a usage refusal to stderr (`Usage: hermes goals {rejudge}`) and exits 2 — the same usage-error family as a missing or invalid subcommand elsewhere in the CLI. Nothing is judged and nothing is written.
+
 It is scoped to exactly one session. The command:
 
 1. Loads the goal bound to that session and shows it (text, status, turns used).

@@ -9,6 +9,7 @@ goal judge for one exact session on its original evidence (see
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Callable, Optional
 
 
@@ -62,12 +63,21 @@ def build_goals_parser(subparsers, *, cmd_goals: Optional[Callable]) -> None:
 
 def cmd_goals(args) -> int:
     """Handle ``hermes goals`` dispatch. Returns a process exit code."""
-    from hermes_cli.goals import rejudge_goal
-
-    command = getattr(args, "goals_command", None) or "rejudge"
+    command = getattr(args, "goals_command", None)
+    if not command:
+        # Bare `hermes goals`: there is no sensible default action (the
+        # only operation, rejudge, requires a SESSION_ID), so refuse
+        # with usage instead of falling into the rejudge handler with a
+        # namespace that has no `session_id` attribute. Same family as
+        # argparse's own usage errors: exit 2, message on stderr.
+        print("Usage: hermes goals {rejudge}", file=sys.stderr)
+        print("Run 'hermes goals --help' for details.", file=sys.stderr)
+        return 2
     if command != "rejudge":
         print(f"Unknown goals command: {command}")
         return 2
+
+    from hermes_cli.goals import rejudge_goal
 
     sid = (args.session_id or "").strip()
     dry = bool(getattr(args, "dry_run", False))
