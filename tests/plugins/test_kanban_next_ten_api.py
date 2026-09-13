@@ -349,6 +349,73 @@ elif behavior == "unknown_data_foreign_nested":
     receipt["data"] = d
     emit(receipt)
     sys.exit(1)
+elif behavior == "unknown_data_count_mismatch":
+    # C10: claimed requested does not reconcile with returned + omitted.
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "incomplete commission; see per-item advice"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict):
+        d["requested"] = 99
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_requested_count_mismatch":
+    # C10 (scope): requested == returned + omitted but exceeds the number of
+    # unique cards actually selected (claims more than the request sent).
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "incomplete commission; see per-item advice"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict):
+        d["omitted"] = 1
+        d["requested"] = d.get("returned", 0) + 1
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_duplicate_item":
+    # C11: the same card identity is carried by more than one item.
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "partial"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict) and isinstance(d.get("items"), list) and d["items"]:
+        first = d["items"][0].get("card")
+        for item in d["items"]:
+            item["card"] = first
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_missing_card":
+    # Item card identity absent (null) -> must reject, not tolerate.
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "partial"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict) and isinstance(d.get("items"), list) and d["items"]:
+        d["items"][0].pop("card", None)
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_unhashable_card":
+    # Item card identity unhashable (dict) -> must reject, never throw 500.
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "partial"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict) and isinstance(d.get("items"), list) and d["items"]:
+        d["items"][0]["card"] = {{"not": "a string"}}
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
+elif behavior == "unknown_data_omitted":
+    # A valid omitted batch: requested == returned + omitted, one card
+    # returned, one omitted. This must be preserved, not dropped.
+    receipt["state"] = "UNKNOWN"
+    receipt["reason"] = "one card omitted; see per-item advice"
+    d = next_ten_data(tool, args)
+    if isinstance(d, dict) and isinstance(d.get("items"), list) and len(d["items"]) >= 2:
+        d["items"] = d["items"][:1]
+        d["returned"] = len(d["items"])
+        d["omitted"] = d.get("requested", 0) - d["returned"]
+    receipt["data"] = d
+    emit(receipt)
+    sys.exit(1)
 elif behavior == "oversized":
     receipt["data"] = {{"pad": "x" * 2000000}}
     emit(receipt)
@@ -908,6 +975,109 @@ def test_readiness_batch_nonzero_claimed_pass_rejected(client, helper_bin, evo_a
     assert "claiming PASS" in body["reason"]
     assert body["evidence"] is None
     assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_count_mismatch_dropped(client, helper_bin, evo_aligned):
+    """C10: a receipt whose requested count does not reconcile with
+    returned + omitted is inconsistent; its evidence must be dropped."""
+    helper_bin("unknown_data_count_mismatch")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_requested_count_mismatch_dropped(client, helper_bin, evo_aligned):
+    """C10 (scope): requested reconciles with returned + omitted but does not
+    match the number of unique cards actually selected."""
+    helper_bin("unknown_data_requested_count_mismatch")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_duplicate_item_dropped(client, helper_bin, evo_aligned):
+    """C11: the same card identity carried by more than one item is
+    inconsistent; evidence must be dropped."""
+    helper_bin("unknown_data_duplicate_item")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001", "t_00000002"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_missing_item_card_dropped(client, helper_bin, evo_aligned):
+    """Absent/null item.card must reject (drop evidence), never be tolerated."""
+    helper_bin("unknown_data_missing_card")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_unhashable_item_card_dropped(client, helper_bin, evo_aligned):
+    """An unhashable item.card must reject cleanly (evidence dropped), never
+    raise an unhandled TypeError that becomes a 500."""
+    helper_bin("unknown_data_unhashable_card")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert body["evidence"] is None
+    assert body["helper"]["execution_host"] == "unverified"
+
+
+def test_readiness_batch_omitted_batch_preserved(client, helper_bin, evo_aligned):
+    """A valid omitted batch (requested == returned + omitted) is preserved:
+    the omitted card is absent from items but counted, never dropped."""
+    helper_bin("unknown_data_omitted")
+    r = _post(
+        client,
+        "/workflow/readiness-batch?board=default",
+        {"cards": ["t_00000001", "t_00000002"], "check_model": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "UNKNOWN"
+    assert "exited 1" in body["reason"]
+    ev = body["evidence"]
+    assert isinstance(ev, dict)
+    assert ev["requested"] == 2
+    assert ev["returned"] == 1
+    assert ev["omitted"] == 1
+    assert ev["returned"] == len(ev["items"])
+    assert [i["card"] for i in ev["items"]] == ["t_00000001"]
+    assert ev["no_mutation_performed"] is True
+    assert body["helper"]["execution_host"] == "evo"
 
 
 def test_next_ten_allowlist_constant():

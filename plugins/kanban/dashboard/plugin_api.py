@@ -4942,14 +4942,21 @@ def _next_ten_pass_shape_error(tool: str, data: Any) -> Optional[str]:
                     f"PASS receipt for kanban_readiness_batch field "
                     f"{field!r} is not a non-negative integer"
                 )
-        if data.get("requested") != len(items) and data.get("returned") != len(items):
-            # One of the two must account for the carried items (omitted
-            # cards may be absent from items but counted in requested).
-            if data.get("returned") != len(items):
-                return (
-                    f"PASS receipt returned {data.get('returned')!r} does not "
-                    f"account for {len(items)} items"
-                )
+        returned = data.get("returned")
+        if returned != len(items):
+            # The returned count must account for exactly the carried items;
+            # omitted cards are absent from items but still counted in requested.
+            return (
+                f"PASS receipt returned {returned!r} does not equal the "
+                f"{len(items)} carried items"
+            )
+        if data.get("requested") != returned + data.get("omitted"):
+            # requested must reconcile with returned + omitted; a receipt that
+            # claims counts it did not deliver is inconsistent and untrusted.
+            return (
+                f"PASS receipt requested {data.get('requested')!r} does not equal "
+                f"returned ({returned!r}) + omitted ({data.get('omitted')!r})"
+            )
         if data.get("no_mutation_performed") is not True:
             return "PASS receipt for kanban_readiness_batch claims a mutation was performed"
     err = _need_observed_at()
@@ -4977,8 +4984,14 @@ def _next_ten_scope_error(
                 f"requested board {board!r}"
             )
         if tool == "kanban_readiness_batch":
+            requested_cards = set(args.get("cards") or [])
+            if data.get("requested") != len(requested_cards):
+                return (
+                    f"PASS receipt requested {data.get('requested')!r} does not "
+                    f"match the {len(requested_cards)} unique requested cards"
+                )
             item_error = _next_ten_batch_item_scope_error(
-                data, board, set(args.get("cards") or [])
+                data, board, requested_cards
             )
             if item_error:
                 return f"PASS receipt {item_error}"
@@ -5030,21 +5043,32 @@ def _next_ten_batch_item_scope_error(
     nested ``receipt.requested`` (when present) must re-echo the request's
     board and card. A foreign item card or a foreign nested request identity
     is a scope violation: the data is for a different read than the one
-    requested, so it must not be trusted. Absent echoes are tolerated (not
-    every adapter fills the nested request block); a mismatched echo is not.
+    requested, so it must not be trusted. Every item card must be a real
+    string identity (absent/null/unhashable cards are rejected), and a
+    duplicated card identity across items is rejected as inconsistent.
     """
     items = data.get("items")
     if not isinstance(items, list):
         return None
+    seen_cards: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
         item_card = item.get("card")
-        if item_card is not None and item_card not in requested_cards:
+        if not isinstance(item_card, str) or not item_card:
+            return (
+                f"readiness item card {item_card!r} is not a string identity"
+            )
+        if item_card not in requested_cards:
             return (
                 f"readiness item card {item_card!r} was not among the "
                 f"requested cards"
             )
+        if item_card in seen_cards:
+            return (
+                f"readiness item card {item_card!r} is duplicated in the batch"
+            )
+        seen_cards.add(item_card)
         nested = item.get("receipt")
         if isinstance(nested, dict):
             requested = nested.get("requested")
