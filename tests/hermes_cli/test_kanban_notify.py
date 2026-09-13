@@ -1150,9 +1150,17 @@ def test_gc_spares_reopened_task_even_when_old(kanban_home):
 
 
 def _set_task_status(kb, conn, tid, status):
-    """Force a task into ``status`` with a matching status event."""
+    """Force a task into ``status`` with a matching status event.
+
+    The block-reason guard triggers refuse a ``blocked`` row with an empty
+    reason, so a fixture that engineers blocked state must stamp one.
+    """
+    reason = "fixture: forced blocked for GC test" if status == "blocked" else None
     with kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+        conn.execute(
+            "UPDATE tasks SET status = ?, block_reason = ? WHERE id = ?",
+            (status, reason, tid),
+        )
         kb._append_event(conn, tid, "status", {"status": status})
 
 
