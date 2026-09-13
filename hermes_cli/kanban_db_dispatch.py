@@ -505,6 +505,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     error=error, metadata=payload,
                 )
                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+                _write_resume_note(
+                    conn, tid, run_id,
+                    outcome="timed_out", error=error,
+                )
                 timed_out.append(tid)
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -617,6 +621,11 @@ def detect_stale_running(
                 metadata=payload,
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
+            _write_resume_note(
+                conn, tid, run_id,
+                outcome="stale",
+                error=str(payload.get("heartbeat_age_seconds") or "no heartbeat"),
+            )
             reclaimed.append(tid)
 
     return reclaimed
@@ -978,6 +987,10 @@ def _reclaim_dead_workers(
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            _write_resume_note(
+                conn, row["id"], run_id,
+                outcome=dead.run_outcome, error=dead.error_text,
+            )
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1216,6 +1229,10 @@ def _record_task_failure(
                     {"error": error, "failures": failures, "retry_status": retry_status},
                     run_id=run_id,
                 )
+                if run_id is not None:
+                    _write_resume_note(
+                        conn, task_id, run_id, outcome=outcome, error=error,
+                    )
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
@@ -1255,6 +1272,10 @@ def _record_task_failure(
                     "retry_status": retry_status,
                 },
             )
+            if run_id is not None:
+                _write_resume_note(
+                    conn, task_id, run_id, outcome="gave_up", error=error,
+                )
         if event_payload_extra:
             payload.update(event_payload_extra)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
@@ -1269,6 +1290,94 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+# --- Automatic dispatcher resume note ---------------------------------------
+#
+# Every path that closes a run with a non-completed outcome writes one
+# self-contained ``author='dispatcher'`` comment so the retry worker resumes
+# from the previous attempt's real state instead of restarting blind
+# (hand-written precedent: the seven "Retry note from the parent" comments on
+# the align-apple-feel wave, 2026-09-13).
+#
+# ``_kb.RESUME_NOTE_AUTHOR`` / ``_kb.RESUME_NOTE_MARKER`` live in
+# ``kanban_db`` (single source) because ``build_worker_context`` hoists the
+# newest note above the attempt history; this module imports ``kanban_db``
+# late (bottom of file), so they are referenced through ``_kb`` at call time.
+
+
+def _worker_log_path(task_id: str) -> Optional[str]:
+    """Per-task worker log path if it exists on disk (TUI-rendered stdout)."""
+    try:
+        p = _kb.worker_logs_dir() / f"{task_id}.log"
+    except Exception:
+        return None
+    return str(p) if p.exists() else None
+
+
+def _write_resume_note(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int], *,
+    outcome: str, error: Optional[str] = None,
+) -> None:
+    """Insert the idempotent resume-note comment for ``run_id``.
+
+    Idempotency: one note per run. A re-sweep finds no live ``running`` row so
+    never gets here twice for the same run; the marker-scan guard makes that
+    structural instead of relying on the caller's discipline. Never raises —
+    the note is evidence, not bookkeeping that must succeed.
+    """
+    try:
+        if run_id is not None and conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND body LIKE ?",
+            (task_id, _kb.RESUME_NOTE_AUTHOR, f"%{_kb.RESUME_NOTE_MARKER}%run {run_id}%"),
+        ).fetchone():
+            return
+        row = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        workspace_path = _kb._row_get(row, "workspace_path") if row is not None else None
+        # Base SHA, opportunistic: the just-closed run's metadata (written by
+        # ``_end_run`` immediately before this call), else the ``tasks`` row
+        # when a future schema adds it (``_row_get`` is column-tolerant).
+        # Neither present -> the note builder derives it from
+        # ``git merge-base HEAD <default branch>``.
+        base_sha = None
+        meta = None
+        if run_id is not None:
+            run_row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            meta = _kb._json_or(run_row["metadata"]) if run_row is not None else None
+        if not isinstance(meta, dict) and row is not None:
+            meta = _kb._json_or(_kb._row_get(row, "metadata"))
+        if isinstance(meta, dict):
+            candidate = meta.get("base_sha") or meta.get("merge_base")
+            if isinstance(candidate, str) and candidate.strip():
+                base_sha = candidate.strip()
+        note_body = _kb.build_resume_note(
+            workspace_path, base_sha=base_sha,
+            run={"outcome": outcome, "error": error},
+            log_path=_worker_log_path(task_id),
+        )
+        body = (
+            f"{_kb.RESUME_NOTE_MARKER} — run {run_id} closed as ``{outcome}``. "
+            f"Resume from this state; do not redo committed work.\n\n{note_body}"
+        )
+        # Plain INSERT (not add_comment): caller holds the reclaim txn and
+        # add_comment would open a nested write_txn + emit a duplicate
+        # ``commented`` event per reclaim.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, _kb.RESUME_NOTE_AUTHOR, body, int(time.time())),
+        )
+        _kb._append_event(
+            conn, task_id, "resume_note",
+            {"run_id": run_id, "outcome": outcome}, run_id=run_id,
+        )
+    except Exception:
+        # Best-effort by contract; a note failure must never abort a reclaim.
+        pass
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:

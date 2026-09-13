@@ -2396,6 +2396,9 @@ def _record_reclaim(
     )
     payload.update(termination)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    # Late-bound global (bottom import) — resolves at call time, after the
+    # import cycle completes. One resume note per reclaimed run.
+    _write_resume_note(conn, task_id, run_id, outcome="reclaimed", error=error)  # noqa: F821
     return run_id
 
 
@@ -3647,11 +3650,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    comments = list_comments(conn, task_id)
     _ctx_attachments(lines, list_attachments(conn, task_id))
+    _ctx_resume_note(lines, comments)
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
+    _ctx_comments(lines, comments, now)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -4020,6 +4025,153 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 
 # --- Runs (attempt history on a task) ---
 
+# --- Dispatcher resume note (what the retry worker reads first) ---
+
+# Written by the dispatcher (kanban_db_dispatch) on every non-completed run;
+# defined here because build_worker_context hoists these above the attempt
+# history. ``dispatcher`` matches the hand-written "Retry note from the
+# parent" precedent on the align-apple-feel wave (2026-09-13).
+RESUME_NOTE_AUTHOR = "dispatcher"
+# Marker every generated note starts with; used for per-run idempotency in
+# the dispatcher. Never render user/worker text inside a generated note.
+RESUME_NOTE_MARKER = "Resume note (dispatcher)"
+
+
+def _ctx_resume_note(lines: list[str], comments: list[Comment]) -> None:
+    """Hoist the newest dispatcher resume note verbatim above the attempt
+    history so the retry worker reads the previous attempt's real state
+    before anything else. Only ``author == RESUME_NOTE_AUTHOR`` comments
+    qualify; everything else stays in the comment thread below. Newest =
+    last in ``list_comments`` order (``created_at ASC`` with insert order
+    breaking same-second ties)."""
+    newest = None
+    for c in comments:
+        if c.author == RESUME_NOTE_AUTHOR:
+            newest = c
+    if newest is None:
+        return
+    lines.append("## Resume note from the previous run")
+    lines.append(
+        "Written by the dispatcher when the previous run closed non-completed; "
+        "resume from this state, do not redo committed work."
+    )
+    lines.append(newest.body)
+    lines.append("")
+
+
+# Caps sized for one bounded comment row (``_CTX_MAX_COMMENT_BYTES`` headroom).
+RESUME_NOTE_MAX_COMMITS = 15
+RESUME_NOTE_MAX_STATUS = 20
+RESUME_NOTE_MAX_LOG_TOOL_LINES = 5
+# TUI-rendered tool-call markers in worker logs: ``┊ ⚡ tool_nam…   0.0s`` and
+# the plain fallback ``⚡ tool_name``. The name column is truncated by the TUI
+# (~8 chars); that's still enough to name the last action taken.
+_TOOL_LINE_RE = re.compile(r"^\s*.*⚡\s*(\S+)")
+
+
+def _last_tool_lines(log_path: Optional[str], cap: int) -> list[str]:
+    """Newest ``cap`` tool-call marker lines from a TUI-rendered worker log,
+    plain text (ANSI escapes stripped), order preserved."""
+    if not log_path or cap <= 0:
+        return []
+    try:
+        raw = Path(log_path).read_bytes()[-64 * 1024:]
+    except OSError:
+        return []
+    hits: list[str] = []
+    for line in raw.decode(errors="replace").splitlines():
+        m = _TOOL_LINE_RE.match(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line))
+        if m:
+            hits.append(f"⚡ {m.group(1)}")
+    return hits[-cap:]
+
+
+def build_resume_note(
+    workspace_path: Optional[str],
+    *,
+    base_sha: Optional[str],
+    run: Any,
+    log_path: Optional[str] = None,
+) -> str:
+    """One bounded, self-contained handoff note for the retry worker:
+    commits since base, dirty files, the last tool calls from the worker log,
+    and the closing run's outcome/error. Pure (no DB) and total — a non-git
+    workspace yields a note that says so; NOTHING here may raise, because the
+    dispatcher calls it inside its reclaim transaction.
+
+    ``base_sha``: explicit base (task metadata wins). ``None``: derive from
+    ``git merge-base HEAD <default branch>`` (origin/main → main → master).
+    ``run``: the just-closed ``Run`` (or a mapping with ``outcome``/``error``).
+    """
+    lines: list[str] = []
+
+    # --- Run outcome first: the one line that always exists. ---
+    outcome = error = None
+    if isinstance(run, Run):
+        outcome, error = run.outcome, run.error
+    elif isinstance(run, dict):
+        outcome, error = run.get("outcome"), run.get("error")
+    if outcome:
+        lines.append(f"Previous run outcome: {outcome}")
+    if error:
+        lines.append(f"Previous run error: {_first_line(error, 300)}")
+
+    # --- Workspace evidence (git), best-effort. ---
+    if workspace_path and os.path.isdir(workspace_path):
+        base = (base_sha or "").strip() or _resolve_git_base(workspace_path)
+        if base:
+            log = _git_out(Path(workspace_path), "log", "--oneline", f"{base}..HEAD") or ""
+            commits = [l for l in log.splitlines() if l.strip()]
+            if commits:
+                lines.append(f"Commits since {base[:12]} ({len(commits)} total):")
+                # ``git log`` is newest-first: the head of the list is the
+                # state the retry worker resumes from — keep it, drop the tail.
+                lines.extend(commits[:RESUME_NOTE_MAX_COMMITS])
+                if len(commits) > RESUME_NOTE_MAX_COMMITS:
+                    lines.append(
+                        f"_(and {len(commits) - RESUME_NOTE_MAX_COMMITS} older; "
+                        f"showing newest {RESUME_NOTE_MAX_COMMITS})_"
+                    )
+            else:
+                lines.append(f"No commits since {base[:12]}.")
+            status = _git_out(Path(workspace_path), "status", "--short") or ""
+            entries = [l for l in status.splitlines() if l.strip()]
+            if entries:
+                lines.append(f"Dirty files ({len(entries)}):")
+                lines.extend(entries[:RESUME_NOTE_MAX_STATUS])
+                if len(entries) > RESUME_NOTE_MAX_STATUS:
+                    lines.append(
+                        f"_(and {len(entries) - RESUME_NOTE_MAX_STATUS} more; "
+                        f"showing first {RESUME_NOTE_MAX_STATUS})_"
+                    )
+            else:
+                lines.append("Working tree clean.")
+        else:
+            lines.append(f"Workspace is not a git repository: {workspace_path}")
+    elif workspace_path:
+        lines.append(f"Workspace path missing on disk: {workspace_path}")
+    else:
+        lines.append("No workspace path recorded for this task.")
+
+    # --- Worker log evidence, best-effort. ---
+    tool_lines = _last_tool_lines(log_path, RESUME_NOTE_MAX_LOG_TOOL_LINES)
+    if tool_lines:
+        lines.append("Last tool calls (oldest→newest):")
+        lines.extend(tool_lines)
+
+    return "\n".join(lines)
+
+
+def _resolve_git_base(workspace: str) -> Optional[str]:
+    """Merge-base of HEAD against the first resolvable default branch
+    (``origin/main``, local ``main``, ``origin/master``, ``master``)."""
+    for ref in ("origin/main", "main", "origin/master", "master"):
+        out = _git_out(Path(workspace), "merge-base", "HEAD", ref)
+        if out and out.strip():
+            return out.strip()
+    return None
+
+
 def list_runs(
     conn: sqlite3.Connection, task_id: str, *, include_active: bool = True,
     state_type: Optional[str] = None, state_name: Optional[str] = None,
@@ -4114,6 +4266,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _terminate_reclaimed_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    _write_resume_note,
 )
 
 
