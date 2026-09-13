@@ -117,6 +117,10 @@ export interface ReadinessReceipt {
   freshness?: { checked_at?: number; stale_after?: number; note?: string }
   ready_to_release?: boolean
   checks?: ReadinessCheck[]
+  /** Next-repair preview, derived ONLY from failed/unknown checks; passing
+   *  checks are omitted. Each action is a text preview, never executable
+   *  shell from untrusted data. */
+  repair_preview?: RepairPreview[]
   boundary?: string
   reason?: string
 }
@@ -176,4 +180,126 @@ export interface HoldReceipt {
   read_back?: Record<string, unknown>
   warning?: string
   reason?: string
+}
+
+// ── next-ten: release identity / browser readiness / acceptance compare /
+//    reviewer packet / attachment provenance / readiness batch ───────────────
+
+/** One release identity (adapter or backend) from GET /evidence/releases. The
+ *  served adapter identity is the ONLY adapter identity — never live main
+ *  HEAD. Absent or invalid identity is UNKNOWN. */
+export interface ReleaseIdentity {
+  state: 'PASS' | 'FAIL' | 'UNKNOWN'
+  revision?: null | string
+  source?: null | string
+}
+
+/** GET /evidence/releases evidence payload: board + adapter + backend
+ *  identity. The FRONTEND adds its own build stamp locally (see support.tsx),
+ *  never served by this endpoint. */
+export interface ReleasesData {
+  board?: string
+  adapter?: ReleaseIdentity
+  backend?: ReleaseIdentity
+  observed_at?: number
+}
+
+/** GET /evidence/browser-readiness returns the standard envelope (state +
+ *  board + evidence + reason/remedy); `evidence` is the readiness triple. */
+export interface BrowserReadinessEvidence {
+  reachable: boolean
+  authenticated: boolean
+  board_readable: boolean
+  observed_at?: number
+}
+
+/** One acceptance check compared across two runs. `change` distinguishes a
+ *  parent attestation from machine validation and reports reverified /
+ *  regressed / new / unproved. `source` is the check's ORIGIN as emitted by
+ *  the adapter (`parent` = the parent's attestation, `machine` = this
+ *  machine's own validation, `unknown` = no origin). */
+export interface AcceptanceCheck {
+  name: string
+  current: string
+  previous: string
+  change: 'reverified' | 'regressed' | 'new' | 'unproved'
+  /** Origin of the check: parent attestation vs machine validation. */
+  source?: 'parent' | 'machine' | 'unknown'
+}
+
+/** GET /evidence/acceptance-compare evidence payload. Missing historical
+ *  receipt is UNKNOWN, never invented. */
+export interface AcceptanceCompareData {
+  board?: string
+  card?: string
+  current?: Record<string, unknown>
+  previous?: Record<string, unknown>
+  checks?: AcceptanceCheck[]
+  limitations?: string[]
+  observed_at?: number
+}
+
+/** The compact allowlisted packet (schema_version 1). No raw body/result/log/
+ *  comments/argv/env/stored_path or content reads. */
+export interface ReviewerPacket {
+  identity?: Record<string, unknown>
+  task?: Record<string, unknown>
+  worker?: Record<string, unknown>
+  runs?: unknown[]
+  attachments?: unknown[]
+  acceptance?: Record<string, unknown>
+}
+
+/** GET /evidence/reviewer-packet evidence payload. */
+export interface ReviewerPacketData {
+  schema_version: number
+  board?: string
+  card?: string
+  observed_at?: number
+  packet?: ReviewerPacket
+  bounds?: Record<string, unknown>
+  limitations?: string[]
+}
+
+/** GET /evidence/attachment-provenance evidence payload. `accepted_run_id` is
+ *  linked ONLY from an actual persisted guarded receipt association — an
+ *  attachment existing beside a done card is not acceptance. */
+export interface AttachmentProvenanceData {
+  board?: string
+  card?: string
+  attachment_id?: null | number
+  accepted_run_id?: null | number
+  acceptance_state: 'PASS' | 'FAIL' | 'UNKNOWN'
+  reason?: string
+  observed_at?: number
+}
+
+/** One next-repair preview: a TEXT action preview derived only from a failed/
+ *  unknown check. Never executable shell from untrusted data. */
+export interface RepairPreview {
+  check: string
+  state: 'PASS' | 'FAIL' | 'UNKNOWN'
+  action: string
+  reason?: string
+}
+
+/** One card's readiness-batch result. */
+export interface ReadinessBatchItem {
+  card: string
+  state: 'PASS' | 'FAIL' | 'UNKNOWN'
+  receipt?: ReadinessReceipt
+  repair_preview?: RepairPreview[]
+}
+
+/** POST /workflow/readiness-batch evidence payload. Read-only: never
+ *  dispatches, releases or writes config. Every per-card failure is visible;
+ *  there is no all-clear from a partial result. */
+export interface ReadinessBatchData {
+  board?: string
+  items?: ReadinessBatchItem[]
+  requested?: number
+  returned?: number
+  omitted?: number
+  observed_at?: number
+  no_mutation_performed?: boolean
 }

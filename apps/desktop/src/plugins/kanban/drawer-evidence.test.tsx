@@ -35,7 +35,10 @@ const apiMock = vi.hoisted(() => ({
   fetchProfiles: vi.fn(),
   fetchOrchestration: vi.fn(),
   fetchEvidencePage: vi.fn(),
-  fetchAttachmentDownload: vi.fn()
+  fetchAttachmentDownload: vi.fn(),
+  fetchAttachmentProvenance: vi.fn(),
+  fetchAcceptanceCompare: vi.fn(),
+  fetchReviewerPacket: vi.fn()
 }))
 
 vi.mock('./api', async importOriginal => {
@@ -52,7 +55,10 @@ vi.mock('./api', async importOriginal => {
     fetchProfiles: apiMock.fetchProfiles,
     fetchOrchestration: apiMock.fetchOrchestration,
     fetchEvidencePage: apiMock.fetchEvidencePage,
-    fetchAttachmentDownload: apiMock.fetchAttachmentDownload
+    fetchAttachmentDownload: apiMock.fetchAttachmentDownload,
+    fetchAttachmentProvenance: apiMock.fetchAttachmentProvenance,
+    fetchAcceptanceCompare: apiMock.fetchAcceptanceCompare,
+    fetchReviewerPacket: apiMock.fetchReviewerPacket
   }
 })
 
@@ -161,6 +167,18 @@ beforeEach(() => {
     content_type: 'text/plain',
     size: 6,
     content_base64: btoa('hello!')
+  })
+  apiMock.fetchAttachmentProvenance.mockResolvedValue({
+    state: 'PASS',
+    evidence: {
+      board: 'evo',
+      card: 't_1',
+      attachment_id: 7,
+      accepted_run_id: null,
+      acceptance_state: 'UNKNOWN',
+      reason: 'no guarded receipt',
+      observed_at: 1
+    }
   })
   getGlobalModelOptions.mockResolvedValue({ providers: [] })
 })
@@ -431,5 +449,200 @@ describe('TaskDrawer — evo repair controls', () => {
     expect(screen.getByText('second run summary')).toBeTruthy()
     expect(screen.queryByText('first run summary')).toBeNull()
     expect(screen.queryByText('stale third run')).toBeNull()
+  })
+})
+
+// ── R8 — attachment provenance (reverse-link to accepted run or unknown) ─────
+describe('TaskDrawer — R8 attachment provenance', () => {
+  it('links an attachment to its accepted run from the guarded receipt', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        attachment_id: 7,
+        accepted_run_id: 43,
+        acceptance_state: 'PASS',
+        reason: 'guarded receipt associated',
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText('accepted run 43')).toBeTruthy()
+  })
+
+  it('shows acceptance unknown (not acceptance) when there is no guarded receipt', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    // beforeEach default: accepted_run_id null, acceptance_state UNKNOWN.
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText('acceptance unknown')).toBeTruthy()
+  })
+
+  it('distinguishes absent receipt (UNKNOWN transport) from acceptance-unknown', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    // The adapter's absent-receipt shape: state UNKNOWN, no guarded receipt.
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'UNKNOWN',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        attachment_id: 7,
+        accepted_run_id: null,
+        acceptance_state: 'UNKNOWN',
+        reason: 'no persisted guarded acceptance receipt',
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText('no acceptance receipt')).toBeTruthy()
+  })
+
+  it('labels rejected acceptance (PASS transport, acceptance_state FAIL) — never "accepted run"', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        attachment_id: 7,
+        accepted_run_id: 9,
+        acceptance_state: 'FAIL',
+        reason: 'guarded receipt verdict FAIL',
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText('acceptance rejected')).toBeTruthy()
+    expect(screen.queryByText(/accepted run/)).toBeNull()
+  })
+
+  it('labels a failed lookup (FAIL transport) distinctly from a missing receipt', async () => {
+    apiMock.fetchEvidencePage.mockImplementation((_slug, resource) =>
+      resource === 'attachments'
+        ? Promise.resolve(page([attachment(7, 'report.txt')], false, null))
+        : Promise.resolve(emptyPage())
+    )
+    apiMock.fetchAttachmentProvenance.mockResolvedValue({
+      state: 'FAIL',
+      evidence: null,
+      reason: 'attachment belongs to a different card',
+      observed_at: 1
+    })
+
+    renderDrawer()
+
+    expect(await screen.findByText('report.txt')).toBeTruthy()
+    expect(await screen.findByText(/provenance lookup failed: attachment belongs to a different card/)).toBeTruthy()
+  })
+})
+
+// ── R4 — current vs previous run acceptance comparison ───────────────────────
+describe('TaskDrawer — R4 acceptance comparison', () => {
+  it('compares two run ids and shows the per-check change verdict', async () => {
+    apiMock.fetchAcceptanceCompare.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        checks: [{ name: 'release_identity', current: 'PASS', previous: 'UNKNOWN', change: 'new' }],
+        limitations: [],
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    fireEvent.change(await screen.findByLabelText('Current run id'), { target: { value: '10' } })
+    fireEvent.change(screen.getByLabelText('Previous run id'), { target: { value: '9' } })
+    fireEvent.click(screen.getByText('Compare'))
+
+    expect(await screen.findByText('release_identity')).toBeTruthy()
+    expect(screen.getByText('new')).toBeTruthy()
+    expect(screen.getByText(/UNKNOWN → PASS/)).toBeTruthy()
+    expect(apiMock.fetchAcceptanceCompare).toHaveBeenCalledWith('evo', 't_1', 10, 9)
+  })
+
+  it('renders each check origin — parent attestation vs machine validation, unknown origin labelled', async () => {
+    apiMock.fetchAcceptanceCompare.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        board: 'evo',
+        card: 't_1',
+        checks: [
+          { name: 'release_identity', current: 'PASS', previous: 'PASS', change: 'reverified', source: 'machine' },
+          { name: 'parent:source_validation', current: 'PASS', previous: 'PASS', change: 'reverified', source: 'parent' },
+          { name: 'adapter_identity', current: 'PASS', previous: 'UNKNOWN', change: 'new' }
+        ],
+        limitations: [],
+        observed_at: 1
+      }
+    })
+
+    renderDrawer()
+
+    fireEvent.change(await screen.findByLabelText('Current run id'), { target: { value: '10' } })
+    fireEvent.change(screen.getByLabelText('Previous run id'), { target: { value: '9' } })
+    fireEvent.click(screen.getByText('Compare'))
+
+    expect(await screen.findByText('machine validation')).toBeTruthy()
+    expect(screen.getByText('parent attestation')).toBeTruthy()
+    expect(screen.getByText('unknown origin')).toBeTruthy()
+  })
+})
+
+// ── R6 — reviewer-packet export (real Blob download) ─────────────────────────
+describe('TaskDrawer — R6 reviewer packet export', () => {
+  it('downloads the compact packet as a real JSON Blob, never clipboard text', async () => {
+    apiMock.fetchReviewerPacket.mockResolvedValue({
+      state: 'PASS',
+      evidence: {
+        schema_version: 1,
+        board: 'evo',
+        card: 't_1',
+        packet: { identity: { adapter: 'adapter-abc123' }, task: { id: 't_1', title: 'Review me' } },
+        bounds: {},
+        limitations: []
+      }
+    })
+
+    renderDrawer()
+
+    fireEvent.click(await screen.findByText('Export packet (JSON)'))
+
+    await waitFor(() => expect(capturedBlob).not.toBeNull())
+    expect(capturedBlob!.type).toBe('application/json')
+    const text = await capturedBlob!.text()
+    const parsed = JSON.parse(text)
+    expect(parsed.packet.task.title).toBe('Review me')
+    expect(clickedAnchor?.download).toBe('reviewer-packet-t_1.json')
   })
 })

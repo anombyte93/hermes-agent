@@ -768,3 +768,123 @@ describe('exact-card action', () => {
     expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
   })
 })
+
+describe('R5 — meaningful-intervention dedup', () => {
+  it('an unchanged blocked reason is quiet on repeat, a changed reason notifies', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // First block (reason "needs input") notifies.
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Same reason, new event id — quiet (unchanged intervention).
+    const quiet = await m.onKanbanEventsFrame('smoke', [ev(102, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(quiet).toBe(false)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Changed reason — notifies.
+    const changed = await m.onKanbanEventsFrame('smoke', [ev(103, 'blocked', { reason: 'different blocker' }, 't_x')])
+    expect(changed).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('a new run (spawned) clears the fingerprint so an identical block notifies again', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // New run starts (spawned) — clears the fingerprint.
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'spawned', null, 't_x')])
+
+    // Identical block after a new run — notifies again.
+    const refired = await m.onKanbanEventsFrame('smoke', [ev(103, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(refired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('recovery (unblocked) clears the fingerprint so a later identical block notifies', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Recovery — worker unblocked.
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'unblocked', null, 't_x')])
+
+    // Same block reason after recovery — notifies again.
+    const refired = await m.onKanbanEventsFrame('smoke', [ev(103, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(refired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('completion notifications are never fingerprint-deduped', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done' }, 't_x')])
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'completed', { summary: 'Done' }, 't_x')])
+
+    // Two completions with the same summary both notify (progress, not intervention).
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('intervention fingerprints are board-isolated', async () => {
+    const latest = new Map<string, number>([
+      ['a', 100],
+      ['b', 200]
+    ])
+
+    const m = await loadModule()
+
+    const rest = vi.fn(async (path: string) => {
+      if (path.startsWith('/events/baseline')) {
+        const slug = new URLSearchParams(path.split('?')[1]).get('board') ?? ''
+
+        return { state: 'PASS', board: slug, evidence: { baseline_id: latest.get(slug) ?? 0 } }
+      }
+
+      throw new Error(`unexpected rest call: ${path}`)
+    })
+
+    m.bindCompletionNotify(rest as never)
+
+    // Same reason blocks on board a — the second is quiet.
+    await m.onKanbanEventsFrame('a', [ev(101, 'blocked', { reason: 'needs input' }, 't_x')])
+    await m.onKanbanEventsFrame('a', [ev(102, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // The same reason on board b (different board) must still notify — the
+    // fingerprint map is keyed by board+task.
+    const refired = await m.onKanbanEventsFrame('b', [ev(201, 'blocked', { reason: 'needs input' }, 't_x')])
+    expect(refired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('a re-block under a NEW run id (missed claim frame) notifies — run_id is part of the fingerprint', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // First block under run 7.
+    const block1 = { id: 101, kind: 'blocked', task_id: 't_x', run_id: 7, payload: { reason: 'needs input' } } as CompletionEvent
+    await m.onKanbanEventsFrame('smoke', [block1])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Same reason, NEW run id (8), with no claim/spawn frame reaching the
+    // renderer in between (socket gap). This is a NEW intervention: the
+    // fingerprint includes run_id, so it notifies instead of staying quiet.
+    const block2 = { id: 102, kind: 'blocked', task_id: 't_x', run_id: 8, payload: { reason: 'needs input' } } as CompletionEvent
+    const refired = await m.onKanbanEventsFrame('smoke', [block2])
+    expect(refired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+
+    // Same run id (8) + same reason again → still quiet (unchanged intervention).
+    const block3 = { id: 103, kind: 'blocked', task_id: 't_x', run_id: 8, payload: { reason: 'needs input' } } as CompletionEvent
+    const quiet = await m.onKanbanEventsFrame('smoke', [block3])
+    expect(quiet).toBe(false)
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+})
