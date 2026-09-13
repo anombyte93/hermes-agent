@@ -83,6 +83,7 @@ import { TaskDrawer } from './drawer'
 import { type BoardEvidence, EvidenceStateBadge, useBoardEvidence, viewsToBoardColumns, type WorkerState } from './evidence'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
+import { SupportPanel } from './support'
 import { COLUMN_META, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
@@ -1151,6 +1152,7 @@ export function KanbanBoardPage() {
   const [addStatus, setAddStatus] = useState<null | string>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [workflowOpen, setWorkflowOpen] = useState(false)
+  const [supportOpen, setSupportOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
@@ -1470,6 +1472,17 @@ export function KanbanBoardPage() {
               <Codicon name="organization" size="0.85rem" />
             </Button>
           </Tip>
+          <Tip label="Support">
+            <Button
+              aria-label="Support"
+              className={cn(supportOpen && 'bg-(--ui-control-active-background) text-foreground')}
+              onClick={() => setSupportOpen(!supportOpen)}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name="info" size="0.85rem" />
+            </Button>
+          </Tip>
           <Button onClick={() => setAddStatus('triage')} size="sm">
             <Codicon name="add" size="0.8rem" />
             {k.newTask}
@@ -1479,6 +1492,7 @@ export function KanbanBoardPage() {
 
       {settingsOpen && <OrchestrationPanel />}
       {workflowOpen && <BoardWorkflowPanel />}
+      {supportOpen && <SupportPanel />}
 
       {board && <Intro />}
 
@@ -1540,6 +1554,14 @@ export function KanbanBoardPage() {
               )
             })}
           </div>
+          {alignedEvidence && alignedEvidence.error === null && alignedEvidence.snapshotChanged && (
+            <div className="flex items-center justify-center gap-2 px-4 py-1">
+              <span className="inline-flex items-center gap-1 text-[0.625rem] text-amber-500">
+                <Codicon name="refresh" size="0.7rem" />
+                Snapshot changed — paging restarted
+              </span>
+            </div>
+          )}
           {alignedEvidence && alignedEvidence.error === null && alignedEvidence.hasMore && (
             <div className="flex items-center justify-center gap-2 px-4 py-1.5">
               <Button

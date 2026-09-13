@@ -65,6 +65,7 @@ const h = vi.hoisted(() => {
     draftContinuation: vi.fn(),
     continueCard: vi.fn(),
     holdCard: vi.fn(),
+    fetchReadinessBatch: vi.fn(),
     // Dispatch/creation — must never fire from any workflow action.
     nudgeDispatcher: vi.fn()
   }
@@ -145,6 +146,7 @@ vi.mock('./api', async () => {
     draftContinuation: h.fetch.draftContinuation,
     continueCard: h.fetch.continueCard,
     holdCard: h.fetch.holdCard,
+    fetchReadinessBatch: h.fetch.fetchReadinessBatch,
     nudgeDispatcher: h.fetch.nudgeDispatcher
   }
 })
@@ -200,6 +202,7 @@ beforeEach(() => {
   h.fetch.draftContinuation.mockReset()
   h.fetch.continueCard.mockReset()
   h.fetch.holdCard.mockReset()
+  h.fetch.fetchReadinessBatch.mockReset()
   h.fetch.nudgeDispatcher.mockReset()
   h.fetch.createTask.mockReset()
   h.atoms.$boardSlug.set('')
@@ -609,5 +612,214 @@ describe('KanbanBoardPage workflow wiring', () => {
 
     // The page consumes the request (the drawer opens) and clears the atom.
     await waitFor(() => expect($openCard.get()).toBeNull())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// R3 — next-repair preview (text only, never executed)
+// ---------------------------------------------------------------------------
+
+describe('CardWorkflowPanel — R3 repair preview', () => {
+  it('renders the next-repair preview from failed checks, as a text action never applied', async () => {
+    h.fetch.runReadiness.mockResolvedValue(
+      envelope(
+        {
+          state: 'FAIL',
+          ready_to_release: false,
+          checks: [{ name: 'board_permission', state: 'FAIL', reason: 'read-only for this board', mutation_authorized: false }],
+          repair_preview: [
+            { check: 'board_permission', state: 'FAIL', action: 'Set the board writable in config.yaml', reason: 'read-only' }
+          ]
+        },
+        'PASS'
+      )
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByText('Check readiness'))
+
+    expect(await screen.findByText('Next repair (preview)')).toBeTruthy()
+    expect(screen.getByText(/Set the board writable in config.yaml/)).toBeTruthy()
+    expect(screen.getByText(/preview — not applied/)).toBeTruthy()
+    expect(h.fetch.nudgeDispatcher).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// R9 — readiness batch preview (select held cards, never bulk-release)
+// ---------------------------------------------------------------------------
+
+describe('BoardWorkflowPanel — R9 readiness batch', () => {
+  it('previews readiness for selected held cards and never releases', async () => {
+    h.fetch.fetchEvidenceSnapshot.mockImplementation((slug: string, status: string) =>
+      status === 'blocked'
+        ? Promise.resolve(
+            envelope({
+              board: 'evo',
+              cards: [
+                { id: 't_held1', title: 'Held card one', status: 'blocked' },
+                { id: 't_held2', title: 'Held card two', status: 'blocked' }
+              ],
+              counts: { by_status: { blocked: 2 }, total: 2 }
+            })
+          )
+        : Promise.resolve(envelope({ board: 'evo', cards: [], counts: { by_status: {}, total: 0 } }))
+    )
+    h.fetch.fetchReadinessBatch.mockResolvedValue(
+      envelope({
+        board: 'evo',
+        items: [
+          {
+            card: 't_held1',
+            state: 'FAIL',
+            repair_preview: [{ check: 'profile_exists', state: 'FAIL', action: 'Assign a profile', reason: 'no assignee' }]
+          }
+        ],
+        requested: 1,
+        returned: 1,
+        omitted: 0,
+        no_mutation_performed: true
+      })
+    )
+
+    renderBoardPanel()
+
+    fireEvent.click(await screen.findByText('Preview held cards'))
+    expect(await screen.findByText('Held card one')).toBeTruthy()
+
+    // Select one held card, then preview.
+    fireEvent.click(screen.getAllByRole('checkbox')[0])
+    fireEvent.click(screen.getByText('Preview readiness'))
+
+    expect(await screen.findByText('t_held1')).toBeTruthy()
+    expect(screen.getByText(/Assign a profile/)).toBeTruthy()
+    expect(screen.getByText(/no mutation performed/)).toBeTruthy()
+    expect(h.fetch.fetchReadinessBatch).toHaveBeenCalledWith('evo', ['t_held1'], false)
+    expect(h.fetch.nudgeDispatcher).not.toHaveBeenCalled()
+  })
+
+  it('a FAIL batch envelope surfaces its reason, never an all-clear', async () => {
+    h.fetch.fetchEvidenceSnapshot.mockResolvedValue(
+      envelope({
+        board: 'evo',
+        cards: [{ id: 't_held1', title: 'Held card one', status: 'blocked' }],
+        counts: { by_status: { blocked: 1 }, total: 1 }
+      })
+    )
+    h.fetch.fetchReadinessBatch.mockResolvedValue(envelope(null, 'FAIL', { reason: 'board database absent' }))
+
+    renderBoardPanel()
+
+    fireEvent.click(await screen.findByText('Preview held cards'))
+    // Wait for the held card list to render before selecting a card.
+    await screen.findByText('Held card one')
+    fireEvent.click(screen.getAllByRole('checkbox')[0])
+    fireEvent.click(screen.getByText('Preview readiness'))
+
+    expect(await screen.findByText(/Readiness batch fail/)).toBeTruthy()
+    expect(h.fetch.nudgeDispatcher).not.toHaveBeenCalled()
+  })
+
+  it('exposes the held-card 100-cap omission and pages the rest via the snapshot cursor', async () => {
+    h.fetch.fetchEvidenceSnapshot.mockImplementation((slug: string, status: string, cursor: null | string) => {
+      if (status !== 'blocked') {
+        return Promise.resolve(envelope({ board: 'evo', cards: [], counts: { by_status: {}, total: 0 } }))
+      }
+
+      return cursor
+        ? Promise.resolve(
+            envelope({
+              board: 'evo',
+              cards: [{ id: 't_held101', title: 'Held card 101', status: 'blocked' }],
+              counts: { by_status: { blocked: 101 }, total: 101, omitted: 0 },
+              has_more: false,
+              next_cursor: null,
+              omitted: 0
+            })
+          )
+        : Promise.resolve(
+            envelope({
+              board: 'evo',
+              cards: [{ id: 't_held1', title: 'Held card one', status: 'blocked' }],
+              counts: { by_status: { blocked: 101 }, total: 101, omitted: 100 },
+              has_more: true,
+              next_cursor: 'p2',
+              omitted: 100
+            })
+          )
+    })
+    h.fetch.fetchReadinessBatch.mockResolvedValue(envelope(null, 'PASS', {}))
+
+    renderBoardPanel()
+
+    fireEvent.click(await screen.findByText('Preview held cards'))
+    await screen.findByText('Held card one')
+
+    // The omitted tail is exposed, never silently dropped.
+    expect(await screen.findByText(/\+100 held cards omitted/)).toBeTruthy()
+
+    // A path to the further held cards exists via the snapshot cursor.
+    fireEvent.click(screen.getByText('Load more held cards'))
+    expect(await screen.findByText('Held card 101')).toBeTruthy()
+    expect(h.fetch.fetchEvidenceSnapshot).toHaveBeenLastCalledWith('evo', 'blocked', 'p2', 100)
+  })
+
+  it('a late batch response for a stale selection is discarded, never painted under the new selection', async () => {
+    let resolveBatch!: (value: unknown) => void
+
+    const pendingBatch = new Promise<unknown>(resolve => {
+      resolveBatch = resolve
+    })
+
+    h.fetch.fetchEvidenceSnapshot.mockImplementation((slug: string, status: string) =>
+      status === 'blocked'
+        ? Promise.resolve(
+            envelope({
+              board: 'evo',
+              cards: [
+                { id: 't_held1', title: 'Held card one', status: 'blocked' },
+                { id: 't_held2', title: 'Held card two', status: 'blocked' }
+              ],
+              counts: { by_status: { blocked: 2 }, total: 2 }
+            })
+          )
+        : Promise.resolve(envelope({ board: 'evo', cards: [], counts: { by_status: {}, total: 0 } }))
+    )
+    h.fetch.fetchReadinessBatch.mockImplementation(() => pendingBatch)
+
+    renderBoardPanel()
+
+    fireEvent.click(await screen.findByText('Preview held cards'))
+    await screen.findByText('Held card one')
+    const checkboxes = screen.getAllByRole('checkbox')
+    fireEvent.click(checkboxes[0]) // select t_held1
+    fireEvent.click(screen.getByText('Preview readiness'))
+
+    // While the t_held1 batch is in flight, change the selection (unselect
+    // t_held1, select t_held2) — this bumps the generation.
+    await act(async () => {
+      fireEvent.click(checkboxes[0]) // unselect t_held1
+      fireEvent.click(checkboxes[1]) // select t_held2
+    })
+
+    // The stale t_held1 response resolves late — it must not paint under the
+    // t_held2 selection.
+    await act(async () => {
+      resolveBatch(
+        envelope({
+          board: 'evo',
+          items: [{ card: 't_held1', state: 'PASS', repair_preview: [] }],
+          requested: 1,
+          returned: 1,
+          omitted: 0,
+          no_mutation_performed: true
+        })
+      )
+      await Promise.resolve()
+    })
+
+    // The stale result for t_held1 is never painted (the result section would
+    // show its card id); no all-clear appears either.
+    expect(screen.queryByText(/1 returned/)).toBeNull()
   })
 })

@@ -16,7 +16,7 @@
  */
 
 import { Codicon, useQuery, useValue } from '@hermes/plugin-sdk'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   $boardSlug,
@@ -217,6 +217,10 @@ export type BoardEvidence =
       hasMore: boolean
       nextCursor: null | string
       observedAt: null | number
+      /** True when the first page's observed_at advanced while later pages were
+       *  loaded (a refresh/board-switch dropped them) — the snapshot changed and
+       *  paging restarted. Rendered as an explicit "snapshot changed" note. */
+      snapshotChanged: boolean
       error: null | string
       loadMoreError: null | string
       loadMore: () => void
@@ -238,6 +242,7 @@ function alignedError(error: string): Extract<BoardEvidence, { phase: 'aligned' 
     hasMore: false,
     nextCursor: null,
     observedAt: null,
+    snapshotChanged: false,
     error,
     loadMoreError: null,
     loadMore: () => undefined,
@@ -264,6 +269,7 @@ export function useBoardEvidence(): BoardEvidence {
 
   const [loadingMore, setLoadingMore] = useState(false)
   const [loadMoreError, setLoadMoreError] = useState<null | string>(null)
+  const [snapshotChanged, setSnapshotChanged] = useState(false)
   const loadingRef = useRef(false)
 
   const snapshot = snapshotEnvelope?.state === 'PASS' ? snapshotEnvelope.evidence : null
@@ -272,6 +278,15 @@ export function useBoardEvidence(): BoardEvidence {
   // Guard against the past: pages stamped with an older observed_at (or board)
   // are dropped once the first page's timestamp advances.
   const liveExtra = extra.observedAt === observedAt ? extra : { observedAt, cards: [], cursor: null, hasMore: false }
+
+  // When a refresh/board-switch advances the first page's stamp while later
+  // pages were loaded, those pages are dropped and paging restarted — surface
+  // it as an explicit "snapshot changed" signal (R10).
+  useEffect(() => {
+    if (extra.observedAt !== null && extra.observedAt !== observedAt) {
+      setSnapshotChanged(true)
+    }
+  }, [extra.observedAt, observedAt])
 
   const firstCards = useMemo(() => snapshotCardsToViews(snapshot), [snapshot])
 
@@ -310,6 +325,7 @@ export function useBoardEvidence(): BoardEvidence {
     loadingRef.current = true
     setLoadingMore(true)
     setLoadMoreError(null)
+    setSnapshotChanged(false)
 
     fetchEvidenceSnapshot(slug, 'all', cursor)
       .then(envelope => {
@@ -369,6 +385,7 @@ export function useBoardEvidence(): BoardEvidence {
     hasMore,
     nextCursor,
     observedAt,
+    snapshotChanged,
     error: null,
     loadMoreError,
     loadMore,

@@ -28,6 +28,7 @@ import {
 } from '@hermes/plugin-sdk'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 
+import { AcceptanceCompareSection, ReviewerPacketSection } from './acceptance'
 import {
   addComment,
   deleteTask,
@@ -840,6 +841,8 @@ export function TaskDrawer({
                 the selected board is identity-aligned with the EVO database. */}
             <WorkerEvidenceSection id={task.id} />
             {aligned && <CardWorkflowPanel card={task.id} slug={slug} />}
+            {aligned && <AcceptanceCompareSection card={task.id} slug={slug} />}
+            {aligned && <ReviewerPacketSection card={task.id} slug={slug} />}
 
             {/* Aligned history: paged runs/events/attachments + authenticated
                 download. The legacy sections below render only when unaligned. */}
