@@ -40,7 +40,7 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | `HERMES_KANBAN_WORKSPACES_ROOT` | root of the board's workspace tree |
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |
 | `HERMES_KANBAN_RUN_ID` | the current run's id (for the lifecycle gate) |
-| `HERMES_KANBAN_CLAIM_LOCK` | the claim lock string (`<host>:<pid>:<uuid>`) |
+| `HERMES_KANBAN_CLAIM_LOCK` | the claim lock string (`<host>:<pid>` or, for board-scoped claims, `<host>:<pid>@<board-db-path>` — reclaim/kill paths only act on a row whose claim was minted for this board by this process or a dead claimer) |
 | `HERMES_PROFILE` | the worker's own profile name (for `kanban_comment` author attribution) |
 | `HERMES_TENANT` | tenant namespace, if the task has one |
 
