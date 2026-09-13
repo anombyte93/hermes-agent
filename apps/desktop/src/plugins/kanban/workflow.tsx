@@ -35,6 +35,8 @@ import {
   fetchAttentionQueue,
   fetchBoards,
   fetchChanges,
+  fetchEvidenceSnapshot,
+  fetchReadinessBatch,
   fetchTimeline,
   holdCard,
   runReadiness
@@ -47,7 +49,9 @@ import type {
   ContinuationDraft,
   ContinueReceipt,
   HoldReceipt,
+  ReadinessBatchData,
   ReadinessReceipt,
+  RepairPreview,
   TimelineInterval
 } from './workflow-api'
 
@@ -420,9 +424,12 @@ function draftReceipt(draft: EvidenceEnvelope<ContinuationDraft> | null): Contin
 
 /** Every readiness check, with the board permission as its own separate check
  *  (never folded into a readiness verdict). Permission alone is never
- *  readiness, and readiness never dispatches. */
+ *  readiness, and readiness never dispatches. The next-repair preview (R3) is
+ *  a TEXT preview only, derived from failed/unknown checks — never executable
+ *  shell from untrusted data, and never triggered from here. */
 function ReadinessChecks({ receipt }: { receipt: ReadinessReceipt }) {
   const checks = Array.isArray(receipt.checks) ? receipt.checks : []
+  const repairPreviews = Array.isArray(receipt.repair_preview) ? receipt.repair_preview : []
 
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-2">
@@ -440,7 +447,30 @@ function ReadinessChecks({ receipt }: { receipt: ReadinessReceipt }) {
           {check.reason && <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)">{check.reason}</span>}
         </div>
       ))}
+      {repairPreviews.length > 0 && (
+        <div className="mt-0.5 flex flex-col gap-1 border-t border-(--ui-stroke-tertiary) pt-1.5">
+          <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)">Next repair (preview)</span>
+          {repairPreviews.map((repair, index) => (
+            <RepairPreviewLine key={`${repair.check}-${index}`} repair={repair} />
+          ))}
+        </div>
+      )}
       {receipt.reason && <span className="text-[0.625rem] text-(--ui-text-quaternary)">{receipt.reason}</span>}
+    </div>
+  )
+}
+
+/** One R3 repair preview line — a text action, never executable. */
+function RepairPreviewLine({ repair }: { repair: RepairPreview }) {
+  return (
+    <div className="flex flex-col gap-0.5 text-[0.6875rem]">
+      <div className="flex items-baseline gap-2">
+        <StateDot state={repair.state} />
+        <span className="font-medium text-(--ui-text-secondary)">{repair.check}</span>
+        <span className="text-[0.625rem] text-(--ui-text-quaternary)">preview — not applied</span>
+      </div>
+      <span className="whitespace-pre-wrap text-[0.625rem] text-(--ui-text-quaternary)">{repair.action}</span>
+      {repair.reason && <span className="text-[0.625rem] text-(--ui-text-quaternary)">{repair.reason}</span>}
     </div>
   )
 }
@@ -481,13 +511,157 @@ export function BoardWorkflowPanel() {
   return (
     <div className="flex flex-col gap-3 border-t border-(--ui-stroke-secondary) px-4 py-2">
       <AlignmentGate slug={slug}>
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
           <AttentionSection slug={slug} />
           <ChangesSection slug={slug} />
           <TimelineSection slug={slug} />
+          <ReadinessBatchSection slug={slug} />
         </div>
       </AlignmentGate>
     </div>
+  )
+}
+
+// ── R9 — readiness batch preview ─────────────────────────────────────────────
+
+const READINESS_BATCH_MAX = 10
+
+/** Preview readiness for a selected group of held (blocked) cards. Read-only:
+ *  selecting held cards only previews readiness, never bulk-releases. The held
+ *  card list is a bounded snapshot read (status='blocked'); the batch itself is
+ *  capped at 10 distinct cards and reports per-card state + repair preview. */
+function ReadinessBatchSection({ slug }: { slug: string }) {
+  const [open, setOpen] = useState(false)
+  const [selected, setSelected] = useState<string[]>([])
+  const [checkModel, setCheckModel] = useState(false)
+  const [result, setResult] = useState<EvidenceEnvelope<ReadinessBatchData> | null>(null)
+
+  useEffect(() => {
+    setOpen(false)
+    setSelected([])
+    setCheckModel(false)
+    setResult(null)
+  }, [slug])
+
+  const heldQuery = useQuery({
+    queryKey: ['kanban', 'workflow', 'readiness-batch', 'held', slug],
+    queryFn: () => fetchEvidenceSnapshot(slug, 'blocked', null, 100),
+    enabled: open && slug !== '',
+    retry: false
+  })
+
+  const heldEnvelope = heldQuery.data
+  const heldCards = heldEnvelope?.state === 'PASS' ? (heldEnvelope.evidence?.cards ?? []) : []
+
+  const batchMut = useMutation({
+    mutationFn: () => fetchReadinessBatch(slug, selected, checkModel),
+    onSuccess: data => setResult(data)
+  })
+
+  const toggle = (card: string) => {
+    setResult(null)
+    setSelected(prev => {
+      const next = new Set(prev)
+
+      if (!next.delete(card) && next.size < READINESS_BATCH_MAX) {
+        next.add(card)
+      }
+
+      return [...next]
+    })
+  }
+
+  if (!open) {
+    return (
+      <section className="flex flex-col gap-2">
+        <SectionLabel>Readiness batch</SectionLabel>
+        <Button onClick={() => setOpen(true)} size="sm" variant="outline">
+          <Codicon name="checklist" size="0.8rem" />
+          Preview held cards
+        </Button>
+      </section>
+    )
+  }
+
+  const data = result?.state === 'PASS' ? result.evidence : null
+
+  return (
+    <section className="flex flex-col gap-2">
+      <SectionLabel>Readiness batch</SectionLabel>
+      {heldQuery.isFetching && <Loader type="lemniscate-bloom" />}
+      {heldQuery.isError && <span className="text-destructive">Held cards unavailable.</span>}
+      {heldEnvelope && heldEnvelope.state !== 'PASS' && (
+        <span className="text-destructive">{heldEnvelope.reason ?? 'held cards unavailable'}</span>
+      )}
+      {heldCards.length === 0 && !heldQuery.isFetching && heldEnvelope?.state === 'PASS' && (
+        <span className="text-[0.625rem] text-(--ui-text-quaternary)">No held cards on this board.</span>
+      )}
+      {heldCards.length > 0 && (
+        <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto">
+          {heldCards.map(card => {
+            const id = String(card.id ?? '')
+            const title = typeof card.title === 'string' ? card.title : id
+            const checked = selected.includes(id)
+
+            return (
+              <li key={id}>
+                <label className="flex cursor-pointer items-start gap-2 text-[0.6875rem]">
+                  <input
+                    checked={checked}
+                    disabled={!checked && selected.length >= READINESS_BATCH_MAX}
+                    onChange={() => toggle(id)}
+                    type="checkbox"
+                  />
+                  <span className="min-w-0 truncate text-(--ui-text-secondary)">{title}</span>
+                  <span className="ml-auto shrink-0 font-mono text-[0.625rem] text-(--ui-text-quaternary)">{id}</span>
+                </label>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      {heldCards.length > READINESS_BATCH_MAX && (
+        <span className="text-[0.625rem] text-(--ui-text-quaternary)">Select up to {READINESS_BATCH_MAX} held cards.</span>
+      )}
+      <label className="flex cursor-pointer items-center gap-2 text-[0.6875rem]">
+        <input checked={checkModel} onChange={event => setCheckModel(event.target.checked)} type="checkbox" />
+        Check the exact provider and model
+      </label>
+      <Button disabled={selected.length === 0 || batchMut.isPending} onClick={() => batchMut.mutate()} size="sm" variant="outline">
+        {batchMut.isPending ? 'Checking…' : 'Preview readiness'}
+      </Button>
+
+      {result && result.state !== 'PASS' && (
+        <span className="text-destructive">
+          Readiness batch {result.state.toLowerCase()}: {result.reason ?? 'unavailable'}
+        </span>
+      )}
+      {batchMut.isError && <span className="text-destructive">Readiness batch could not be checked.</span>}
+
+      {data && (
+        <div className="flex flex-col gap-1.5">
+          <span className="text-[0.625rem] text-(--ui-text-quaternary)">
+            {data.returned ?? 0} returned
+            {typeof data.omitted === 'number' && data.omitted > 0 ? ` · ${data.omitted} omitted` : ''}
+            {data.no_mutation_performed === true ? ' · no mutation performed' : ''}
+          </span>
+          {(data.items ?? []).map(item => (
+            <div className="flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) p-2" key={item.card}>
+              <div className="flex items-center gap-2">
+                <StateDot state={item.state} />
+                <span className="font-mono text-[0.625rem] text-(--ui-text-secondary)">{item.card}</span>
+                <span className="font-medium text-[0.6875rem]" style={{ color: stateTone(item.state) }}>
+                  {item.state}
+                </span>
+              </div>
+              {(item.repair_preview ?? []).map((repair, index) => (
+                <RepairPreviewLine key={`${item.card}-${repair.check}-${index}`} repair={repair} />
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   )
 }
 
