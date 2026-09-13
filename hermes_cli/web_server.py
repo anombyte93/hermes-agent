@@ -18986,16 +18986,19 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
             detail="File not found",
         )
     media_type = content_types[suffix]
-    # R1 (kanban next-ten): for JavaScript assets, embed a SHA-256 digest of
-    # the EXACT bytes in this same response, bound to that script's own
-    # execution. The digest is prepended as a self-contained statement that
-    # publishes it on a per-script global registry keyed by the served path,
-    # so concurrent/interleaved script loads can never borrow another
-    # response's identity (each response carries its own value lexically;
-    # no cookie, no shared mutable slot written by a different response).
-    # Path/suffix/auth/cache rules above are unchanged; non-JS assets and
-    # missing files keep the plain FileResponse path.
-    if suffix in (".js", ".mjs"):
+    # R1 (kanban next-ten): ONLY the kanban plugin's dashboard bundle gets the
+    # identity wrapper — the single consumer that captures it at execution.
+    # Every other asset (any plugin, any JS) keeps its original bytes through
+    # the unchanged FileResponse path. The kanban bundle opens with a block
+    # comment and an IIFE whose "use strict" is FUNCTION-scoped inside it,
+    # so prepending a statement before the IIFE does not affect its strict
+    # semantics. The digest covers the ORIGINAL asset bytes (the wrapper
+    # itself is excluded and labelled as such by the consumer).
+    if (
+        suffix in (".js", ".mjs")
+        and plugin_name == "kanban"
+        and file_path == "dist/index.js"
+    ):
         try:
             data = target.read_bytes()
         except OSError:

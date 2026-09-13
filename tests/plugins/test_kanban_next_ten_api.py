@@ -775,3 +775,89 @@ def test_browser_readiness_unknown_when_helper_absent(client, helper_bin, monkey
     body = r.json()
     assert body["state"] == "UNKNOWN"
     assert body["evidence"]["board_readable"] is None
+
+
+# ---------------------------------------------------------------------------
+# R1 asset identity door (hermes_cli/web_server.py serve_plugin_asset)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def asset_server(tmp_path, monkeypatch):
+    """Boot the REAL web_server app against a synthetic plugin set.
+
+    Uses a fixture plugin directory (not the repo's live plugins/) so the
+    test owns the bytes: a kanban plugin with dist/index.js plus an
+    unrelated other.js, both enabled."""
+    import hashlib as _hashlib
+
+    plugins_root = tmp_path / "plugins"
+    kanban_dir = plugins_root / "kanban" / "dashboard"
+    kanban_dist = kanban_dir / "dist"
+    kanban_dist.mkdir(parents=True)
+    (kanban_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    kanban_js = kanban_dist / "index.js"
+    kanban_bytes = b"(function(){\"use strict\"; window.__X__=1;})();\n"
+    kanban_js.write_bytes(kanban_bytes)
+    other_js = kanban_dist / "other.js"
+    other_bytes = b"console.log('unrelated');\n"
+    other_js.write_bytes(other_bytes)
+
+    from hermes_cli import web_server
+
+    def fake_plugins():
+        return [
+            {
+                "name": "kanban",
+                "source": "bundled",
+                "_dir": str(kanban_dir),
+            }
+        ]
+
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", fake_plugins)
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._get_enabled_set", lambda: set()
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._get_disabled_set", lambda: set()
+    )
+    from starlette.testclient import TestClient as _TC
+
+    tc = _TC(web_server.app)
+    tc._kanban_js = kanban_js
+    tc._kanban_bytes = kanban_bytes
+    tc._other_bytes = other_bytes
+    tc._hashlib = _hashlib
+    return tc
+
+
+def test_plugin_asset_identity_wraps_only_kanban_index(asset_server):
+    """/dashboard-plugins/kanban/dist/index.js carries the SHA-256 of the
+    exact original bytes (wrapper excluded) in the SAME response; the
+    unrelated JS asset keeps its original bytes untouched."""
+    r = asset_server.get("/dashboard-plugins/kanban/dist/index.js")
+    assert r.status_code == 200, r.text
+    expected = asset_server._hashlib.sha256(asset_server._kanban_bytes).hexdigest()
+    assert r.headers["X-Hermes-Asset-SHA256"] == expected
+    body = r.content
+    # The response = wrapper line + original bytes; the digest covers ONLY
+    # the original bytes (wrapper excluded, labelled by the consumer).
+    assert body.endswith(asset_server._kanban_bytes)
+    wrapper_line = body[: len(body) - len(asset_server._kanban_bytes)]
+    assert b"__HERMES_PLUGIN_ASSET_ID__" in wrapper_line
+    assert expected.encode() in wrapper_line
+    assert b"sha256" in wrapper_line
+
+    # Unrelated JS: byte-identical to the file on disk.
+    r2 = asset_server.get("/dashboard-plugins/kanban/dist/other.js")
+    assert r2.status_code == 200
+    assert r2.content == asset_server._other_bytes
+    assert "X-Hermes-Asset-SHA256" not in r2.headers
+
+
+def test_plugin_asset_identity_changes_with_bytes(asset_server):
+    """Artifact change -> identity change (the digest tracks the bytes)."""
+    r1 = asset_server.get("/dashboard-plugins/kanban/dist/index.js")
+    asset_server._kanban_js.write_bytes(b"(function(){\"use strict\"; window.__X__=2;})();\n")
+    r2 = asset_server.get("/dashboard-plugins/kanban/dist/index.js")
+    assert r1.headers["X-Hermes-Asset-SHA256"] != r2.headers["X-Hermes-Asset-SHA256"]

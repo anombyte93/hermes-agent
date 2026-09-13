@@ -1839,9 +1839,14 @@
       return function () { alive = false; };
     }, [open, board, reloadTick]);
 
-    const rel = (releases && releases.state === "PASS" && releases.evidence) ? releases.evidence : null;
-    const adapter = (rel && rel.adapter) ? rel.adapter : null;
-    const backend = (rel && rel.backend) ? rel.backend : null;
+    // The identity lines read whatever evidence the envelope carried, even
+    // when the overall state is FAIL/UNKNOWN (the backend identity is still
+    // real); only a missing evidence object falls back to honest UNKNOWN.
+    const relData = (releases && releases.evidence && typeof releases.evidence === "object")
+      ? releases.evidence : null;
+    const rel = (releases && releases.state === "PASS" && relData) ? relData : null;
+    const adapter = (relData && relData.adapter) ? relData.adapter : null;
+    const backend = (relData && relData.backend) ? relData.backend : null;
     const ready = (readiness && readiness.evidence) ? readiness.evidence : null;
     // R7: the snapshot's OWN measured timing, not the bridge subprocess
     // round-trip alone.
