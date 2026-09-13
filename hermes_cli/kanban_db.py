@@ -1987,11 +1987,24 @@ def _end_run(
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
-    ``current_run_id``; None when no run was active (never-claimed task)."""
+    ``current_run_id``; None when no run was active (never-claimed task).
+
+    On close, workspace evidence is harvested onto the run's metadata
+    (``harvest`` + ``agreement``, see :mod:`hermes_cli.kanban_harvest_run`)
+    BEFORE any caller-side workspace cleanup can remove the git tree — the
+    board keeps derived facts even when the worker died before reporting."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    # Snapshot the claim-time boundary stamp BEFORE the UPDATE replaces the
+    # run's metadata with the worker's handoff fields.
+    try:
+        from hermes_cli.kanban_harvest_run import attempt_base_head_of_run
+
+        attempt_base = attempt_base_head_of_run(conn, run_id)
+    except Exception:
+        attempt_base = None
     conn.execute(
         """
         UPDATE task_runs
@@ -2010,6 +2023,13 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    # Evidence harvest: best-effort, never breaks the transition it observes.
+    try:
+        from hermes_cli.kanban_harvest_run import attach_run_harvest
+
+        attach_run_harvest(conn, task_id, run_id, metadata=metadata, attempt_base=attempt_base)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("kanban harvest on run end %s/%s: %s", task_id, run_id, exc)
     return run_id
 
 

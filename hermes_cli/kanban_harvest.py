@@ -323,6 +323,14 @@ def format_mismatch_comment(task_id: str, run_id: "int | None", harvest: dict, a
 
 # --- the harvest itself -------------------------------------------------------
 
+def workspace_head(workspace_path: "str | Path") -> "str | None":
+    """Current HEAD sha of a git workspace (``None`` for non-git/missing)."""
+    ws = Path(workspace_path).expanduser() if workspace_path else None
+    if ws is None or not ws.is_dir():
+        return None
+    return _git_ok(ws, "rev-parse", "HEAD")
+
+
 def harvest_workspace(
     workspace_path: "str | Path",
     base_sha: "str | None",
@@ -386,6 +394,17 @@ def harvest_workspace(
                     "insertions": sum(v[0] for v in per_path.values()),
                     "deletions": sum(v[1] for v in per_path.values()),
                 }
+        else:
+            # No base sha (first attempt on a repo the dispatcher never
+            # stamped): list the most recent commits as a partial record —
+            # honest facts, capped — but no diffstat (no honest range).
+            log_proc = _git(ws, "log", "-n", str(max_commits), "--pretty=%H%x1f%s")
+            if log_proc is not None and log_proc.returncode == 0:
+                for line in (log_proc.stdout or "").splitlines():
+                    if not line.strip():
+                        continue
+                    sha, _, subject = line.partition("\x1f")
+                    out["commits"].append({"sha": sha.strip(), "subject": subject.strip()})
         status = _git(ws, "status", "--porcelain")
         if status is not None and status.returncode == 0:
             out["dirty"] = sum(1 for line in (status.stdout or "").splitlines() if line.strip())

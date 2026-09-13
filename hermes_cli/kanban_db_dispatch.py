@@ -1890,6 +1890,46 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _stamp_attempt_base_head(conn: sqlite3.Connection, task_id: str) -> None:
+    """Record the workspace's current git head on the freshly-opened run.
+
+    The claim-time boundary for the run-end evidence harvest: attempt N lists
+    ``base_head..HEAD`` so a retry never re-credits attempt N-1's commits.
+    Best-effort — no workspace/git yet (scratch dir, spawn about to fail)
+    simply leaves the metadata key absent and the harvest falls back to the
+    prior-run boundary. Runs in its own tiny txn AFTER the claim committed.
+    """
+    try:
+        from hermes_cli import kanban_harvest as _harvest
+
+        row = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or not row["workspace_path"]:
+            return
+        head = _harvest.workspace_head(row["workspace_path"])
+        if not head:
+            return
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is None:
+            return
+        with _kb.write_txn(conn):
+            metadata = _kb._json_dict(
+                conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+                ).fetchone()["metadata"],
+            )
+            metadata["workspace_head_at_claim"] = head
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (_kb._json_or_null(metadata), run_id),
+            )
+    except Exception:
+        # Boundary stamping is an optimisation for precise commit ranges;
+        # failure must never affect the spawn path.
+        pass
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1954,6 +1994,10 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    # Stamp the attempt's evidence boundary before the worker starts: the
+    # harvest at run end lists workspace_head_at_claim..HEAD so a retry
+    # never re-credits the prior attempt's commits (trust wave #9).
+    _stamp_attempt_base_head(conn, claimed.id)
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":

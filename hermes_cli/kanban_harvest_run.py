@@ -18,17 +18,13 @@ completion into a crash, so each stage degrades to a partial record.
 from __future__ import annotations
 
 import sqlite3
+import time
 from typing import Any, Optional
 
 from hermes_cli import kanban_harvest as _harvest
 from hermes_cli import kanban_db as _kb
 
 __all__ = ["attach_run_harvest"]
-
-# Outcomes that end a worker's attempt on the workspace. ``spawn_failed`` runs
-# also flow through _end_run but no workspace work happened yet; harvesting
-# them anyway is harmless (the harvest is facts, not a verdict).
-_ALL_OUTCOMES = None  # sentinel: harvest at every _end_run
 
 
 def _task_row(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
@@ -38,19 +34,57 @@ def _task_row(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
-def _prior_run_head_sha(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def attempt_base_head_of_run(conn: sqlite3.Connection, run_id: int) -> Optional[str]:
+    """``workspace_head_at_claim`` stamped on a run at claim time, if any.
+
+    Read from the run row; used by ``_end_run`` BEFORE the closing UPDATE
+    replaces the metadata with the worker's handoff fields.
+    """
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    meta = _kb._json_dict(row["metadata"])
+    stamped = meta.get("workspace_head_at_claim")
+    return stamped.strip() if isinstance(stamped, str) and stamped.strip() else None
+
+
+def _attempt_base_head(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+    stamped: Optional[str] = None,
+) -> Optional[str]:
+    """The commit boundary for this attempt, most precise first.
+
+    1. ``stamped`` — the ``workspace_head_at_claim`` snapshotted by
+       ``_end_run`` before the worker's metadata replaced it.
+    2. The same key read from the run row (crash path: no replacement).
+    3. The prior closed run's harvest head / self-reported head.
+    """
+    if isinstance(stamped, str) and stamped.strip():
+        return stamped.strip()
+    own = attempt_base_head_of_run(conn, run_id)
+    if own:
+        return own
+    return _prior_run_head_sha(conn, task_id, exclude_run_id=run_id)
+
+
+def _prior_run_head_sha(
+    conn: sqlite3.Connection, task_id: str, exclude_run_id: Optional[int],
+) -> Optional[str]:
     """Head sha recorded by a PREVIOUS closed run's harvest (or self-report).
 
     The commits-of-attempt boundary: attempt N lists ``prior_head..HEAD`` so
-    retries don't re-credit attempt N-1's commits. Falls back to the worker's
-    own ``head_sha`` self-report on older runs, else None (first attempt
-    harvests from the merge-base-free full history cap).
+    retries don't re-credit attempt N-1's commits. ``exclude_run_id`` is the
+    run being closed right now — its own row already carries ``ended_at`` at
+    this point and must not become its own base. Falls back to the worker's
+    own ``head_sha`` self-report on older runs, else None.
     """
     row = conn.execute(
         "SELECT metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "WHERE task_id = ? AND ended_at IS NOT NULL AND id != ? "
         "ORDER BY ended_at DESC, id DESC LIMIT 1",
-        (task_id,),
+        (task_id, exclude_run_id),
     ).fetchone()
     if row is None:
         return None
@@ -72,6 +106,7 @@ def attach_run_harvest(
     run_id: Optional[int],
     *,
     metadata: Optional[dict],
+    attempt_base: Optional[str] = None,
     board: Optional[str] = None,
 ) -> None:
     """Harvest workspace evidence onto the just-closed ``run_id`` (in-txn helper).
@@ -81,6 +116,10 @@ def attach_run_harvest(
     id (the run row still exists; the workspace is not yet cleaned up). A
     missing run id (never-claimed task) or any harvest failure is a no-op:
     evidence collection must never break the transition it observes.
+
+    A ``mismatch`` verdict is surfaced as a dispatcher comment in the same
+    txn, so the next worker/human sees the discrepancy without digging
+    through run metadata.
     """
     if run_id is None:
         return
@@ -91,7 +130,7 @@ def attach_run_harvest(
         workspace_path = row["workspace_path"]
         if not workspace_path or not str(workspace_path).strip():
             return
-        base_sha = _prior_run_head_sha(conn, task_id)
+        base_sha = _attempt_base_head(conn, task_id, run_id, stamped=attempt_base)
         log_path = _kb.worker_log_path(task_id, board=board)
         harvest = _harvest.harvest_workspace(
             workspace_path, base_sha, log_path=log_path if log_path.exists() else None,
@@ -101,6 +140,12 @@ def attach_run_harvest(
         self_report = metadata if isinstance(metadata, dict) else {}
         agreement = _harvest.compare_harvest_to_self_report(harvest, self_report)
         _merge_harvest_into_run_metadata(conn, run_id, harvest, agreement)
+        if _harvest.mismatch_fields(agreement):
+            _kb._insert_comment(
+                conn, task_id, "dispatcher",
+                _harvest.format_mismatch_comment(task_id, run_id, harvest, agreement),
+                int(time.time()),
+            )
     except Exception as exc:  # best-effort by contract
         try:
             _kb._log.debug("kanban harvest: run %s on %s: %s", run_id, task_id, exc)
@@ -111,7 +156,12 @@ def attach_run_harvest(
 def _merge_harvest_into_run_metadata(
     conn: sqlite3.Connection, run_id: int, harvest: dict, agreement: dict,
 ) -> None:
-    """Read-modify-write ``task_runs.metadata`` adding ``harvest``/``agreement``."""
+    """Read-modify-write ``task_runs.metadata`` adding ``harvest``/``agreement``.
+
+    Preserves keys already on the run — ``workspace_head_at_claim`` (the
+    boundary stamp) and the worker's own handoff fields — by merging into the
+    row's CURRENT metadata rather than replacing it.
+    """
     row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         return

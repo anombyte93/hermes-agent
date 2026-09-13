@@ -586,7 +586,34 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+            evidence = _run_evidence_line(r)
+            if evidence:
+                print(f"        ⌂ {evidence}")
     return 0
+
+
+def _run_evidence_line(r) -> str:
+    """One-line workspace-evidence summary harvested onto a closed run
+    (``commits N, +A/-B over F files, dirty D · tests unit 483, e2e 320 ·
+    head abc1234``); empty when the run carries no harvest."""
+    meta = r.metadata if isinstance(r.metadata, dict) else {}
+    h = meta.get("harvest")
+    if not isinstance(h, dict) or not h.get("head_sha"):
+        return ""
+    diff = h.get("diffstat") or {}
+    bits = [
+        f"commits {len(h.get('commits') or [])}",
+        f"+{diff.get('insertions', 0)}/-{diff.get('deletions', 0)} over {diff.get('files', 0)} files",
+        f"dirty {h.get('dirty', 0)}",
+    ]
+    counts = h.get("test_counts") or {}
+    if counts:
+        bits.append("tests " + ", ".join(f"{b} {n}" for b, n in sorted(counts.items())))
+    agreement = meta.get("agreement")
+    if isinstance(agreement, dict) and agreement:
+        bits.append("·".join(f"{k}:{v}" for k, v in sorted(agreement.items())))
+    bits.append(f"head {str(h.get('head_sha'))[:7]}")
+    return " ".join(bits)
 
 
 def _cmd_assign(args: argparse.Namespace) -> int:
