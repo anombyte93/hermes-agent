@@ -144,6 +144,10 @@ class TestReconcileOrphanedRunning:
     def test_non_running_statuses_ignored(self, conn):
         for status in ("todo", "ready", "blocked", "done"):
             tid = kb.create_task(conn, title=f"s-{status}", assignee="w")
+            if status == "blocked":
+                # blocked rows require a durable block_reason (trust/1 trigger)
+                kb.block_task(conn, tid, reason="fixture: non-running status probe")
+                continue
             conn.execute(
                 "UPDATE tasks SET status=?, claim_lock=NULL, "
                 "claim_expires=NULL WHERE id=?", (status, tid),
