@@ -97,7 +97,9 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert requested.payload["summary"] == "Implementation and focused tests are ready."
     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
     assert implementation_run.summary == "Implementation and focused tests are ready."
-    assert implementation_run.metadata == {"commit": "abc123"}
+    # Key checks, not exact-dict: trust/9's harvest stamps harvest/agreement
+    # metadata on closed runs alongside the caller's metadata.
+    assert implementation_run.metadata.get("commit") == "abc123"
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
@@ -560,10 +562,8 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
     assert run.outcome == "completed"
     assert run.profile == "reviewer"
     assert run.summary == "Review approved without additional evidence."
-    assert run.metadata == {
-        "source_status": "review",
-        "approval": "manual",
-    }
+    assert run.metadata.get("source_status") == "review"
+    assert run.metadata.get("approval") == "manual"
 
 
 def test_legacy_review_child_deadlock_is_reported_immediately(conn):
