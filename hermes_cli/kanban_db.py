@@ -2908,9 +2908,17 @@ def complete_task(
         # Never-claimed task: synthesize a run so the handoff fields survive.
         if run_id is None and (summary or metadata or result or prior_status == "review"):
             synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
+            if prior_status == "review" and not synth_summary:
+                # Review-approved synthesis must survive a completion-contract
+                # stamp: the contract makes `metadata` truthy (completion_evidence),
+                # which used to suppress the manual-approval note AND its keys —
+                # keep both (audit note + contract stamp) instead of either/or.
                 synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
+                synth_metadata = {
+                    **(synth_metadata or {}),
+                    "source_status": "review",
+                    "approval": "manual",
+                }
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
             )
