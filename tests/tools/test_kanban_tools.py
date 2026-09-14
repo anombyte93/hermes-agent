@@ -130,8 +130,12 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        # Scratch workspace (no git): contract runs but stamps unverified, nothing else added.
-        assert run.metadata == {"files": 2, "completion_evidence": "unverified"}
+        # Scratch workspace (no git): contract runs but stamps unverified. The
+        # dispatcher's evidence harvest (trust/9) also stamps `harvest`/`agreement`
+        # metadata on every closed run, so assert the contract keys by value
+        # rather than exact-dict equality.
+        assert run.metadata.get("files") == 2
+        assert run.metadata.get("completion_evidence") == "unverified"
     finally:
         conn.close()
 
@@ -677,8 +681,10 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"],
-                                "completion_evidence": "unverified"}  # scratch workspace
+        # Exact-dict relaxed to key checks: the trust/9 evidence harvest also
+        # stamps `harvest`/`agreement` metadata on every closed run.
+        assert run.metadata.get("child_task") == child_out["task_id"]
+        assert run.metadata.get("completion_evidence") == "unverified"  # scratch workspace
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
