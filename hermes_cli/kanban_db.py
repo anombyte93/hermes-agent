@@ -10230,6 +10230,111 @@ def _append_skill_rejected_event(
         )
 
 
+# How long a ``dispatch_skipped`` (non-spawnable assignee) notice stays
+# authoritative before the dispatcher re-states it. The card is skipped on
+# EVERY tick — at a 30s interval that is 120 notices an hour — so the notice
+# is rate-limited rather than emitted per tick. It is deliberately re-stated
+# (rather than emitted exactly once) so a card cannot go quiet while it is
+# still stranded: a re-notice every hour is what makes "ready forever with a
+# bad assignee" self-announcing instead of silent.
+NONSPAWNABLE_RENOTIFY_SECONDS = 3600
+
+
+def _append_nonspawnable_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+) -> bool:
+    """Record a non-spawnable-assignee skip as a durable ``dispatch_skipped``
+    event, rate-limited to one notice per ``NONSPAWNABLE_RENOTIFY_SECONDS``.
+
+    Mirrors :func:`_append_skill_rejected_event` — same shape, same
+    fail-closed contract (the card is never spawned, edited or auto-blocked
+    here). The difference is the rate limit: a skill refusal is a one-shot
+    condition an operator fixes, while a non-resolving assignee can sit for
+    days, so an unchanged streak is re-stated hourly instead of suppressed
+    forever.
+
+    Returns True when an event was actually appended, so the caller can
+    emit exactly one matching log line per notice.
+
+    The rate-limit read runs OUTSIDE ``write_txn`` on purpose. This branch is
+    hit on every tick for as long as the card is stranded, and ``write_txn``
+    is a ``BEGIN IMMEDIATE``: taking the board's write lock only to discover
+    there is nothing to write would add lock churn to every tick of every
+    board carrying a parked card. The dispatch tick already runs under the
+    board's single-writer dispatch lock, so no other dispatcher can append a
+    competing notice between the read and the write.
+    """
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN ('dispatch_skipped', 'claimed', 'spawned') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["kind"] == "dispatch_skipped":
+        try:
+            prev = json.loads(row["payload"] or "{}")
+        except Exception:
+            prev = {}
+        age = now - int(row["created_at"] or 0)
+        if (
+            isinstance(prev, dict)
+            and prev.get("assignee") == assignee
+            and prev.get("reason") == "assignee_not_a_profile"
+            and age < NONSPAWNABLE_RENOTIFY_SECONDS
+        ):
+            return False
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_skipped",
+            {"reason": "assignee_not_a_profile", "assignee": assignee},
+        )
+    return True
+
+
+def _note_nonspawnable(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    *,
+    dry_run: bool,
+    lane: str,
+) -> None:
+    """Make a non-spawnable skip visible: durable event + one log line.
+
+    Before this, the ready/review loops appended the id to
+    ``skipped_nonspawnable`` and moved on with no event and no log, so a card
+    whose assignee was a typo or a deleted profile was indistinguishable from
+    an empty queue on every unattended surface (the gateway logs only when
+    something spawned; the ``--verbose`` daemon's ``did_work`` tuple does not
+    include this bucket). The card then sat ``ready`` until a human happened
+    to run ``hermes kanban diagnostics``.
+    """
+    if dry_run:
+        return
+    try:
+        if _append_nonspawnable_event(conn, task_id, assignee):
+            _log.warning(
+                "kanban dispatch: %s task %s is assigned to %r, which is not a "
+                "live Hermes profile — not spawning. If this is a control-plane "
+                "lane pulled by a terminal, it is expected; otherwise the "
+                "assignee is a typo or a deleted profile and the card will stay "
+                "ready until it is reassigned.",
+                lane, task_id, assignee,
+            )
+    except Exception:
+        # Visibility must never break dispatch. A failed notice degrades to
+        # the previous (silent) behaviour rather than dropping the tick.
+        _log.debug(
+            "kanban dispatch: failed to record non-spawnable notice for %s",
+            task_id, exc_info=True,
+        )
+
+
 def _missing_worker_skills(
     skill_identifiers: Optional[list[str]], assignee: str
 ) -> list[str]:
@@ -10581,7 +10686,15 @@ def _dispatch_once_locked(
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
+            #
+            # That suppression is exactly why the skip must announce itself
+            # here: has_spawnable_ready() excludes these assignees, so such a
+            # card can never raise the dispatcher's "stuck" alarm, and with no
+            # event and no log it was invisible on every unattended surface.
             result.skipped_nonspawnable.append(row["id"])
+            _note_nonspawnable(
+                conn, row["id"], row_assignee, dry_run=dry_run, lane="ready"
+            )
             continue
         candidate = get_task(conn, row["id"])
         missing_skills = _missing_worker_skills(
@@ -10747,6 +10860,9 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            _note_nonspawnable(
+                conn, row["id"], row["assignee"], dry_run=dry_run, lane="review"
+            )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

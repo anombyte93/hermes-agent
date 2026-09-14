@@ -2854,8 +2854,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
     if res.skipped_nonspawnable:
+        # Do NOT assert "OK" here: this bucket cannot tell a legitimate
+        # control-plane lane from a typo'd or deleted profile, and calling
+        # both of them fine is how a stranded card reads as healthy.
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (assignee is not a live Hermes profile — a terminal "
+            f"lane pulled via claim_task, or a typo/deleted profile): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     for tid, missing in res.rejected_skills:
