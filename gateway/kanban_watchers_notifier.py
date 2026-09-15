@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 
+from gateway.kanban_timeout_format import format_timeout_budget
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 
 
@@ -294,6 +295,11 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
+def _payload_mapping(ev: Any) -> dict:
+    """Whole payload as a mapping (0/None-safe) for typed budget rendering (#113)."""
+    return dict(ev.payload) if getattr(ev, "payload", None) else {}
+
+
 def _clip(ev: Any, key: str, fmt: str, limit: int) -> str:
     """``fmt`` applied to the truncated payload value, or ``""`` when absent."""
     value = _payload(ev, key)
@@ -370,7 +376,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
         None, None,
     ),
     "timed_out": lambda ev, n: (
-        f"⏱ {n.head} timed out (max_runtime={int(_payload(ev, 'limit_seconds') or 0)}s); will retry", None, None,
+        f"⏱ {n.head} timed out ({format_timeout_budget(_payload_mapping(ev))}); will retry", None, None,
     ),
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
