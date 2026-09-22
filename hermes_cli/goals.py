@@ -2134,6 +2134,393 @@ class GoalManager:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Scoped goal rejudge
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _last_assistant_response(session_id: str) -> Optional[Tuple[str, float]]:
+    """Return ``(content, epoch timestamp)`` of the last stored assistant
+    response for a session, or None.
+
+    Reads the real transcript through ``SessionDB.get_messages`` — the
+    original evidence the goal loop judged, not a re-rendered or replayed
+    version. Trailing tool rows are skipped: they are side-effect output,
+    not the agent's report. Empty/whitespace content (e.g. a tool-call-only
+    assistant row) is skipped too so a real response is found. The row's
+    stored timestamp rides along so callers can check evidence freshness
+    against the goal's ``created_at`` (0.0 when unknown).
+    """
+    try:
+        db = _get_session_db()
+        if db is None:
+            return None
+        messages = db.get_messages(session_id, include_compacted=True)
+    except Exception as exc:
+        logger.debug("rejudge: transcript read failed for %s: %s", session_id, exc)
+        return None
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        text: Optional[str] = None
+        if isinstance(content, str) and content.strip():
+            text = content
+        if isinstance(content, list):
+            joined = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            if joined.strip():
+                text = joined
+        if text is None:
+            continue
+        try:
+            ts = float(msg.get("timestamp") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        return text, ts
+    return None
+
+
+# Exit codes shared by the CLI route and any future caller. Distinct
+# nonzero codes keep scripting on `hermes goals rejudge` deterministic.
+REJUDGE_EXIT_OK = 0
+REJUDGE_EXIT_INCOMPLETE = 1      # judged, and the goal is genuinely not done
+REJUDGE_EXIT_UNKNOWN_SESSION = 2
+REJUDGE_EXIT_JUDGE_UNREACHABLE = 3
+REJUDGE_EXIT_JUDGE_UNPARSEABLE = 4
+
+
+def rejudge_goal(
+    session_id: str,
+    *,
+    dry_run: bool = False,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Re-run the goal judge for exactly one session, on its original
+    evidence, and report the outcome explicitly.
+
+    The recovery path for a goal whose loop ended in an auth/transport
+    pause (or is still parked): the work itself may have been complete all
+    along — the judge just couldn't be reached to say so. This re-asks the
+    same judge the loop uses, against the same stored evidence (the
+    session's last assistant response), with the same subgoals/contract
+    context, and either performs a genuine done transition through
+    ``GoalManager.mark_done`` or reports an explicit non-done outcome.
+
+    Safety contract (deliberately narrow):
+
+    - Scoped to ONE exact session id — a goal on another session is never
+      touched, and a trailing tool row never substitutes for evidence.
+    - No budget reset, no extra agent turns, no tool-side-effect replay,
+      no direct SQL edits — state changes go through GoalManager's normal
+      persistence exactly as the loop does.
+    - ``done`` is only written when the judge returns an explicit done
+      verdict AND every quality gate passes; anything else leaves the
+      stored state untouched.
+    - Evidence freshness: the loop only ever judges responses produced
+      AFTER the goal was set (``created_at``). If the newest stored
+      response predates the goal, it belongs to an earlier goal on the
+      same session and is refused (``stale_evidence``) rather than judged
+      into a possible false done. Legacy goals stored without
+      ``created_at`` (0.0) can't be checked and judge as before.
+    - Identity recheck: the judge call takes wall-clock time; a goal that
+      was re-set, cleared, or completed by someone else during that
+      window is never overwritten by this (now stale) snapshot — the
+      transition is refused (``goal_changed``) or reported
+      (``already_done``).
+    - Idempotent: a goal already in ``done`` is reported as
+      ``already_done`` without judging again.
+    - ``dry_run=True`` judges the evidence and reports, but writes
+      NOTHING and executes NOTHING: quality gates are deferred entirely
+      (never run, never persisted, retry budget untouched), so a done
+      verdict on a gated goal is reported as ``gates_pending`` — an
+      honest preview, not a certification.
+
+    Returns a result dict:
+
+    - ``outcome``: ``done`` | ``gates_pending`` | ``incomplete`` |
+      ``already_done`` | ``unreachable`` | ``unparseable`` |
+      ``no_session`` | ``no_goal`` | ``cleared`` | ``no_evidence`` |
+      ``stale_evidence`` | ``goal_changed``
+    - ``reason``: human-readable one-liner
+    - ``changed``: True iff a goal STATE TRANSITION was persisted
+      (e.g. paused→done, active→paused); mere gate attempt bookkeeping
+      is not a transition
+    - ``status_after``: the goal's stored status after the call
+    - ``verdict``: the raw judge verdict when one was produced
+    - ``evidence``: the evidence text that was judged, when reached
+    - ``exit_code``: REJUDGE_EXIT_* for the CLI route
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return {
+            "outcome": "no_session",
+            "reason": "no session id given",
+            "changed": False,
+            "status_after": None,
+            "verdict": None,
+            "evidence": None,
+            "exit_code": REJUDGE_EXIT_UNKNOWN_SESSION,
+        }
+
+    state = load_goal(sid)
+    if state is None:
+        # Distinguish "this session has no goal at all" (wrong id, or the
+        # goal lives on a different session) from terminal states below.
+        try:
+            db = _get_session_db()
+            session_exists = db is not None and db.get_session(sid) is not None
+        except Exception as exc:
+            logger.debug("rejudge: session lookup failed for %s: %s", sid, exc)
+            session_exists = False
+        if session_exists:
+            reason = f"session {sid} has no goal"
+        else:
+            reason = f"unknown session {sid}"
+        return {
+            "outcome": "no_session" if not session_exists else "no_goal",
+            "reason": reason,
+            "changed": False,
+            "status_after": None,
+            "verdict": None,
+            "evidence": None,
+            "exit_code": REJUDGE_EXIT_UNKNOWN_SESSION,
+        }
+
+    if state.status == "done":
+        return {
+            "outcome": "already_done",
+            "reason": f"goal already done: {state.last_reason or state.goal}",
+            "changed": False,
+            "status_after": "done",
+            "verdict": "done",
+            "evidence": None,
+            "exit_code": REJUDGE_EXIT_OK,
+        }
+
+    if state.status == "cleared":
+        return {
+            "outcome": "cleared",
+            "reason": f"goal on session {sid} was cleared — nothing to rejudge",
+            "changed": False,
+            "status_after": "cleared",
+            "verdict": None,
+            "evidence": None,
+            "exit_code": REJUDGE_EXIT_INCOMPLETE,
+        }
+
+    response = _last_assistant_response(sid)
+    evidence = response[0] if response is not None else None
+    if not evidence:
+        return {
+            "outcome": "no_evidence",
+            "reason": (
+                f"session {sid} has no stored assistant response to judge"
+            ),
+            "changed": False,
+            "status_after": state.status,
+            "verdict": None,
+            "evidence": None,
+            "exit_code": REJUDGE_EXIT_INCOMPLETE,
+        }
+
+    # Evidence freshness. The loop only ever judges responses produced
+    # AFTER the goal was set; a newest response that predates created_at
+    # belongs to an EARLIER goal on this session, and judging it against
+    # the current goal text could certify a false done. Legacy rows
+    # (created_at unknown, 0.0) predate the field and judge as before.
+    evidence_ts = response[1] if response is not None else 0.0
+    if state.created_at > 0.0 and evidence_ts > 0.0 and evidence_ts < state.created_at:
+        return {
+            "outcome": "stale_evidence",
+            "reason": (
+                f"newest stored response for {sid} predates this goal "
+                f"(evidence {datetime.fromtimestamp(evidence_ts, tz=timezone.utc):%Y-%m-%d %H:%M:%S}Z "
+                f"< goal set {datetime.fromtimestamp(state.created_at, tz=timezone.utc):%Y-%m-%d %H:%M:%S}Z) "
+                "— it belongs to an earlier goal on this session; run the "
+                "agent toward this goal rather than judge stale evidence"
+            ),
+            "changed": False,
+            "status_after": state.status,
+            "verdict": None,
+            "evidence": evidence,
+            "exit_code": REJUDGE_EXIT_INCOMPLETE,
+        }
+
+    mgr = GoalManager(session_id=sid)
+    mgr._state = state
+
+    # Quality gates run before the judge on a REAL run, exactly as in the
+    # loop: a failing gate is deterministic evidence the goal is not done.
+    # Under --dry-run gates are DEFERRED entirely: they are shell
+    # commands, and a read-only report must not execute them, persist
+    # their bookkeeping, or consume their retry budget. The trade-off is
+    # honesty — with gates present, a dry-run done verdict is a preview
+    # (gates_pending), never a certification.
+    if not dry_run:
+        status_before = state.status  # _check_gates mutates `state` in place
+        gate_decision = mgr._check_gates()
+        if gate_decision is not None:
+            reloaded = load_goal(sid)
+            status_after = reloaded.status if reloaded is not None else state.status
+            return {
+                "outcome": "incomplete",
+                "reason": gate_decision.get("reason", "quality gate failed"),
+                # A persisted pause IS a state transition (active→paused);
+                # attempt bookkeeping on a still-active goal is not.
+                "changed": status_after != status_before,
+                "status_after": status_after,
+                "verdict": gate_decision.get("verdict", "gate_failed"),
+                "evidence": evidence,
+                "exit_code": REJUDGE_EXIT_INCOMPLETE,
+            }
+
+    verdict, reason, parse_failed, _wait_directive, transport_failed = judge_goal(
+        state.goal,
+        evidence,
+        subgoals=state.subgoals or None,
+        background_processes=None,
+        contract=state.contract if state.has_contract() else None,
+        timeout=timeout,
+    )
+
+    if transport_failed:
+        return {
+            "outcome": "unreachable",
+            "reason": (
+                f"{reason} — fix auxiliary.goal_judge "
+                "provider/key in config.yaml and retry"
+            ),
+            "changed": False,
+            "status_after": state.status,
+            "verdict": verdict,
+            "evidence": evidence,
+            "exit_code": REJUDGE_EXIT_JUDGE_UNREACHABLE,
+        }
+
+    if verdict == "done":
+        if dry_run:
+            if state.gates:
+                return {
+                    "outcome": "gates_pending",
+                    "reason": (
+                        f"{reason} — but the quality gates were NOT evaluated "
+                        "under --dry-run (no gate command was run)"
+                    ),
+                    "changed": False,
+                    "status_after": state.status,
+                    "verdict": "done",
+                    "evidence": evidence,
+                    "dry_run": True,
+                    "gates_deferred": True,
+                    "exit_code": REJUDGE_EXIT_OK,
+                }
+            return {
+                "outcome": "done",
+                "reason": reason,
+                "changed": False,
+                "status_after": state.status,
+                "verdict": "done",
+                "evidence": evidence,
+                "dry_run": True,
+                "exit_code": REJUDGE_EXIT_OK,
+            }
+
+        # The judge call above took wall-clock time. Re-verify the goal's
+        # identity before writing a terminal state: a goal that was
+        # re-set, cleared, or completed by someone else during that window
+        # must never be overwritten by this (now stale) snapshot.
+        current = load_goal(sid)
+        if current is None:
+            return {
+                "outcome": "no_goal",
+                "reason": f"goal on session {sid} disappeared while judging",
+                "changed": False,
+                "status_after": None,
+                "verdict": "done",
+                "evidence": evidence,
+                "exit_code": REJUDGE_EXIT_UNKNOWN_SESSION,
+            }
+        if current.status == "done":
+            return {
+                "outcome": "already_done",
+                "reason": (
+                    f"goal already done: {current.last_reason or current.goal}"
+                ),
+                "changed": False,
+                "status_after": "done",
+                "verdict": "done",
+                "evidence": evidence,
+                "exit_code": REJUDGE_EXIT_OK,
+            }
+        if current.status == "cleared":
+            return {
+                "outcome": "cleared",
+                "reason": (
+                    f"goal on session {sid} was cleared while judging — "
+                    "nothing to transition"
+                ),
+                "changed": False,
+                "status_after": "cleared",
+                "verdict": "done",
+                "evidence": evidence,
+                "exit_code": REJUDGE_EXIT_INCOMPLETE,
+            }
+        if (current.goal or "").strip() != (state.goal or "").strip():
+            return {
+                "outcome": "goal_changed",
+                "reason": (
+                    "the goal was changed while the judge ran "
+                    f"(now: {_truncate(current.goal, 120)}) — not "
+                    "transitioning; re-run rejudge on the new goal"
+                ),
+                "changed": False,
+                "status_after": current.status,
+                "verdict": "done",
+                "evidence": evidence,
+                "exit_code": REJUDGE_EXIT_INCOMPLETE,
+            }
+        # Same goal: adopt the fresh snapshot (preserving any concurrent
+        # subgoal/contract edits) and perform the genuine transition.
+        mgr._state = current
+        mgr.mark_done(reason)
+        return {
+            "outcome": "done",
+            "reason": reason,
+            "changed": True,
+            "status_after": "done",
+            "verdict": "done",
+            "evidence": evidence,
+            "exit_code": REJUDGE_EXIT_OK,
+        }
+
+    # continue / wait / skipped / unparseable — the goal is genuinely not
+    # done. Report explicitly; nothing is written.
+    if transport_failed or (
+        verdict == "continue" and reason.startswith("judge error")
+    ):
+        outcome = "unreachable"
+        exit_code = REJUDGE_EXIT_JUDGE_UNREACHABLE
+    elif parse_failed or verdict == "skipped":
+        outcome = "unparseable"
+        exit_code = REJUDGE_EXIT_JUDGE_UNPARSEABLE
+    else:
+        outcome = "incomplete"
+        exit_code = REJUDGE_EXIT_INCOMPLETE
+    return {
+        "outcome": outcome,
+        "reason": reason,
+        "changed": False,
+        "status_after": state.status,
+        "verdict": verdict,
+        "evidence": evidence,
+        "exit_code": exit_code,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Kanban worker goal loop
 # ──────────────────────────────────────────────────────────────────────
 
@@ -2322,5 +2709,6 @@ __all__ = [
     "clear_goal",
     "migrate_goal_to_session",
     "judge_goal",
+    "rejudge_goal",
     "run_kanban_goal_loop",
 ]
