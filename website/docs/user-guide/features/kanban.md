@@ -1008,6 +1008,25 @@ that have *already* happened, use the reconciliation-card pattern above with
 the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
 
+### Stale premises: check HEAD before working an old card
+
+A card written days ago describes the repo as it was *then*. Before writing —
+or picking up — a card more than a few days old, check whether HEAD already
+carries the requested feature, possibly in a newer form under a different
+name. If it does, the deliverable becomes the missing test/contract coverage
+that pins the shipped behavior, and the card body should say so explicitly:
+restate the deliverable as the coverage gap rather than leaving the original
+feature ask standing.
+
+Measured evidence (2026-09-22): two of four cards written 2026-08-31 had
+stale premises — the requested popup search had already shipped in its
+issue-#38 form and the manifest was already at 0.4.0 — so the correct
+deliverable each time was the missing contract test suite, not the feature.
+
+The check is cheap: `git log -p -S "<symbol>"` or a read of the current code
+path before planning the work. A worker that skips it either rebuilds what
+HEAD already carries or "fixes" a premise that never held.
+
 ## Multi-tenant usage
 
 When one specialist fleet serves multiple businesses, tag each task with a tenant:
