@@ -749,6 +749,29 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _schedule_type(job: Dict[str, Any]) -> str:
+    """Resolved schedule TYPE for readbacks (issue #45).
+
+    The create/update echo previously showed only ``schedule`` (the display
+    string) and ``repeat`` — and ``repeat`` rendered 'once' even for
+    recurring cron schedules, so a mis-parsed one-shot looked identical to a
+    deliberate one. Print the resolved type explicitly, derived from the
+    STORED parsed schedule (never from the input string): interval ->
+    recurring-interval, cron -> cron, once -> one-shot. Unknown/legacy
+    shapes fall back to 'unknown' rather than guessing.
+    """
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict):
+        kind = schedule.get("kind")
+        if kind == "interval":
+            return "recurring-interval"
+        if kind == "cron":
+            return "cron"
+        if kind == "once":
+            return "one-shot"
+    return "unknown"
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -764,6 +787,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
+        "schedule_type": _schedule_type(job),
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
         "next_run_at": job.get("next_run_at"),
@@ -1618,6 +1642,7 @@ def cronjob(
                 "skill": job.get("skill"),
                 "skills": job.get("skills", []),
                 "schedule": job["schedule_display"],
+                "schedule_type": _schedule_type(job),
                 "repeat": _repeat_display(job),
                 "deliver": job.get("deliver", "local"),
                 "next_run_at": job["next_run_at"],
