@@ -531,10 +531,11 @@ By default each worker gets **one shot** at its card — do the work, call `kanb
 hermes kanban create "Translate the docs site to French" \
     --body "Acceptance: every page translated, no English left, links intact." \
     --assignee linguist \
-    --goal \
+    --goal "Ship a French docs site a native reader can navigate end-to-end without hitting English." \
     --goal-max-turns 15      # optional; default 20
 ```
 
+Bare `--goal` (no text) enables the loop and leaves the body untouched. `--goal "<text>"` additionally appends the text to the card body under a `## Goal` heading — the judge reads the title + body, so a stated goal text is visible to it (and to humans skimming the card) without you pre-composing the body.
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
 
 :::note Goal-mode cards borrow the `/goal` engine — they don't connect to it

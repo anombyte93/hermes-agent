@@ -3425,6 +3425,18 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
+    # Empty parent ids (typically an unset shell variable reaching
+    # ``--parent ""``) must not be silently dropped: the card would land
+    # parentless and 'ready', free to dispatch ahead of the card it depended
+    # on (issue #42). The CLI rejects these with exit 2; the DB layer is the
+    # durable trust boundary (children import kanban_db directly), so it
+    # raises instead.
+    blank_parents = [p for p in parents if not str(p).strip()]
+    if blank_parents:
+        raise ValueError(
+            "parent task id(s) cannot be empty: "
+            + ", ".join(repr(p) for p in blank_parents)
+        )
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
