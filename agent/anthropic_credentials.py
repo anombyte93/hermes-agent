@@ -320,22 +320,81 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     return None
 
 
-def claude_code_credentials_path() -> Path:
-    """Location Claude Code CLI writes its shared OAuth credentials file.
+def claude_config_dir() -> Optional[Path]:
+    """The explicitly selected Claude Code config directory, if any.
 
-    This file is not profile-owned: every Hermes profile's credential pool
-    reads and writes the *same* path, so cross-profile refresh races on a
+    ``CLAUDE_CONFIG_DIR`` is how Claude Code itself is pointed at a specific
+    account's config directory, and how a caller (Atlas Relay's borrower
+    directories, a per-worker account assignment) selects *which account* this
+    process must use. When it is set, that account is an explicit selection:
+    Hermes must read, lock, refresh and write back inside it and must never
+    silently substitute the global account.
+
+    Returns ``None`` when unset or blank, which preserves the historical
+    global behaviour exactly.
+
+    Fail-soft: this is a routing path rather than secret material, so a
+    scope-resolution failure is treated as "unset" instead of taking down
+    credential resolution.
+    """
+    try:
+        raw = _getenv("CLAUDE_CONFIG_DIR").strip()
+    except Exception:  # pragma: no cover - defensive, see docstring
+        logger.debug("Failed to read CLAUDE_CONFIG_DIR", exc_info=True)
+        return None
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _resolve_credentials_owner(path: Path) -> Path:
+    """Resolve a borrower symlink to the canonical file that owns the token.
+
+    An account directory is commonly a *borrower*: its ``.credentials.json``
+    is a symlink to the canonical account file elsewhere. Locking or writing
+    the symlink path itself is what produces divergent copies — an atomic
+    ``os.replace()`` onto a symlink REPLACES the link with a regular file, so
+    the borrower silently stops tracking the owner and the two accounts drift
+    apart after the next rotation. The cross-process lock has the same
+    problem: two borrowers of one owner would take two different locks and
+    both spend the same single-use refresh token.
+
+    Only the leaf is resolved, and only when it really is a symlink, so no
+    other path component is rewritten. A broken link resolves to its target,
+    which is the path a write should create.
+    """
+    try:
+        if path.is_symlink():
+            return Path(os.path.realpath(path))
+    except OSError:
+        logger.debug("Failed to resolve credentials symlink %s", path, exc_info=True)
+    return path
+
+
+def claude_code_credentials_path() -> Path:
+    """Location Claude Code CLI writes its OAuth credentials file.
+
+    Honours an explicitly selected account directory (``CLAUDE_CONFIG_DIR``)
+    and otherwise falls back to the shared ``~/.claude`` file.
+
+    The shared file is not profile-owned: every Hermes profile's credential
+    pool reads and writes the *same* path, so cross-profile refresh races on a
     ``claude_code`` pool entry must be serialized against this exact path
     (see ``CredentialPool._claude_code_credentials_lock`` in
-    ``agent/credential_pool.py``).
+    ``agent/credential_pool.py``). That serialization is why the borrower
+    symlink is resolved to its canonical owner here rather than at each call
+    site: read, lock, refresh and write-back must all name one path, or the
+    lock does not cover the file being written.
     """
-    return Path.home() / ".claude" / ".credentials.json"
+    base = claude_config_dir() or (Path.home() / ".claude")
+    return _resolve_credentials_owner(base / ".credentials.json")
 
 
 def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
-    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
+    """Read Claude Code OAuth credentials from the selected credentials file.
 
-    Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
+    That is ``$CLAUDE_CONFIG_DIR/.credentials.json`` when an account directory
+    is explicitly selected, and ``~/.claude/.credentials.json`` otherwise.
     """
     cred_path = claude_code_credentials_path()
     if not cred_path.exists():
@@ -374,6 +433,13 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
       - Otherwise, prefer the source with the later ``expiresAt`` so that
         any subsequent refresh uses the most recent ``refreshToken``.
 
+    When an account directory is explicitly selected (``CLAUDE_CONFIG_DIR``),
+    the Keychain is NOT consulted: that entry is a single global one, keyed by
+    service name with no notion of which account directory is in play, so
+    reading it is exactly the substitution of an unrelated global account this
+    selection exists to prevent. The explicitly selected directory is then the
+    only source, and finding nothing there is an honest miss.
+
     This intentionally excludes ~/.claude.json primaryApiKey. Opencode's
     subscription flow is OAuth/setup-token based with refreshable credentials,
     and native direct Anthropic provider usage should follow that path rather
@@ -381,7 +447,8 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
-    kc_creds = _read_claude_code_credentials_from_keychain()
+    scoped = claude_config_dir() is not None
+    kc_creds = None if scoped else _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
     if kc_creds and file_creds:
@@ -502,6 +569,12 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     try:
         from hermes_cli.auth import AUTH_LOCK_TIMEOUT_SECONDS, _auth_store_lock, env_float
 
+        # Resolve the target ONCE: the lock, the re-read, the write-back and
+        # the fail-closed verdict must all name the same file. Recomputing it
+        # per call site would re-resolve the borrower symlink each time, so a
+        # link swapped mid-refresh could be locked at one path and written at
+        # another — the exact divergence the owner resolution exists to stop.
+        cred_path = claude_code_credentials_path()
         refresh_timeout_seconds = env_float(
             "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS", 20
         )
@@ -511,7 +584,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         )
         with _auth_store_lock(
             timeout_seconds=lock_timeout_seconds,
-            target_path=claude_code_credentials_path(),
+            target_path=cred_path,
         ):
             # Only adopt when the live re-read produced a DIFFERENT token with
             # a real future expiry: re-adopting the same credential we were
@@ -543,7 +616,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
             # shared source. POSTing it again would just burn the family into
             # ``invalid_grant``.
             if is_rotation_consumed_uncommitted(
-                refresh_token, source_path=claude_code_credentials_path()
+                refresh_token, source_path=cred_path
             ):
                 logger.debug(
                     "Refresh token was already consumed by an uncommitted rotation "
@@ -569,13 +642,14 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
                     refreshed["access_token"],
                     refreshed["refresh_token"],
                     refreshed["expires_at_ms"],
+                    target_path=cred_path,
                 )
             except Exception as e:
                 logger.error(
                     "Anthropic OAuth refresh rotated the single-use token but could not "
                     "commit it to %s (%s) — treating the refresh as failed; "
                     "re-run 'claude setup-token' to reauthenticate",
-                    claude_code_credentials_path(),
+                    cred_path,
                     e,
                 )
                 # The POST already spent ``refresh_token`` server-side and the
@@ -587,7 +661,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
                     creds.get("accessToken", ""),
                     (current or {}).get("accessToken", ""),
                     (current or {}).get("refreshToken", ""),
-                    source_path=claude_code_credentials_path(),
+                    source_path=cred_path,
                 )
                 return None
 
@@ -606,8 +680,14 @@ def _write_claude_code_credentials(
     expires_at_ms: int,
     *,
     scopes: Optional[list] = None,
+    target_path: Optional[Path] = None,
 ) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json.
+    """Write refreshed credentials back to the selected credentials file.
+
+    *target_path* lets the refresh transaction pass the exact path it locked
+    and re-read, so read, lock and commit cannot drift apart. When omitted the
+    path is resolved the usual way (honouring ``CLAUDE_CONFIG_DIR``), which
+    keeps every existing caller working unchanged.
 
     The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
     is persisted so that Claude Code's own auth check recognises the credential
@@ -620,7 +700,7 @@ def _write_claude_code_credentials(
     pre-rotation pair on disk to be re-seeded and replayed (see
     ``CredentialPersistError``).
     """
-    cred_path = claude_code_credentials_path()
+    cred_path = target_path or claude_code_credentials_path()
     try:
         # Read existing file to preserve other fields
         existing = {}
@@ -711,6 +791,11 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     later refresh impossible because the static env token wins before we ever
     inspect Claude Code's refreshable credential file. If we have a refreshable
     Claude Code credential record, prefer it over the static env OAuth token.
+
+    ``creds`` is always read through ``read_claude_code_credentials()``, which
+    is account-scoped: with ``CLAUDE_CONFIG_DIR`` set it can only describe the
+    explicitly selected account, so this preference stays inside that account.
+    With it unset the behaviour is the historical global one, unchanged.
     """
     if not env_token or not _is_oauth_token(env_token) or not isinstance(creds, dict):
         return None
@@ -793,9 +878,17 @@ def resolve_anthropic_token() -> Optional[str]:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
       2. CLAUDE_CODE_OAUTH_TOKEN env var
       3. ANTHROPIC_API_KEY env var (explicit regular API key)
-      4. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
+      4. Claude Code credentials (``$CLAUDE_CONFIG_DIR`` when an account
+         directory is explicitly selected, else ~/.claude/.credentials.json)
          — with automatic refresh if expired and a refresh token is available
       5. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
+
+    Step 5 is skipped when an account directory is explicitly selected. The
+    pool is a global store seeded from the *global* singleton files, so
+    falling through to it would answer a request for account A with account
+    B's token — the silent substitution that made a worker call an exhausted
+    account and sit in 429 retries. With a selection in force, "this account
+    has no usable credential" is the honest answer.
 
     Returns the token string or None.
     """
@@ -836,7 +929,14 @@ def resolve_anthropic_token() -> Optional[str]:
     if resolved_claude_token:
         return resolved_claude_token
 
-    # 5. Hermes credential_pool OAuth entry.
+    # 5. Hermes credential_pool OAuth entry. Global store: never consulted
+    # while an explicit account directory is selected (see docstring).
+    if claude_config_dir() is not None:
+        logger.debug(
+            "CLAUDE_CONFIG_DIR selects an explicit account with no usable "
+            "credential - not substituting a global credential_pool entry"
+        )
+        return None
     resolved_pool_token = _resolve_anthropic_pool_token()
     if resolved_pool_token:
         return resolved_pool_token
