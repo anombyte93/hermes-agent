@@ -1461,8 +1461,6 @@ def create_task(
     block_reason = (block_reason or "").strip() or None
     if initial_status == "blocked" and block_reason is None:
         raise ValueError("block reason is required when initial_status='blocked'")
-    if assignee and initial_status == "running" and not triage:
-        _require_dispatchable_assignee(assignee)
     # Per-assignee default runtime (``kanban.max_runtime_by_assignee``); an explicit
     # value always wins, and no config leaves the card uncapped as before.
     if max_runtime_seconds is None and assignee:
@@ -1505,6 +1503,11 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # After the idempotency lookup: a retry of an existing card returns it rather than
+    # being refused by a guard that was switched on after the card was made.
+    if assignee and initial_status == "running" and not triage:
+        _require_dispatchable_assignee(assignee)
 
     now = int(time.time())
 
