@@ -163,6 +163,31 @@ _DAEMON_DEPRECATED = (
 )
 
 
+def stranded_warning(task_ids, *, now: int, state: dict, enabled: bool):
+    """One WARN line naming ready cards whose assignee is not a Hermes profile, or ``None``.
+
+    Upstream treats such an assignee as a control-plane lane pulled via ``claim_task`` and
+    deliberately keeps the "stuck" warning quiet for it. An estate with no such lanes says
+    so with ``kanban.require_known_assignee``; under that flag a ``skipped_nonspawnable``
+    card is an error the operator must hear, not correctly-idle silence. Measured
+    2026-09-23: 17 cards sat 21 days in ``ready`` beside a daemon that logged nothing.
+
+    Rate-limited to once per 300s via ``state["last_stranded_warn_at"]``, like the stuck
+    warning above it.
+    """
+    if not enabled or not task_ids:
+        return None
+    if now - int(state.get("last_stranded_warn_at", 0)) < 300:
+        return None
+    state["last_stranded_warn_at"] = now
+    ids = ", ".join(task_ids)
+    return (
+        f"[{_fmt_ts(now)}] WARN {len(task_ids)} ready card(s) can never be dispatched: their "
+        f"assignee is not a Hermes profile. {ids}. Reassign with `hermes kanban assign <id> "
+        f"<profile>` (see `hermes kanban assignees`) or park them with `hermes kanban block`."
+    )
+
+
 def _cmd_daemon(args: argparse.Namespace) -> int:
     """Deprecated — the dispatcher now runs inside the gateway. Kept so old
     scripts/systemd units get a clear migration message; ``--force`` (hidden
@@ -196,7 +221,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {"bad_ticks": 0, "last_warn_at": 0, "last_stranded_warn_at": 0}
+    strict_assignees = kb.require_known_assignee_enabled()
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
@@ -208,6 +234,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     def _on_tick(res):
+        stranded = stranded_warning(res.skipped_nonspawnable, now=int(time.time()),
+                                    state=health_state, enabled=strict_assignees)
+        if stranded:
+            print(stranded, file=sys.stderr, flush=True)
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         if ready_pending and not res.spawned:
             health_state["bad_ticks"] += 1

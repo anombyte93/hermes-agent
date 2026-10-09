@@ -1765,6 +1765,11 @@ DEFAULT_CONFIG = {
         # profiles only, so a single-GPU local model is never oversubscribed while cloud profiles keep
         # fanning out (#83). The standalone daemon re-reads this every tick (no restart needed).
         "max_in_progress_by_assignee": {},
+        # Refuse to create a dispatchable (ready) card whose assignee is not a profile on disk, and
+        # have the standalone daemon WARN about such cards. Off by default: a non-profile assignee
+        # may be a control-plane lane pulled via claim_task. Human-parked cards (blocked/triage)
+        # are always exempt.
+        "require_known_assignee": False,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
