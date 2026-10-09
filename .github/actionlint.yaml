@@ -1,9 +1,8 @@
-# actionlint knows only GitHub-hosted runner labels. An org admin names the
-# larger runners. Each one therefore reads as "unknown runner label" and hides
-# the real findings, unless this file declares it.
+# actionlint knows only GitHub-hosted runner labels, and anything else reads
+# as "unknown runner label". Upstream declared its org's larger runners here
+# (ubuntu-latest-96-core, ubuntu-latest-32-core, ubuntu-latest-32-arm-core,
+# windows-latest-32-core). This fork has none of them: a job that requests one
+# queues forever and never starts. Declaring no extra labels makes actionlint
+# flag any reintroduction, alongside tests/ci/test_workflow_runners.py.
 self-hosted-runner:
-  labels:
-    - ubuntu-latest-96-core
-    - ubuntu-latest-32-core
-    - ubuntu-latest-32-arm-core
-    - windows-latest-32-core
+  labels: []
