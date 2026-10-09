@@ -2410,8 +2410,11 @@ def goal_run_status(
         if outcome is not None or task.current_run_id != int(expected_run_id):
             return "superseded"
     if task.status in {"ready", "todo"}:
+        # Concurrency-wait markers ('capped', 'capped_alerted') are not lifecycle
+        # events; a wait written after a review must not mask changes_requested.
         event = conn.execute(
             "SELECT kind FROM task_events WHERE task_id = ? "
+            "AND kind NOT IN ('capped', 'capped_alerted') "
             "ORDER BY id DESC LIMIT 1", (task_id,),
         ).fetchone()
         if event and event["kind"] == "changes_requested":

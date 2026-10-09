@@ -641,3 +641,23 @@ def test_cli_dispatch_forwards_config_groups_and_reports_scope(kanban_home, caps
     out = json.loads(capsys.readouterr().out)
     assert len(out["spawned"]) == 1
     assert [d["scope"] for d in out["capped_details"]] == ["group:gpu0"]
+
+
+def test_capped_event_does_not_hide_changes_requested_from_goal_run_status(tmp_path, monkeypatch):
+    """A 'capped' wait marker written after a review's changes_requested must not mask it:
+    goal loops read goal_run_status to learn the review asked for changes."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb2
+    from hermes_cli import kanban_db_connect as kbc2
+    kb2.init_db()
+    with kbc2.connect_closing() as conn:
+        tid = kb2.create_task(conn, title="t", assignee="evo")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        with kb2.write_txn(conn):
+            kb2._append_event(conn, tid, "changes_requested", {"note": "fix it"})
+            kb2._append_event(conn, tid, "capped", {"assignee": "evo", "running": 2, "cap": 2, "scope": "assignee"})
+            kb2._append_event(conn, tid, "capped_alerted", None)
+        assert kb2.goal_run_status(conn, tid) == "changes_requested"
