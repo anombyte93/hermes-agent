@@ -681,7 +681,9 @@ def test_bulk_status_done_forwards_completion_summary(client):
             assert task.status == "done"
             assert task.result == "DECIDED: ship it"
             assert run.summary == "DECIDED: ship it"
-            assert run.metadata == {"source": "dashboard"}
+            # complete_task stamps the completion contract (6a4d340163d); the test
+            # workspace is not a git repo, so the evidence is recorded as unverified.
+            assert run.metadata == {"source": "dashboard", "completion_evidence": "unverified"}
     finally:
         conn.close()
 
