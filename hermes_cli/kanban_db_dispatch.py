@@ -1885,6 +1885,39 @@ def configured_capped_alert() -> Optional[tuple[int, list[str]]]:
     return parse_capped_alert(kanban_cfg.get("capped_alert")) if kanban_cfg else None
 
 
+def configured_max_runtime_by_assignee() -> dict[str, int]:
+    """``kanban.max_runtime_by_assignee`` as ``{canonical assignee: seconds}``.
+
+    Normalised with :func:`parse_assignee_caps` (invalid or < 1 entries dropped)
+    and keyed by the same lowercase canonical name ``create_task`` stores, so
+    ``Kimi: 600`` matches a card assigned to ``kimi``. Empty when unset or the
+    config cannot be read: no config means creation is unchanged.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        kanban_cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        return {}
+    raw = parse_assignee_caps(kanban_cfg.get("max_runtime_by_assignee"))
+    out: dict[str, int] = {}
+    for name, seconds in raw.items():
+        try:
+            key = _kb._canonical_assignee(name)
+        except Exception:
+            key = name
+        if key:
+            out[key] = seconds
+    return out
+
+
+def default_max_runtime_for(assignee: Optional[str]) -> Optional[int]:
+    """The configured default max runtime (seconds) for a card assigned to
+    ``assignee`` (already canonical), or ``None`` when it has none."""
+    if not assignee:
+        return None
+    return configured_max_runtime_by_assignee().get(assignee)
+
+
 def configured_max_spawn() -> Optional[int]:
     """``kanban.max_spawn`` from config, or None when unset/invalid."""
     try:
