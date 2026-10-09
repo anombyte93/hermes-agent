@@ -1893,12 +1893,8 @@ def configured_max_runtime_by_assignee() -> dict[str, int]:
     ``Kimi: 600`` matches a card assigned to ``kimi``. Empty when unset or the
     config cannot be read: no config means creation is unchanged.
     """
-    try:
-        from hermes_cli.config import load_config_readonly
-        kanban_cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
-    except Exception:
-        return {}
-    raw = parse_assignee_caps(kanban_cfg.get("max_runtime_by_assignee"))
+    # Board-level: profile value when set, else the root config (see kanban_board_setting).
+    raw = parse_assignee_caps(_kb.kanban_board_setting("max_runtime_by_assignee", {}))
     out: dict[str, int] = {}
     for name, seconds in raw.items():
         try:

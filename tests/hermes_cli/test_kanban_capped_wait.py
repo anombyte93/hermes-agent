@@ -287,7 +287,9 @@ def test_gateway_settings_carry_assignee_groups_into_dispatch_once(kanban_home, 
         captured.update(kwargs)
         return kb.DispatchResult()
 
-    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    # Patch the module the gateway actually resolves: other suite files purge sys.modules,
+    # so this file's top-level `kbd` can be a stale copy by the time this runs.
+    monkeypatch.setattr(kwd._kbd(), "dispatch_once", fake_dispatch_once)
     kwd._KanbanDispatcher(kb, settings).tick_once_for_board("default")
     assert captured["assignee_groups"] == {"gpu0": {"members": ["evo"], "max": 1}}
 

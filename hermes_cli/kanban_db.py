@@ -1231,16 +1231,50 @@ def unknown_assignee_message(assignee: Optional[str]) -> Optional[str]:
     )
 
 
+_MISSING = object()
+
+
+def kanban_board_setting(key: str, default: Any = None) -> Any:
+    """A board-level ``kanban.<key>``: the active profile's value when it sets one,
+    otherwise the ROOT config's (``<hermes root>/config.yaml``).
+
+    Boards live under the Hermes root and are shared by every profile, but cards are
+    created from whichever profile the caller runs as (a bare ``hermes`` follows the
+    sticky active profile). Without the fallback, a setting kept in the root config
+    (where ``-p default`` board daemons read it) is invisible to cards created from
+    another profile. Unreadable root config = ignored, never fatal.
+    """
+    try:
+        # Presence is judged on the RAW profile file: the merged config always carries the
+        # schema default, which would hide the root value. The merged value is what we return.
+        from hermes_cli.config import load_config_readonly, read_raw_config_readonly
+        raw_kanban = (read_raw_config_readonly() or {}).get("kanban") or {}
+        if isinstance(raw_kanban, dict) and key in raw_kanban:
+            merged = (load_config_readonly() or {}).get("kanban") or {}
+            return merged.get(key, raw_kanban[key]) if isinstance(merged, dict) else raw_kanban[key]
+    except Exception:
+        pass
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        root_cfg_path = Path(get_default_hermes_root()) / "config.yaml"
+        if Path(get_hermes_home()).resolve() == root_cfg_path.parent.resolve():
+            return default  # the active config IS the root config; already consulted
+        import yaml
+        data = yaml.safe_load(root_cfg_path.read_text(encoding="utf-8")) or {}
+        root_kanban = data.get("kanban") if isinstance(data, dict) else None
+        if isinstance(root_kanban, dict):
+            return root_kanban.get(key, default)
+    except Exception:
+        pass
+    return default
+
+
 def require_known_assignee_enabled() -> bool:
     """``kanban.require_known_assignee`` (default off, so upstream fixtures that assign to
     ``worker``/``alice`` under a HOME with other profiles keep working). Turn it on where
-    cards are created by agents that can invent an assignee."""
-    try:
-        from hermes_cli.config import load_config_readonly
-        kanban_cfg = (load_config_readonly() or {}).get("kanban") or {}
-        return bool(kanban_cfg.get("require_known_assignee", False))
-    except Exception:
-        return False
+    cards are created by agents that can invent an assignee. Falls back to the root
+    config when the active profile does not set it (:func:`kanban_board_setting`)."""
+    return bool(kanban_board_setting("require_known_assignee", False))
 
 
 def _require_dispatchable_assignee(assignee: str) -> None:
