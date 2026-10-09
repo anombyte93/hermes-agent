@@ -112,3 +112,13 @@ def test_cli_create_warns_but_creates_when_not_enforcing(home, tmp_path, monkeyp
     assert "not a Hermes profile" in out
     with kbc.connect() as c:
         assert [t for t in kb.list_tasks(c) if t.title == "warned card"]
+
+
+def test_idempotent_retry_returns_the_existing_card_even_once_enforcing(home, conn):
+    """A card made before enforcement (or by another path) is found by its idempotency key;
+    a retry must return it, not raise: the key lookup comes before the guard."""
+    tid = kb.create_task(conn, title="legacy", assignee="developer", idempotency_key="k-1")
+    (home / "config.yaml").write_text("kanban:\n  require_known_assignee: true\n")
+    assert kb.create_task(conn, title="legacy", assignee="developer", idempotency_key="k-1") == tid
+    with pytest.raises(ValueError):
+        kb.create_task(conn, title="fresh", assignee="developer", idempotency_key="k-2")
