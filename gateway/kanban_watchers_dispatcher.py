@@ -41,6 +41,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    max_in_progress_by_assignee: dict
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -114,6 +115,10 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        # Named per-assignee overrides of the scalar cap (#83).
+        max_in_progress_by_assignee=_kbd().parse_assignee_caps(
+            kanban_cfg.get("max_in_progress_by_assignee")
+        ),
     )
 
 
