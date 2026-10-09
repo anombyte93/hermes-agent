@@ -1770,6 +1770,10 @@ DEFAULT_CONFIG = {
         # may be a control-plane lane pulled via claim_task. Human-parked cards (blocked/triage)
         # are always exempt.
         "require_known_assignee": False,
+        # Per-assignee default max runtime in seconds, e.g. {"evo": 1800}: a card created for that
+        # profile without an explicit max runtime gets this cap (an explicit value always wins).
+        # Applied at creation only; {} = no defaults (cards stay uncapped unless given one).
+        "max_runtime_by_assignee": {},
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

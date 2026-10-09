@@ -1429,6 +1429,11 @@ def create_task(
         raise ValueError("block reason is required when initial_status='blocked'")
     if assignee and initial_status == "running" and not triage:
         _require_dispatchable_assignee(assignee)
+    # Per-assignee default runtime (``kanban.max_runtime_by_assignee``); an explicit
+    # value always wins, and no config leaves the card uncapped as before.
+    if max_runtime_seconds is None and assignee:
+        from hermes_cli.kanban_db_dispatch import default_max_runtime_for
+        max_runtime_seconds = default_max_runtime_for(assignee)
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
