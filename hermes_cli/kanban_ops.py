@@ -70,6 +70,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
         by_assignee = kbd.parse_assignee_caps(_kanban_cfg.get("max_in_progress_by_assignee"))
+        assignee_groups = kbd.parse_assignee_groups(_kanban_cfg.get("assignee_groups"))
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
@@ -82,6 +83,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         by_assignee = {}
+        assignee_groups = {}
         max_spawn = getattr(args, "max", None)
     # Explicit --max-per-assignee pairs win per name over config (#83).
     by_assignee.update(kbd.parse_assignee_caps(getattr(args, "max_per_assignee", None)))
@@ -96,6 +98,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 max_in_progress_by_assignee=by_assignee,
+                assignee_groups=assignee_groups,
                 on_locked="raise",
             )
         except kbd.BoardDispatchLockedError as exc:
@@ -116,6 +119,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "capped_details": res.capped_details,
             "auto_assigned_default": res.auto_assigned_default,
         }, ascii=True)
         return 0
@@ -141,8 +145,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
-    for tid, who, current in res.skipped_per_profile_capped:
-        print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
+    for detail in res.capped_details:
+        scope = detail["scope"]
+        where = "per-profile cap" if scope == "assignee" else f"{scope} cap"
+        print(
+            f"Deferred ({detail['assignee']} at {where} {detail['cap']}, "
+            f"{detail['running']} running): {detail['task_id']}"
+        )
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
@@ -196,7 +205,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {"bad_ticks": 0, "last_warn_at": 0, "last_capped_by": {}}
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
@@ -207,9 +216,22 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         except Exception:
             return False
 
+    def _only_cap_deferred(res) -> bool:
+        """Every spawnable ready task was deferred by a concurrency cap: the
+        dispatcher is working and the queue is waiting for capacity, not stuck.
+        Unassigned ready work is operator-actionable, so it still counts."""
+        capped_ids = {tid for (tid, _who, _cur) in res.skipped_per_profile_capped}
+        if not capped_ids or res.skipped_unassigned:
+            return False
+        try:
+            with kbc.connect_closing() as conn:
+                return not (kbd.spawnable_ready_ids(conn) - capped_ids)
+        except Exception:
+            return False
+
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        if ready_pending and not res.spawned and not _only_cap_deferred(res):
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
@@ -226,18 +248,30 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
+        capped_by: dict = {}
+        for _tid, who, _cur in res.skipped_per_profile_capped:
+            capped_by[who] = capped_by.get(who, 0) + 1
+        capped_changed = capped_by != health_state["last_capped_by"]
+        health_state["last_capped_by"] = capped_by
         if not verbose:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
         )
-        if did_work:
+        # A changed cap picture prints once; an unchanged wait stays quiet.
+        if did_work or (capped_by and capped_changed):
+            capped_n = len(res.skipped_per_profile_capped)
+            capped_txt = f"capped={capped_n}"
+            if capped_n:
+                capped_txt += " capped_by={" + ",".join(
+                    f"{who}:{n}" for who, n in sorted(capped_by.items())
+                ) + "}"
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
                 f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} {capped_txt}",
                 flush=True,
             )
 
