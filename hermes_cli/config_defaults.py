@@ -1761,6 +1761,10 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Named per-assignee caps, e.g. {"evo": 2}: override max_in_progress_per_profile for those
+        # profiles only, so a single-GPU local model is never oversubscribed while cloud profiles keep
+        # fanning out (#83). The standalone daemon re-reads this every tick (no restart needed).
+        "max_in_progress_by_assignee": {},
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

@@ -344,6 +344,9 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
+        _arg("--max-per-assignee", dest="max_per_assignee", action="append", metavar="NAME=N",
+             help="Cap running workers for one assignee profile (repeatable, e.g. evo=2); "
+                  "overrides kanban.max_in_progress_by_assignee for that name"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
@@ -352,6 +355,9 @@ _SPECS = [
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),
+        _arg("--max-per-assignee", dest="max_per_assignee", action="append", metavar="NAME=N",
+             help="Cap running workers for one assignee profile (repeatable, e.g. evo=2); "
+                  "overrides kanban.max_in_progress_by_assignee for that name"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT),
         _arg("--pidfile", help="Write the daemon's PID to this file on start"),
         _arg("--verbose", "-v", action="store_true", help="Log each tick's outcome to stdout"),

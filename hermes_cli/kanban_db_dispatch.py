@@ -1725,6 +1725,61 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def parse_assignee_caps(raw: Any) -> dict[str, int]:
+    """Normalise per-assignee caps to ``{assignee: positive int}``.
+
+    Accepts the ``kanban.max_in_progress_by_assignee`` mapping (``{evo: 2}``)
+    or the CLI's repeated ``NAME=N`` strings (later pairs win). Invalid entries
+    (empty name, non-integer, bool, below 1) are dropped rather than raising:
+    a typo must not brick dispatch, and a dropped entry falls back to the
+    scalar ``max_in_progress_per_profile``.
+    """
+    pairs: list[tuple[Any, Any]] = []
+    if isinstance(raw, Mapping):
+        pairs = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, str) and "=" in item:
+                name, _, value = item.partition("=")
+                pairs.append((name, value))
+    caps: dict[str, int] = {}
+    for name, value in pairs:
+        name = str(name).strip() if name is not None else ""
+        if not name or isinstance(value, bool):
+            continue
+        try:
+            ival = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if ival >= 1:
+            caps[name] = ival
+    return caps
+
+
+def configured_per_assignee_caps() -> tuple[Optional[int], dict[str, int]]:
+    """``(kanban.max_in_progress_per_profile, kanban.max_in_progress_by_assignee)``
+    from config. Read per tick by the standalone daemon (config load is
+    mtime-cached) so operators can retune a saturated local model without a
+    restart (#83)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        kanban_cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        return None, {}
+    scalar = _positive_int(kanban_cfg.get("max_in_progress_per_profile"), None)
+    return scalar, parse_assignee_caps(kanban_cfg.get("max_in_progress_by_assignee"))
+
+
+def configured_max_spawn() -> Optional[int]:
+    """``kanban.max_spawn`` from config, or None when unset/invalid."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = ((load_config_readonly() or {}).get("kanban", {}) or {}).get("max_spawn")
+    except Exception:
+        return None
+    return _positive_int(raw, None)
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -1820,6 +1875,7 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     on_locked: Optional[str] = None,
+    max_in_progress_by_assignee: Optional[Mapping[str, int]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1849,6 +1905,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            max_in_progress_by_assignee=max_in_progress_by_assignee,
         )
 
     try:
@@ -1944,6 +2001,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    assignee_caps: Optional[Mapping[str, int]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1960,9 +2018,10 @@ def _dispatch_lane_task(
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
+    assignee_cap = (assignee_caps or {}).get(assignee, per_profile_cap)
+    if assignee_cap is not None:
         current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
+        if current >= assignee_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
@@ -1983,7 +2042,7 @@ def _dispatch_lane_task(
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
-        if per_profile_cap is not None and name:
+        if (per_profile_cap is not None or assignee_caps) and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
@@ -2210,6 +2269,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    max_in_progress_by_assignee: Optional[Mapping[str, int]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2254,8 +2314,11 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    # Named per-assignee caps override the scalar for those profiles only (#83): a single-GPU local
+    # profile can be held at 2 while cloud profiles keep fanning out.
+    assignee_caps = parse_assignee_caps(max_in_progress_by_assignee)
     per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None:
+    if per_profile_cap is not None or assignee_caps:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -2266,6 +2329,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        assignee_caps=assignee_caps,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2779,6 +2843,7 @@ def run_daemon(
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
+    max_in_progress_by_assignee: Optional[Mapping[str, int]] = None,
 ) -> None:
     """Run the dispatcher in a loop until interrupted.
 
@@ -2792,6 +2857,7 @@ def run_daemon(
 
     if stop_event is None:
         stop_event = threading.Event()
+    cli_assignee_caps = parse_assignee_caps(max_in_progress_by_assignee)
 
     def _handle(_signum, _frame):
         stop_event.set()
@@ -2810,12 +2876,20 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            # Per-profile caps re-resolve every tick too (#83). Explicit CLI
+            # caps win per assignee; an explicit ``--max`` wins over
+            # ``kanban.max_spawn``, otherwise the config value is live.
+            per_profile, by_assignee = configured_per_assignee_caps()
+            by_assignee.update(cli_assignee_caps)
+            tick_max_spawn = max_spawn if max_spawn is not None else configured_max_spawn()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
+                    max_spawn=tick_max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    max_in_progress_per_profile=per_profile,
+                    max_in_progress_by_assignee=by_assignee,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

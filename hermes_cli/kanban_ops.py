@@ -69,6 +69,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
+        by_assignee = kbd.parse_assignee_caps(_kanban_cfg.get("max_in_progress_by_assignee"))
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
@@ -80,7 +81,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
+        by_assignee = {}
         max_spawn = getattr(args, "max", None)
+    # Explicit --max-per-assignee pairs win per name over config (#83).
+    by_assignee.update(kbd.parse_assignee_caps(getattr(args, "max_per_assignee", None)))
     with kbc.connect_closing() as conn:
         try:
             res = kbd.dispatch_once(
@@ -91,6 +95,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                max_in_progress_by_assignee=by_assignee,
                 on_locked="raise",
             )
         except kbd.BoardDispatchLockedError as exc:
@@ -242,6 +247,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             on_tick=_on_tick,
+            max_in_progress_by_assignee=kbd.parse_assignee_caps(
+                getattr(args, "max_per_assignee", None)
+            ),
         )
     finally:
         if pidfile:
