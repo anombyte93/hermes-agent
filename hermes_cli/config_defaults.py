@@ -1765,6 +1765,15 @@ DEFAULT_CONFIG = {
         # profiles only, so a single-GPU local model is never oversubscribed while cloud profiles keep
         # fanning out (#83). The standalone daemon re-reads this every tick (no restart needed).
         "max_in_progress_by_assignee": {},
+        # Profiles that share one GPU / local model server, capped together, e.g.
+        # {"gpu0": {"members": ["evo", "coder-local"], "max": 4}}. Group running = host-wide sum over the
+        # members; a ready task is deferred when its own cap OR any group containing it is full. Invalid
+        # groups are dropped, never fatal. The standalone daemon re-reads this every tick.
+        "assignee_groups": {},
+        # Alert when a task has waited on a cap too long: {"after_minutes": 30, "command": ["notify", ...]}.
+        # The command runs once per wait episode with JSON on stdin ({"board", "alerts": [...]}); hermes
+        # itself sends nothing. Empty = off. Standalone daemon only.
+        "capped_alert": {},
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
