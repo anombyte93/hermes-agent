@@ -42,6 +42,7 @@ class _DispatcherSettings:
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
     max_in_progress_by_assignee: dict
+    assignee_groups: dict
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -119,6 +120,8 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         max_in_progress_by_assignee=_kbd().parse_assignee_caps(
             kanban_cfg.get("max_in_progress_by_assignee")
         ),
+        # Profiles sharing one GPU, capped together host-wide; invalid groups dropped.
+        assignee_groups=_kbd().parse_assignee_groups(kanban_cfg.get("assignee_groups")),
     )
 
 

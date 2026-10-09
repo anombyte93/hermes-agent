@@ -196,15 +196,20 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    assignee = _canonical_assignee(child.get("assignee"))
+    # This path bypasses create_task, so it applies the same per-assignee
+    # default runtime (``kanban.max_runtime_by_assignee``) itself.
+    from hermes_cli.kanban_db_dispatch import default_max_runtime_for
+    max_runtime = default_max_runtime_for(assignee)
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, max_runtime_seconds) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            assignee, child_ws_kind, child_ws_path,
+            root_row["tenant"], now, (author or "decomposer"), max_runtime,
         ),
     )
     _append_event(

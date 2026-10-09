@@ -124,7 +124,14 @@ class DispatchResult:
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
-    tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    tick; separate bucket so dashboards show "profile busy" vs "stuck".
+    For an assignee-scope deferral ``current`` is that assignee's host-wide
+    running count; for a group-scope deferral it is the group's running count
+    (the number that hit the cap). ``capped_details`` carries the scope."""
+    capped_details: list[dict] = field(default_factory=list)
+    """One dict per ``skipped_per_profile_capped`` entry, same order:
+    ``{"task_id", "assignee", "running", "cap", "scope"}`` where ``scope`` is
+    ``"assignee"`` (its own cap) or ``"group:<name>"`` (``kanban.assignee_groups``)."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1634,6 +1641,23 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return _has_spawnable(conn, "ready")
 
 
+def spawnable_ready_ids(conn: sqlite3.Connection) -> set[str]:
+    """Ids of ready+assigned+unclaimed tasks whose assignee is a real profile
+    (all assigned ones when ``profile_exists`` is unimportable). Health
+    telemetry compares this with a tick's cap deferrals: a queue that is
+    entirely cap-deferred is waiting, not stuck."""
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'ready' AND assignee IS NOT NULL AND assignee != '' "
+        "AND claim_lock IS NULL"
+    ).fetchall()
+    profile_exists = _profile_exists_fn()
+    return {
+        row["id"] for row in rows
+        if profile_exists is None or profile_exists(row["assignee"])
+    }
+
+
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
     return _has_spawnable(conn, "review")
@@ -1756,18 +1780,138 @@ def parse_assignee_caps(raw: Any) -> dict[str, int]:
     return caps
 
 
+def _strict_int(value: Any, *, minimum: int) -> Optional[int]:
+    """``int(value)`` when it is an integer (or integer string) >= ``minimum``;
+    None otherwise. Bools are rejected (``True`` is not a cap of 1)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        ival = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= minimum else None
+
+
+def parse_assignee_groups(raw: Any) -> dict[str, dict]:
+    """Normalise ``kanban.assignee_groups`` to ``{group: {"members": [..], "max": N}}``.
+
+    Profiles that share one GPU / local model server are capped together: the
+    group's running count is the host-wide sum over its members. ``members``
+    is a list of profile names (a comma-separated string is accepted);
+    duplicates and blanks are dropped, order is kept. A group with no valid
+    member or no positive integer ``max`` is dropped — a config typo must
+    never brick dispatch.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    groups: dict[str, dict] = {}
+    for name, spec in raw.items():
+        name = str(name).strip() if name is not None else ""
+        if not name or not isinstance(spec, Mapping):
+            continue
+        cap = _strict_int(spec.get("max"), minimum=1)
+        raw_members = spec.get("members")
+        if isinstance(raw_members, str):
+            raw_members = raw_members.split(",")
+        if cap is None or not isinstance(raw_members, (list, tuple)):
+            continue
+        members: list[str] = []
+        for member in raw_members:
+            if not isinstance(member, str):
+                continue
+            member = member.strip()
+            if member and member not in members:
+                members.append(member)
+        if members:
+            groups[name] = {"members": members, "max": cap}
+    return groups
+
+
+def parse_capped_alert(raw: Any) -> Optional[tuple[int, list[str]]]:
+    """Normalise ``kanban.capped_alert`` to ``(after_minutes, argv)`` or None (off).
+
+    ``after_minutes`` is a non-negative integer; ``command`` is an argv list of
+    strings (a plain string is split with :func:`shlex.split`). Anything else
+    disables the alert rather than raising.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    after = _strict_int(raw.get("after_minutes"), minimum=0)
+    command = raw.get("command")
+    if isinstance(command, str):
+        import shlex
+        try:
+            command = shlex.split(command)
+        except ValueError:
+            return None
+    if after is None or not isinstance(command, (list, tuple)) or not command:
+        return None
+    if not all(isinstance(part, str) and part for part in command):
+        return None
+    return after, list(command)
+
+
+def _kanban_config_readonly() -> Optional[dict]:
+    """The ``kanban:`` config section (mtime-cached load), or None when the
+    config cannot be loaded."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        return (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        return None
+
+
 def configured_per_assignee_caps() -> tuple[Optional[int], dict[str, int]]:
     """``(kanban.max_in_progress_per_profile, kanban.max_in_progress_by_assignee)``
     from config. Read per tick by the standalone daemon (config load is
     mtime-cached) so operators can retune a saturated local model without a
     restart (#83)."""
-    try:
-        from hermes_cli.config import load_config_readonly
-        kanban_cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
-    except Exception:
+    kanban_cfg = _kanban_config_readonly()
+    if kanban_cfg is None:
         return None, {}
     scalar = _positive_int(kanban_cfg.get("max_in_progress_per_profile"), None)
     return scalar, parse_assignee_caps(kanban_cfg.get("max_in_progress_by_assignee"))
+
+
+def configured_assignee_groups() -> dict[str, dict]:
+    """``kanban.assignee_groups`` from config, normalised; re-read every daemon tick."""
+    kanban_cfg = _kanban_config_readonly()
+    return parse_assignee_groups(kanban_cfg.get("assignee_groups")) if kanban_cfg else {}
+
+
+def configured_capped_alert() -> Optional[tuple[int, list[str]]]:
+    """``kanban.capped_alert`` from config, normalised; None when off/invalid."""
+    kanban_cfg = _kanban_config_readonly()
+    return parse_capped_alert(kanban_cfg.get("capped_alert")) if kanban_cfg else None
+
+
+def configured_max_runtime_by_assignee() -> dict[str, int]:
+    """``kanban.max_runtime_by_assignee`` as ``{canonical assignee: seconds}``.
+
+    Normalised with :func:`parse_assignee_caps` (invalid or < 1 entries dropped)
+    and keyed by the same lowercase canonical name ``create_task`` stores, so
+    ``Kimi: 600`` matches a card assigned to ``kimi``. Empty when unset or the
+    config cannot be read: no config means creation is unchanged.
+    """
+    # Board-level: profile value when set, else the root config (see kanban_board_setting).
+    raw = parse_assignee_caps(_kb.kanban_board_setting("max_runtime_by_assignee", {}))
+    out: dict[str, int] = {}
+    for name, seconds in raw.items():
+        try:
+            key = _kb._canonical_assignee(name)
+        except Exception:
+            key = name
+        if key:
+            out[key] = seconds
+    return out
+
+
+def default_max_runtime_for(assignee: Optional[str]) -> Optional[int]:
+    """The configured default max runtime (seconds) for a card assigned to
+    ``assignee`` (already canonical), or ``None`` when it has none."""
+    if not assignee:
+        return None
+    return configured_max_runtime_by_assignee().get(assignee)
 
 
 def configured_max_spawn() -> Optional[int]:
@@ -1797,13 +1941,13 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
-    """Total ``running`` tasks across every board EXCEPT ``board``.
+def _for_each_other_board(board: Optional[str], fn: Callable[[sqlite3.Connection], None]) -> None:
+    """Call ``fn(conn)`` on every non-archived board EXCEPT ``board``.
 
-    Caps bound the HOST, but each board's tick only sees its own DB; without
-    this a derived cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
+    board to one file) visits nothing. Fails open: a board that cannot be
+    enumerated, opened or read is skipped — never brick dispatch on healthy
+    boards because one is broken.
     """
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
@@ -1812,8 +1956,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
-        return 0
-    total = 0
+        return
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
@@ -1825,13 +1968,62 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                 continue
             other = _kbc.connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                fn(other)
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
         except Exception:
             continue
-    return total
+
+
+def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+    """Total ``running`` tasks across every board EXCEPT ``board``.
+
+    Caps bound the HOST, but each board's tick only sees its own DB; without
+    this a derived cap of N gets multiplied by the number of active boards.
+    Fails open per board (see :func:`_for_each_other_board`).
+    """
+    totals = [0]
+
+    def _add(conn: sqlite3.Connection) -> None:
+        totals[0] += count_running_tasks(conn)
+
+    _for_each_other_board(board, _add)
+    return totals[0]
+
+
+def count_running_by_assignee(conn: sqlite3.Connection) -> dict[str, int]:
+    """``{assignee: running count}`` for one board. Raises on a broken DB;
+    the host-wide wrapper decides whether to fail open."""
+    return {
+        row["assignee"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        )
+    }
+
+
+def count_running_by_assignee_host(
+    conn: sqlite3.Connection, board: Optional[str] = None,
+) -> dict[str, int]:
+    """``{assignee: running count}`` summed over THIS board (``conn``) and every
+    other board on the host.
+
+    Per-assignee, per-profile and group caps protect a shared resource (one
+    GPU, one API quota), not a board: without the other boards, two boards
+    each running ``cap`` evo workers put ``2 * cap`` on one llama-server.
+    Other boards fail open (skipped when unreadable).
+    """
+    counts = count_running_by_assignee(conn)
+
+    def _add(other: sqlite3.Connection) -> None:
+        for name, n in count_running_by_assignee(other).items():
+            counts[name] = counts.get(name, 0) + n
+
+    _for_each_other_board(board, _add)
+    return counts
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -1876,6 +2068,7 @@ def dispatch_once(
     reconcile_orphans: bool = True,
     on_locked: Optional[str] = None,
     max_in_progress_by_assignee: Optional[Mapping[str, int]] = None,
+    assignee_groups: Optional[Mapping[str, Any]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1906,6 +2099,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             max_in_progress_by_assignee=max_in_progress_by_assignee,
+            assignee_groups=assignee_groups,
         )
 
     try:
@@ -1987,6 +2181,138 @@ def _stamp_attempt_base_head(conn: sqlite3.Connection, task_id: str) -> None:
         pass
 
 
+def _cap_hit(
+    assignee: str,
+    per_profile_cap: Optional[int],
+    assignee_caps: Optional[Mapping[str, int]],
+    assignee_groups: Optional[Mapping[str, Mapping]],
+    running_by_assignee: Mapping[str, int],
+) -> Optional[tuple[int, int, str]]:
+    """``(running, cap, scope)`` of the first full cap that defers ``assignee``,
+    or None when it has headroom. The assignee's own cap (named, else the
+    scalar) is checked first, then every group containing it in name order;
+    a group's running count is the sum over its members."""
+    own_cap = (assignee_caps or {}).get(assignee, per_profile_cap)
+    if own_cap is not None:
+        current = running_by_assignee.get(assignee, 0)
+        if current >= own_cap:
+            return current, own_cap, "assignee"
+    for name in sorted(assignee_groups or {}):
+        spec = assignee_groups[name]
+        members = spec.get("members") or ()
+        if assignee not in members:
+            continue
+        group_running = sum(running_by_assignee.get(m, 0) for m in members)
+        if group_running >= spec["max"]:
+            return group_running, int(spec["max"]), f"group:{name}"
+    return None
+
+
+def _capped_episode_open(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's latest event (ignoring ``capped_alerted``) is
+    ``capped``: it is still in the wait episode that event started. Any other
+    event since (claim, spawn, status change, ...) ended that episode."""
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? AND kind != 'capped_alerted' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None and row["kind"] == "capped"
+
+
+def _record_capped_event(conn: sqlite3.Connection, task_id: str, payload: dict) -> None:
+    """Append a ``capped`` event at most once per wait episode. Best-effort:
+    visibility must never fail the dispatch tick."""
+    try:
+        if _capped_episode_open(conn, task_id):
+            return
+        with _kb.write_txn(conn):
+            if not _capped_episode_open(conn, task_id):
+                _kb._append_event(conn, task_id, "capped", payload)
+    except Exception:
+        _kb._log.debug("kanban dispatch: failed to record capped event for %s",
+                       task_id, exc_info=True)
+
+
+def check_capped_alerts(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    after_minutes: int,
+    command: list[str],
+    now: Optional[int] = None,
+) -> list[str]:
+    """Run ``command`` once for ready tasks whose cap wait is too long.
+
+    A task qualifies when it is ``ready``, its open wait episode (see
+    :func:`_capped_episode_open`) began more than ``after_minutes`` ago, and no
+    ``capped_alerted`` event follows that episode's ``capped`` event. The
+    command gets ``{"board", "alerts": [{"task_id", "title", "assignee",
+    "scope", "waiting_minutes"}]}`` as JSON on stdin and 30 s to finish. Every
+    alerted task then gets a ``capped_alerted`` event — even if the command
+    failed, so a broken command cannot run (and time out) every tick. Never
+    raises; returns the alerted task ids. Generic by design: hermes sends no
+    Discord/HTTP itself, the operator's command does.
+    """
+    try:
+        now = int(time.time()) if now is None else int(now)
+        cutoff = now - int(after_minutes) * 60
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.assignee, e.payload, e.created_at "
+            "FROM tasks t JOIN task_events e ON e.task_id = t.id "
+            "WHERE t.status = 'ready' AND e.kind = 'capped' AND e.created_at < ? "
+            "AND e.id = (SELECT MAX(x.id) FROM task_events x "
+            "            WHERE x.task_id = t.id AND x.kind != 'capped_alerted') "
+            "AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id "
+            "                AND a.kind = 'capped_alerted' AND a.id > e.id) "
+            "ORDER BY e.created_at ASC, t.id ASC",
+            (cutoff,),
+        ).fetchall()
+    except Exception:
+        _kb._log.warning("kanban capped_alert: query failed", exc_info=True)
+        return []
+    if not rows:
+        return []
+    import json
+
+    alerts = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        alerts.append({
+            "task_id": row["id"],
+            "title": row["title"],
+            "assignee": payload.get("assignee") or row["assignee"],
+            "scope": payload.get("scope") or "assignee",
+            "waiting_minutes": max(0, (now - int(row["created_at"])) // 60),
+        })
+    body = json.dumps({"board": board, "alerts": alerts})
+    try:
+        proc = subprocess.run(
+            list(command), input=body, text=True, capture_output=True,
+            timeout=30, check=False,
+        )
+        if proc.returncode != 0:
+            _kb._log.warning(
+                "kanban capped_alert: command %r exited %s: %s",
+                command[0], proc.returncode, (proc.stderr or "").strip()[-500:],
+            )
+    except Exception as exc:
+        _kb._log.warning("kanban capped_alert: command %r failed: %s", command[0], exc)
+    alerted = [a["task_id"] for a in alerts]
+    try:
+        with _kb.write_txn(conn):
+            for tid in alerted:
+                _kb._append_event(conn, tid, "capped_alerted")
+    except Exception:
+        _kb._log.warning("kanban capped_alert: could not record capped_alerted", exc_info=True)
+    return alerted
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2002,10 +2328,12 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
     assignee_caps: Optional[Mapping[str, int]] = None,
+    assignee_groups: Optional[Mapping[str, Mapping]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
-    skip is recorded on ``result``.
+    skip is recorded on ``result``. ``assignee_groups`` must already be
+    normalised by :func:`parse_assignee_groups`.
     """
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
@@ -2018,12 +2346,15 @@ def _dispatch_lane_task(
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
-    assignee_cap = (assignee_caps or {}).get(assignee, per_profile_cap)
-    if assignee_cap is not None:
-        current = per_profile_running.get(assignee, 0)
-        if current >= assignee_cap:
-            result.skipped_per_profile_capped.append((task_id, assignee, current))
-            return False
+    hit = _cap_hit(assignee, per_profile_cap, assignee_caps, assignee_groups, per_profile_running)
+    if hit is not None:
+        running, cap, scope = hit
+        result.skipped_per_profile_capped.append((task_id, assignee, running))
+        payload = {"assignee": assignee, "running": running, "cap": cap, "scope": scope}
+        result.capped_details.append({"task_id": task_id, **payload})
+        if not dry_run:
+            _record_capped_event(conn, task_id, payload)
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2040,9 +2371,10 @@ def _dispatch_lane_task(
         return False
 
     def _count_spawn(name: str) -> None:
-        # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
-        if (per_profile_cap is not None or assignee_caps) and name:
+        # Later rows in this tick respect the per-profile and group caps
+        # (group running is summed from these counts); subsequent ticks
+        # re-query from the DBs.
+        if name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
@@ -2270,6 +2602,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     max_in_progress_by_assignee: Optional[Mapping[str, int]] = None,
+    assignee_groups: Optional[Mapping[str, Any]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2317,19 +2650,17 @@ def _dispatch_once_locked(
     # Named per-assignee caps override the scalar for those profiles only (#83): a single-GPU local
     # profile can be held at 2 while cloud profiles keep fanning out.
     assignee_caps = parse_assignee_caps(max_in_progress_by_assignee)
+    # Groups cap profiles that share one GPU / model server together.
+    groups = parse_assignee_groups(assignee_groups)
     per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None or assignee_caps:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+    if per_profile_cap is not None or assignee_caps or groups:
+        # Host-wide: the capped resource is shared by every board on the host.
+        per_profile_running = count_running_by_assignee_host(conn, board)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-        assignee_caps=assignee_caps,
+        assignee_caps=assignee_caps, assignee_groups=groups,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2836,6 +3167,18 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
 
+def _run_capped_alert(conn: sqlite3.Connection, after_minutes: int, command: list[str]) -> None:
+    """Daemon-tick wrapper around :func:`check_capped_alerts`; never raises."""
+    try:
+        try:
+            board = _kb.get_current_board()
+        except Exception:
+            board = _kb.DEFAULT_BOARD
+        check_capped_alerts(conn, board=board, after_minutes=after_minutes, command=command)
+    except Exception:
+        _kb._log.warning("kanban capped_alert: tick check failed", exc_info=True)
+
+
 def run_daemon(
     *,
     interval: float = 60.0,
@@ -2882,6 +3225,9 @@ def run_daemon(
             per_profile, by_assignee = configured_per_assignee_caps()
             by_assignee.update(cli_assignee_caps)
             tick_max_spawn = max_spawn if max_spawn is not None else configured_max_spawn()
+            # GPU-sharing groups and the long-wait alert are live too.
+            groups = configured_assignee_groups()
+            capped_alert = configured_capped_alert()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
@@ -2890,7 +3236,10 @@ def run_daemon(
                     failure_limit=failure_limit,
                     max_in_progress_per_profile=per_profile,
                     max_in_progress_by_assignee=by_assignee,
+                    assignee_groups=groups,
                 )
+                if capped_alert is not None:
+                    _run_capped_alert(conn, *capped_alert)
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
