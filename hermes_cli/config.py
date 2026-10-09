@@ -1920,6 +1920,28 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def read_root_config_section(section: str) -> Dict[str, Any]:
+    """One top-level section of the ROOT ``<hermes root>/config.yaml``, env-expanded.
+
+    For board-level settings that must agree across profiles: kanban boards live under the
+    Hermes root and are shared by every profile, so a profile that does not set a board key
+    falls back to the root config (see ``kanban_db.kanban_board_setting``). Not merged with
+    defaults or the managed overlay; the caller supplies its own default. ``{}`` when the
+    file is missing, unparseable or the section is not a mapping. Never raises.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        data = read_user_config_raw(Path(get_default_hermes_root()) / "config.yaml")
+        value = data.get(section) if isinstance(data, dict) else None
+        if not isinstance(value, dict):
+            return {}
+        expanded = _expand_env_vars(value)
+        return expanded if isinstance(expanded, dict) else {}
+    except Exception:
+        return {}
+
+
 def read_raw_config_readonly() -> Dict[str, Any]:
     """``read_raw_config()`` without the per-call deepcopy, for callers that ONLY READ.
     **Mutating the result corrupts the in-process cache for every subsequent caller.** Meant for

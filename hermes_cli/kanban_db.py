@@ -1256,14 +1256,10 @@ def kanban_board_setting(key: str, default: Any = None) -> Any:
         pass
     try:
         from hermes_constants import get_default_hermes_root, get_hermes_home
-        root_cfg_path = Path(get_default_hermes_root()) / "config.yaml"
-        if Path(get_hermes_home()).resolve() == root_cfg_path.parent.resolve():
+        if Path(get_hermes_home()).resolve() == Path(get_default_hermes_root()).resolve():
             return default  # the active config IS the root config; already consulted
-        import yaml
-        data = yaml.safe_load(root_cfg_path.read_text(encoding="utf-8")) or {}
-        root_kanban = data.get("kanban") if isinstance(data, dict) else None
-        if isinstance(root_kanban, dict):
-            return root_kanban.get(key, default)
+        from hermes_cli.config import read_root_config_section
+        return read_root_config_section("kanban").get(key, default)
     except Exception:
         pass
     return default
