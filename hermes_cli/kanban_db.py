@@ -345,6 +345,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.skipped_assignee_not_allowed,
             result.rejected_skills,
         )):
             outcome = "idle"
@@ -3230,6 +3231,88 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def board_slug_for_conn(conn: sqlite3.Connection, board: Optional[str] = None) -> str:
+    """The board whose ``kanban.db`` ``conn`` has open.
+
+    The connection is the authority (it is where the row lands), so its file path wins
+    over an explicit ``board`` argument; a DB outside the board layout (a custom
+    ``HERMES_KANBAN_DB``, ``:memory:``) falls back to ``board``, then the current board.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main = next((r for r in rows if r[1] == "main"), None)
+        db_file = Path(main[2]).resolve() if main is not None and main[2] else None
+    except Exception:
+        db_file = None
+    if db_file is not None:
+        try:
+            if db_file == (kanban_home() / "kanban.db").resolve():
+                return DEFAULT_BOARD
+            if db_file.name == "kanban.db" and db_file.parent.parent == boards_root().resolve():
+                slug = _normalize_board_slug(db_file.parent.name)
+                if slug:
+                    return slug
+        except (OSError, ValueError):
+            pass
+    return (_normalize_board_slug(board) or DEFAULT_BOARD) if board else get_current_board()
+
+
+def board_allowed_assignees(
+    conn: Optional[sqlite3.Connection] = None, *, board: Optional[str] = None,
+) -> Optional[frozenset]:
+    """``board.json`` ``allowed_assignees`` as canonical profile names, or ``None``.
+
+    ``None`` (key absent or null) means no restriction: today's behaviour. A list
+    restricts which profiles may own a dispatchable card on the board and which ones
+    the dispatcher will spawn. An empty list allows nobody. A malformed value (not a
+    list of non-empty strings) fails closed to an empty allowlist, logged.
+    """
+    if conn is not None:
+        slug = board_slug_for_conn(conn, board)
+    else:
+        slug = (_normalize_board_slug(board) or DEFAULT_BOARD) if board else get_current_board()
+    raw = read_board_metadata(slug).get("allowed_assignees")
+    if raw is None:
+        return None
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)) or not all(
+            isinstance(i, str) and i.strip() for i in items):
+        _log.warning(
+            "board %r: allowed_assignees in board.json must be a list of profile names; "
+            "got %r. Failing closed: no assignee is allowed on this board.", slug, raw)
+        return frozenset()
+    from hermes_cli.profiles import normalize_profile_name
+    return frozenset(normalize_profile_name(i) for i in items)
+
+
+def assignee_not_allowed_message(
+    assignee: Optional[str], allowed: Optional[frozenset], board: str,
+) -> Optional[str]:
+    """Why ``assignee`` may not own a dispatchable card on ``board``, or ``None``."""
+    if allowed is None or not assignee:
+        return None
+    canonical = _canonical_assignee(assignee)
+    if canonical in allowed:
+        return None
+    return (
+        f"assignee {canonical!r} is not allowed on board {board!r}: its board.json "
+        f"allowed_assignees is {sorted(allowed) or '[] (nobody)'}. Assign one of those "
+        f"profiles, or change allowed_assignees in board.json."
+    )
+
+
+def require_allowed_assignee(
+    conn: sqlite3.Connection, assignee: Optional[str], *, board: Optional[str] = None,
+) -> None:
+    """Raise ``ValueError`` when the board's ``allowed_assignees`` excludes ``assignee``."""
+    if not assignee:
+        return
+    slug = board_slug_for_conn(conn, board)
+    msg = assignee_not_allowed_message(assignee, board_allowed_assignees(board=slug), slug)
+    if msg:
+        raise ValueError(msg)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3486,6 +3569,13 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # Board-level allowlist (board.json ``allowed_assignees``), after the idempotency
+    # lookup so a retry of an existing card returns it. Human-parked cards (blocked /
+    # triage) are exempt: they can never spawn without passing dispatch, and dispatch
+    # re-checks the allowlist before every spawn.
+    if assignee and initial_status == "running" and not triage:
+        require_allowed_assignee(conn, assignee, board=board)
 
     now = int(time.time())
 
@@ -8291,6 +8381,10 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_assignee_not_allowed: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` refused because the board's ``board.json``
+    ``allowed_assignees`` does not list the assignee. The card is blocked with the
+    reason and an ``assignee_not_allowed`` event (operator-actionable)."""
     rejected_skills: list[tuple[str, list[str]]] = field(default_factory=list)
     """Ready tasks rejected before claim/workspace/spawn because one or more
     force-loaded skill identifiers could not be resolved for the assignee."""
@@ -10296,6 +10390,28 @@ def _append_nonspawnable_event(
     return True
 
 
+def _refuse_disallowed_assignee(
+    conn: sqlite3.Connection, task_id: str, assignee: str, reason: str, *, lane: str,
+) -> None:
+    """Record why a card was not spawned: an ``assignee_not_allowed`` event and a
+    block with the reason (``kind=capability``: a human must reassign the card or
+    widen the board's allowlist), so the refusal is durable and visible on every
+    surface and is not re-evaluated every tick."""
+    payload = {"assignee": assignee, "lane": lane, "reason": reason}
+    try:
+        last = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if last is None or last["kind"] != "assignee_not_allowed":
+            with write_txn(conn):
+                _append_event(conn, task_id, "assignee_not_allowed", payload)
+        block_task(conn, task_id, reason=reason, kind="capability")
+    except Exception:
+        _log.warning(
+            "kanban dispatch: could not record assignee_not_allowed for %s", task_id, exc_info=True)
+
+
 def _note_nonspawnable(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10618,6 +10734,22 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # Board allowlist (board.json ``allowed_assignees``), read once per tick from the
+    # board this connection actually has open.
+    _board_slug = board_slug_for_conn(conn, board)
+    _allowed_assignees = board_allowed_assignees(board=_board_slug)
+
+    def _refused_by_allowlist(task_id: str, assignee: str, lane: str) -> bool:
+        """The last line of defence for cards that reached a lane without passing
+        create (reassignment, an unblocked parked card, default_assignee)."""
+        refusal = assignee_not_allowed_message(assignee, _allowed_assignees, _board_slug)
+        if refusal is None:
+            return False
+        result.skipped_assignee_not_allowed.append((task_id, assignee))
+        if not dry_run:
+            _refuse_disallowed_assignee(conn, task_id, assignee, refusal, lane=lane)
+        return True
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10695,6 +10827,8 @@ def _dispatch_once_locked(
             _note_nonspawnable(
                 conn, row["id"], row_assignee, dry_run=dry_run, lane="ready"
             )
+            continue
+        if _refused_by_allowlist(row["id"], row_assignee, "ready"):
             continue
         candidate = get_task(conn, row["id"])
         missing_skills = _missing_worker_skills(
@@ -10863,6 +10997,8 @@ def _dispatch_once_locked(
             _note_nonspawnable(
                 conn, row["id"], row["assignee"], dry_run=dry_run, lane="review"
             )
+            continue
+        if _refused_by_allowlist(row["id"], row["assignee"], "review"):
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
