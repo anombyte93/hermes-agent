@@ -121,6 +121,10 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_assignee_not_allowed: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` refused because the board's ``board.json``
+    ``allowed_assignees`` does not list the assignee. A ready card is blocked with
+    the reason (operator-actionable); a review card is left in place with an event."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -2329,6 +2333,8 @@ def _dispatch_lane_task(
     per_profile_running: dict[str, int],
     assignee_caps: Optional[Mapping[str, int]] = None,
     assignee_groups: Optional[Mapping[str, Mapping]] = None,
+    allowed_assignees: Optional[frozenset] = None,
+    board_slug: Optional[str] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2343,6 +2349,16 @@ def _dispatch_lane_task(
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
+        return False
+    # Board allowlist (board.json ``allowed_assignees``): the last line of defence for
+    # cards that reached the lane without passing create (reassignment, a parked card
+    # unblocked, default_assignee, a direct DB write).
+    refusal = _kb.assignee_not_allowed_message(
+        assignee, allowed_assignees, board_slug or board or _kb.DEFAULT_BOARD)
+    if refusal is not None:
+        result.skipped_assignee_not_allowed.append((task_id, assignee))
+        if not dry_run:
+            _refuse_disallowed_assignee(conn, task_id, assignee, refusal, lane=lane)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2429,6 +2445,29 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+
+def _refuse_disallowed_assignee(
+    conn: sqlite3.Connection, task_id: str, assignee: str, reason: str, *, lane: str,
+) -> None:
+    """Record why a card was not spawned. A ready card is blocked with the reason
+    (``kind=capability``: a human must reassign it or widen the allowlist), so the
+    refusal is durable and is not re-evaluated every tick. A review card cannot be
+    blocked from ``review``; it gets one ``assignee_not_allowed`` event per episode."""
+    payload = {"assignee": assignee, "lane": lane, "reason": reason}
+    try:
+        last = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if last is None or last["kind"] != "assignee_not_allowed":
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, task_id, "assignee_not_allowed", payload)
+        if lane == "ready":
+            _kb.block_task(conn, task_id, reason=reason, kind="capability")
+    except Exception:
+        _kb._log.warning(
+            "kanban dispatch: could not record assignee_not_allowed for %s", task_id, exc_info=True)
 
 
 def _apply_default_assignee(
@@ -2656,11 +2695,14 @@ def _dispatch_once_locked(
     if per_profile_cap is not None or assignee_caps or groups:
         # Host-wide: the capped resource is shared by every board on the host.
         per_profile_running = count_running_by_assignee_host(conn, board)
+    # Read once per tick from the board this connection actually has open.
+    board_slug = _kb.board_slug_for_conn(conn, board)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         assignee_caps=assignee_caps, assignee_groups=groups,
+        allowed_assignees=_kb.board_allowed_assignees(board=board_slug), board_slug=board_slug,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

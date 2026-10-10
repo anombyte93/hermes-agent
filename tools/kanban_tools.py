@@ -102,6 +102,148 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _visible(to_env_worker=False)
 
 
+# --- Worker containment: kanban.worker_tools_exclude / kanban.worker_scope ---
+#
+# Every dispatcher-spawned worker receives the whole ``kanban`` toolset, whatever its
+# profile's own toolsets say. Several of those tools reach past the worker's own card:
+# ``kanban_create`` (a ready card for any assignee/workspace: privilege escalation to a
+# terminal-capable profile), ``kanban_attach_url`` (a server-side GET to any public URL:
+# an exfiltration channel), ``kanban_comment`` on any task (comments are injected into
+# later workers' prompts) and ``kanban_show`` of any task. Both settings are read from
+# the WORKER's profile config and apply only in worker context (HERMES_KANBAN_TASK set);
+# orchestrator chats of the same profile are unaffected.
+
+WORKER_SCOPE_ALL = "all"
+WORKER_SCOPE_OWN_TASK = "own_task"
+_WORKER_SCOPES = (WORKER_SCOPE_ALL, WORKER_SCOPE_OWN_TASK)
+# A worker must always be able to end its run; excluding these would strand the card.
+_NEVER_EXCLUDABLE = frozenset({"kanban_complete", "kanban_block"})
+# What a present-but-malformed ``worker_tools_exclude`` falls back to (fail closed):
+# every worker tool that can read or write beyond the worker's own card or the host.
+_CROSS_TASK_WORKER_TOOLS = frozenset(
+    {"kanban_create", "kanban_attach_url", "kanban_comment", "kanban_show", "kanban_link"})
+_policy_warned: set[str] = set()
+
+
+def _warn_policy_once(message: str) -> None:
+    if message not in _policy_warned:
+        _policy_warned.add(message)
+        logger.warning(message)
+
+
+def _in_worker_context() -> bool:
+    """A dispatcher-spawned worker (or anything inheriting its env). Deliberately
+    broader than ``_is_dispatcher_owned_worker``: containment must also bind a
+    delegate child or in-process job that inherited the worker's task env."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
+def _parse_worker_tools_exclude(raw: Any) -> frozenset[str]:
+    if raw is None:
+        return frozenset()
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)) or not all(isinstance(i, str) for i in items):
+        _warn_policy_once(
+            "kanban.worker_tools_exclude must be a list of tool names; got "
+            f"{type(raw).__name__}. Failing closed: excluding {sorted(_CROSS_TASK_WORKER_TOOLS)}.")
+        return _CROSS_TASK_WORKER_TOOLS
+    names = {i.strip().lower() for i in items if i.strip()}
+    kept = names - _NEVER_EXCLUDABLE
+    if kept != names:
+        _warn_policy_once(
+            "kanban.worker_tools_exclude: ignoring "
+            f"{sorted(names & _NEVER_EXCLUDABLE)}; a worker must always be able to finish "
+            "(kanban_complete) or ask for help (kanban_block).")
+    known = {name for name, *_ in _TOOLS}
+    if kept - known:
+        _warn_policy_once(
+            f"kanban.worker_tools_exclude names unknown tools {sorted(kept - known)}; "
+            f"known Kanban tools: {sorted(known)}.")
+    return frozenset(kept)
+
+
+def _parse_worker_scope(raw: Any) -> str:
+    if raw is None:
+        return WORKER_SCOPE_ALL
+    value = str(raw).strip().lower().replace("-", "_") if isinstance(raw, str) else None
+    if value in _WORKER_SCOPES:
+        return value
+    _warn_policy_once(
+        f"kanban.worker_scope must be one of {list(_WORKER_SCOPES)}; got {raw!r}. "
+        f"Failing closed to {WORKER_SCOPE_OWN_TASK!r}.")
+    return WORKER_SCOPE_OWN_TASK
+
+
+def worker_tool_policy() -> tuple[frozenset[str], str]:
+    """``(excluded tool names, scope)`` from the active profile's ``kanban`` config.
+    Read on every call (no cache) so a config edit lands on the next schema build."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        section = (load_config_readonly() or {}).get("kanban") or {}
+    except Exception as exc:
+        _warn_policy_once(f"kanban worker policy: could not read config ({exc}); no exclusions applied")
+        section = {}
+    if not isinstance(section, dict):
+        section = {}
+    return (_parse_worker_tools_exclude(section.get("worker_tools_exclude")),
+            _parse_worker_scope(section.get("worker_scope")))
+
+
+def worker_tool_excluded(tool_name: str) -> bool:
+    """True when ``tool_name`` is excluded for this profile's Kanban workers."""
+    return _in_worker_context() and tool_name in worker_tool_policy()[0]
+
+
+def _worker_own_task_scope() -> Optional[str]:
+    """The worker's own task id when ``kanban.worker_scope: own_task`` binds it, else None."""
+    if not _in_worker_context() or worker_tool_policy()[1] != WORKER_SCOPE_OWN_TASK:
+        return None
+    return os.environ.get("HERMES_KANBAN_TASK")
+
+
+def _enforce_worker_scope(tool_name: str, tid: Any) -> None:
+    """Under ``worker_scope: own_task`` a worker may only read or write its own card."""
+    own = _worker_own_task_scope()
+    if own is not None and str(tid) != own:
+        raise _Reject(
+            f"{tool_name} refused: this profile's Kanban workers may only read or write their "
+            f"own task {own} (kanban.worker_scope: own_task); {tid} is another task.")
+
+
+def _refuse_excluded_worker_tool(tool_name: str) -> None:
+    """Backstop for a call that arrives although the schema never offered the tool
+    (stale schema, MCP bridge, prompt-injected tool name)."""
+    if worker_tool_excluded(tool_name):
+        raise _Reject(
+            f"{tool_name} is disabled for this profile's Kanban workers "
+            "(kanban.worker_tools_exclude). Finish with kanban_complete, or kanban_block "
+            "if the task needs something outside your own card.")
+
+
+def worker_containment_guidance(tool_names: Any) -> str:
+    """Prompt addendum naming what this profile's workers cannot do, so the generic
+    Kanban protocol never steers the model at a tool it does not have. Empty when
+    no containment applies."""
+    if not _in_worker_context():
+        return ""
+    excluded, scope = worker_tool_policy()
+    excluded = sorted(n for n in excluded if n not in set(tool_names or ()))
+    lines = []
+    if excluded:
+        lines.append(
+            "These Kanban tools are disabled for this profile and are not in your schema: "
+            + ", ".join(f"`{n}`" for n in excluded) + ". Where the protocol above mentions them, "
+            "skip that step: put follow-up work and notes in your `kanban_complete` summary, or "
+            "`kanban_block` if the task cannot be finished without them.")
+        if "kanban_show" in excluded:
+            lines.append("Your task details are already in this prompt; there is no `kanban_show`.")
+    if scope == WORKER_SCOPE_OWN_TASK:
+        lines.append(
+            "You may only read or write your own task ($HERMES_KANBAN_TASK); calls naming any "
+            "other task id are refused.")
+    return ("\n\n## Containment for this profile\n\n" + "\n".join(f"- {line}" for line in lines)) if lines else ""
+
+
 # --- Shared helpers: validation failures raise _Reject; _kanban_handler renders it ---
 
 class _Reject(Exception):
@@ -125,6 +267,7 @@ def _kanban_handler(tool_name: str) -> Callable:
         @functools.wraps(fn)
         def wrapper(args: dict, **kw) -> str:
             try:
+                _refuse_excluded_worker_tool(tool_name)
                 return fn(args, **kw)
             except _Reject as e:
                 return e.args[0]
@@ -515,6 +658,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
+    _enforce_worker_scope("kanban_show", tid)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         return json.dumps({
@@ -721,9 +865,12 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     _reject_delegated_child_mutation("kanban_comment")
-    tid = args.get("task_id")
+    # Under ``kanban.worker_scope: own_task`` the only legal target is the worker's
+    # own card, so an omitted task_id means that card.
+    tid = args.get("task_id") or _worker_own_task_scope()
     _check(tid, "task_id is required (use the current task id if that's what "
                 "you mean — pulls from env but kept explicit here)")
+    _enforce_worker_scope("kanban_comment", tid)
     body = _redact(_require_text(args, "body"))
     # Author comes from the worker's runtime identity, never caller args: comments are
     # injected into future workers' system prompts, so an args["author"] override could
@@ -829,8 +976,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_attachments")
 def _handle_attachments(args: dict, **kw) -> str:
-    """List a task's attachments (read-only; no ownership restriction)."""
+    """List a task's attachments (read-only; unrestricted unless ``worker_scope: own_task``)."""
     tid = _require_task_id(args)
+    _enforce_worker_scope("kanban_attachments", tid)
     with _board(args.get("board")) as (kb, conn):
         _existing_task(kb, conn, tid)
         return json.dumps({
@@ -990,6 +1138,9 @@ def _handle_link(args: dict, **kw) -> str:
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
+    # own_task: the only edge a contained worker may add is a dependency of its own
+    # card (child = own task); making it a parent would gate another card.
+    _enforce_worker_scope("kanban_link", child_id)
     with _board(args.get("board")) as (kb, conn):
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
         return _ok(parent_id=parent_id, child_id=child_id)
@@ -1015,7 +1166,18 @@ _TOOLS = (
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
+def _worker_policy_gate(tool_name: str, base: Callable[[], bool]) -> Callable[[], bool]:
+    """Per-tool check_fn: the lifecycle/orchestrator gate AND not excluded for this
+    profile's workers (``kanban.worker_tools_exclude``), so an excluded tool is never
+    offered in the schema. Uncached: it reads config and the worker env."""
+    @no_cache_check_fn
+    def _gate() -> bool:
+        return base() and not worker_tool_excluded(tool_name)
+    _gate.__name__ = _gate.__qualname__ = f"_check_{tool_name}"
+    return _gate
+
+
 for _name, _sch, _handler, _emoji in _TOOLS:
-    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    _base_gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
-                      check_fn=_gate)
+                      check_fn=_worker_policy_gate(_name, _base_gate))

@@ -224,6 +224,10 @@ chars, must start with alphanumeric. Uppercase input is auto-downcased.
 Anything else (slashes, spaces, dots, `..`) is rejected at the CLI layer
 so path-traversal tricks can't name a board.
 
+A board can also restrict which profiles may work on it with
+`allowed_assignees` in its `board.json`; see
+[Containing workers and boards](#containing-workers-and-boards).
+
 ### Managing boards from the dashboard
 
 `hermes dashboard` → Kanban tab shows a board switcher at the top as soon
@@ -400,6 +404,69 @@ saved; `all` alone is not a Kanban opt-in.
 
 Dispatcher-owned workers receive their task lifecycle tools automatically.
 `delegate_task` children do not gain permission to mutate the board.
+
+## Containing workers and boards
+
+Every dispatcher-spawned worker gets the whole `kanban` toolset, whatever its
+profile's own toolsets say, and several of those tools reach past the worker's
+own card: `kanban_create` makes a ready card for any assignee and workspace,
+`kanban_attach_url` fetches any public URL from the host, `kanban_comment`
+writes to any card (and comments are injected into later workers' prompts),
+and `kanban_show` reads any card. A profile that handles untrusted input (an
+email drafter, a web reader) should not have them. Two settings close this.
+
+### Per-profile: `kanban.worker_tools_exclude` and `kanban.worker_scope`
+
+Both live in the **worker's** profile config and apply only when that profile
+runs as a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set). An
+orchestrator chat on the same profile is unaffected.
+
+```yaml
+# ~/.hermes/profiles/mail-drafter/config.yaml
+kanban:
+  worker_tools_exclude: [kanban_create, kanban_attach_url]
+  worker_scope: own_task      # kanban_show / kanban_comment: own card only
+```
+
+| Config key | Default | What it does |
+|------------|---------|--------------|
+| `kanban.worker_tools_exclude` | `[]` | Kanban tool names this profile's workers never get. They are left out of the tool schema (and out of the `hermes-tools` MCP bridge), the worker prompt says they are unavailable, and a call that arrives anyway is refused with a tool error. Any Kanban tool can be listed except `kanban_complete` and `kanban_block`, which a worker needs to finish or ask for help. A malformed value (not a list of names) fails closed: `kanban_create`, `kanban_attach_url`, `kanban_comment`, `kanban_show` and `kanban_link` are all excluded. |
+| `kanban.worker_scope` | `all` | `own_task` limits `kanban_show`, `kanban_comment`, `kanban_attachments` and `kanban_link` (child side) to the worker's own task id; any other id is refused. `kanban_comment` without a `task_id` then means the own card. A softer alternative to excluding `kanban_show` and `kanban_comment` outright. An unknown value fails closed to `own_task`. |
+
+These settings shape the **tool surface**. A worker profile that also has the
+`terminal` toolset can still run `hermes kanban create` from a shell, so pair
+them with a board allowlist (below) and keep terminal off profiles that read
+untrusted input.
+
+### Per-board: `allowed_assignees` in `board.json`
+
+```json
+{
+  "name": "Mail replies",
+  "allowed_assignees": ["mail-drafter"]
+}
+```
+
+`~/.hermes/kanban/boards/<slug>/board.json` (for `default`:
+`~/.hermes/kanban/boards/default/board.json`) may list the profiles allowed to
+work on that board. With the list present:
+
+- **Create refuses** a dispatchable card for any other assignee: `hermes kanban
+  create`, the `kanban_create` tool, the dashboard and `hermes kanban swarm` all
+  fail with an error naming the allowed profiles (a swarm is refused as a whole,
+  nothing is written). Human-parked cards (`--triage`, `--initial-status
+  blocked`) are exempt, like `kanban.require_known_assignee`.
+- **Dispatch refuses** to spawn a card whose assignee is not listed, however it
+  got there (reassignment, an unblocked parked card, `kanban.default_assignee`).
+  A `ready` card is blocked with the reason (`kind=capability`) and an
+  `assignee_not_allowed` event; a `review` card stays put with the event. The
+  tick reports it as `skipped_assignee_not_allowed` (`hermes kanban dispatch
+  --json`).
+
+No `allowed_assignees` key (or `null`) keeps today's behaviour. An empty list
+allows nobody, and a malformed value fails closed to an empty list.
+Edit `board.json` by hand; other board writes (`boards rename`, archive)
+preserve the key.
 
 ## How workers interact with the board
 

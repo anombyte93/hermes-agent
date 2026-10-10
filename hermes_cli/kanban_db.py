@@ -222,7 +222,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "output_limit", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "skipped_assignee_not_allowed",
 )
 
 
@@ -1284,6 +1284,86 @@ def _require_dispatchable_assignee(assignee: str) -> None:
         raise ValueError(msg)
 
 
+def board_slug_for_conn(conn: sqlite3.Connection, board: Optional[str] = None) -> str:
+    """The board whose ``kanban.db`` ``conn`` has open.
+
+    The connection is the authority (it is where the row lands), so its file path wins
+    over an explicit ``board`` argument; a DB outside the board layout (a custom
+    ``HERMES_KANBAN_DB``, ``:memory:``) falls back to ``board``, then the current board.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main = next((r for r in rows if r[1] == "main"), None)
+        db_file = Path(main[2]).resolve() if main is not None and main[2] else None
+    except Exception:
+        db_file = None
+    if db_file is not None:
+        try:
+            if db_file == (kanban_home() / "kanban.db").resolve():
+                return DEFAULT_BOARD
+            if db_file.name == "kanban.db" and db_file.parent.parent == boards_root().resolve():
+                slug = _normalize_board_slug(db_file.parent.name)
+                if slug:
+                    return slug
+        except (OSError, ValueError):
+            pass
+    return _slug_or_default(board) if board else get_current_board()
+
+
+def board_allowed_assignees(
+    conn: Optional[sqlite3.Connection] = None, *, board: Optional[str] = None,
+) -> Optional[frozenset[str]]:
+    """``board.json`` ``allowed_assignees`` as canonical profile names, or ``None``.
+
+    ``None`` (key absent or null) means no restriction: today's behaviour. A list
+    restricts which profiles may own a dispatchable card on the board and which ones
+    the dispatcher will spawn. An empty list allows nobody. A malformed value (not a
+    list of non-empty strings) fails closed to an empty allowlist, logged.
+    """
+    slug = board_slug_for_conn(conn, board) if conn is not None else (
+        _slug_or_default(board) if board else get_current_board())
+    raw = read_board_metadata(slug).get("allowed_assignees")
+    if raw is None:
+        return None
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)) or not all(
+            isinstance(i, str) and i.strip() for i in items):
+        _log.warning(
+            "board %r: allowed_assignees in board.json must be a list of profile names; "
+            "got %r. Failing closed: no assignee is allowed on this board.", slug, raw)
+        return frozenset()
+    from hermes_cli.profiles import normalize_profile_name
+    return frozenset(normalize_profile_name(i) for i in items)
+
+
+def assignee_not_allowed_message(
+    assignee: Optional[str], allowed: Optional[frozenset[str]], board: str,
+) -> Optional[str]:
+    """Why ``assignee`` may not own a dispatchable card on ``board``, or ``None``."""
+    if allowed is None or not assignee:
+        return None
+    canonical = _canonical_assignee(assignee)
+    if canonical in allowed:
+        return None
+    return (
+        f"assignee {canonical!r} is not allowed on board {board!r}: its board.json "
+        f"allowed_assignees is {sorted(allowed) or '[] (nobody)'}. Assign one of those "
+        f"profiles, or change allowed_assignees in board.json."
+    )
+
+
+def require_allowed_assignee(
+    conn: sqlite3.Connection, assignee: Optional[str], *, board: Optional[str] = None,
+) -> None:
+    """Raise ``ValueError`` when the board's ``allowed_assignees`` excludes ``assignee``."""
+    if not assignee:
+        return
+    slug = board_slug_for_conn(conn, board)
+    msg = assignee_not_allowed_message(assignee, board_allowed_assignees(board=slug), slug)
+    if msg:
+        raise ValueError(msg)
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1504,6 +1584,10 @@ def create_task(
     # being refused by a guard that was switched on after the card was made.
     if assignee and initial_status == "running" and not triage:
         _require_dispatchable_assignee(assignee)
+        # Board-level allowlist (board.json ``allowed_assignees``). Same exemption as
+        # above: a human-parked card can never be spawned without passing dispatch,
+        # and dispatch re-checks the allowlist before every spawn.
+        require_allowed_assignee(conn, assignee, board=board)
 
     now = int(time.time())
 
