@@ -123,8 +123,9 @@ class DispatchResult:
     telemetry can tell "stuck" from "correctly idle"."""
     skipped_assignee_not_allowed: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, assignee)`` refused because the board's ``board.json``
-    ``allowed_assignees`` does not list the assignee. A ready card is blocked with
-    the reason (operator-actionable); a review card is left in place with an event."""
+    ``allowed_assignees`` does not list the assignee. The card is blocked with the
+    reason (operator-actionable); a review card is held with ``source_status=review``
+    so it leaves the lane (no reserved review slot) and unblock restores review."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -2450,10 +2451,12 @@ def _dispatch_lane_task(
 def _refuse_disallowed_assignee(
     conn: sqlite3.Connection, task_id: str, assignee: str, reason: str, *, lane: str,
 ) -> None:
-    """Record why a card was not spawned. A ready card is blocked with the reason
-    (``kind=capability``: a human must reassign it or widen the allowlist), so the
-    refusal is durable and is not re-evaluated every tick. A review card cannot be
-    blocked from ``review``; it gets one ``assignee_not_allowed`` event per episode."""
+    """Record why a card was not spawned: an ``assignee_not_allowed`` event and a
+    block with the reason (``kind=capability``: a human must reassign it or widen
+    the allowlist), so the refusal is durable and is not re-evaluated every tick.
+    A review card is held (``source_status=review``): left in ``review`` it would
+    stay a spawnable review forever, reserve a slot from the ready lane on every
+    tick and trip the gateway's "dispatcher stuck" warning."""
     payload = {"assignee": assignee, "lane": lane, "reason": reason}
     try:
         last = conn.execute(
@@ -2463,8 +2466,7 @@ def _refuse_disallowed_assignee(
         if last is None or last["kind"] != "assignee_not_allowed":
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "assignee_not_allowed", payload)
-        if lane == "ready":
-            _kb.block_task(conn, task_id, reason=reason, kind="capability")
+        _kb.block_task(conn, task_id, reason=reason, kind="capability", hold_review=lane == "review")
     except Exception:
         _kb._log.warning(
             "kanban dispatch: could not record assignee_not_allowed for %s", task_id, exc_info=True)
@@ -2596,15 +2598,25 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:
+def _any_spawnable_review(
+    review_rows: list[sqlite3.Row], allowed_assignees: Optional[frozenset] = None,
+    board_slug: str = "",
+) -> bool:
     """Mirrors the review loop's own gate so human-pulled control-plane lanes
-    don't tax ready throughput; assumes spawnable when profiles are unimportable."""
-    if not review_rows:
+    don't tax ready throughput; assumes spawnable when profiles are unimportable.
+    A card the board allowlist refuses never spawns (the review loop holds it),
+    so it reserves no slot either."""
+    rows = [
+        row for row in review_rows
+        if row["assignee"] and _kb.assignee_not_allowed_message(
+            row["assignee"], allowed_assignees, board_slug) is None
+    ]
+    if not rows:
         return False
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
-        return any(row["assignee"] for row in review_rows)
-    return any(row["assignee"] and profile_exists(row["assignee"]) for row in review_rows)
+        return True
+    return any(profile_exists(row["assignee"]) for row in rows)
 
 
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
@@ -2673,8 +2685,12 @@ def _dispatch_once_locked(
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
     # one slot back.
+    # Board allowlist, read once per tick from the board this connection actually has open.
+    board_slug = _kb.board_slug_for_conn(conn, board)
+    allowed_assignees = _kb.board_allowed_assignees(board=board_slug)
     ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(review_rows):
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
+            review_rows, allowed_assignees, board_slug):
         ready_budget = max(spawn_budget - 1, 0)
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
@@ -2695,14 +2711,12 @@ def _dispatch_once_locked(
     if per_profile_cap is not None or assignee_caps or groups:
         # Host-wide: the capped resource is shared by every board on the host.
         per_profile_running = count_running_by_assignee_host(conn, board)
-    # Read once per tick from the board this connection actually has open.
-    board_slug = _kb.board_slug_for_conn(conn, board)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         assignee_caps=assignee_caps, assignee_groups=groups,
-        allowed_assignees=_kb.board_allowed_assignees(board=board_slug), board_slug=board_slug,
+        allowed_assignees=allowed_assignees, board_slug=board_slug,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

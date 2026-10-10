@@ -258,3 +258,106 @@ def test_dispatch_reads_the_list_of_the_connections_board_not_the_current_one(co
     res, calls = _tick(conn, board=None)
     assert calls == []
     assert res.skipped_assignee_not_allowed == [(bad, "coder")]
+
+
+# --- a board.json that does not parse ----------------------------------------------
+
+def test_unparseable_board_json_fails_closed(conn, mail_board):
+    """A hand-edit typo (here a trailing comma) must not silently lift the list."""
+    kb.board_metadata_path(mail_board).write_text(
+        '{"slug": "mail", "allowed_assignees": ["mail-drafter"],}', encoding="utf-8")
+    assert kb.board_allowed_assignees(conn) == frozenset()
+    with pytest.raises(ValueError, match="nobody"):
+        kb.create_task(conn, title="escalate", assignee="coder")
+    res, calls = _tick(conn)
+    assert calls == []
+
+
+def test_non_object_board_json_fails_closed(home):
+    kb.create_board("listy")
+    kb.board_metadata_path("listy").write_text('["mail-drafter"]', encoding="utf-8")
+    assert kb.board_allowed_assignees(board="listy") == frozenset()
+
+
+def test_unparseable_board_json_is_not_rewritten_without_the_list(mail_board):
+    path = kb.board_metadata_path(mail_board)
+    broken = '{"allowed_assignees": ["mail-drafter"],}'
+    path.write_text(broken, encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable"):
+        kb.write_board_metadata(mail_board, name="renamed")
+    assert path.read_text(encoding="utf-8") == broken
+
+
+# --- review lane --------------------------------------------------------------------
+
+def _to_review(conn, tid, **kw):
+    claimed = kb.claim_task(conn, tid)
+    ok, reason = kb.request_review(
+        conn, tid, summary="done", expected_run_id=claimed.current_run_id,
+        with_reason=True, **kw)
+    return ok, reason
+
+
+def test_request_review_refuses_a_disallowed_reviewer(conn):
+    """A contained worker must not route its card onto a terminal-capable profile
+    by naming it as reviewer."""
+    tid = kb.create_task(conn, title="draft", assignee="mail-drafter")
+    ok, reason = _to_review(conn, tid, reviewer="coder")
+    assert ok is False and "not allowed on board 'mail'" in reason
+    task = kb.get_task(conn, tid)
+    assert task.assignee == "mail-drafter" and task.status == "running"
+
+
+def test_request_review_tool_refuses_a_disallowed_reviewer(conn, monkeypatch, mail_board):
+    tid = kb.create_task(conn, title="draft", assignee="mail-drafter")
+    claimed = kb.claim_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", mail_board)
+    monkeypatch.setenv("HERMES_PROFILE", "mail-drafter")
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_request_review({"summary": "done", "reviewer": "coder"}))
+    assert "error" in out and "not allowed" in out["error"]
+    assert kb.get_task(conn, tid).assignee == "mail-drafter"
+
+
+def test_request_review_with_an_allowed_reviewer_is_unchanged(conn):
+    tid = kb.create_task(conn, title="draft", assignee="mail-drafter")
+    ok, reason = _to_review(conn, tid, reviewer="mail-drafter")
+    assert ok is True, reason
+    assert kb.get_task(conn, tid).status == "review"
+
+
+def test_dispatch_holds_a_review_card_whose_assignee_is_not_allowed(conn, mail_board):
+    """A review card that reached the lane with a disallowed assignee (here the
+    board was locked down after review was requested) is moved out of review, so it
+    neither spawns nor holds a review slot back from the ready lane every tick."""
+    _set_allowed(mail_board, _UNSET)
+    rev = kb.create_task(conn, title="review me", assignee="mail-drafter")
+    ok, reason = _to_review(conn, rev, reviewer="coder")
+    assert ok is True, reason
+    _set_allowed(mail_board, ["mail-drafter"])
+    good = kb.create_task(conn, title="draft", assignee="mail-drafter")
+
+    # The refused review card reserves no slot: the ready card spawns on the
+    # first tick even with max_spawn=1.
+    res, calls = _tick(conn, max_spawn=1)
+    assert _spawned(calls) == [good], "the ready lane was starved by a refused review card"
+    # Once the review loop has budget (the max_spawn slot is taken by the running
+    # card, so tick uncapped) it holds the card, which leaves the lane.
+    res, calls = _tick(conn)
+    assert calls == []
+    assert res.skipped_assignee_not_allowed == [(rev, "coder")]
+    res, calls = _tick(conn)
+    assert res.skipped_assignee_not_allowed == []
+    task = kb.get_task(conn, rev)
+    assert task.status == "blocked"
+    assert "not allowed on board 'mail'" in task.block_reason
+    assert [e.kind for e in kb.list_events(conn, rev)].count("assignee_not_allowed") == 1
+    assert kbd.has_spawnable_review(conn) is False
+
+    # Unblocking after widening the list resumes review, not ready.
+    _set_allowed(mail_board, ["mail-drafter", "coder"])
+    assert kb.unblock_task(conn, rev) is True
+    assert kb.get_task(conn, rev).status == "review"

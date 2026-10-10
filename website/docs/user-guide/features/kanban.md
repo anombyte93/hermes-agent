@@ -430,8 +430,8 @@ kanban:
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.worker_tools_exclude` | `[]` | Kanban tool names this profile's workers never get. They are left out of the tool schema (and out of the `hermes-tools` MCP bridge), the worker prompt says they are unavailable, and a call that arrives anyway is refused with a tool error. Any Kanban tool can be listed except `kanban_complete` and `kanban_block`, which a worker needs to finish or ask for help. A malformed value (not a list of names) fails closed: `kanban_create`, `kanban_attach_url`, `kanban_comment`, `kanban_show` and `kanban_link` are all excluded. |
-| `kanban.worker_scope` | `all` | `own_task` limits `kanban_show`, `kanban_comment`, `kanban_attachments` and `kanban_link` (child side) to the worker's own task id; any other id is refused. `kanban_comment` without a `task_id` then means the own card. A softer alternative to excluding `kanban_show` and `kanban_comment` outright. An unknown value fails closed to `own_task`. |
+| `kanban.worker_tools_exclude` | `[]` | Kanban tool names this profile's workers never get. They are left out of the tool schema (and out of the `hermes-tools` MCP bridge), the worker prompt says they are unavailable, and a call that arrives anyway is refused with a tool error. `kanban_show` is a worker's only way to read its own card, so when it is excluded the worker's own task context (title, body, prior attempts, parent handoffs, comments: what `kanban_show` returns as `worker_context`) is put into the worker's system prompt instead, read once at spawn. Any Kanban tool can be listed except `kanban_complete` and `kanban_block`, which a worker needs to finish or ask for help. A malformed value (not a list of names) fails closed: `kanban_create`, `kanban_attach_url`, `kanban_comment`, `kanban_show` and `kanban_link` are all excluded. |
+| `kanban.worker_scope` | `all` | `own_task` limits `kanban_show`, `kanban_comment`, `kanban_attachments` and `kanban_link` (child side) to the worker's own task id; any other id is refused. `kanban_comment` without a `task_id` then means the own card (never inside a cron job or delegate child that inherited the worker's environment). A softer alternative to excluding `kanban_show` and `kanban_comment` outright. An unknown value fails closed to `own_task`. |
 
 These settings shape the **tool surface**. A worker profile that also has the
 `terminal` toolset can still run `hermes kanban create` from a shell, so pair
@@ -456,17 +456,24 @@ work on that board. With the list present:
   fail with an error naming the allowed profiles (a swarm is refused as a whole,
   nothing is written). Human-parked cards (`--triage`, `--initial-status
   blocked`) are exempt, like `kanban.require_known_assignee`.
+- **Review reassignment refuses** a `reviewer` that is not listed
+  (`kanban_request_review`, `hermes kanban request-review --reviewer`), so a
+  worker cannot route its card onto another profile that way.
 - **Dispatch refuses** to spawn a card whose assignee is not listed, however it
   got there (reassignment, an unblocked parked card, `kanban.default_assignee`).
-  A `ready` card is blocked with the reason (`kind=capability`) and an
-  `assignee_not_allowed` event; a `review` card stays put with the event. The
-  tick reports it as `skipped_assignee_not_allowed` (`hermes kanban dispatch
-  --json`).
+  The card (`ready` or `review`) is blocked with the reason
+  (`kind=capability`) and an `assignee_not_allowed` event; a review card is
+  held with `source_status=review`, so `unblock` returns it to review. The
+  card leaves its lane, so it never holds a spawn slot back. The tick reports
+  it as `skipped_assignee_not_allowed` (`hermes kanban dispatch --json`).
 
 No `allowed_assignees` key (or `null`) keeps today's behaviour. An empty list
-allows nobody, and a malformed value fails closed to an empty list.
+allows nobody, and a malformed value fails closed to an empty list. So does a
+`board.json` that exists but does not parse as a JSON object (a typo such as a
+trailing comma): nothing is allowed until it is fixed, with a warning in the log.
 Edit `board.json` by hand; other board writes (`boards rename`, archive)
-preserve the key.
+preserve the key, and refuse to run while `board.json` does not parse rather
+than rewrite it without the list.
 
 ## How workers interact with the board
 

@@ -43,7 +43,8 @@ def worker(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        own = kb.create_task(conn, title="draft a reply", assignee="mail-drafter")
+        own = kb.create_task(conn, title="draft a reply TITLE-MARKER", assignee="mail-drafter",
+                             body="Reply to the lease thread. BODY-MARKER")
         other = kb.create_task(conn, title="someone else's card", assignee="coder")
         kb.claim_task(conn, own)
     finally:
@@ -175,7 +176,44 @@ def test_worker_prompt_says_what_is_unavailable(worker):
     # Still told how to finish even though kanban_show (the old gate) is gone.
     assert guidance.startswith(KANBAN_GUIDANCE)
     assert "`kanban_create`" in guidance.split("## Containment for this profile")[1]
-    assert "already in this prompt" in guidance
+
+
+def test_excluded_show_still_delivers_the_own_card_to_the_model(worker):
+    """kanban_show is a worker's only way to read its card (the spawn prompt is just
+    ``work kanban task <id>``), so excluding it must put the card in the prompt."""
+    _write_kanban_config(worker["home"], "  worker_tools_exclude: [kanban_show]\n")
+    from agent.prompt_builder import kanban_guidance_for
+
+    names = _worker_tool_names()
+    assert "kanban_show" not in names
+    guidance = kanban_guidance_for(names)
+    own_block = guidance.split("## Your task (in place of `kanban_show`)")[1]
+    assert "TITLE-MARKER" in own_block and "BODY-MARKER" in own_block
+    # Only the worker's own card: never a sibling's.
+    assert "someone else's card" not in guidance
+
+
+def test_own_card_is_not_injected_when_show_is_available(worker):
+    from agent.prompt_builder import kanban_guidance_for
+    assert "BODY-MARKER" not in kanban_guidance_for(_worker_tool_names())
+
+
+def test_own_card_is_not_injected_into_a_cron_context(worker):
+    _write_kanban_config(worker["home"], "  worker_tools_exclude: [kanban_show]\n")
+    from agent.delegation_context import non_dispatcher_owned_context
+    from tools import kanban_tools as kt
+
+    with non_dispatcher_owned_context():
+        assert "BODY-MARKER" not in kt.worker_containment_guidance(set())
+
+
+def test_excluded_show_with_an_unreadable_card_says_so(worker, monkeypatch):
+    _write_kanban_config(worker["home"], "  worker_tools_exclude: [kanban_show]\n")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")
+    from tools import kanban_tools as kt
+
+    text = kt.worker_containment_guidance(set())
+    assert "t_missing could not be loaded" in text and "kanban_block" in text
 
 
 def test_default_prompt_is_unchanged(worker):
@@ -227,6 +265,24 @@ def test_own_task_scope_refuses_other_cards(own_task_scope):
     try:
         assert kb.list_comments(conn, other) == []
         assert kb.parent_ids(conn, other) == []
+    finally:
+        conn.close()
+
+
+def test_own_task_comment_default_does_not_leak_into_a_cron_context(own_task_scope):
+    """A cron job fired in-process from a worker must not inherit the worker's task
+    id as the comment target (same invariant as _default_task_id)."""
+    from agent.delegation_context import non_dispatcher_owned_context
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with non_dispatcher_owned_context():
+        out = json.loads(kt._handle_comment({"body": "from a cron job"}))
+    assert "error" in out and "task_id is required" in out["error"]
+    conn = kbc.connect()
+    try:
+        assert kb.list_comments(conn, own_task_scope["own"]) == []
     finally:
         conn.close()
 

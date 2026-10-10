@@ -1785,6 +1785,7 @@ DEFAULT_CONFIG = {
         # ["kanban_create", "kanban_attach_url", "kanban_comment", "kanban_show"]. Excluded tools
         # are left out of the schema and refused if called anyway. kanban_complete and
         # kanban_block can't be excluded. A malformed value fails closed (cross-task tools hidden).
+        # Excluding kanban_show puts the worker's own task context into its prompt instead.
         "worker_tools_exclude": [],
         # "all" (default) or "own_task": kanban_show / kanban_comment / kanban_attachments /
         # kanban_link only accept the worker's own task id. A softer alternative to excluding

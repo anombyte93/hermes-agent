@@ -569,6 +569,13 @@ def write_board_metadata(
     "" = clear (``project_id`` is not validated here)."""
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
+    existing = board_metadata_path(slug)
+    _, broken = _load_board_json(existing)
+    if broken is not None:
+        # Rewriting from synthesized defaults would silently drop every
+        # hand-edited key, including a fail-closed ``allowed_assignees``.
+        raise ValueError(
+            f"refusing to rewrite {existing}: it is unreadable ({broken}); fix it by hand")
     meta = read_board_metadata(slug)
     # db_path is derived on every read; never persist it into board.json.
     meta.pop("db_path", None)
@@ -1310,6 +1317,21 @@ def board_slug_for_conn(conn: sqlite3.Connection, board: Optional[str] = None) -
     return _slug_or_default(board) if board else get_current_board()
 
 
+def _load_board_json(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """``(contents, None)`` for a ``board.json`` that parses as a JSON object,
+    ``(None, None)`` when there is no file, ``(None, why)`` when it exists but
+    cannot be used. One read, so the answer cannot change between checks."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(raw, dict):
+        return None, f"top level is {type(raw).__name__}, not an object"
+    return raw, None
+
+
 def board_allowed_assignees(
     conn: Optional[sqlite3.Connection] = None, *, board: Optional[str] = None,
 ) -> Optional[frozenset[str]]:
@@ -1318,11 +1340,22 @@ def board_allowed_assignees(
     ``None`` (key absent or null) means no restriction: today's behaviour. A list
     restricts which profiles may own a dispatchable card on the board and which ones
     the dispatcher will spawn. An empty list allows nobody. A malformed value (not a
-    list of non-empty strings) fails closed to an empty allowlist, logged.
+    list of non-empty strings) fails closed to an empty allowlist, logged, and so does
+    a ``board.json`` that exists but does not parse as a JSON object.
     """
     slug = board_slug_for_conn(conn, board) if conn is not None else (
         _slug_or_default(board) if board else get_current_board())
-    raw = read_board_metadata(slug).get("allowed_assignees")
+    # Read board.json directly, not through read_board_metadata (which swallows a
+    # parse error and returns synthesized defaults): a hand-edit typo must not
+    # silently lift the allowlist.
+    path = board_metadata_path(slug)
+    data, broken = _load_board_json(path)
+    if broken is not None:
+        _log.warning(
+            "board %r: %s is unreadable (%s). Failing closed: no assignee is allowed on "
+            "this board until it parses as a JSON object.", slug, path, broken)
+        return frozenset()
+    raw = (data or {}).get("allowed_assignees")
     if raw is None:
         return None
     items = [raw] if isinstance(raw, str) else raw
@@ -3405,10 +3438,17 @@ def edit_completed_task_result(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    hold_review: bool = False,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition.
+
+    ``hold_review=True`` also accepts a card parked in ``review`` (the
+    dispatcher's board-allowlist refusal): it is held with
+    ``source_status=review`` on the block event, so :func:`unblock_task`
+    restores ``review``. A review card has no live run, so none is ended or
+    synthesized. Without the flag a ``review`` card is refused, as before.
 
     ``reason`` is required: a blocked card must carry its current reason as
     durable task state (``tasks.block_reason``), so a missing or blank reason
@@ -3426,7 +3466,14 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        is_review_hold = hold_review and cur_row["status"] == "review"
+        if is_review_hold:
+            source_status = "review"
+        elif cur_row["status"] == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        else:
+            source_status = "ready"
+        blockable = "('running', 'ready', 'review')" if is_review_hold else "('running', 'ready')"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
@@ -3439,7 +3486,7 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN {blockable}
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
@@ -3448,7 +3495,8 @@ def block_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="blocked", status="blocked", summary=reason,
+            synthesize=bool(reason) and not is_review_hold,
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
@@ -3559,6 +3607,14 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        if reviewer is not None:
+            # Reassigning to a reviewer is a route onto another profile, like create:
+            # the board's ``allowed_assignees`` applies (dispatch re-checks it too).
+            _slug = board_slug_for_conn(conn)
+            refusal = assignee_not_allowed_message(
+                reviewer, board_allowed_assignees(board=_slug), _slug)
+            if refusal is not None:
+                return _ret(False, f"reviewer refused: {refusal}")
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
