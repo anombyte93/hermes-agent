@@ -1065,11 +1065,10 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # Kanban guidance is session-static (lifecycle tools iff HERMES_KANBAN_TASK or the
+    # kanban toolset); resolve once, with the profile's worker-containment addendum.
+    from agent.prompt_builder import kanban_guidance_for
+    agent._kanban_worker_guidance = kanban_guidance_for(agent.valid_tool_names)
     if agent.quiet_mode:
         return
     if agent.tools:

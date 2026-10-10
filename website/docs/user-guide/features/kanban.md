@@ -224,6 +224,10 @@ chars, must start with alphanumeric. Uppercase input is auto-downcased.
 Anything else (slashes, spaces, dots, `..`) is rejected at the CLI layer
 so path-traversal tricks can't name a board.
 
+A board can also restrict which profiles may work on it with
+`allowed_assignees` in its `board.json`; see
+[Containing workers and boards](#containing-workers-and-boards).
+
 ### Managing boards from the dashboard
 
 `hermes dashboard` → Kanban tab shows a board switcher at the top as soon
@@ -400,6 +404,91 @@ saved; `all` alone is not a Kanban opt-in.
 
 Dispatcher-owned workers receive their task lifecycle tools automatically.
 `delegate_task` children do not gain permission to mutate the board.
+
+## Containing workers and boards
+
+Every dispatcher-spawned worker gets the whole `kanban` toolset, whatever its
+profile's own toolsets say, and several of those tools reach past the worker's
+own card: `kanban_create` makes a ready card for any assignee and workspace,
+`kanban_attach_url` fetches any public URL from the host, `kanban_comment`
+writes to any card (and comments are injected into later workers' prompts),
+`kanban_show` reads any card, and `kanban_request_review` with a `reviewer`
+reassigns the worker's own card to another profile, which the review lane then
+spawns with a summary the worker wrote. A profile that handles untrusted input
+(an email drafter, a web reader) should not have them. Two settings close this.
+
+### Per-profile: `kanban.worker_tools_exclude` and `kanban.worker_scope`
+
+Both live in the **worker's** profile config and apply only when that profile
+runs as a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set). An
+orchestrator chat on the same profile is unaffected.
+
+```yaml
+# ~/.hermes/profiles/mail-drafter/config.yaml
+kanban:
+  worker_tools_exclude: [kanban_create, kanban_attach_url]
+  worker_scope: own_task      # kanban_show / kanban_comment: own card only
+```
+
+With either `worker_scope: own_task` or `kanban_create` in
+`worker_tools_exclude`, `kanban_request_review` refuses a `reviewer` other than
+the card's current assignee (omitting `reviewer` still requests review on the
+same card). That closes the reassignment route even on a board with no
+`allowed_assignees`. To remove review handoff entirely, add
+`kanban_request_review` to `worker_tools_exclude`.
+
+| Config key | Default | What it does |
+|------------|---------|--------------|
+| `kanban.worker_tools_exclude` | `[]` | Kanban tool names this profile's workers never get. They are left out of the tool schema (and out of the `hermes-tools` MCP bridge), the worker prompt says they are unavailable, and a call that arrives anyway is refused with a tool error. `kanban_show` is a worker's only way to read its own card, so when it is excluded the worker's own task context (title, body, prior attempts, parent handoffs, comments: what `kanban_show` returns as `worker_context`) is put into the worker's system prompt instead, read once at spawn. Any Kanban tool can be listed except `kanban_complete` and `kanban_block`, which a worker needs to finish or ask for help. A malformed value (not a list of names) fails closed: `kanban_create`, `kanban_attach_url`, `kanban_comment`, `kanban_show`, `kanban_link` and `kanban_request_review` are all excluded. |
+| `kanban.worker_scope` | `all` | `own_task` limits `kanban_show`, `kanban_comment`, `kanban_attachments` and `kanban_link` (child side) to the worker's own task id; any other id is refused. `kanban_comment` without a `task_id` then means the own card (never inside a cron job or delegate child that inherited the worker's environment). A softer alternative to excluding `kanban_show` and `kanban_comment` outright. An unknown value fails closed to `own_task`. |
+
+These settings shape the **tool surface**. A worker profile that also has the
+`terminal` toolset can still run `hermes kanban create` from a shell, so pair
+them with a board allowlist (below) and keep terminal off profiles that read
+untrusted input.
+
+### Per-board: `allowed_assignees` in `board.json`
+
+```json
+{
+  "name": "Mail replies",
+  "allowed_assignees": ["mail-drafter"]
+}
+```
+
+`~/.hermes/kanban/boards/<slug>/board.json` (for `default`:
+`~/.hermes/kanban/boards/default/board.json`) may list the profiles allowed to
+work on that board. With the list present:
+
+- **Create refuses** a dispatchable card for any other assignee: `hermes kanban
+  create`, the `kanban_create` tool, the dashboard and `hermes kanban swarm` all
+  fail with an error naming the allowed profiles (a swarm is refused as a whole,
+  nothing is written). Human-parked cards (`--triage`, `--initial-status
+  blocked`) are exempt, like `kanban.require_known_assignee`.
+- **Review reassignment refuses** a `reviewer` that is not listed
+  (`kanban_request_review`, `hermes kanban request-review --reviewer`), so a
+  worker cannot route its card onto another profile that way.
+- **Dispatch refuses** to spawn a card whose assignee is not listed, however it
+  got there (reassignment, an unblocked parked card, `kanban.default_assignee`).
+  The card (`ready` or `review`) is blocked with the reason
+  (`kind=capability`) and an `assignee_not_allowed` event; a review card is
+  held with `source_status=review`, so `unblock` returns it to review. The
+  card leaves its lane, so it never holds a spawn slot back. The tick reports
+  it as `skipped_assignee_not_allowed` (`hermes kanban dispatch --json`).
+
+No `allowed_assignees` key (or `null`) keeps today's behaviour. An empty list
+allows nobody. A policy that cannot be read, meaning a malformed value or a
+`board.json` that exists but does not parse as a JSON object (a typo such as a
+trailing comma), fails closed with a warning in the log: create and review
+reassignment are refused, and dispatch spawns nothing on that board **for that
+tick only**. Cards stay in their lanes (reported as `skipped_board_unreadable`
+with the reason in `board_allowlist_unreadable`), are never blocked for it, and
+spawn on the first tick after the file is fixed. Only a well-formed list that
+leaves the assignee out blocks a card. Edit `board.json` by hand; other board
+writes (`boards rename`, archive) preserve the key, write the file atomically
+(temp file and rename, so the dispatcher never sees it half-written), and refuse
+to run while `board.json` does not parse rather than rewrite it without the
+list.
 
 ## How workers interact with the board
 

@@ -1779,6 +1779,20 @@ DEFAULT_CONFIG = {
         # may be a control-plane lane pulled via claim_task. Human-parked cards (blocked/triage)
         # are always exempt.
         "require_known_assignee": False,
+        # Worker containment, read from the WORKER's profile config and applied only when this
+        # profile runs as a dispatcher-spawned Kanban worker. Every worker gets the whole kanban
+        # toolset whatever its toolsets say; list tools its workers must never see, e.g.
+        # ["kanban_create", "kanban_attach_url", "kanban_comment", "kanban_show"]. Excluded tools
+        # are left out of the schema and refused if called anyway. kanban_complete and
+        # kanban_block can't be excluded. A malformed value fails closed (cross-task tools hidden).
+        # Excluding kanban_show puts the worker's own task context into its prompt instead.
+        # With kanban_create excluded (or worker_scope own_task), kanban_request_review also
+        # refuses a reviewer other than the card's own assignee (no reassignment route).
+        "worker_tools_exclude": [],
+        # "all" (default) or "own_task": kanban_show / kanban_comment / kanban_attachments /
+        # kanban_link only accept the worker's own task id. A softer alternative to excluding
+        # kanban_show and kanban_comment outright. An unknown value fails closed to own_task.
+        "worker_scope": "all",
         # Per-assignee default max runtime in seconds, e.g. {"evo": 1800}: a card created for that
         # profile without an explicit max runtime gets this cap (an explicit value always wins).
         # Applied at creation only; {} = no defaults (cards stay uncapped unless given one).
