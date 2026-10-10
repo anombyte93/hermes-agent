@@ -126,6 +126,12 @@ class DispatchResult:
     ``allowed_assignees`` does not list the assignee. The card is blocked with the
     reason (operator-actionable); a review card is held with ``source_status=review``
     so it leaves the lane (no reserved review slot) and unblock restores review."""
+    skipped_board_unreadable: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` not spawned this tick because the board's
+    ``allowed_assignees`` policy could not be read (see ``board_allowlist_state``).
+    Transient: the card stays in its lane and is retried next tick."""
+    board_allowlist_unreadable: Optional[str] = None
+    """Why the board's ``allowed_assignees`` policy could not be read this tick."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -2336,6 +2342,7 @@ def _dispatch_lane_task(
     assignee_groups: Optional[Mapping[str, Mapping]] = None,
     allowed_assignees: Optional[frozenset] = None,
     board_slug: Optional[str] = None,
+    allowlist_unreadable: Optional[str] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2354,6 +2361,12 @@ def _dispatch_lane_task(
     # Board allowlist (board.json ``allowed_assignees``): the last line of defence for
     # cards that reached the lane without passing create (reassignment, a parked card
     # unblocked, default_assignee, a direct DB write).
+    if allowlist_unreadable is not None:
+        # Fail closed for this tick only. The policy could not be read (a board.json
+        # caught mid-write, a hand-edit typo), which is not a decision about this card:
+        # leave it in its lane and retry next tick, never block.
+        result.skipped_board_unreadable.append((task_id, assignee))
+        return False
     refusal = _kb.assignee_not_allowed_message(
         assignee, allowed_assignees, board_slug or board or _kb.DEFAULT_BOARD)
     if refusal is not None:
@@ -2687,7 +2700,9 @@ def _dispatch_once_locked(
     # one slot back.
     # Board allowlist, read once per tick from the board this connection actually has open.
     board_slug = _kb.board_slug_for_conn(conn, board)
-    allowed_assignees = _kb.board_allowed_assignees(board=board_slug)
+    allowed_assignees, allowlist_unreadable = _kb.board_allowlist_state(board=board_slug)
+    if allowlist_unreadable is not None:
+        result.board_allowlist_unreadable = allowlist_unreadable
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
             review_rows, allowed_assignees, board_slug):
@@ -2717,6 +2732,7 @@ def _dispatch_once_locked(
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         assignee_caps=assignee_caps, assignee_groups=groups,
         allowed_assignees=allowed_assignees, board_slug=board_slug,
+        allowlist_unreadable=allowlist_unreadable,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

@@ -109,7 +109,9 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ``kanban_create`` (a ready card for any assignee/workspace: privilege escalation to a
 # terminal-capable profile), ``kanban_attach_url`` (a server-side GET to any public URL:
 # an exfiltration channel), ``kanban_comment`` on any task (comments are injected into
-# later workers' prompts) and ``kanban_show`` of any task. Both settings are read from
+# later workers' prompts), ``kanban_show`` of any task, and ``kanban_request_review``
+# with a ``reviewer`` (reassigns the card to that profile, which the review lane then
+# spawns; refused under containment, see _enforce_contained_reviewer). Both settings are read from
 # the WORKER's profile config and apply only in worker context (HERMES_KANBAN_TASK set);
 # orchestrator chats of the same profile are unaffected.
 
@@ -120,8 +122,11 @@ _WORKER_SCOPES = (WORKER_SCOPE_ALL, WORKER_SCOPE_OWN_TASK)
 _NEVER_EXCLUDABLE = frozenset({"kanban_complete", "kanban_block"})
 # What a present-but-malformed ``worker_tools_exclude`` falls back to (fail closed):
 # every worker tool that can read or write beyond the worker's own card or the host.
+# ``kanban_request_review`` is here because its ``reviewer`` argument reassigns the
+# worker's own card to another profile, which the review lane then spawns.
 _CROSS_TASK_WORKER_TOOLS = frozenset(
-    {"kanban_create", "kanban_attach_url", "kanban_comment", "kanban_show", "kanban_link"})
+    {"kanban_create", "kanban_attach_url", "kanban_comment", "kanban_show", "kanban_link",
+     "kanban_request_review"})
 _policy_warned: set[str] = set()
 
 
@@ -210,6 +215,34 @@ def _enforce_worker_scope(tool_name: str, tid: Any) -> None:
             f"own task {own} (kanban.worker_scope: own_task); {tid} is another task.")
 
 
+def _worker_containment_active() -> bool:
+    """Containment binds this worker: ``worker_scope: own_task`` or ``kanban_create``
+    excluded. Either says the profile must not route work onto another profile."""
+    if not _in_worker_context():
+        return False
+    excluded, scope = worker_tool_policy()
+    return scope == WORKER_SCOPE_OWN_TASK or "kanban_create" in excluded
+
+
+def _enforce_contained_reviewer(task: Any, reviewer: Optional[str]) -> None:
+    """``kanban_request_review(reviewer=X)`` reassigns the worker's card to profile X,
+    which the review lane then spawns with a summary the worker wrote: the same
+    escalation route as ``kanban_create``. A contained worker may only hand review
+    to the card's current assignee (or omit ``reviewer``)."""
+    if not reviewer or not _worker_containment_active():
+        return
+    from hermes_cli import kanban_db as _kb
+    current = getattr(task, "assignee", None)
+    if current is not None and _kb._canonical_assignee(reviewer) == _kb._canonical_assignee(current):
+        return
+    raise _Reject(
+        f"kanban_request_review refused: this profile's Kanban workers may not route "
+        f"their card to another profile (reviewer {reviewer!r}; current assignee "
+        f"{current!r}). Omit reviewer to request review on this card, or kanban_block "
+        "if a different profile must review it (kanban.worker_scope: own_task / "
+        "kanban.worker_tools_exclude: [kanban_create]).")
+
+
 def _refuse_excluded_worker_tool(tool_name: str) -> None:
     """Backstop for a call that arrives although the schema never offered the tool
     (stale schema, MCP bridge, prompt-injected tool name)."""
@@ -226,8 +259,8 @@ def worker_containment_guidance(tool_names: Any) -> str:
     no containment applies."""
     if not _in_worker_context():
         return ""
-    excluded, scope = worker_tool_policy()
-    excluded = sorted(n for n in excluded if n not in set(tool_names or ()))
+    excluded_all, scope = worker_tool_policy()
+    excluded = sorted(n for n in excluded_all if n not in set(tool_names or ()))
     lines = []
     if excluded:
         lines.append(
@@ -239,6 +272,11 @@ def worker_containment_guidance(tool_names: Any) -> str:
         lines.append(
             "You may only read or write your own task ($HERMES_KANBAN_TASK); calls naming any "
             "other task id are refused.")
+    if (scope == WORKER_SCOPE_OWN_TASK or "kanban_create" in excluded_all) and \
+            "kanban_request_review" not in excluded_all:
+        lines.append(
+            "`kanban_request_review` may not name a `reviewer` other than this card's "
+            "current assignee; omit `reviewer`.")
     out = ("\n\n## Containment for this profile\n\n" + "\n".join(f"- {line}" for line in lines)) if lines else ""
     if "kanban_show" in excluded:
         # kanban_show is the worker's only way to read its own card (the spawn prompt
@@ -858,7 +896,9 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        task = kb.get_task(conn, tid)
+        _enforce_contained_reviewer(task, reviewer)
+        _goal_gate("kanban_request_review", task, tid, summary)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=_worker_run_id(tid), with_reason=True)
@@ -1204,6 +1244,8 @@ _TOOLS = (
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+# Every tool this module registers (test_known_tool_names_match_the_registry).
+_KANBAN_TOOL_NAMES = frozenset(name for name, *_ in _TOOLS)
 
 def _worker_policy_gate(tool_name: str, base: Callable[[], bool]) -> Callable[[], bool]:
     """Per-tool check_fn: the lifecycle/orchestrator gate AND not excluded for this
