@@ -2807,6 +2807,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who}
                 for (tid, who) in res.skipped_assignee_not_allowed
             ],
+            "skipped_board_unreadable": [
+                {"task_id": tid, "assignee": who}
+                for (tid, who) in res.skipped_board_unreadable
+            ],
+            "board_allowlist_unreadable": res.board_allowlist_unreadable,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2872,6 +2877,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     for tid, who in res.skipped_assignee_not_allowed:
         print(f"Refused ({who} not in board allowed_assignees): {tid}")
+    if res.skipped_board_unreadable:
+        print(
+            f"Deferred (board allowed_assignees unreadable: "
+            f"{res.board_allowlist_unreadable}; cards stay in their lanes): "
+            f"{', '.join(tid for tid, _ in res.skipped_board_unreadable)}"
+        )
     for tid, missing in res.rejected_skills:
         print(
             f"Rejected (forced skills unavailable): {tid}: "

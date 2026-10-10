@@ -346,6 +346,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_unassigned,
             result.skipped_nonspawnable,
             result.skipped_assignee_not_allowed,
+            result.skipped_board_unreadable,
             result.rejected_skills,
         )):
             outcome = "idle"
@@ -926,10 +927,10 @@ def write_board_metadata(
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    # Temp file + rename: a reader (the dispatcher's allowlist check) must never
+    # see a truncated board.json mid-write.
+    from utils import atomic_write_text
+    atomic_write_text(path, json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -3279,16 +3280,18 @@ def _load_board_json(path: Path) -> tuple[Optional[dict], Optional[str]]:
     return raw, None
 
 
-def board_allowed_assignees(
+def board_allowlist_state(
     conn: Optional[sqlite3.Connection] = None, *, board: Optional[str] = None,
-) -> Optional[frozenset]:
-    """``board.json`` ``allowed_assignees`` as canonical profile names, or ``None``.
+) -> tuple[Optional[frozenset], Optional[str]]:
+    """``(allowed, unreadable)`` for the board's ``board.json`` ``allowed_assignees``.
 
-    ``None`` (key absent or null) means no restriction: today's behaviour. A list
-    restricts which profiles may own a dispatchable card on the board and which ones
-    the dispatcher will spawn. An empty list allows nobody. A malformed value (not a
-    list of non-empty strings) fails closed to an empty allowlist, logged, and so does
-    a ``board.json`` that exists but does not parse as a JSON object.
+    ``allowed`` is ``None`` (no restriction: today's behaviour) or the canonical
+    profile names of a well-formed list. ``unreadable`` is ``None``, or why the
+    policy could not be read: ``board.json`` exists but does not parse as a JSON
+    object, or ``allowed_assignees`` is not a list of non-empty strings. When it is
+    set, ``allowed`` is ``frozenset()`` (fail closed). Callers that make a durable
+    decision (the dispatcher blocking a card) must treat ``unreadable`` as
+    transient: a truncated mid-write file or a hand-edit typo is not a policy.
     """
     if conn is not None:
         slug = board_slug_for_conn(conn, board)
@@ -3300,22 +3303,36 @@ def board_allowed_assignees(
     path = board_metadata_path(slug)
     data, broken = _load_board_json(path)
     if broken is not None:
+        why = f"{path} is unreadable ({broken})"
         _log.warning(
-            "board %r: %s is unreadable (%s). Failing closed: no assignee is allowed on "
-            "this board until it parses as a JSON object.", slug, path, broken)
-        return frozenset()
+            "board %r: %s. Failing closed: no assignee is allowed on this board until it "
+            "parses as a JSON object.", slug, why)
+        return frozenset(), why
     raw = (data or {}).get("allowed_assignees")
     if raw is None:
-        return None
+        return None, None
     items = [raw] if isinstance(raw, str) else raw
     if not isinstance(items, (list, tuple)) or not all(
             isinstance(i, str) and i.strip() for i in items):
-        _log.warning(
-            "board %r: allowed_assignees in board.json must be a list of profile names; "
-            "got %r. Failing closed: no assignee is allowed on this board.", slug, raw)
-        return frozenset()
+        why = f"allowed_assignees in {path} must be a list of profile names; got {raw!r}"
+        _log.warning("board %r: %s. Failing closed: no assignee is allowed on this board.",
+                     slug, why)
+        return frozenset(), why
     from hermes_cli.profiles import normalize_profile_name
-    return frozenset(normalize_profile_name(i) for i in items)
+    return frozenset(normalize_profile_name(i) for i in items), None
+
+
+def board_allowed_assignees(
+    conn: Optional[sqlite3.Connection] = None, *, board: Optional[str] = None,
+) -> Optional[frozenset]:
+    """``board.json`` ``allowed_assignees`` as canonical profile names, or ``None``.
+
+    ``None`` (key absent or null) means no restriction: today's behaviour. A list
+    restricts which profiles may own a dispatchable card on the board and which ones
+    the dispatcher will spawn. An empty list allows nobody. An unreadable policy (see
+    :func:`board_allowlist_state`) fails closed to an empty allowlist, logged.
+    """
+    return board_allowlist_state(conn, board=board)[0]
 
 
 def assignee_not_allowed_message(
@@ -3341,7 +3358,12 @@ def require_allowed_assignee(
     if not assignee:
         return
     slug = board_slug_for_conn(conn, board)
-    msg = assignee_not_allowed_message(assignee, board_allowed_assignees(board=slug), slug)
+    allowed, unreadable = board_allowlist_state(board=slug)
+    if unreadable is not None:
+        raise ValueError(
+            f"board {slug!r}: refusing to assign {_canonical_assignee(assignee)!r} because "
+            f"the board's allowed_assignees policy could not be read: {unreadable}")
+    msg = assignee_not_allowed_message(assignee, allowed, slug)
     if msg:
         raise ValueError(msg)
 
@@ -6859,8 +6881,12 @@ def request_review(
             # Reassigning to a reviewer is a route onto another profile, like create:
             # the board's ``allowed_assignees`` applies (dispatch re-checks it too).
             _slug = board_slug_for_conn(conn)
-            refusal = assignee_not_allowed_message(
-                reviewer, board_allowed_assignees(board=_slug), _slug)
+            _allowed, _unreadable = board_allowlist_state(board=_slug)
+            if _unreadable is not None:
+                return _ret(False, (
+                    f"reviewer refused: board {_slug!r} allowed_assignees policy could "
+                    f"not be read: {_unreadable}"))
+            refusal = assignee_not_allowed_message(reviewer, _allowed, _slug)
             if refusal is not None:
                 return _ret(False, f"reviewer refused: {refusal}")
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
@@ -8426,6 +8452,12 @@ class DispatchResult:
     """``(task_id, assignee)`` refused because the board's ``board.json``
     ``allowed_assignees`` does not list the assignee. The card is blocked with the
     reason and an ``assignee_not_allowed`` event (operator-actionable)."""
+    skipped_board_unreadable: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` not spawned this tick because the board's
+    ``allowed_assignees`` policy could not be read (see
+    ``board_allowed_assignees``). Transient: the card stays in its lane."""
+    board_allowlist_unreadable: Optional[str] = None
+    """Why the board's ``allowed_assignees`` policy could not be read this tick."""
     rejected_skills: list[tuple[str, list[str]]] = field(default_factory=list)
     """Ready tasks rejected before claim/workspace/spawn because one or more
     force-loaded skill identifiers could not be resolved for the assignee."""
@@ -10725,7 +10757,9 @@ def _dispatch_once_locked(
     # Board allowlist (board.json ``allowed_assignees``), read once per tick from the
     # board this connection actually has open.
     _board_slug = board_slug_for_conn(conn, board)
-    _allowed_assignees = board_allowed_assignees(board=_board_slug)
+    _allowed_assignees, _allowlist_unreadable = board_allowlist_state(board=_board_slug)
+    if _allowlist_unreadable is not None:
+        result.board_allowlist_unreadable = _allowlist_unreadable
 
     def _any_spawnable_review() -> bool:
         # A review card the allowlist refuses never spawns (the review loop holds
@@ -10788,6 +10822,12 @@ def _dispatch_once_locked(
     def _refused_by_allowlist(task_id: str, assignee: str, lane: str) -> bool:
         """The last line of defence for cards that reached a lane without passing
         create (reassignment, an unblocked parked card, default_assignee)."""
+        if _allowlist_unreadable is not None:
+            # Fail closed for this tick only. The policy could not be read (a
+            # board.json caught mid-write, a hand-edit typo), which is not a decision
+            # about this card: leave it in its lane and retry next tick, never block.
+            result.skipped_board_unreadable.append((task_id, assignee))
+            return True
         refusal = assignee_not_allowed_message(assignee, _allowed_assignees, _board_slug)
         if refusal is None:
             return False

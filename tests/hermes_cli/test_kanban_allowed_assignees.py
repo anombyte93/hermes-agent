@@ -113,11 +113,27 @@ def test_create_refuses_a_disallowed_assignee_by_name(conn):
 
 
 def test_human_parked_cards_are_exempt_and_still_never_dispatch(conn):
-    tid = kb.create_task(conn, title="decide", assignee="hayden", initial_status="blocked",
+    tid = kb.create_task(conn, title="decide", assignee="coder", initial_status="blocked",
                          block_reason="waiting on a human")
     assert kb.get_task(conn, tid).status == "blocked"
     tid2 = kb.create_task(conn, title="look", assignee="coder", triage=True)
     assert kb.get_task(conn, tid2).status == "triage"
+
+    # The exemption holds only because dispatch re-checks: once a human unblocks
+    # the parked card (or promotes the triage card), it reaches the ready lane
+    # with a disallowed assignee and is refused there, not spawned.
+    assert kb.unblock_task(conn, tid) is True
+    assert kb.get_task(conn, tid).status == "ready"
+    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid2,))
+    conn.commit()
+    res, calls = _tick(conn)
+    assert calls == []
+    assert sorted(res.skipped_assignee_not_allowed) == sorted([(tid, "coder"), (tid2, "coder")])
+    for t in (tid, tid2):
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        assert "not allowed on board 'mail'" in task.block_reason
+        assert "assignee_not_allowed" in [e.kind for e in kb.list_events(conn, t)]
 
 
 def test_empty_list_allows_nobody(home):
@@ -262,13 +278,93 @@ def test_dispatch_reads_the_list_of_the_connections_board_not_the_current_one(co
 
 def test_unparseable_board_json_fails_closed(conn, mail_board):
     """A hand-edit typo (here a trailing comma) must not silently lift the list."""
-    kb.board_metadata_path(mail_board).write_text(
-        '{"slug": "mail", "allowed_assignees": ["mail-drafter"],}', encoding="utf-8")
+    path = kb.board_metadata_path(mail_board)
+    whole = path.read_text(encoding="utf-8")
+    ready = kb.create_task(conn, title="draft", assignee="mail-drafter")
+    path.write_text('{"slug": "mail", "allowed_assignees": ["mail-drafter"],}', encoding="utf-8")
     assert kb.board_allowed_assignees(conn) == frozenset()
-    with pytest.raises(ValueError, match="nobody"):
+    assert kb.board_allowlist_state(conn)[1] is not None
+    with pytest.raises(ValueError, match="could not be read"):
         kb.create_task(conn, title="escalate", assignee="coder")
     res, calls = _tick(conn)
     assert calls == []
+    # Fail closed for the tick only: the card is deferred, not blocked.
+    assert res.skipped_board_unreadable == [(ready, "mail-drafter")]
+    assert res.skipped_assignee_not_allowed == []
+    assert res.board_allowlist_unreadable
+    assert kb.get_task(conn, ready).status == "ready"
+    path.write_text(whole, encoding="utf-8")
+    res, calls = _tick(conn)
+    assert _spawned(calls) == [ready]
+
+
+@pytest.mark.parametrize("unreadable", ["", '{"slug": "op', "[1]"])
+def test_unreadable_board_json_defers_cards_for_the_tick_only(home, unreadable):
+    """A board that never opted in (no ``allowed_assignees`` key) whose board.json
+    is unreadable for one tick, e.g. caught mid-write, must keep today's behaviour
+    once the file is whole again: no card is durably blocked by that tick."""
+    kb.create_board("open")
+    path = kb.board_metadata_path("open")
+    whole = path.read_text(encoding="utf-8")
+    assert "allowed_assignees" not in json.loads(whole)
+    c = kb.connect(board="open")
+    try:
+        ids = [kb.create_task(c, title=f"t{i}", assignee="coder") for i in range(3)]
+        rev = kb.create_task(c, title="review me", assignee="coder")
+        claimed = kb.claim_task(c, rev)
+        ok, reason = kb.request_review(
+            c, rev, summary="done", expected_run_id=claimed.current_run_id, with_reason=True)
+        assert ok is True, reason
+
+        path.write_text(unreadable, encoding="utf-8")
+        res, calls = _tick(c, board="open")
+        assert calls == []
+        assert sorted(t for t, _ in res.skipped_board_unreadable) == sorted(ids + [rev])
+        assert res.skipped_assignee_not_allowed == []
+        assert [kb.get_task(c, t).status for t in ids] == ["ready"] * 3
+        assert kb.get_task(c, rev).status == "review"
+        for t in ids + [rev]:
+            kinds = [e.kind for e in kb.list_events(c, t)]
+            assert "assignee_not_allowed" not in kinds and "blocked" not in kinds
+
+        path.write_text(whole, encoding="utf-8")
+        res, calls = _tick(c, board="open")
+        assert sorted(_spawned(calls)) == sorted(ids + [rev])
+        assert res.skipped_board_unreadable == []
+    finally:
+        c.close()
+
+
+def test_malformed_list_defers_dispatch_without_blocking(conn, mail_board):
+    ready = kb.create_task(conn, title="draft", assignee="mail-drafter")
+    _set_allowed(mail_board, {"oops": 1})
+    res, calls = _tick(conn)
+    assert calls == [] and res.skipped_board_unreadable == [(ready, "mail-drafter")]
+    assert kb.get_task(conn, ready).status == "ready"
+    _set_allowed(mail_board, ["mail-drafter"])
+    res, calls = _tick(conn)
+    assert _spawned(calls) == [ready]
+
+
+def test_board_metadata_is_written_atomically(mail_board, monkeypatch):
+    """write_board_metadata must never truncate board.json in place: a dispatcher
+    reading it mid-write would see an empty file."""
+    path = kb.board_metadata_path(mail_board)
+    before = path.stat().st_ino
+    seen = []
+    real_write_text = Path.write_text
+
+    def spy(self, *a, **kw):
+        if self == path:
+            seen.append("in-place write of board.json")
+        return real_write_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    kb.write_board_metadata(mail_board, name="renamed")
+    assert seen == []
+    assert path.stat().st_ino != before, "board.json was rewritten in place, not replaced"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    assert meta["name"] == "renamed" and meta["allowed_assignees"] == ["mail-drafter"]
 
 
 def test_non_object_board_json_fails_closed(home):

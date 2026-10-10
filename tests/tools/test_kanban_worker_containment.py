@@ -294,3 +294,119 @@ def test_unknown_scope_fails_closed_to_own_task(worker):
 def test_own_task_scope_prompt_addendum(own_task_scope):
     from agent.prompt_builder import kanban_guidance_for
     assert "only read or write your own task" in kanban_guidance_for(_worker_tool_names())
+
+
+# --- the toolset is discoverable in a real process -----------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_kanban_tools_module_is_found_by_builtin_discovery():
+    """Tool discovery only imports modules with a top-level ``registry.register``
+    statement. Folding the registrations into a loop made the module invisible, so
+    no Kanban tool existed outside the tests (which import the module directly)."""
+    from tools.registry import _module_registers_tools, discover_builtin_tools
+
+    assert _module_registers_tools(_REPO_ROOT / "tools" / "kanban_tools.py")
+    assert "tools.kanban_tools" in discover_builtin_tools()
+
+
+def test_known_tool_names_match_the_registry():
+    import tools.kanban_tools as kt
+    from tools.registry import registry
+
+    assert set(registry.get_tool_names_for_toolset("kanban")) == set(kt._KANBAN_TOOL_NAMES)
+
+
+def test_a_fresh_worker_process_is_offered_the_lifecycle_tools(worker, tmp_path):
+    """End to end in a clean interpreter: nothing imports tools.kanban_tools by hand,
+    exactly as a dispatcher-spawned worker starts. The schema must carry the
+    lifecycle tools, and an excluded tool must still be absent."""
+    import os
+    import subprocess
+    import sys
+
+    _write_kanban_config(worker["home"], "  worker_tools_exclude: [kanban_create]\n")
+    probe = (
+        "import json, sys\n"
+        "assert 'tools.kanban_tools' not in sys.modules\n"
+        "from model_tools import get_tool_definitions\n"
+        "defs = get_tool_definitions(['file'], quiet_mode=True, skip_tool_search_assembly=True)\n"
+        "print(json.dumps(sorted(d['function']['name'] for d in defs\n"
+        "                        if d['function']['name'].startswith('kanban_'))))\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+    env["HOME"] = str(tmp_path)
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=str(tmp_path), env=env,
+        capture_output=True, text=True, timeout=180, check=False)
+    assert out.returncode == 0, out.stderr[-4000:]
+    names = set(json.loads(out.stdout.strip().splitlines()[-1]))
+    assert {"kanban_complete", "kanban_block", "kanban_heartbeat"} <= names
+    assert "kanban_create" not in names
+
+
+# --- kanban_request_review(reviewer=...) under containment ----------------------------
+
+def _claimed_run(worker, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker["own"])
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+
+def _own_card():
+    from hermes_cli import kanban_db as kb
+    import os
+    conn = kb.connect()
+    try:
+        return kb.get_task(conn, os.environ["HERMES_KANBAN_TASK"])
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("config", [
+    "  worker_scope: own_task\n",
+    "  worker_tools_exclude: [kanban_create, kanban_attach_url, kanban_comment, kanban_show]\n",
+])
+def test_contained_worker_cannot_route_its_card_to_another_profile(worker, monkeypatch, config):
+    """With no board allowlist, ``reviewer=`` would reassign the card to any profile
+    (e.g. a terminal-capable coder) and the review lane would spawn it with a summary
+    the worker wrote: the same escalation as kanban_create."""
+    _write_kanban_config(worker["home"], config)
+    _claimed_run(worker, monkeypatch)
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_request_review({"summary": "done", "reviewer": "coder"}))
+    assert "error" in out and "another profile" in out["error"]
+    card = _own_card()
+    assert card.assignee == "mail-drafter" and card.status == "running"
+
+    # Its own profile (or no reviewer) is still a legitimate review handoff.
+    out = json.loads(kt._handle_request_review({"summary": "done", "reviewer": "Mail-Drafter"}))
+    assert out.get("ok") is True, out
+    card = _own_card()
+    assert card.assignee == "mail-drafter" and card.status == "review"
+
+
+def test_contained_worker_prompt_mentions_the_reviewer_limit(own_task_scope):
+    from agent.prompt_builder import kanban_guidance_for
+    assert "may not name a `reviewer`" in kanban_guidance_for(_worker_tool_names())
+
+
+def test_uncontained_worker_may_still_name_a_reviewer(worker, monkeypatch):
+    _claimed_run(worker, monkeypatch)
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_request_review({"summary": "done", "reviewer": "coder"}))
+    assert out.get("ok") is True, out
+    assert _own_card().assignee == "coder"
+
+
+def test_malformed_exclusion_also_removes_request_review(worker):
+    _write_kanban_config(worker["home"], "  worker_tools_exclude: {kanban_create: true}\n")
+    assert "kanban_request_review" not in _worker_tool_names()
