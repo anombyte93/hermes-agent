@@ -897,6 +897,13 @@ def write_board_metadata(
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    existing = board_metadata_path(slug)
+    _, broken = _load_board_json(existing)
+    if broken is not None:
+        # Rewriting from synthesized defaults would silently drop every
+        # hand-edited key, including a fail-closed ``allowed_assignees``.
+        raise ValueError(
+            f"refusing to rewrite {existing}: it is unreadable ({broken}); fix it by hand")
     meta = read_board_metadata(slug)
     # Preserve existing DB-derived fields — they get re-computed each
     # read but shouldn't be written into board.json.
@@ -3257,6 +3264,21 @@ def board_slug_for_conn(conn: sqlite3.Connection, board: Optional[str] = None) -
     return (_normalize_board_slug(board) or DEFAULT_BOARD) if board else get_current_board()
 
 
+def _load_board_json(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """``(contents, None)`` for a ``board.json`` that parses as a JSON object,
+    ``(None, None)`` when there is no file, ``(None, why)`` when it exists but
+    cannot be used. One read, so the answer cannot change between checks."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(raw, dict):
+        return None, f"top level is {type(raw).__name__}, not an object"
+    return raw, None
+
+
 def board_allowed_assignees(
     conn: Optional[sqlite3.Connection] = None, *, board: Optional[str] = None,
 ) -> Optional[frozenset]:
@@ -3265,13 +3287,24 @@ def board_allowed_assignees(
     ``None`` (key absent or null) means no restriction: today's behaviour. A list
     restricts which profiles may own a dispatchable card on the board and which ones
     the dispatcher will spawn. An empty list allows nobody. A malformed value (not a
-    list of non-empty strings) fails closed to an empty allowlist, logged.
+    list of non-empty strings) fails closed to an empty allowlist, logged, and so does
+    a ``board.json`` that exists but does not parse as a JSON object.
     """
     if conn is not None:
         slug = board_slug_for_conn(conn, board)
     else:
         slug = (_normalize_board_slug(board) or DEFAULT_BOARD) if board else get_current_board()
-    raw = read_board_metadata(slug).get("allowed_assignees")
+    # Read board.json directly, not through read_board_metadata (which swallows a
+    # parse error and returns synthesized defaults): a hand-edit typo must not
+    # silently lift the allowlist.
+    path = board_metadata_path(slug)
+    data, broken = _load_board_json(path)
+    if broken is not None:
+        _log.warning(
+            "board %r: %s is unreadable (%s). Failing closed: no assignee is allowed on "
+            "this board until it parses as a JSON object.", slug, path, broken)
+        return frozenset()
+    raw = (data or {}).get("allowed_assignees")
     if raw is None:
         return None
     items = [raw] if isinstance(raw, str) else raw
@@ -6822,6 +6855,14 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        if reviewer is not None:
+            # Reassigning to a reviewer is a route onto another profile, like create:
+            # the board's ``allowed_assignees`` applies (dispatch re-checks it too).
+            _slug = board_slug_for_conn(conn)
+            refusal = assignee_not_allowed_message(
+                reviewer, board_allowed_assignees(board=_slug), _slug)
+            if refusal is not None:
+                return _ret(False, f"reviewer refused: {refusal}")
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -10681,18 +10722,28 @@ def _dispatch_once_locked(
     # full budget. "Spawnable" mirrors the review loop's own gate
     # (assigned + real profile) so a review column full of human-pulled
     # control-plane lanes doesn't permanently tax ready throughput.
+    # Board allowlist (board.json ``allowed_assignees``), read once per tick from the
+    # board this connection actually has open.
+    _board_slug = board_slug_for_conn(conn, board)
+    _allowed_assignees = board_allowed_assignees(board=_board_slug)
+
     def _any_spawnable_review() -> bool:
-        if not review_rows:
+        # A review card the allowlist refuses never spawns (the review loop holds
+        # it), so it must not reserve a slot from the ready lane either.
+        rows = [
+            row for row in review_rows
+            if row["assignee"] and assignee_not_allowed_message(
+                row["assignee"], _allowed_assignees, _board_slug) is None
+        ]
+        if not rows:
             return False
         try:
             from hermes_cli.profiles import profile_exists as _rpe
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+            return True
+        return any(_rpe(row["assignee"]) for row in rows)
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
@@ -10734,11 +10785,6 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    # Board allowlist (board.json ``allowed_assignees``), read once per tick from the
-    # board this connection actually has open.
-    _board_slug = board_slug_for_conn(conn, board)
-    _allowed_assignees = board_allowed_assignees(board=_board_slug)
-
     def _refused_by_allowlist(task_id: str, assignee: str, lane: str) -> bool:
         """The last line of defence for cards that reached a lane without passing
         create (reassignment, an unblocked parked card, default_assignee)."""

@@ -288,13 +288,52 @@ def worker_containment_guidance(tool_names: Any) -> str:
             + ", ".join(f"`{n}`" for n in excluded) + ". Where the protocol above mentions them, "
             "skip that step: put follow-up work and notes in your `kanban_complete` summary, or "
             "`kanban_block` if the task cannot be finished without them.")
-        if "kanban_show" in excluded:
-            lines.append("Your task details are already in this prompt; there is no `kanban_show`.")
     if scope == WORKER_SCOPE_OWN_TASK:
         lines.append(
             "You may only read or write your own task ($HERMES_KANBAN_TASK); calls naming any "
             "other task id are refused.")
-    return ("\n\n## Containment for this profile\n\n" + "\n".join(f"- {line}" for line in lines)) if lines else ""
+    out = ("\n\n## Containment for this profile\n\n" + "\n".join(f"- {line}" for line in lines)) if lines else ""
+    if "kanban_show" in excluded:
+        # kanban_show is the worker's only way to read its own card (the spawn prompt
+        # is just ``work kanban task <id>``), so deliver that card here instead.
+        out += _own_task_context_block()
+    return out
+
+
+# Bound on the own-task context injected when kanban_show is excluded.
+# build_worker_context caps each part already; this caps the whole block.
+_OWN_TASK_CONTEXT_MAX_CHARS = 24_000
+
+
+def _own_task_context_block() -> str:
+    """The worker's own card (title, body, prior attempts, parent handoffs,
+    comments), as ``kanban_show`` would return it in ``worker_context``, for a
+    profile that excludes ``kanban_show``. Read at prompt build time: each spawn
+    starts a fresh process, so it is current for the run."""
+    # Same guard as _default_task_id: a delegate child or an in-process cron job
+    # that inherited the worker's env does not own the card.
+    tid = _default_task_id(None)
+    if not tid:
+        return ""
+    header = (
+        "\n\n## Your task (in place of `kanban_show`)\n\n"
+        "`kanban_show` is not available to this profile, so your task is given here. "
+        "Where the protocol above says to call `kanban_show` first, read this instead.\n\n"
+    )
+    try:
+        kb, conn = _connect()
+        try:
+            text = kb.build_worker_context(conn, tid)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("kanban worker containment: could not load task %s for the prompt: %s", tid, exc)
+        return header + (
+            f"Task {tid} could not be loaded ({type(exc).__name__}). Do not guess at the "
+            "assignment: call `kanban_block` with kind `needs_input` and say so.")
+    if len(text) > _OWN_TASK_CONTEXT_MAX_CHARS:
+        text = text[:_OWN_TASK_CONTEXT_MAX_CHARS] + "\n\n[... task context truncated ...]"
+    return header + text
 
 
 # ---------------------------------------------------------------------------
@@ -1249,8 +1288,11 @@ def _handle_comment(args: dict, **kw) -> str:
     if delegated_err:
         return delegated_err
     # Under ``kanban.worker_scope: own_task`` the only legal target is the worker's
-    # own card, so an omitted task_id means that card.
-    tid = args.get("task_id") or _worker_own_task_scope()
+    # own card, so an omitted task_id means that card. The default still goes
+    # through ``_default_task_id``: a non-dispatcher-owned context (a cron job
+    # fired in-process from a worker) must never inherit the worker's task id.
+    tid = args.get("task_id") or (
+        _default_task_id(None) if _worker_own_task_scope() else None)
     if not tid:
         return tool_error(
             "task_id is required (use the current task id if that's what "
