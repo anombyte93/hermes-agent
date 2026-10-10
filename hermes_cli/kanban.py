@@ -1676,31 +1676,35 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=initial_status,
-            block_reason=block_reason,
-        )
+        try:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=initial_status,
+                block_reason=block_reason,
+            )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
@@ -2799,6 +2803,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_assignee_not_allowed": [
+                {"task_id": tid, "assignee": who}
+                for (tid, who) in res.skipped_assignee_not_allowed
+            ],
+            "skipped_board_unreadable": [
+                {"task_id": tid, "assignee": who}
+                for (tid, who) in res.skipped_board_unreadable
+            ],
+            "board_allowlist_unreadable": res.board_allowlist_unreadable,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2861,6 +2874,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (assignee is not a live Hermes profile — a terminal "
             f"lane pulled via claim_task, or a typo/deleted profile): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    for tid, who in res.skipped_assignee_not_allowed:
+        print(f"Refused ({who} not in board allowed_assignees): {tid}")
+    if res.skipped_board_unreadable:
+        print(
+            f"Deferred (board allowed_assignees unreadable: "
+            f"{res.board_allowlist_unreadable}; cards stay in their lanes): "
+            f"{', '.join(tid for tid, _ in res.skipped_board_unreadable)}"
         )
     for tid, missing in res.rejected_skills:
         print(

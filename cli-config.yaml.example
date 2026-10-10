@@ -330,8 +330,22 @@ model:
 # is spawned with the bundled sdlc-review skill and can approve, request changes
 # back to the original implementer, or escalate a genuine external blocker.
 # Disable this only when every review is performed manually from the dashboard.
+#
+# Kanban Worker Containment (set in a WORKER profile's config): every
+# dispatcher-spawned worker gets the whole kanban toolset. worker_tools_exclude
+# hides the listed tools from this profile's workers (left out of the schema,
+# refused if called); kanban_complete/kanban_block cannot be excluded.
+# worker_scope: own_task limits kanban_show/kanban_comment/kanban_attachments/
+# kanban_link to the worker's own task. With worker_scope: own_task or
+# kanban_create excluded, kanban_request_review also refuses a reviewer other
+# than the card's own assignee (a reviewer reassigns the card to that profile);
+# exclude kanban_request_review to drop review handoff entirely. Boards can also
+# restrict assignees with "allowed_assignees": [...] in
+# kanban/boards/<slug>/board.json.
 kanban:
   review_dispatch: true
+  # worker_tools_exclude: [kanban_create, kanban_attach_url]
+  # worker_scope: own_task
   # Optional physical hostname for workers. Run the board and dispatcher there.
   # Choosing a remote model provider alone still executes tools on this machine.
   # execution_host: "evo"

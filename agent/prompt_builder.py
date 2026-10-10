@@ -399,6 +399,24 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+
+def kanban_guidance_for(tool_names) -> str:
+    """KANBAN_GUIDANCE when the schema carries Kanban lifecycle tools, plus the
+    profile's containment addendum (``kanban.worker_tools_exclude`` /
+    ``kanban.worker_scope``). Keyed on ``kanban_complete`` as well as
+    ``kanban_show``: a contained worker may have ``kanban_show`` excluded but must
+    still be told how to finish its run."""
+    names = set(tool_names or ())
+    if "kanban_show" not in names and "kanban_complete" not in names:
+        return ""
+    try:
+        from tools.kanban_tools import worker_containment_guidance
+        addendum = worker_containment_guidance(names)
+    except Exception:
+        addendum = ""
+    return KANBAN_GUIDANCE + addendum
+
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
