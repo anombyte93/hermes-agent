@@ -350,6 +350,11 @@ def test_a_fresh_worker_process_is_offered_the_lifecycle_tools(worker, tmp_path)
 # --- kanban_request_review(reviewer=...) under containment ----------------------------
 
 def _claimed_run(worker, monkeypatch):
+    # Both profiles installed, so a reviewer refusal can only come from containment
+    # (some lineages refuse a reviewer that is not an installed profile first).
+    for prof in ("mail-drafter", "coder"):
+        (worker["home"] / "profiles" / prof).mkdir(parents=True, exist_ok=True)
+        (worker["home"] / "profiles" / prof / "config.yaml").write_text("model: x\n")
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
