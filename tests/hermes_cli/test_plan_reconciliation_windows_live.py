@@ -14,7 +14,7 @@ reconciliation. No mocks on the components under test.
 import io, contextlib, json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 
-WORKTREE = Path(__file__).resolve().parents[1]
+WORKTREE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(WORKTREE))
 
 import pytest

@@ -452,6 +452,76 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 })
 
 
+_PURGEABLE_MODULE_PREFIXES = ("hermes_cli", "hermes_state", "hermes_constants")
+
+
+def _purgeable_modules() -> dict:
+    return {
+        name: mod
+        for name, mod in list(sys.modules.items())
+        if name.startswith(_PURGEABLE_MODULE_PREFIXES)
+    }
+
+
+@pytest.fixture(autouse=True)
+def _restore_purged_hermes_modules():
+    """Undo ``del sys.modules[...]`` purges of hermes_cli/hermes_state (#92).
+
+    Several fixtures force a fresh import by deleting these modules. Without
+    a restore, every later test runs against a SECOND copy of each module
+    while test modules imported at collection time still hold the first: a
+    hook registered on one plugin registry is fired on the other, and the
+    kanban write guard patches a ``connect`` the test never calls.
+    """
+    before = _purgeable_modules()
+    yield
+    after = _purgeable_modules()
+    if all(after.get(name) is mod for name, mod in before.items()):
+        return
+    # Something was purged or replaced: put the originals back and drop
+    # modules first imported against the replacements (they would re-bind
+    # to the orphans). Parent-package attributes are fixed too, because
+    # ``from pkg import sub`` reads the attribute before sys.modules.
+    for name, mod in after.items():
+        if name not in before:
+            sys.modules.pop(name, None)
+            parent_name, _, child = name.rpartition(".")
+            parent = before.get(parent_name)
+            if parent is not None and getattr(parent, child, None) is mod:
+                delattr(parent, child)
+    for name, mod in before.items():
+        sys.modules[name] = mod
+        parent_name, _, child = name.rpartition(".")
+        parent = before.get(parent_name)
+        if parent is not None:
+            setattr(parent, child, mod)
+
+
+@pytest.fixture(autouse=True)
+def _restore_session_context_vars():
+    """Restore gateway session ContextVars after each test (#92).
+
+    Sync tests share one context, and ``clear_session_vars`` sets every var to
+    ``""`` ("explicitly cleared") rather than back to unset — so a test that
+    binds and clears a session leaves ``get_session_env`` ignoring
+    ``os.environ`` for every later test. Probed via ``sys.modules`` so the
+    fixture never imports the gateway into unrelated tests.
+    """
+    sc = sys.modules.get("gateway.session_context")
+    var_map = getattr(sc, "_VAR_MAP", None)
+    if not var_map:
+        yield
+        return
+    extra = [getattr(sc, n) for n in ("_SESSION_ASYNC_DELIVERY", "_SESSION_HISTORY_DELIVERY")
+             if hasattr(sc, n)]
+    saved = [(var, var.get()) for var in (*var_map.values(), *extra)]
+    saved_engaged = getattr(sc, "_session_context_engaged", False)
+    yield
+    for var, value in saved:
+        var.set(value)
+    setattr(sc, "_session_context_engaged", saved_engaged)
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
