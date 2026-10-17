@@ -332,18 +332,56 @@ def claude_code_credentials_path() -> Path:
     return Path.home() / ".claude" / ".credentials.json"
 
 
+# Pauses between re-reads of a credentials file that looks mid-swap. The
+# shared login is a symlink that account switchers repoint, often with a
+# non-atomic ``rm`` + ``ln -s`` or an in-place rewrite of the target. A read
+# landing in that gap used to return None, which surfaced as a hard
+# "No Anthropic credentials found" for the whole run (hermes-agent #100).
+# Total wait is bounded (~0.2s) and only spent when the file is transiently
+# missing/unparseable while its directory exists.
+_CREDENTIALS_SETTLE_DELAYS = (0.02, 0.06, 0.12)
+
+
+def _settle_pause(seconds: float) -> None:
+    import time
+
+    time.sleep(seconds)
+
+
+def _read_claude_code_credentials_file_once(cred_path: Path) -> tuple:
+    """One read attempt. Returns ``(data, transient)``.
+
+    ``transient`` is True when the failure looks like a swap/write in
+    progress (missing file inside an existing directory, dangling symlink,
+    truncated JSON) rather than "Claude Code is not set up here".
+    """
+    if not cred_path.exists():
+        return None, cred_path.is_symlink() or cred_path.parent.is_dir()
+    try:
+        return json.loads(cred_path.read_text(encoding="utf-8")), False
+    except (json.JSONDecodeError, OSError, IOError) as e:
+        logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+        return None, True
+
+
 def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
+
+    Always a fresh read (no caching). Retries briefly when the file looks
+    mid-swap so a symlink repoint is not mistaken for a missing login.
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
     cred_path = claude_code_credentials_path()
-    if not cred_path.exists():
+    data, transient = _read_claude_code_credentials_file_once(cred_path)
+    for delay in _CREDENTIALS_SETTLE_DELAYS:
+        if data is not None or not transient:
+            break
+        _settle_pause(delay)
+        data, transient = _read_claude_code_credentials_file_once(cred_path)
+    if data is None:
         return None
-    try:
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, IOError) as e:
-        logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+    if not isinstance(data, dict):
         return None
 
     oauth_data = data.get("claudeAiOauth")
