@@ -97,3 +97,77 @@ def test_record_success_is_no_op_when_not_exhausted(tmp_path, monkeypatch):
     assert cleared is not None
     assert cleared.last_status is None
     assert cleared.last_error_code is None
+
+
+def test_record_success_stale_id_prefers_key_match(tmp_path, monkeypatch):
+    """#79156: a stale credential_id must not clear the non-serving entry.
+
+    When per-turn env refresh rewrites ``api_key`` without rebinding
+    ``_credential_pool_entry_id``, recovery passes a stale id together with
+    the key that actually served.  ``record_success`` must attribute the
+    clear to the key-matched entry, not the stale-id entry (mirroring
+    ``mark_exhausted_and_rotate``).
+    """
+    cred_a = _exhausted_entry("cred-a")
+    cred_a["access_token"] = "sk-keyA"
+    cred_a["priority"] = 1
+    cred_b = _exhausted_entry("cred-b")
+    cred_b["access_token"] = "sk-keyB"
+    cred_b["priority"] = 0
+    pool = _load(tmp_path, monkeypatch, [cred_a, cred_b])
+
+    from agent.credential_pool import STATUS_EXHAUSTED, STATUS_OK
+
+    cleared = pool.record_success(credential_id="cred-a", api_key_hint="sk-keyB")
+
+    by_id = {e.id: e for e in pool.entries()}
+    # The entry that actually served (key-matched) is cleared to ok…
+    assert cleared is not None
+    assert cleared.id == "cred-b"
+    assert cleared.last_status == STATUS_OK
+    assert cleared.last_error_code is None
+    assert by_id["cred-b"].last_status == STATUS_OK
+    # …while the stale-id entry (which did NOT serve) stays exhausted.
+    assert by_id["cred-a"].last_status == STATUS_EXHAUSTED
+    assert by_id["cred-a"].last_error_code == 402
+
+
+def test_record_success_unmatched_identity_clears_nothing(tmp_path, monkeypatch):
+    """A supplied id + hint matching nothing must NOT fall through to current.
+
+    ``mark_exhausted_and_rotate`` deliberately refuses to guess when the
+    supplied identity matches no entry; ``record_success`` must do the same,
+    otherwise it clears whatever happens to be current.
+    """
+    pool = _load(tmp_path, monkeypatch, [_exhausted_entry("cred-a")])
+    # Establish a current entry so the buggy fall-through has something to clear.
+    pool.acquire_lease("cred-a")
+
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    cleared = pool.record_success(credential_id="does-not-exist", api_key_hint="sk-nope")
+
+    assert cleared is None
+    by_id = {e.id: e for e in pool.entries()}
+    assert by_id["cred-a"].last_status == STATUS_EXHAUSTED
+    assert by_id["cred-a"].last_error_code == 402
+
+
+def test_record_success_no_identity_clears_current_entry(tmp_path, monkeypatch):
+    """With no id and no hint, fall through to the current entry.
+
+    Mirrors ``mark_exhausted_and_rotate``'s identity-less resolution: when no
+    identity is supplied, the serving entry is the current selection and
+    ``record_success`` should clear it.
+    """
+    pool = _load(tmp_path, monkeypatch, [_exhausted_entry("cred-1")])
+    pool.acquire_lease("cred-1")
+
+    from agent.credential_pool import STATUS_OK
+
+    cleared = pool.record_success()
+
+    assert cleared is not None
+    assert cleared.id == "cred-1"
+    assert cleared.last_status == STATUS_OK
+    assert cleared.last_error_code is None
