@@ -6,6 +6,7 @@ from hermes_cli.cli_output import line_input
 import math
 import sys
 import time
+from datetime import datetime
 from types import SimpleNamespace
 import uuid
 
@@ -216,6 +217,17 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
 
 
 
+def _format_last_failure_time(entry) -> str:
+    """Format the timestamp of the credential's last failure, if recorded."""
+    last_at = getattr(entry, "last_status_at", None)
+    if not last_at:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(last_at)).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
 def _format_exhausted_status(entry) -> str:
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
@@ -223,14 +235,20 @@ def _format_exhausted_status(entry) -> str:
     reason = getattr(entry, "last_error_reason", None)
     reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
     code = f" ({entry.last_error_code})" if entry.last_error_code else ""
+    last_at = _format_last_failure_time(entry)
+    last_at_text = (
+        f" (last {entry.last_error_code} at {last_at})"
+        if entry.last_error_code and last_at
+        else ""
+    )
     if not show_retry_window:
         return f" {label}{reason_text}{code} (re-auth may be required)"
     exhausted_until = _exhausted_until(entry)
     if exhausted_until is None:
-        return f" {label}{reason_text}{code}"
+        return f" {label}{reason_text}{code}{last_at_text}"
     remaining = max(0, int(math.ceil(exhausted_until - time.time())))
     if remaining <= 0:
-        return f" {label}{reason_text}{code} (ready to retry)"
+        return f" {label}{reason_text}{code}{last_at_text}"
     minutes, seconds = divmod(remaining, 60)
     hours, minutes = divmod(minutes, 60)
     days, hours = divmod(hours, 24)
@@ -242,7 +260,7 @@ def _format_exhausted_status(entry) -> str:
         wait = f"{minutes}m {seconds}s"
     else:
         wait = f"{seconds}s"
-    return f" {label}{reason_text}{code} ({wait} left)"
+    return f" {label}{reason_text}{code}{last_at_text} ({wait} left)"
 
 
 def auth_add_command(args) -> None:

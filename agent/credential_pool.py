@@ -2571,6 +2571,73 @@ class CredentialPool:
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
 
+    def record_success(
+        self,
+        *,
+        api_key_hint: Optional[str] = None,
+        credential_id: Optional[str] = None,
+        persist: bool = True,
+    ) -> Optional[PooledCredential]:
+        """Clear any exhausted/error state on the credential that just succeeded.
+
+        Symmetric counterpart to :meth:`mark_exhausted_and_rotate`.  A
+        successful request proves a credential that was in cooldown (or marked
+        exhausted by a transient 402/429) is healthy again, so its error state
+        is cleared and the next ``hermes auth list`` renders it as ok instead
+        of a stale ``exhausted ... (ready to retry)`` (#104).
+
+        Borrowed (env-seeded) credentials are resolved straight from the
+        environment, so their pool entry is never touched by the
+        ``select``/``clear_expired`` recovery path — this is the only
+        mechanism that flips them back to ok after they recover.
+        """
+        with self._lock:
+            entry: Optional[PooledCredential] = None
+            if credential_id:
+                entry = next(
+                    (e for e in self._entries if e.id == credential_id),
+                    None,
+                )
+            if entry is None and api_key_hint:
+                entry = next(
+                    (e for e in self._entries if e.runtime_api_key == api_key_hint),
+                    None,
+                )
+            if entry is None:
+                entry = self._current_unlocked()
+            if entry is None:
+                return None
+            # No error state to clear — healthy and DEAD/exhausted-free entries
+            # are left untouched so a per-request success on an already-clean
+            # credential never forces an auth.json rewrite.
+            if (
+                entry.last_status not in (STATUS_EXHAUSTED, STATUS_DEAD)
+                and entry.last_error_code is None
+                and entry.last_error_reason is None
+                and entry.last_error_message is None
+                and entry.last_error_reset_at is None
+            ):
+                return entry
+            # Stamp ``last_status_at`` with the success time so the persist-side
+            # cooldown merge (``_merge_disk_cooldown_state``) treats this clear
+            # as more recent than the on-disk exhaustion it is clearing.  A
+            # bare ``last_status=None`` would be read as the oldest possible
+            # timestamp (0) and the merge would resurrect a still-binding
+            # on-disk cooldown over the successful clear.
+            cleared = replace(
+                entry,
+                last_status=STATUS_OK,
+                last_status_at=time.time(),
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, cleared)
+            if persist:
+                self._persist()
+            return cleared
+
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
 
