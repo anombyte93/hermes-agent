@@ -412,7 +412,8 @@ def install_distribution(
 ) -> InstallPlan:
     """Install a distribution from *source* into a new profile; returns the resolved plan.
     Use :func:`plan_install` first to preview + prompt."""
-    from hermes_cli.profiles import check_alias_collision, create_wrapper_script
+    from hermes_cli.default_soul import DEFAULT_SOUL_MD
+    from hermes_cli.profiles import _seed_file_if_missing, check_alias_collision, create_wrapper_script
     with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
         plan = plan_install(source, Path(tmp), override_name=name)
         if plan.existing and not force:
@@ -424,6 +425,7 @@ def install_distribution(
         # Fresh install: config.yaml comes from the distribution.
         _bootstrap_user_dirs(plan.target_dir)
         _copy_dist_payload(plan.staged_dir, plan.target_dir, plan.manifest, preserve_config=False)
+        _seed_file_if_missing(plan.target_dir / "SOUL.md", DEFAULT_SOUL_MD)  # as create_profile does
         if create_alias and check_alias_collision(plan.manifest.name) is None:
             create_wrapper_script(plan.manifest.name)
         return plan

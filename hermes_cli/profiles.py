@@ -1596,6 +1596,11 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         extracted = staging_root / archive_root
         if not extracted.is_dir():
             raise ValueError(f"Profile archive root is missing or invalid: {archive_root}")
+        # Refuse before the profile dir exists; the temp staging tree is discarded on raise.
+        try:
+            refuse_oversize_soul(extracted / "SOUL.md")
+        except ValueError as exc:
+            raise ValueError(f"Profile archive {archive}: {exc}") from exc
         final_source = extracted
         if archive_root != canon:
             final_source = staging_root / canon
