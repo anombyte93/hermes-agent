@@ -115,3 +115,53 @@ def test_distribution_install_refuses_oversize_soul(profile_env, tmp_path):
         install_distribution(str(staged), name="dist")
     _assert_refused(excinfo, over)
     assert not get_profile_dir("dist").exists()
+
+
+def _make_profile_archive(tmp_path: Path, root: str, soul_chars: int) -> Path:
+    import tarfile
+
+    tree = tmp_path / "archive-src" / root
+    tree.mkdir(parents=True)
+    (tree / "SOUL.md").write_text("a" * soul_chars, encoding="utf-8")
+    (tree / "config.yaml").write_text("model:\n  model: gpt-4\n")
+    archive = tmp_path / f"{root}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(tree, arcname=root)
+    return archive
+
+
+def test_import_refuses_soul_over_limit_and_leaves_no_profile_dir(profile_env, tmp_path):
+    from hermes_cli.profiles import import_profile
+
+    over = SOUL_CHAR_LIMIT + 1
+    archive = _make_profile_archive(tmp_path, "imp", over)
+    with pytest.raises(ValueError) as excinfo:
+        import_profile(str(archive))
+    _assert_refused(excinfo, over)
+    assert str(archive) in str(excinfo.value)
+    assert not get_profile_dir("imp").exists()
+
+
+def test_import_allows_soul_exactly_at_limit(profile_env, tmp_path):
+    from hermes_cli.profiles import import_profile
+
+    archive = _make_profile_archive(tmp_path, "imp", SOUL_CHAR_LIMIT)
+    dst = import_profile(str(archive), name="edge")
+    assert dst == get_profile_dir("edge")
+    assert len((dst / "SOUL.md").read_text(encoding="utf-8")) == SOUL_CHAR_LIMIT
+
+
+def test_distribution_install_without_soul_seeds_default(profile_env, tmp_path):
+    from hermes_cli.default_soul import DEFAULT_SOUL_MD
+    from hermes_cli.profile_distribution import (
+        DistributionManifest,
+        install_distribution,
+        write_manifest,
+    )
+
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "config.yaml").write_text("model:\n  model: gpt-4\n")
+    write_manifest(staged, DistributionManifest(name="dist", version="0.1.0"))
+    plan = install_distribution(str(staged), name="dist")
+    assert (plan.target_dir / "SOUL.md").read_text(encoding="utf-8") == DEFAULT_SOUL_MD
