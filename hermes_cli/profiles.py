@@ -736,6 +736,25 @@ def _seed_file_if_missing(path: Path, text: str, mode: Optional[int] = None) -> 
             os.chmod(str(path), mode)
 
 
+# Boot limit for a SOUL.md a new profile inherits. A clone copies the source SOUL through
+# symlinks, which is how a 308 KB legacy render became a profile's boot prompt.
+SOUL_CHAR_LIMIT = 20_000
+
+
+def refuse_oversize_soul(soul: Path) -> None:
+    """Raise ``ValueError`` if *soul* (symlinks resolved) is over ``SOUL_CHAR_LIMIT``
+    characters. A missing SOUL passes: creation seeds the default one. No override flag."""
+    if not soul.is_file():
+        return
+    size = len(soul.read_text(encoding="utf-8", errors="replace"))
+    if size > SOUL_CHAR_LIMIT:
+        raise ValueError(
+            f"{soul} (resolves to {soul.resolve()}) is {size:,} chars, over the "
+            f"{SOUL_CHAR_LIMIT:,}-character SOUL.md boot limit; refusing to create a profile "
+            "from it. Render the seat with `cortex render-seat` instead."
+        )
+
+
 def _clone_file(source_dir: Path, profile_dir: Path, relpath: str) -> None:
     """Copy one profile-relative file if it exists. ``.env`` is tightened to owner-only:
     ``copy2`` preserves source mode bits, so a loose source (umask 0o644) would leak."""
@@ -753,6 +772,7 @@ def _clone_file(source_dir: Path, profile_dir: Path, relpath: str) -> None:
 def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> None:
     """--clone-all: full copytree minus infrastructure/history, then strip runtime files
     and cloned single-use OAuth grants."""
+    refuse_oversize_soul(source_dir / "SOUL.md")
     shutil.copytree(source_dir, profile_dir, symlinks=True, ignore=_clone_all_copytree_ignore(source_dir))
     # Excluded history dirs (sessions/, cron/) must still exist as empty dirs so the clone runs.
     for subdir in _PROFILE_DIRS:
@@ -776,6 +796,8 @@ def _bootstrap_profile_dir(profile_dir: Path, source_dir: Optional[Path]) -> Non
     """Fresh layout: bootstrap dirs, then either seed a model block (no source) or clone
     config files, installed skills (the dashboard's "clone from default" must keep bundled
     AND user-installed skills), and memory/identity files from *source_dir*."""
+    if source_dir is not None:
+        refuse_oversize_soul(source_dir / "SOUL.md")
     profile_dir.mkdir(parents=True, exist_ok=True)
     for subdir in _PROFILE_DIRS:
         (profile_dir / subdir).mkdir(parents=True, exist_ok=True)

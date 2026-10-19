@@ -315,6 +315,12 @@ def plan_install(source: str, workdir: Path, override_name: Optional[str] = None
             f"No {MANIFEST_FILENAME} found at the distribution root — this source is not a Hermes distribution."
         )
     check_hermes_requires(manifest.hermes_requires, hermes_version)  # fail fast
+    if any(rel_parts == ("SOUL.md",) for _, rel_parts in _owned_entries(staged, manifest)):
+        from hermes_cli.profiles import refuse_oversize_soul
+        try:
+            refuse_oversize_soul(staged / "SOUL.md")
+        except ValueError as exc:
+            raise DistributionError(f"Distribution {provenance!r}: {exc}") from exc
     canon = _canon_valid(override_name or manifest.name)
     if canon == "default":
         raise DistributionError(
