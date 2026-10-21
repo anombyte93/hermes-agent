@@ -475,6 +475,31 @@ class _KanbanNotification:
             self.wake_handoff = handoff
         if review_detail is not None:
             self.wake_review_detail = review_detail
+        if self.platform_str == "discord":
+            # Discord-only layout (#111): title first with one state marker,
+            # clipped outcome, machinery in `-# ` subtext, masked links, no
+            # pings. Every other platform keeps the legacy ``msg`` above
+            # byte-for-byte. Rendering is pure; delivery, dedupe and wake
+            # below are untouched.
+            try:
+                from gateway.kanban_notice_discord import render_discord_kanban_notice
+
+                _discord_msg = render_discord_kanban_notice(
+                    ev.kind,
+                    task_id=self.task_id,
+                    title=(self.task.title if self.task else None),
+                    assignee=(self.task.assignee if self.task else None),
+                    board=self.board_slug,
+                    payload=ev.payload,
+                    result=(self.task.result if self.task else None),
+                )
+                if _discord_msg:
+                    msg = _discord_msg
+            except Exception as _fmt_exc:
+                logger.debug(
+                    "kanban notifier: discord format failed for %s; using plain text: %s",
+                    self.task_id, _fmt_exc,
+                )
         return msg
 
     def build_wake_text(self) -> None:
