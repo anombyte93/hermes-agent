@@ -341,6 +341,38 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
+    """Warn text when this call's board came only from ``<root>/kanban/current``.
+
+    That file is global: any session's ``boards switch`` (or a dashboard
+    switch) rewrites it for every later caller with no ``--board`` and no
+    ``HERMES_KANBAN_BOARD`` pin, so a card can silently land on a board no
+    dispatcher serves. Returns None when the board was named explicitly,
+    pinned by env (board or DB path), or resolved to ``default``.
+    """
+    if getattr(args, "board", None):
+        return None
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return None
+    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if env_board:
+        try:
+            normed = kb._normalize_board_slug(env_board)
+        except ValueError:
+            normed = None
+        if normed and kb.board_exists(normed):
+            return None
+    board = kb.get_current_board()
+    if board == kb.DEFAULT_BOARD:
+        return None
+    return (
+        f"kanban: no --board given; this card went to board {board!r} because "
+        f"{kb.current_board_path()} (kanban/current, shared by every session) "
+        f"names it. Pass --board {board} to confirm, or --board default if "
+        f"that is not what you meant."
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -385,6 +417,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
         except ValueError as exc:
             return _err(f"kanban: {exc}", 2)
         task = kb.get_task(conn, task_id)
+    implicit = _implicit_board_warning(args)
+    if implicit:
+        # stderr in both modes: --json stdout must stay machine-parseable.
+        print(f"⚠  {implicit}", file=sys.stderr)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
