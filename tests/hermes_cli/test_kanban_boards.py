@@ -343,4 +343,53 @@ class TestCLI:
         assert titlesD == []
 
 
+class TestImplicitBoardWarning:
+    """`create` with no --board / env pin that lands on a non-default board
+    via the global ``<root>/kanban/current`` file must say so on stderr —
+    including in --json mode, whose stdout must stay machine-parseable."""
+
+    def _switched_home(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_KANBAN_BOARD": "",
+               "HERMES_KANBAN_DB": ""}
+        assert _cli(["boards", "create", "other"], env_extra=env).returncode == 0
+        assert _cli(["boards", "switch", "other"], env_extra=env).returncode == 0
+        return env
+
+    def test_json_create_from_current_file_warns_on_stderr(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        r = _cli(["create", "Implicit", "--assignee", "dev", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)  # stdout stays pure JSON
+        assert "board 'other'" in r.stderr
+        assert "kanban/current" in r.stderr
+        assert "--board" in r.stderr
+
+    def test_plain_create_from_current_file_warns(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        r = _cli(["create", "Implicit", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "board 'other'" in r.stderr
+
+    def test_explicit_board_flag_is_silent(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        r = _cli(["--board", "other", "create", "Explicit", "--assignee", "dev", "--json"],
+                 env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "kanban/current" not in r.stderr
+
+    def test_env_pin_is_silent(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        env["HERMES_KANBAN_BOARD"] = "other"
+        r = _cli(["create", "Pinned", "--assignee", "dev", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "kanban/current" not in r.stderr
+
+    def test_default_board_is_silent(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_KANBAN_BOARD": "",
+               "HERMES_KANBAN_DB": ""}
+        r = _cli(["create", "Default", "--assignee", "dev", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "kanban/current" not in r.stderr
+
+
 
