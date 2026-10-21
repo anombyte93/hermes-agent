@@ -696,6 +696,35 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        if platform_str == "discord":
+                            # Discord-only layout (#111): title first with one
+                            # state marker, clipped outcome, machinery in
+                            # `-# ` subtext, masked links, no pings. Every
+                            # other platform keeps the legacy ``msg`` above
+                            # byte-for-byte. Rendering is pure; delivery,
+                            # dedupe and wake below are untouched.
+                            try:
+                                from gateway.kanban_notice_discord import (
+                                    render_discord_kanban_notice,
+                                )
+
+                                _discord_msg = render_discord_kanban_notice(
+                                    kind,
+                                    task_id=sub["task_id"],
+                                    title=(task.title if task else None),
+                                    assignee=who,
+                                    board=board_slug,
+                                    payload=ev.payload,
+                                    result=(task.result if task else None),
+                                )
+                                if _discord_msg:
+                                    msg = _discord_msg
+                            except Exception as _fmt_exc:
+                                logger.debug(
+                                    "kanban notifier: discord format failed for %s; "
+                                    "using plain text: %s",
+                                    sub["task_id"], _fmt_exc,
+                                )
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
