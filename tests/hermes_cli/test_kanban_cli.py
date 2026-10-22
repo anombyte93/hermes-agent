@@ -20,6 +20,8 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_TASK"):
+        monkeypatch.delenv(var, raising=False)
     kb.init_db()
     return home
 
@@ -74,6 +76,67 @@ def _run_kanban(*tokens):
     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
     kc.build_parser(parser.add_subparsers(dest="command"))
     return kc.kanban_command(parser.parse_args(["kanban", *tokens]))
+
+
+@pytest.mark.parametrize("config_failure", [False, True])
+def test_implicit_dispatch_refuses_before_dispatch_once(
+    kanban_home, monkeypatch, capsys, config_failure
+):
+    kb.create_board("other")
+    kb.set_current_board("other")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="queued work", assignee="dev")
+        before = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        assert before is not None
+        assert before.status == "ready"
+        assert kb.list_runs(conn, tid) == []
+
+    if config_failure:
+        from hermes_cli import config
+
+        def fail_config():
+            raise OSError("config unavailable")
+
+        monkeypatch.setattr(config, "load_config", fail_config)
+
+    dispatched = []
+
+    def unexpected_dispatch(*args, **kwargs):
+        dispatched.append(True)
+        raise AssertionError("dispatch_once must not run before board confirmation")
+
+    monkeypatch.setattr(kb, "dispatch_once", unexpected_dispatch)
+    assert _run_kanban("dispatch", "--json") == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "board 'other'" in captured.err
+    assert str(kb.current_board_path()) in captured.err
+    assert "--board other" in captured.err
+    assert "HERMES_KANBAN_BOARD" in captured.err
+    assert "kanban.require_explicit_board: false" in captured.err
+    assert dispatched == []
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid) == before
+        assert kb.list_events(conn, tid) == events
+        assert kb.list_runs(conn, tid) == []
+
+
+def test_implicit_create_refuses_when_config_read_fails(kanban_home, monkeypatch, capsys):
+    from hermes_cli import config
+
+    kb.create_board("other")
+    kb.set_current_board("other")
+
+    def fail_config():
+        raise OSError("config unavailable")
+
+    monkeypatch.setattr(config, "load_config", fail_config)
+    assert _run_kanban("create", "refused", "--json") == 2
+    assert "kanban.require_explicit_board: false" in capsys.readouterr().err
+    for board in ("other", "default"):
+        with kb.connect_closing(board=board) as conn:
+            assert kb.list_tasks(conn) == []
 
 
 @pytest.mark.parametrize("status", ["triage", "todo", "scheduled"])

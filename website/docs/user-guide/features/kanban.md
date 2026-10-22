@@ -238,11 +238,21 @@ up on the next tick (60s by default).
 # config.yaml
 kanban:
   dispatch_in_gateway: true        # default
+  require_explicit_board: true     # default: confirm non-default current-file routing
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
 ```
+
+By default, `hermes kanban create` and `hermes kanban dispatch` refuse with
+exit code 2 when the shared `kanban/current` file is the only source selecting
+a non-default board. No task is created or dispatched. Pass `--board <slug>`
+(before the subcommand), export `HERMES_KANBAN_BOARD`, or set
+`kanban.require_explicit_board: false` in `config.yaml` to allow it. Setting
+the flag to `false` restores legacy routing, including the existing stderr
+warning on `create`. An explicit `HERMES_KANBAN_DB` pin, the `default` board,
+and all other subcommands are unaffected.
 
 If the assignee profile cannot load `sdlc-review`, the card stays in `review` without a worker run, even when the card's own other skills resolve fine; a deduplicated `review_unavailable` event names the profile and missing skill, and dispatch resumes once the profile can load it or the card is reassigned to one that can. The check resolves skills the way the worker would, including the trusted project skills (`.hermes/skills`, `.agents/skills`) of the card's workspace when that workspace is listed in `skills.trusted_project_dirs`. A parked review does not reserve a dispatch slot, so it never starves ready cards under `max_in_progress`. `hermes kanban diagnostics` reports a parked review card with the profile and the missing skill.
 

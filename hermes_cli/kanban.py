@@ -1689,8 +1689,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
-def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
-    """Warn text when this call's board came only from ``<root>/kanban/current``.
+def _implicit_board(args: argparse.Namespace) -> Optional[str]:
+    """Board slug when this call's board came only from ``<root>/kanban/current``.
 
     That file is global: any session's ``boards switch`` (or a dashboard
     switch) rewrites it for every later caller with no ``--board`` and no
@@ -1705,6 +1705,13 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
     board, source = kb.resolve_current_board_with_source()
     if source != kb.BOARD_SOURCE_CURRENT_FILE or board == kb.DEFAULT_BOARD:
         return None
+    return board
+
+
+def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
+    board = _implicit_board(args)
+    if board is None:
+        return None
     return (
         f"kanban: no --board given; this card went to board {board!r} because "
         f"{kb.current_board_path()} (kanban/current, shared by every session) "
@@ -1713,7 +1720,32 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
     )
 
 
+def _implicit_board_refusal(args: argparse.Namespace) -> Optional[str]:
+    """Fail closed unless config explicitly permits shared-current routing."""
+    board = _implicit_board(args)
+    if board is None:
+        return None
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        require_explicit = cfg.get("kanban", {}).get("require_explicit_board", True)
+    except Exception:
+        require_explicit = True
+    if require_explicit is False:
+        return None
+    return (
+        f"kanban: refusing to use board {board!r} selected only by "
+        f"{kb.current_board_path()} (kanban/current, shared by every session). "
+        f"Pass --board {board}, export HERMES_KANBAN_BOARD={board}, or set "
+        "kanban.require_explicit_board: false in config.yaml to proceed."
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -2825,6 +2857,10 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
