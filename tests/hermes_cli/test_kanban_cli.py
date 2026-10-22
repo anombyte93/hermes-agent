@@ -90,6 +90,8 @@ def test_kanban_refusal_unsupported_status(kanban_home, capsys, status):
     assert "complete accepts running/ready/blocked/review" in captured.err
     assert "kanban archive" in captured.err
     assert "drop" in captured.err
+    if status == "triage":
+        assert "kanban specify" in captured.err
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, tid)
         assert task is not None
@@ -135,6 +137,21 @@ def test_kanban_refusal_unsatisfied_parents(kanban_home, capsys):
     assert "unsatisfied parents" in error
     assert all(parent in error for parent in parents[:2])
     assert parents[2] not in error
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_kanban_refusal_terminal_before_open_parents(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="reopened parent")
+        tid = kb.create_task(conn, title="finished child", parents=[parent])
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.commit()
+        assert kb.get_task(conn, parent).status != "done"
+
+    assert _run_kanban("complete", tid) == 1
+    error = capsys.readouterr().err
+    assert f"already terminal (status is {status})" in error
+    assert "unsatisfied parents" not in error
 
 
 def test_kanban_refusal_stale_completion_run(kanban_home, monkeypatch, capsys):
@@ -188,10 +205,78 @@ def test_kanban_refusal_not_found_board_source(kanban_home, monkeypatch, capsys,
 
     assert _run_kanban("show", "missing-task") == 1
     error = capsys.readouterr().err
-    assert f"board {board!r}" in error
-    assert f"resolved from {expected_source}" in error
     if source == "db":
         assert str(kanban_home / "isolated.db") in error
+        assert "pinned by HERMES_KANBAN_DB" in error
+        assert f"board {board!r}" not in error
+    else:
+        assert f"board {board!r}" in error
+        assert f"resolved from {expected_source}" in error
+
+
+@pytest.mark.parametrize("command", [
+    ["comment", "missing-task", "hello"],
+    ["link", "missing-task", "other-missing"],
+    ["context", "missing-task"],
+])
+def test_kanban_db_unknown_task_errors_name_board(kanban_home, capsys, command):
+    kb.create_board("example")
+    assert _run_kanban("--board", "example", *command) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unknown task" in captured.err
+    assert "missing-task" in captured.err
+    assert "board 'example'" in captured.err
+    assert "resolved from --board" in captured.err
+
+
+def test_kanban_pinned_db_ignores_board_selection(kanban_home, monkeypatch, capsys):
+    kb.create_board("example")
+    pinned = kanban_home / "isolated.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+    assert _run_kanban("--board", "example", "show", "missing-task") == 1
+    error = capsys.readouterr().err
+    assert str(pinned) in error
+    assert "pinned by HERMES_KANBAN_DB" in error
+    assert "board selection ignored" in error
+    assert "board 'example'" not in error
+
+
+def test_resolve_current_board_with_source_matches_get_current_board(
+    kanban_home, monkeypatch
+):
+    kb.create_board("example")
+    kb.create_board("other")
+    assert kb.resolve_current_board_with_source() == ("default", kb.BOARD_SOURCE_DEFAULT)
+    kb.set_current_board("other")
+    assert kb.resolve_current_board_with_source() == ("other", kb.BOARD_SOURCE_CURRENT_FILE)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "example")
+    assert kb.resolve_current_board_with_source() == ("example", kb.BOARD_SOURCE_ENV)
+    with kb.scoped_current_board("other"):
+        assert kb.resolve_current_board_with_source() == ("other", kb.BOARD_SOURCE_OVERRIDE)
+        assert kb.get_current_board() == "other"
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "missing-board")
+    assert kb.resolve_current_board_with_source() == ("other", kb.BOARD_SOURCE_CURRENT_FILE)
+    assert kb.get_current_board() == "other"
+
+
+def test_explain_complete_refusal_is_shared_by_worker_tool(kanban_home, monkeypatch):
+    import json
+    from tools import kanban_tools
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="unfinished specification", triage=True)
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+        conn.commit()
+        expected = kb.explain_complete_refusal(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    result = json.loads(kanban_tools._handle_complete({"summary": "done"}))
+    assert expected in result["error"]
+    assert "unknown id or already terminal" not in result["error"]
+    assert "status is triage" in result["error"]
 
 
 @pytest.mark.parametrize("status", ["running", "ready", "blocked", "review"])

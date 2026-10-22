@@ -58,30 +58,23 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 def _board_search_context(args: argparse.Namespace) -> str:
     """Describe the existing resolver's result, without choosing a board here."""
-    board = kb.get_current_board()
     if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        # kanban_db_path() honours the pinned database before any board
+        # selection, so a board slug here would be misleading.
         return (
-            f"board {board!r} (resolved from HERMES_KANBAN_DB; "
-            f"database pinned to {kb.kanban_db_path()})"
+            f"database {kb.kanban_db_path()} "
+            "(pinned by HERMES_KANBAN_DB; board selection ignored)"
         )
+    board, source = kb.resolve_current_board_with_source()
     if getattr(args, "board", None):
-        source = "--board"
+        label = "--board"
+    elif source == kb.BOARD_SOURCE_CURRENT_FILE:
+        label = str(kb.current_board_path())
+    elif source == kb.BOARD_SOURCE_DEFAULT:
+        label = "built-in default"
     else:
-        source = "built-in default"
-        try:
-            if kb._normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD")) == board:
-                source = "HERMES_KANBAN_BOARD"
-        except ValueError:
-            pass
-        if source == "built-in default":
-            try:
-                if kb._normalize_board_slug(
-                    kb.current_board_path().read_text(encoding="utf-8")
-                ) == board:
-                    source = str(kb.current_board_path())
-            except (OSError, ValueError):
-                pass
-    return f"board {board!r} (resolved from {source})"
+        label = source
+    return f"board {board!r} (resolved from {label})"
 
 
 def _task_not_found(args: argparse.Namespace, task_id: str) -> str:
@@ -1233,7 +1226,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            message = f"kanban: {exc}"
+            if str(exc).startswith("unknown task"):
+                message += f" on {_board_search_context(args)}"
+            print(message, file=sys.stderr)
             return 1
 
 
@@ -1688,16 +1684,8 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
         return None
     if os.environ.get("HERMES_KANBAN_DB", "").strip():
         return None
-    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
-    if env_board:
-        try:
-            normed = kb._normalize_board_slug(env_board)
-        except ValueError:
-            normed = None
-        if normed and kb.board_exists(normed):
-            return None
-    board = kb.get_current_board()
-    if board == kb.DEFAULT_BOARD:
+    board, source = kb.resolve_current_board_with_source()
+    if source != kb.BOARD_SOURCE_CURRENT_FILE or board == kb.DEFAULT_BOARD:
         return None
     return (
         f"kanban: no --board given; this card went to board {board!r} because "
@@ -2485,32 +2473,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                task = kb.get_task(conn, tid)
-                if task is None:
-                    reason = f"unknown task id on {_board_search_context(args)}"
-                else:
-                    parents = [kb.get_task(conn, pid) for pid in kb.parent_ids(conn, tid)]
-                    unsatisfied = [
-                        p.id for p in parents
-                        if p is not None and p.status not in {"done", "archived"}
-                    ]
-                    if unsatisfied:
-                        reason = f"unsatisfied parents: {', '.join(unsatisfied)}"
-                    elif task.status in {"done", "archived"}:
-                        reason = f"already terminal (status is {task.status})"
-                    elif task.status not in {"running", "ready", "blocked", "review"}:
-                        reason = (
-                            f"status is {task.status}; complete accepts "
-                            "running/ready/blocked/review. "
-                            "Use `kanban archive` to drop a card."
-                        )
-                    elif expected_run_id is not None and task.current_run_id != expected_run_id:
-                        reason = (
-                            f"run id mismatch (expected {expected_run_id}, "
-                            f"current {task.current_run_id})"
-                        )
-                    else:
-                        reason = "task changed while completing; inspect its current state and retry"
+                reason = kb.explain_complete_refusal(
+                    conn, tid, expected_run_id,
+                    unknown_context=_board_search_context(args),
+                )
                 print(f"cannot complete {tid}: {reason}", file=sys.stderr)
             else:
                 print(f"Completed {tid}")

@@ -102,6 +102,20 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Statuses ``complete_task`` accepts, and the terminal states a card cannot
+# leave by completing. Shared by the SQL guards, the parent gate and the
+# refusal explanation so they cannot drift apart.
+COMPLETE_ACCEPTED_STATUSES = ("running", "ready", "blocked", "review")
+TERMINAL_STATUSES = ("done", "archived")
+
+
+def _sql_in_list(values) -> str:
+    """Render a tuple of trusted status constants as an SQL ``IN`` list body."""
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+_COMPLETE_ACCEPTED_SQL = _sql_in_list(COMPLETE_ACCEPTED_STATUSES)
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -628,12 +642,31 @@ def get_current_board() -> str:
     with a best-effort warning — the dispatcher must never crash because a
     user hand-edited a file or removed a board directory.
     """
+    return resolve_current_board_with_source()[0]
+
+
+# Source labels returned by :func:`resolve_current_board_with_source`.
+BOARD_SOURCE_OVERRIDE = "board-override"
+BOARD_SOURCE_ENV = "HERMES_KANBAN_BOARD"
+BOARD_SOURCE_CURRENT_FILE = "current-file"
+BOARD_SOURCE_DEFAULT = "default"
+
+
+def resolve_current_board_with_source() -> tuple[str, str]:
+    """Return ``(slug, source)`` for the active board.
+
+    The one implementation of the resolution chain documented on
+    :func:`get_current_board`. ``source`` is one of ``BOARD_SOURCE_OVERRIDE``
+    (a scoped override such as ``--board``), ``BOARD_SOURCE_ENV``,
+    ``BOARD_SOURCE_CURRENT_FILE`` or ``BOARD_SOURCE_DEFAULT``. Callers that
+    only need the slug use :func:`get_current_board`.
+    """
     scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
     if scoped:
         try:
             normed = _normalize_board_slug(scoped)
             if normed and board_exists(normed):
-                return normed
+                return normed, BOARD_SOURCE_OVERRIDE
         except ValueError:
             pass
 
@@ -642,7 +675,7 @@ def get_current_board() -> str:
         try:
             normed = _normalize_board_slug(env)
             if normed and board_exists(normed):
-                return normed
+                return normed, BOARD_SOURCE_ENV
         except ValueError:
             pass
     try:
@@ -653,12 +686,12 @@ def get_current_board() -> str:
                 try:
                     normed = _normalize_board_slug(val)
                     if normed and board_exists(normed):
-                        return normed
+                        return normed, BOARD_SOURCE_CURRENT_FILE
                 except ValueError:
                     pass
     except OSError:
         pass
-    return DEFAULT_BOARD
+    return DEFAULT_BOARD, BOARD_SOURCE_DEFAULT
 
 
 def set_current_board(slug: str) -> Path:
@@ -4706,7 +4739,7 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"AND p.status NOT IN ({_sql_in_list(TERMINAL_STATUSES)}) LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -5450,6 +5483,52 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def explain_complete_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int] = None,
+    *,
+    unknown_context: Optional[str] = None,
+) -> str:
+    """Say why :func:`complete_task` returned False for ``task_id``.
+
+    Read-only. The order is: unknown id, already terminal, unsatisfied
+    parents, unsupported status, stale run id, then a catch-all for a race.
+    A terminal card is reported as terminal even when a parent has since
+    reopened, because completing that parent would not make it completable.
+    ``unknown_context`` is appended to the unknown-id reason (for example the
+    board that was searched).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        reason = "unknown task id"
+        return f"{reason} on {unknown_context}" if unknown_context else reason
+    if task.status in TERMINAL_STATUSES:
+        return f"already terminal (status is {task.status})"
+    unsatisfied = []
+    for pid in parent_ids(conn, task_id):
+        parent = get_task(conn, pid)
+        if parent is not None and parent.status not in TERMINAL_STATUSES:
+            unsatisfied.append(parent.id)
+    if unsatisfied:
+        return f"unsatisfied parents: {', '.join(unsatisfied)}"
+    if task.status not in COMPLETE_ACCEPTED_STATUSES:
+        accepted = "/".join(COMPLETE_ACCEPTED_STATUSES)
+        hint = "Use `kanban archive` to drop a card."
+        if task.status == "triage":
+            hint = (
+                "Use `kanban specify` to turn it into a spec, "
+                "or `kanban archive` to drop it."
+            )
+        return f"status is {task.status}; complete accepts {accepted}. {hint}"
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        return (
+            f"run id mismatch (expected {expected_run_id}, "
+            f"current {task.current_run_id})"
+        )
+    return "task changed while completing; inspect its current state and retry"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5542,7 +5621,7 @@ def complete_task(
         prior_status = prior["status"] if prior else None
         if expected_run_id is None:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5553,13 +5632,13 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ({_COMPLETE_ACCEPTED_SQL})
                 """,
                 (result, now, task_id),
             )
         else:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5570,7 +5649,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ({_COMPLETE_ACCEPTED_SQL})
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
