@@ -409,3 +409,155 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Specific refusal reasons for reclaim / reassign / edit / block / archive
+# ---------------------------------------------------------------------------
+
+
+def _set_status(tid, status):
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status=?, block_reason=? WHERE id=?",
+            (status, "waiting" if status == "blocked" else None, tid),
+        )
+        conn.commit()
+
+
+_UNKNOWN_ID_COMMANDS = {
+    "reclaim": ["reclaim", "missing-task"],
+    "reassign": ["reassign", "missing-task", "example-profile"],
+    "edit": ["edit", "missing-task", "--result", "backfilled"],
+    "block": ["block", "missing-task", "waiting"],
+    "archive": ["archive", "missing-task"],
+}
+
+
+@pytest.mark.parametrize("verb", sorted(_UNKNOWN_ID_COMMANDS))
+def test_kanban_refusal_unknown_id_names_board(kanban_home, capsys, verb):
+    kb.create_board("example")
+    assert _run_kanban("--board", "example", *_UNKNOWN_ID_COMMANDS[verb]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot {verb}" in captured.err
+    assert "missing-task" in captured.err
+    assert "unknown task id on board 'example'" in captured.err
+    assert "resolved from --board" in captured.err
+    assert "unknown id or" not in captured.err
+
+
+@pytest.mark.parametrize("status", ["todo", "done", "archived"])
+def test_kanban_refusal_reclaim_wrong_status(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="not reclaimable")
+    _set_status(tid, status)
+
+    assert _run_kanban("reclaim", tid) == 1
+    captured = capsys.readouterr()
+    accepted = "/".join(kb.RECLAIM_ACCEPTED_STATUSES)
+    assert captured.out == ""
+    if status == "todo":
+        assert f"status is todo; reclaim accepts {accepted}" in captured.err
+    else:
+        assert f"already terminal (status is {status}); reclaim accepts {accepted}" in captured.err
+    assert "unknown" not in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == status
+
+
+def test_kanban_refusal_reclaim_ready_without_claim(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="idle task")
+    assert _run_kanban("reclaim", tid) == 1
+    assert "no active claim to reclaim" in capsys.readouterr().err
+
+
+def test_kanban_refusal_reassign_running_claimed(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="busy task", assignee="example-profile")
+        assert kb.claim_task(conn, tid) is not None
+
+    assert _run_kanban("reassign", tid, "other-profile") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot reassign {tid}: status is running (claimed by a worker)" in captured.err
+    assert "reassign accepts every status except running" in captured.err
+    assert "--reclaim" in captured.err
+    assert "unknown" not in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).assignee == "example-profile"
+
+    # Success path unchanged: --reclaim releases the claim, then reassigns.
+    assert _run_kanban("reassign", tid, "other-profile", "--reclaim") == 0
+    assert capsys.readouterr().out == f"Reassigned {tid} to other-profile (claim reclaimed)\n"
+
+
+@pytest.mark.parametrize("status", ["todo", "ready", "archived"])
+def test_kanban_refusal_edit_wrong_status(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="not done")
+    _set_status(tid, status)
+
+    assert _run_kanban("edit", tid, "--result", "backfilled") == 1
+    captured = capsys.readouterr()
+    accepted = "/".join(kb.EDIT_ACCEPTED_STATUSES)
+    assert captured.out == ""
+    prefix = "already terminal (status is archived)" if status == "archived" else f"status is {status}"
+    assert f"cannot edit {tid}: {prefix}; edit accepts {accepted}" in captured.err
+    assert "unknown" not in captured.err
+
+
+@pytest.mark.parametrize("status", ["todo", "blocked", "done"])
+def test_kanban_refusal_block_wrong_status(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="not blockable")
+    _set_status(tid, status)
+
+    assert _run_kanban("block", tid, "waiting") == 1
+    captured = capsys.readouterr()
+    accepted = "/".join(kb.BLOCK_ACCEPTED_STATUSES)
+    assert captured.out == ""
+    prefix = "already terminal (status is done)" if status == "done" else f"status is {status}"
+    assert f"cannot block {tid}: {prefix}; block accepts {accepted}" in captured.err
+    assert "unknown" not in captured.err
+
+
+def test_kanban_refusal_block_stale_run(kanban_home, monkeypatch, capsys):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="newer run")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+
+    assert _run_kanban("block", tid, "waiting") == 1
+    assert "run id mismatch" in capsys.readouterr().err
+
+
+def test_kanban_refusal_archive_already_archived(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="old task")
+        assert kb.archive_task(conn, tid)
+
+    assert _run_kanban("archive", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot archive {tid}: already terminal (status is archived)" in captured.err
+    assert "unknown" not in captured.err
+
+
+def test_refusal_status_sets_match_sql_guards(kanban_home):
+    """The shared constants decide each verb's outcome, not a second copy."""
+    outcomes = {
+        "edit": (kb.EDIT_ACCEPTED_STATUSES,
+                 lambda c, t: kb.edit_completed_task_result(c, t, result="r")),
+        "archive": (kb.ARCHIVE_ACCEPTED_STATUSES, kb.archive_task),
+        "block": (kb.BLOCK_ACCEPTED_STATUSES,
+                  lambda c, t: kb.block_task(c, t, reason="r")),
+    }
+    for verb, (accepted, run) in outcomes.items():
+        for status in kb.STATUS_ORDER:
+            with kb.connect_closing() as conn:
+                tid = kb.create_task(conn, title=f"{verb} {status}")
+            _set_status(tid, status)
+            with kb.connect_closing() as conn:
+                assert run(conn, tid) == (status in accepted), (verb, status)

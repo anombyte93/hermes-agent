@@ -77,6 +77,21 @@ def _board_search_context(args: argparse.Namespace) -> str:
     return f"board {board!r} (resolved from {label})"
 
 
+def _refusal_reason(
+    conn,
+    args: argparse.Namespace,
+    task_id: str,
+    verb: str,
+    **kwargs: Any,
+) -> str:
+    """Why ``verb`` was refused for ``task_id``, with the searched board."""
+    return kb.explain_refusal(
+        conn, task_id, verb,
+        unknown_context=_board_search_context(args),
+        **kwargs,
+    )
+
+
 def _task_not_found(args: argparse.Namespace, task_id: str) -> str:
     return f"no such task: {task_id} on {_board_search_context(args)}"
 
@@ -2071,11 +2086,10 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
             conn, args.task_id,
             reason=getattr(args, "reason", None),
         )
+        if not ok:
+            reason = _refusal_reason(conn, args, args.task_id, "reclaim")
     if not ok:
-        print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
-            file=sys.stderr,
-        )
+        print(f"cannot reclaim {args.task_id}: {reason}", file=sys.stderr)
         return 1
     print(f"Reclaimed {args.task_id}")
     return 0
@@ -2089,12 +2103,13 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
         )
+        if not ok:
+            reason = _refusal_reason(
+                conn, args, args.task_id, "reassign",
+                reclaim_requested=bool(getattr(args, "reclaim", False)),
+            )
     if not ok:
-        print(
-            f"cannot reassign {args.task_id} "
-            f"(unknown id, or still running — pass --reclaim to release first)",
-            file=sys.stderr,
-        )
+        print(f"cannot reassign {args.task_id}: {reason}", file=sys.stderr)
         return 1
     print(
         f"Reassigned {args.task_id} to "
@@ -2503,7 +2518,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             metadata=metadata,
         ):
             print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
+                f"cannot edit {args.task_id}: "
+                f"{_refusal_reason(conn, args, args.task_id, 'edit')}",
                 file=sys.stderr,
             )
             return 1
@@ -2519,17 +2535,28 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            if kb.get_task(conn, tid) is None:
+                # No card to comment on or block: say which board was searched
+                # instead of failing inside add_comment.
+                failed.append(tid)
+                detail = _refusal_reason(conn, args, tid, "block")
+                print(f"cannot block {tid}: {detail}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            expected_run_id = _worker_run_id_for(tid)
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                detail = _refusal_reason(
+                    conn, args, tid, "block", expected_run_id=expected_run_id,
+                )
+                print(f"cannot block {tid}: {detail}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
@@ -2769,7 +2796,8 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         for tid in ids:
             if not kb.archive_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot archive {tid}", file=sys.stderr)
+                detail = _refusal_reason(conn, args, tid, "archive")
+                print(f"cannot archive {tid}: {detail}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
