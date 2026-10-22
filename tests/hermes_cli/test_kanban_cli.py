@@ -70,6 +70,151 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def _run_kanban(*tokens):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    return kc.kanban_command(parser.parse_args(["kanban", *tokens]))
+
+
+@pytest.mark.parametrize("status", ["triage", "todo", "scheduled"])
+def test_kanban_refusal_unsupported_status(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="unfinished specification", triage=True)
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.commit()
+
+    assert _run_kanban("complete", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot complete {tid}: status is {status}" in captured.err
+    assert "complete accepts running/ready/blocked/review" in captured.err
+    assert "kanban archive" in captured.err
+    assert "drop" in captured.err
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == status
+
+
+def test_kanban_refusal_unknown_completion(kanban_home, capsys):
+    assert _run_kanban("--board", "default", "complete", "missing-task") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unknown task id" in captured.err
+    assert "missing-task" in captured.err
+    assert "board 'default'" in captured.err
+    assert "--board" in captured.err
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_kanban_refusal_terminal_completion(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="finished task")
+        if status == "done":
+            assert kb.complete_task(conn, tid)
+        else:
+            assert kb.archive_task(conn, tid)
+
+    assert _run_kanban("complete", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"already terminal (status is {status})" in captured.err
+
+
+def test_kanban_refusal_unsatisfied_parents(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        parents = [kb.create_task(conn, title=f"parent {n}") for n in range(3)]
+        assert kb.archive_task(conn, parents[2])
+        tid = kb.create_task(conn, title="dependent task", parents=parents)
+        # A parent can reopen after the child has entered an accepted status.
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+
+    assert _run_kanban("complete", tid) == 1
+    error = capsys.readouterr().err
+    assert "unsatisfied parents" in error
+    assert all(parent in error for parent in parents[:2])
+    assert parents[2] not in error
+
+
+def test_kanban_refusal_stale_completion_run(kanban_home, monkeypatch, capsys):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="newer run")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+
+    assert _run_kanban("complete", tid) == 1
+    assert "run id mismatch" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [
+    ["show", "missing-task"],
+    ["assign", "missing-task", "none"],
+    ["set-model", "missing-task", "example-model"],
+    ["diagnostics", "--task", "missing-task"],
+    ["claim", "missing-task"],
+    ["attachments", "missing-task"],
+    ["notify-subscribe", "missing-task", "--platform", "example", "--chat-id", "test"],
+])
+def test_kanban_refusal_not_found_named_board(kanban_home, capsys, command):
+    kb.create_board("example")
+    assert _run_kanban("--board", "example", *command) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no such task: missing-task" in captured.err
+    assert "board 'example'" in captured.err
+    assert "resolved from --board" in captured.err
+
+
+@pytest.mark.parametrize("source", ["env", "current", "default", "stale-env", "db"])
+def test_kanban_refusal_not_found_board_source(kanban_home, monkeypatch, capsys, source):
+    board = "default"
+    if source in {"env", "current", "stale-env"}:
+        kb.create_board("example")
+        board = "example"
+    if source == "env":
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", " EXAMPLE ")
+        expected_source = "HERMES_KANBAN_BOARD"
+    elif source in {"current", "stale-env"}:
+        kb.set_current_board(board)
+        expected_source = str(kb.current_board_path())
+        if source == "stale-env":
+            monkeypatch.setenv("HERMES_KANBAN_BOARD", "missing-board")
+    elif source == "db":
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "isolated.db"))
+        expected_source = "HERMES_KANBAN_DB"
+    else:
+        expected_source = "built-in default"
+
+    assert _run_kanban("show", "missing-task") == 1
+    error = capsys.readouterr().err
+    assert f"board {board!r}" in error
+    assert f"resolved from {expected_source}" in error
+    if source == "db":
+        assert str(kanban_home / "isolated.db") in error
+
+
+@pytest.mark.parametrize("status", ["running", "ready", "blocked", "review"])
+def test_kanban_completion_success_unchanged(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="completable task")
+        conn.execute(
+            "UPDATE tasks SET status=?, block_reason=? WHERE id=?",
+            (status, "waiting for verification" if status == "blocked" else None, tid),
+        )
+        conn.commit()
+
+    assert _run_kanban("complete", tid, "--result", "verified") == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"Completed {tid}\n"
+    assert captured.err == ""
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.result == "verified"
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

@@ -56,6 +56,38 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _board_search_context(args: argparse.Namespace) -> str:
+    """Describe the existing resolver's result, without choosing a board here."""
+    board = kb.get_current_board()
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return (
+            f"board {board!r} (resolved from HERMES_KANBAN_DB; "
+            f"database pinned to {kb.kanban_db_path()})"
+        )
+    if getattr(args, "board", None):
+        source = "--board"
+    else:
+        source = "built-in default"
+        try:
+            if kb._normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD")) == board:
+                source = "HERMES_KANBAN_BOARD"
+        except ValueError:
+            pass
+        if source == "built-in default":
+            try:
+                if kb._normalize_board_slug(
+                    kb.current_board_path().read_text(encoding="utf-8")
+                ) == board:
+                    source = str(kb.current_board_path())
+            except (OSError, ValueError):
+                pass
+    return f"board {board!r} (resolved from {source})"
+
+
+def _task_not_found(args: argparse.Namespace, task_id: str) -> str:
+    return f"no such task: {task_id} on {_board_search_context(args)}"
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -1845,7 +1877,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
@@ -2015,7 +2047,7 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
+        print(_task_not_found(args, args.task_id), file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
     return 0
@@ -2033,7 +2065,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
     if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
+        print(_task_not_found(args, args.task_id), file=sys.stderr)
         return 1
     if model:
         label = f"{provider}:{model}" if provider else model
@@ -2098,7 +2130,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
             if task is None:
-                print(f"no such task: {args.task}", file=sys.stderr)
+                print(_task_not_found(args, args.task), file=sys.stderr)
                 return 1
             diags_by_task = {
                 args.task: kd.compute_task_diagnostics(
@@ -2242,7 +2274,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             # Report why
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
-                print(f"no such task: {args.task_id}", file=sys.stderr)
+                print(_task_not_found(args, args.task_id), file=sys.stderr)
                 return 1
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
@@ -2312,7 +2344,7 @@ def _cmd_attachments(args: argparse.Namespace) -> int:
     """List a task's attachments."""
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         atts = kb.list_attachments(conn, args.task_id)
     if getattr(args, "json", False):
@@ -2444,15 +2476,42 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            expected_run_id = _worker_run_id_for(tid)
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                task = kb.get_task(conn, tid)
+                if task is None:
+                    reason = f"unknown task id on {_board_search_context(args)}"
+                else:
+                    parents = [kb.get_task(conn, pid) for pid in kb.parent_ids(conn, tid)]
+                    unsatisfied = [
+                        p.id for p in parents
+                        if p is not None and p.status not in {"done", "archived"}
+                    ]
+                    if unsatisfied:
+                        reason = f"unsatisfied parents: {', '.join(unsatisfied)}"
+                    elif task.status in {"done", "archived"}:
+                        reason = f"already terminal (status is {task.status})"
+                    elif task.status not in {"running", "ready", "blocked", "review"}:
+                        reason = (
+                            f"status is {task.status}; complete accepts "
+                            "running/ready/blocked/review. "
+                            "Use `kanban archive` to drop a card."
+                        )
+                    elif expected_run_id is not None and task.current_run_id != expected_run_id:
+                        reason = (
+                            f"run id mismatch (expected {expected_run_id}, "
+                            f"current {task.current_run_id})"
+                        )
+                    else:
+                        reason = "task changed while completing; inspect its current state and retry"
+                print(f"cannot complete {tid}: {reason}", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -3129,7 +3188,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,
