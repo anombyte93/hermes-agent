@@ -274,15 +274,19 @@ def test_outcome_keeps_at_most_two_sentences():
     )
 
 
-def test_paths_are_dropped_from_outcome():
+def test_paths_render_as_file_names_not_deletions():
     summary = (
         "Fixed the renderer in gateway/kanban_notice_discord.py and updated "
         "~/atlas/worktrees/moll-e/docs; /tmp/build.log stays behind."
     )
-    # Paths go, and so do the words they left dangling: the "in" that led
-    # into the first path and the ";" that only separated paths (F3).
+    # A path is never deleted outright — that leaves dangling grammar
+    # (#121 live check). A file path becomes its file name in backticks,
+    # a directory path its last segment plus "/".
     body = _render("completed", {"summary": summary}).splitlines()[1]
-    assert body == "Fixed the renderer and updated stays behind."
+    assert body == (
+        "Fixed the renderer in `kanban_notice_discord.py` and updated "
+        "`docs/`; `build.log` stays behind."
+    )
 
 
 def test_branch_refs_survive_the_path_filter():
@@ -333,12 +337,15 @@ def test_f2_sha_intro_words_still_drop_the_sha():
 
 
 def test_f3_no_dangling_connectors_or_emptied_parens():
-    # When paths are removed, the connectors between them and the
-    # parenthetical they emptied go too. A sentence whose whole content was
-    # the removed machinery carries no plain-words information, so it is
+    # Paths are replaced by their file names, so connectors and
+    # parentheticals keep their grammar. SHA removal can still empty a
+    # parenthetical ("(head <sha>)"), and a sentence whose whole content
+    # was removed machinery carries no plain-words information, so it is
     # dropped rather than padded with a synthesised file count.
-    summary = "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."
-    assert _render("completed", {"summary": summary}).splitlines()[1] == "Done."
+    body = _render(
+        "completed", {"summary": "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."}
+    ).splitlines()[1]
+    assert body == "Wrote `foo.py` and `y.md` (see `a.py`). Done."
 
 
 def test_f4_paren_with_nothing_removed_stays():

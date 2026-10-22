@@ -14,9 +14,11 @@ Rules:
 
 * line 1: one state marker, then the title in bold (Markdown-escaped);
 * line 2: the outcome in plain words — git SHAs (with any ``at`` /
-  ``exact`` / ``head`` / ``@`` scaffolding), absolute and ``~/`` paths,
-  the connectors those drops leave dangling, parentheses emptied by
-  them and sentences reduced to the removed machinery are removed;
+  ``exact`` / ``head`` / ``@`` scaffolding) are removed, but a file path
+  is never deleted outright (that leaves dangling grammar): it is
+  replaced by its file name in backticks, a directory path by its last
+  segment plus ``/``; parentheses emptied by the SHA drops and sentences
+  reduced to the removed machinery are removed;
   a bare hex token counts as a SHA only when it mixes letters and
   digits (counts like ``10000000`` and words like ``deadbeef`` stay),
   ``PR #N`` references render as ``repo #N`` once (a masked link when
@@ -266,12 +268,39 @@ def _collapse_sentence(text: str) -> str:
     return " ".join(kept)
 
 
+def _replace_paths(text: str) -> str:
+    """Swap every file path for its short name (#121 live check).
+
+    Deleting a path outright leaves dangling grammar ("opened the PR and
+    wrote"). A file path becomes its file name in backticks; a directory
+    path becomes its last segment plus ``/``. Branch-looking refs
+    (``origin/main``, ``feat/foo``) are not paths and stay as written —
+    they carry information a phone reader wants.
+    """
+    out: list[str] = []
+    pos = 0
+    for m in _PATH_RE.finditer(text):
+        token = m.group(0)
+        if not _is_file_path(token):
+            continue
+        segments = [s for s in token.split("/") if s]
+        if not segments:  # bare "/" or "~"
+            continue
+        name = segments[-1]
+        replacement = f"`{name + '/' if _EXT_RE.search(name) is None else name}`"
+        out.append(text[pos:m.start()])
+        out.append(replacement)
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _scrub(text: str) -> str:
-    """Drop SHAs (with their introductory words) and file paths, then the
-    words left dangling by those drops."""
+    """Drop SHAs (with their introductory words) and replace file paths
+    with their short names, then the words left dangling by the drops."""
     text = _remove_with_scaffold(_SHA_INTRO_RE, text)
     text = _remove_with_scaffold(_SHA_RE, text, keep=lambda t: not _is_sha(t))
-    text = _remove_with_scaffold(_PATH_RE, text, keep=lambda t: not _is_file_path(t))
+    text = _replace_paths(text)
     text = _clean_hole_words(text)
     text = _drop_hollow_parens(text)
     text = _collapse_sentence(text)
@@ -448,8 +477,9 @@ def _first_sentences(visible: str, count: int = 2) -> tuple[int, bool]:
 def clip_outcome(text: str, limit: int = OUTCOME_LIMIT, budget: int = _SAFE_LIMIT) -> str:
     """Render ``text`` as one Discord line: masked links, clipped, no pings.
 
-    The plain-words pass (#112) runs first: git SHAs and file paths are
-    dropped with their scaffolding, and ``PR #N`` becomes ``repo #N`` when
+    The plain-words pass (#112) runs first: git SHAs are dropped with
+    their scaffolding, file paths are replaced by their short names,
+    and ``PR #N`` becomes ``repo #N`` when
     the outcome carries the repo's GitHub pull URL. ``limit`` bounds the
     *visible* length (link labels count, URLs do not); ``budget`` bounds
     the rendered length — links that would overflow it are emitted as
