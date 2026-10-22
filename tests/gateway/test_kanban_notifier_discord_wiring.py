@@ -72,7 +72,7 @@ def test_notifier_uses_discord_renderer_for_discord(tmp_path, monkeypatch):
     tid, sent = _deliver(tmp_path, monkeypatch, Platform.DISCORD)
     assert sent == [
         "✅ **Verify: port of #332**\n"
-        "Opened [PR #7](https://github.com/o/r/pull/7) and verified.\n"
+        "Opened [r #7](https://github.com/o/r/pull/7) and verified.\n"
         f"-# {tid} · claude"
     ]
 

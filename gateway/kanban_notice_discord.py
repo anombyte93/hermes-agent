@@ -13,11 +13,15 @@ swaps the legacy text for the layout rendered here::
 Rules:
 
 * line 1: one state marker, then the title in bold (Markdown-escaped);
-* line 2: the outcome, at most ~180 visible characters, cut at a sentence
-  or clause boundary and never mid-word;
+* line 2: the outcome in plain words — git SHAs (with any ``at`` /
+  ``exact`` / ``head`` / ``@`` scaffolding), absolute and ``~/`` paths and
+  parentheses emptied by those drops are removed, ``PR #N`` references
+  render as ``repo #N`` (a masked link when the summary carries the repo's
+  GitHub pull URL), and at most the first two sentences are kept, cut at
+  a sentence or clause boundary never mid-word;
 * line 3: Discord subtext (``-# ``) with the card id, the assignee and the
   board only when it is not ``default``;
-* URLs never appear raw: a GitHub PR URL becomes ``[PR #N](url)`` and any
+* URLs never appear raw: a GitHub PR URL becomes ``[repo #N](url)`` and any
   other URL ``[host](url)``;
 * ``@everyone``/``@here`` and ``<@id>``/``<@&id>``/``<#id>`` mention syntax
   is neutralised with a zero-width space, so nothing in the text can ping;
@@ -66,6 +70,36 @@ _MD_SPECIAL_RE = re.compile(r"([\\*_~`|])")
 _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 _CLAUSE_RE = re.compile(r"\s*(?:[,;:]|\s[—–-])(?=\s)")
 
+# --- plain-words pass (#112): machinery a phone reader does not want -------
+
+# A git SHA: 7 to 40 hex chars standing alone (never a decimal fraction).
+_SHA_RE = re.compile(r"(?<![\d.])\b[0-9a-f]{7,40}\b")
+# The same SHA together with the words that only ever introduce one.
+_SHA_INTRO_RE = re.compile(
+    r"\b(?:at|exact|head|commit|sha|treeish)\s+(?:at\s+|head\s+|exact\s+)*"
+    r"(?:0x\s*)?[0-9a-f]{7,40}\b",
+    re.IGNORECASE,
+)
+# Trailing "at" / "head" / "exact head" left dangling before a removal point.
+_AT_HEAD_RE = re.compile(r"\b(?:exact\s+head|head|at)\s*\Z", re.IGNORECASE)
+# A dangling "@" (as in "stacked on #302 @ <sha>") immediately before a removal.
+_ORPHAN_AT_RE = re.compile(r"\s*@\s*\Z")
+# Absolute (starting "~" or "/") or multi-segment file paths. Single-slash
+# candidates without a file extension (origin/main, feat/foo) look like branch
+# refs and are kept; the path filter below decides.
+_PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+")
+_EXT_RE = re.compile(r"\.\w{1,4}\Z")
+# "PR #N", "moll-e PR #N", "pull request #N" — an optional repo qualifier.
+_PR_REF_RE = re.compile(r"\b(?:(\w[\w.-]*)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b")
+_PR_LABEL_RE = re.compile(r"^PR #(\d+)$")
+_HOLLOW_PAREN_RE = re.compile(r"\(([^()]*)\)")
+_PAREN_CONNECTORS = frozenset({"which", "who", "and", "but", "so", "stacked"})
+_TYPO_FIX_RE = re.compile(r"\b(\w+) (?:at|@) \1\b")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:!?)])")
+_GITHUB_PULL_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)(?:[/?#][^\s]*)?"
+)
+
 
 def _neutralise(text: str) -> str:
     """Break every Discord mention form so it renders but cannot ping."""
@@ -90,6 +124,188 @@ def _link_label(url: str) -> str:
         return f"PR #{m.group(1)}"
     host = urlparse(url).netloc or "link"
     return host[4:] if host.startswith("www.") else host
+
+
+def _plain_link_label(label: str, url: Optional[str], repos: Mapping[str, Mapping[str, str]]) -> tuple[str, Optional[str]]:
+    """Relabel a GitHub PR link as ``repo #N`` for the plain-words pass."""
+    m = _PR_LABEL_RE.match(label)
+    if m is None or url is None:
+        return label, url
+    hit = _link_target(url)
+    if hit is None:
+        return label, url
+    canonical, owner_repo, _ = hit
+    number = m.group(1)
+    if number in (repos.get(owner_repo) or {}):
+        name = owner_repo.split("/", 1)[1]
+        return f"{name} #{number}", canonical
+    return label, url
+
+
+def _link_target(url: str) -> Optional[tuple[str, str, str]]:
+    """(canonical_url, "owner/repo", number) for a GitHub pull URL, else None."""
+    m = _GITHUB_PULL_URL_RE.fullmatch(url)
+    if m:
+        canonical = f"https://github.com/{m.group(1)}/{m.group(2)}/pull/{m.group(3)}"
+        return canonical, f"{m.group(1).lower()}/{m.group(2).lower()}", m.group(3)
+    return None
+
+
+def _pr_repos(segs: list[tuple[str, Optional[str]]]) -> dict[str, dict[str, str]]:
+    """``owner/repo`` -> {pr number: canonical pull URL} for links in the text."""
+    repos: dict[str, dict[str, str]] = {}
+    for _label, url in segs:
+        if url is None:
+            continue
+        hit = _link_target(url)
+        if hit:
+            canonical, owner_repo, number = hit
+            repos.setdefault(owner_repo, {})[number] = canonical
+    return repos
+
+
+def _remove_with_scaffold(
+    rx: re.Pattern, text: str, keep=None
+) -> str:
+    """Remove every ``rx`` match, absorbing a dangling ``at``/``head``/``@``
+    left beside the hole (``re-verify at <sha>``, ``#302 @ <sha>``)."""
+    out: list[str] = []
+    pos = 0
+    for m in rx.finditer(text):
+        if keep is not None and keep(m.group(0)):
+            continue
+        start = m.start()
+        prefix = text[:start]
+        lead = _AT_HEAD_RE.search(prefix)
+        if lead:
+            start = lead.start()
+            prefix = text[:start]
+        at = _ORPHAN_AT_RE.search(prefix)
+        if at:
+            start = at.start()
+        out.append(text[pos:start])
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _is_file_path(token: str) -> bool:
+    """Paths start absolute or carry an extension; branch refs stay."""
+    return (
+        token.startswith(("~", "/"))
+        or bool(_EXT_RE.search(token))
+        or token.count("/") >= 2
+    )
+
+
+def _paren_is_machinery(inner: str) -> bool:
+    """A parenthetical that only scaffolded dropped machinery goes too."""
+    s = inner.strip()
+    if not s:
+        return True
+    if s[0] in ",;:&":
+        return True
+    return s.split(None, 1)[0].lower() in _PAREN_CONNECTORS
+
+
+def _drop_hollow_parens(text: str) -> str:
+    prev = None
+    while prev != text:
+        prev = text
+        text = _HOLLOW_PAREN_RE.sub(
+            lambda m: "" if _paren_is_machinery(m.group(1)) else m.group(0), text
+        )
+    return text
+
+
+def _scrub(text: str) -> str:
+    """Drop SHAs (with their introductory words) and file paths."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _remove_with_scaffold(_SHA_INTRO_RE, text)
+        text = _remove_with_scaffold(_SHA_RE, text)
+        text = _remove_with_scaffold(_PATH_RE, text, keep=lambda t: not _is_file_path(t))
+        text = _drop_hollow_parens(text)
+        text = _TYPO_FIX_RE.sub(r"\1", text)
+        text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
+        text = text.rstrip(" —–-,:;&@")
+    return " ".join(text.split())
+
+
+def _pr_ref_link(
+    qual: Optional[str], number: str, repos: Mapping[str, Mapping[str, str]]
+) -> Optional[tuple[str, str]]:
+    """(label, url) for a PR reference, or None to leave it as written."""
+    if qual:
+        for owner_repo, numbers in repos.items():
+            if owner_repo.split("/", 1)[1] == qual.lower() and number in numbers:
+                return f"{qual} #{number}", numbers[number]
+        return None
+    if len(repos) == 1:
+        owner_repo, numbers = next(iter(repos.items()))
+        if number in numbers:
+            name = owner_repo.split("/", 1)[1]
+            return f"{name} #{number}", numbers[number]
+    return None
+
+
+def _rewrite_pr_refs(
+    text: str,
+    repos: Mapping[str, Mapping[str, str]],
+    seen: set[str],
+) -> list[tuple[str, Optional[str]]]:
+    """Turn prose ``PR #N`` references into ``repo #N`` masked-link segments."""
+    if not text or not repos:
+        return [(text, None)] if text else []
+    out: list[tuple[str, Optional[str]]] = []
+    pos = 0
+    for m in _PR_REF_RE.finditer(text):
+        hit = _pr_ref_link(m.group(1), m.group(2), repos)
+        if hit is None or hit[1] in seen:
+            continue
+        label, url = hit
+        if m.start() > pos:
+            out.append((text[pos : m.start()], None))
+        out.append((label, url))
+        seen.add(url)
+        pos = m.end()
+    if pos < len(text):
+        out.append((text[pos:], None))
+    return out or [(text, None)]
+
+
+def plainwords_outcome(
+    segs: list[tuple[str, Optional[str]]]
+) -> list[tuple[str, Optional[str]]]:
+    """Plain-words pass (#112): no SHAs, no paths, ``PR #N`` as ``repo #N``.
+
+    A GitHub pull URL present anywhere in the outcome supplies the repo name,
+    so ``PR #305`` plus the URL becomes the masked link ``moll-e #305``;
+    without a URL the reference keeps the worker's own words. The same PR
+    is linked once — a later duplicate renders as its plain label.
+    """
+    repos = _pr_repos(segs)
+    seen: set[str] = set()
+    out: list[tuple[str, Optional[str]]] = []
+    for label, url in segs:
+        if url is None:
+            pieces = _rewrite_pr_refs(_scrub(label), repos, seen)
+        else:
+            new_label, new_url = _plain_link_label(label, url, repos)
+            if new_url is not None:
+                if new_url in seen:
+                    new_url = None
+                else:
+                    seen.add(new_url)
+            pieces = [(new_label, new_url)]
+        for piece in pieces:
+            if out and piece[0] and out[-1][0]:
+                glue = out[-1][0][-1]
+                if not glue.isspace() and piece[0][0].isalnum():
+                    out.append((" ", None))
+            out.append(piece)
+    return [(label, url) for label, url in out if label]
 
 
 def _segments(text: str) -> list[tuple[str, Optional[str]]]:
@@ -150,25 +366,44 @@ def _cut_index(visible: str, limit: int, forbidden: set[int]) -> tuple[int, bool
     return 0, True
 
 
+def _first_sentences(visible: str, count: int = 2) -> tuple[int, bool]:
+    """Cut ``visible`` to its first ``count`` sentence ends (if any).
+
+    Returns (keep_index, ellipsis). When the text holds fewer than ``count``
+    sentence ends, the whole text is kept (keep == len(visible), ellipsis
+    False) — length clipping still applies afterwards.
+    """
+    ends = [m.end() for m in _SENTENCE_END_RE.finditer(visible)]
+    if len(ends) < count:
+        return len(visible), False
+    return ends[count - 1], True
+
+
 def clip_outcome(text: str, limit: int = OUTCOME_LIMIT, budget: int = _SAFE_LIMIT) -> str:
     """Render ``text`` as one Discord line: masked links, clipped, no pings.
 
-    ``limit`` bounds the *visible* length (link labels count, URLs do not);
-    ``budget`` bounds the rendered length — links that would overflow it are
-    emitted as their bare label.
+    The plain-words pass (#112) runs first: git SHAs and file paths are
+    dropped with their scaffolding, and ``PR #N`` becomes ``repo #N`` when
+    the outcome carries the repo's GitHub pull URL. ``limit`` bounds the
+    *visible* length (link labels count, URLs do not); ``budget`` bounds
+    the rendered length — links that would overflow it are emitted as
+    their bare label.
     """
-    segs = _segments(_one_line(text))
+    segs = plainwords_outcome(_segments(_one_line(text)))
     visible = "".join(label for label, _ in segs)
-    keep = len(visible)
-    ellipsis = False
-    if len(visible) > limit:
+    keep, _ = _first_sentences(visible, 2)
+    if keep < len(visible) or len(visible) > limit:
         forbidden: set[int] = set()
         pos = 0
         for label, url in segs:
             if url is not None:
                 forbidden.update(range(pos + 1, pos + len(label)))
             pos += len(label)
-        keep, ellipsis = _cut_index(visible, limit, forbidden)
+        keep = min(keep, len(visible))
+        if len(visible) > limit:
+            cut, _ = _cut_index(visible, limit, forbidden)
+            keep = min(keep, cut)
+    ellipsis = keep < len(visible) and visible[keep - 1] not in ".!?"
 
     out: list[str] = []
     pos = 0

@@ -147,7 +147,7 @@ def test_pr_url_is_masked_link():
     summary = "Opened https://github.com/anombyte93/moll-e/pull/283 with tests."
     body = _render("completed", {"summary": summary}).splitlines()[1]
     assert body == (
-        "Opened [PR #283](https://github.com/anombyte93/moll-e/pull/283) with tests."
+        "Opened [moll-e #283](https://github.com/anombyte93/moll-e/pull/283) with tests."
     )
 
 
@@ -203,4 +203,85 @@ def test_message_stays_under_discord_limit():
     msg = _render("completed", {"summary": many}, title="T" * 5000)
     assert len(msg) < DISCORD_MESSAGE_LIMIT
     assert "\n-# t_21c201fb" in msg
+
+
+# ------------------------------------------- plain words (#112, card examples)
+
+
+_STACKED_SUMMARY = (
+    "Opened moll-e PR #305 (head 36778d0a4fbc9ae6ffc9ce53cf8440f7089eae26, "
+    "stacked on #302 @ ca5c51bc, which is still open)."
+)
+_REVERIFY_SUMMARY = (
+    "PASS on moll-e PR #304 re-verify at exact head "
+    "c324d57056432526a380efb42eded5cb29bb1cf5. Merge of origin/main is clean."
+)
+
+
+def test_stacked_pr_summary_reads_in_plain_words():
+    assert _render("completed", {"summary": _STACKED_SUMMARY}).splitlines()[1] == (
+        "Opened moll-e PR #305."
+    )
+
+
+def test_reverify_summary_drops_exact_head_sha():
+    assert _render("completed", {"summary": _REVERIFY_SUMMARY}).splitlines()[1] == (
+        "PASS on moll-e PR #304 re-verify. Merge of origin/main is clean."
+    )
+
+
+def test_pr_reference_links_when_url_present():
+    summary = _REVERIFY_SUMMARY.replace(
+        "c324d57056432526a380efb42eded5cb29bb1cf5.",
+        "c324d57056432526a380efb42eded5cb29bb1cf5 "
+        "https://github.com/anombyte93/moll-e/pull/304.",
+    )
+    assert _render("completed", {"summary": summary}).splitlines()[1] == (
+        "PASS on [moll-e #304](https://github.com/anombyte93/moll-e/pull/304) "
+        "re-verify moll-e #304. Merge of origin/main is clean."
+    )
+
+
+def test_plain_words_outcome_keeps_no_machinery():
+    for summary in (_STACKED_SUMMARY, _REVERIFY_SUMMARY):
+        body = _render("completed", {"summary": summary}).splitlines()[1]
+        assert "36778d0a" not in body
+        assert "c324d570" not in body
+        assert "ca5c51bc" not in body
+        assert "@" not in body
+        assert "()" not in body
+        assert "exact head" not in body
+
+
+def test_layout_lines_unchanged_by_plain_words():
+    msg = _render("completed", {"summary": _STACKED_SUMMARY}).splitlines()
+    assert msg[0] == "✅ **Verify: my-agents port of #332**"
+    assert msg[2] == "-# t_21c201fb · claude"
+
+
+def test_outcome_keeps_at_most_two_sentences():
+    summary = (
+        "First sentence lands the outcome. "
+        "Second sentence adds the check result and passes the gate. "
+        "Third sentence drones on about merge trees and should never appear."
+    )
+    assert clip_outcome(summary) == (
+        "First sentence lands the outcome. "
+        "Second sentence adds the check result and passes the gate."
+    )
+
+
+def test_paths_are_dropped_from_outcome():
+    summary = (
+        "Fixed the renderer in gateway/kanban_notice_discord.py and updated "
+        "~/atlas/worktrees/moll-e/docs; /tmp/build.log stays behind."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Fixed the renderer in and updated; stays behind."
+
+
+def test_branch_refs_survive_the_path_filter():
+    summary = "Merge of origin/main into feat/110-112-on-deployed is clean."
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Merge of origin/main into feat/110-112-on-deployed is clean."
 
