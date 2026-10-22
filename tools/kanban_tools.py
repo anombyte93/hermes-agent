@@ -1869,11 +1869,14 @@ KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "Set ``kind`` to say which: 'dependency' (waiting on an unfinished "
+        "parent card — goes to todo and auto-resumes when that card "
+        "finishes), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "'dependency' only when this card has an unfinished parent card; with "
+        "none it lands in blocked for a human. A question for whoever filed "
+        "the card is kind='needs_input'. "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -1898,8 +1901,11 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "Why you're blocked. 'dependency' only when this card has "
+                    "an unfinished parent card (waits in todo and resumes "
+                    "automatically); with none it lands in blocked for a "
+                    "human. A question for whoever filed the card is "
+                    "kind='needs_input'. The others surface to a human. "
                     "Omit only if none apply."
                 ),
             },
