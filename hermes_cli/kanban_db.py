@@ -107,11 +107,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
 # unblocks → worker re-blocks → cron unblocks … forever.
 #
-#   * ``dependency``   — can't proceed until another task finishes. Routed to
-#                        ``todo`` (NOT ``blocked``) so the existing
-#                        parent-gating / ``recompute_ready`` machinery promotes
-#                        it automatically once parents are done. No human, no
-#                        cron, no retry storm.
+#   * ``dependency``   — can't proceed until another task finishes. While the
+#                        task has an unfinished parent it is routed to ``todo``
+#                        (NOT ``blocked``) so the existing parent-gating /
+#                        ``recompute_ready`` machinery promotes it automatically
+#                        once parents are done, and it never counts toward the
+#                        block-loop limit. With no unfinished parent there is
+#                        nothing to wait on: it lands in ``blocked`` for a
+#                        human and counts like any other kind.
 #   * ``needs_input``  — needs a human decision/answer it cannot derive.
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
