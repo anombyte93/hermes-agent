@@ -281,13 +281,21 @@ def _replace_paths(text: str) -> str:
     pos = 0
     for m in _PATH_RE.finditer(text):
         token = m.group(0)
-        if not _is_file_path(token):
+        # A sentence's trailing period is not part of the path; keep it
+        # after the replacement ("wrote /x/proof.py." -> "wrote
+        # `proof.py`."), it would otherwise make a file name look like a
+        # directory.
+        trailing = ""
+        while token.endswith("."):
+            trailing = "." + trailing
+            token = token[:-1]
+        if not token or not _is_file_path(token):
             continue
         segments = [s for s in token.split("/") if s]
         if not segments:  # bare "/" or "~"
             continue
         name = segments[-1]
-        replacement = f"`{name + '/' if _EXT_RE.search(name) is None else name}`"
+        replacement = f"`{name + '/' if _EXT_RE.search(name) is None else name}`{trailing}"
         out.append(text[pos:m.start()])
         out.append(replacement)
         pos = m.end()

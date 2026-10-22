@@ -289,6 +289,19 @@ def test_paths_render_as_file_names_not_deletions():
     )
 
 
+def test_proof_example_keeps_its_grammar():
+    # The exact live-check example (#121 proof msg 1562840413453164556):
+    # the path must not be deleted, and the sentence's trailing period
+    # must survive outside the backticks (it once made the file name
+    # look like a directory: `proof.py./`).
+    summary = (
+        "Proof: opened moll-e PR #305 "
+        "(head 36778d0a4fbc9ae6ffc9ce53cf8440f7089eae26) and wrote /home/x/proof.py."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Proof: opened moll-e PR #305 and wrote `proof.py`."
+
+
 def test_branch_refs_survive_the_path_filter():
     summary = "Merge of origin/main into feat/110-112-on-deployed is clean."
     body = _render("completed", {"summary": summary}).splitlines()[1]
