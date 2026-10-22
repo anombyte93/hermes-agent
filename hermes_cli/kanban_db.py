@@ -3538,7 +3538,8 @@ def _route_block(
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
     ``dependency`` waits in ``todo`` only while a parent is unfinished;
-    otherwise it lands in ``blocked`` for a human. Every kind counts unblock-loop
+    otherwise it lands in ``blocked`` for a human. A genuine wait cannot spin
+    and keeps the recurrence counter unchanged. Other paths count unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
@@ -3546,10 +3547,10 @@ def _route_block(
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    if kind == "dependency" and not parents_satisfied and recurrences < BLOCK_RECURRENCE_LIMIT:
+    if kind == "dependency" and not parents_satisfied:
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-        return "todo", "dependency_wait", set_sql, (kind, recurrences), payload
+        return "todo", "dependency_wait", set_sql, (kind, prev_recurrences), payload
+    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
         payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
