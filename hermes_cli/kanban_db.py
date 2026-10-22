@@ -6388,11 +6388,11 @@ def block_task(
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+    * ``dependency`` — while a parent is unfinished, the task goes to ``todo``
+      so ``recompute_ready`` promotes it automatically once its parents finish.
+      With no unfinished parents it lands in ``blocked`` for a human instead
+      of immediately re-entering the work pool. Dependency blocks participate
+      in the same recurrence limit as every other kind.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -6444,11 +6444,18 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        # Count every kind before routing, including genuine dependency waits.
+        # Preserve the existing same-kind definition of a recurring cause.
+        same_cause = prev_kind == kind
+        recurrences = prev_recurrences + 1 if same_cause else 1
+
+        # Only wait in todo when there is actually an unfinished parent.
+        # Otherwise recompute_ready would immediately re-promote the task.
+        if (
+            kind == "dependency"
+            and recurrences < BLOCK_RECURRENCE_LIMIT
+            and not _parents_satisfied(conn, task_id)
+        ):
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6456,12 +6463,13 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, recurrences, task_id) if expected_run_id is None
+                else (kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6493,15 +6501,6 @@ def block_task(
                 reason=reason,
             )
             return True
-
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route

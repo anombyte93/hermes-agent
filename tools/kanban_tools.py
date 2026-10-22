@@ -1871,6 +1871,8 @@ KANBAN_BLOCK_SCHEMA = {
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "'dependency' is for waiting on another card; a question for the parent "
+        "is a normal block. "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
