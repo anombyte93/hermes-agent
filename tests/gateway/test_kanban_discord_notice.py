@@ -460,3 +460,68 @@ def test_two_paths_and_a_commit_sha_paren_still_render_clean():
         "see `2026-10-22.md` for the diff."
     )
 
+
+#        #122 re-verify finding (t_282ebddd): a path with spaces renders
+#        by its real file name, never cut at the first space
+
+
+def test_quoted_path_with_spaces_renders_whole():
+    # Known-red on 8858dc38: the path was cut at the first space and
+    # rendered as "`Client/` Reports/q3 summary.pdf" — the wrong name
+    # with the rest of the path left in the sentence. Inside quotes the
+    # path is taken whole, spaces included, and renders as its final
+    # segment (single quotes and backticks get the same treatment).
+    summary = (
+        "Copied the export to "
+        "\"/home/anombyte/Nextcloud/Client Reports/q3 summary.pdf\" "
+        "and emailed nobody."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Copied the export to `q3 summary.pdf` and emailed nobody."
+    body = _render(
+        "completed",
+        {"summary": "Saved to '/home/anombyte/Notes/Week 43/plan notes.md' today."},
+    ).splitlines()[1]
+    assert body == "Saved to `plan notes.md` today."
+
+
+def test_unquoted_path_with_spaces_joins_by_segment_or_extension():
+    # Known-red on 8858dc38: the unquoted spaced path produced the same
+    # wrong name plus leftover text. An unquoted path continues past a
+    # space while the next token holds a further "/" segment or ends in
+    # a file extension the path so far lacks, so "~/Notes/Week 43/plan.md"
+    # is one path while prose after it ("today") stays.
+    assert clip_outcome("saved to ~/Notes/Week 43/plan.md today") == (
+        "saved to `plan.md` today"
+    )
+    assert clip_outcome(
+        "Saw the file at /tmp/my file.txt and stopped."
+    ) == "Saw the file at `my file.txt` and stopped."
+    # A directory path with spaces keeps its last segment plus "/".
+    assert clip_outcome("See the docs in ~/Hermes/current projects/notes.") == (
+        "See the docs in `notes/`."
+    )
+
+
+def test_spaced_path_prose_around_it_is_never_swallowed():
+    # The continuation stops at words: "and" is neither a further
+    # segment nor an extension, and a quoted title that is not a path
+    # keeps its words. A spaced path with no extension hints at all
+    # stays cut rather than eating the sentence after it.
+    body = _render(
+        "completed",
+        {"summary": "Attached the report at /home/x/reports/final draft.pdf for review."},
+    ).splitlines()[1]
+    assert body == "Attached the report at `final draft.pdf` for review."
+    body = _render(
+        "completed", {"summary": "Wrote a note called \"todo today\" and one called x.md."}
+    ).splitlines()[1]
+    assert body == "Wrote a note called \"todo today\" and one called x.md."
+    # A bare relative directory ("gateway/") is not a multi-segment path
+    # and stays as written, like "tests/gateway" before it.
+    body = _render(
+        "completed", {"summary": "Logs are in gateway/ and tests pass now."}
+    ).splitlines()[1]
+    assert body == "Logs are in gateway/ and tests pass now."
+
+

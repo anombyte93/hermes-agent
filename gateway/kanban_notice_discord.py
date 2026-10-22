@@ -101,7 +101,9 @@ _ORPHAN_AT_RE = re.compile(r"\s*@\s*" + _HOLE)
 # candidates without a file extension (origin/main, feat/foo) look like branch
 # refs and are kept; the path filter below decides. A trailing "/" belongs to
 # the path (a directory reference), so it is matched too and rendered once
-# inside the backticks instead of leaking after them.
+# inside the backticks instead of leaking after them. This regex matches ONE
+# space-free run; a path with spaces in it is grown from a match by
+# _extend_path (quoted paths never need it — a quote is taken whole).
 _PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+/?")
 # A long hex run inside a file name is a commit hash the name carries
 # (hermes-agent-<sha>); it is shortened to 8 chars, never removed.
@@ -276,6 +278,65 @@ def _collapse_sentence(text: str) -> str:
     return " ".join(kept)
 
 
+_QUOTE_SPAN_RE = re.compile(
+    r"(\"[^\"]*\"|'[^']*'|`[^`]*`)"
+)
+# The extension of the continuation rule: ".ext" at the very end of the
+# next token, or followed only by closing punctuation.
+_EXT_END_RE = re.compile(r"\.[A-Za-z0-9]{1,8}(?:[)\]},;:.!?'\"]*\Z)")
+# Whitespace (never more than one space) between path tokens.
+_GAP_RE = re.compile(r" {1,2}")
+
+
+def _has_ext(token: str) -> bool:
+    return _EXT_END_RE.search(token) is not None
+
+
+def _extend_path(text: str, start: int, end: int, max_len: int = 120) -> int:
+    """Grow an unquoted path past spaces while the card's rule holds.
+
+    The path so far continues over a space when the next token is a
+    further segment (it contains "/"), or when the path so far has no
+    file extension and the next token ends in one (".pdf", ".md").
+    Stopping there keeps prose ("logs are in `gateway/` and the
+    report...") intact: "and" has no slash and no extension.
+    """
+    while end < len(text):
+        m = _GAP_RE.match(text, end)
+        if m is None:
+            break
+        tok_m = re.match(r"[\w~/.,+-]+", text[m.end() :])
+        if tok_m is None:
+            break
+        tok = tok_m.group(0)
+        if len(text[start : m.end()] + tok) > max_len:
+            break
+        if "/" in tok or (_EXT_END_RE.search(text[start:end]) is None and _has_ext(tok)):
+            end = m.end() + len(tok)
+            continue
+        break
+    return end
+
+
+def _render_path_name(token: str) -> Optional[str]:
+    """The rendered replacement for one whole path ``token``: its final
+    segment in backticks, plus ``/`` when that segment is a directory
+    (no file extension). Returns None when ``token`` is not a file path
+    (a branch ref like ``origin/main``) and must stay as written."""
+    if not token or not _is_file_path(token):
+        return None
+    segments = [s for s in token.split("/") if s]
+    if not segments:  # bare "/" or "~"
+        return None
+    name = segments[-1]
+    # A long hex run inside a name is a commit hash the name carries
+    # (release dir hermes-agent-<sha>): shorten it to 8 chars so the
+    # name stays readable, never remove it — the SHA pass runs after
+    # this one and must not find a hash we already replaced.
+    name = _HEX_RUN_RE.sub(lambda h: h.group(0)[:8], name)
+    return f"`{name + '/' if _EXT_RE.search(name) is None else name}`"
+
+
 def _replace_paths(text: str) -> str:
     """Swap every file path for its short name (#121 live check).
 
@@ -284,10 +345,32 @@ def _replace_paths(text: str) -> str:
     path becomes its last segment plus ``/``. Branch-looking refs
     (``origin/main``, ``feat/foo``) are not paths and stay as written —
     they carry information a phone reader wants.
+
+    A path inside quotes or backticks (``"``, ``'``, ```` `` ````) is
+    taken whole, spaces included: the quote already told the reader where
+    the path ends, so nothing is left over outside it (#122 re-verify).
+    An unquoted path grows past a space only while the next token is a
+    further segment or completes an extension (``~/Notes/Week 43/plan.md``);
+    prose around it is never swallowed.
     """
     out: list[str] = []
     pos = 0
+    for m in _QUOTE_SPAN_RE.finditer(text):
+        quoted = m.group(1)
+        name = _render_path_name(quoted[1:-1])
+        if name is None:
+            continue
+        out.append(text[pos:m.start()])
+        out.append(name)
+        pos = m.end()
+    out.append(text[pos:])
+    text = "".join(out)
+
+    out = []
+    pos = 0
     for m in _PATH_RE.finditer(text):
+        if m.start() < pos:
+            continue
         token = m.group(0)
         # A sentence's trailing period is not part of the path; keep it
         # after the replacement ("wrote /x/proof.py." -> "wrote
@@ -297,21 +380,21 @@ def _replace_paths(text: str) -> str:
         while token.endswith("."):
             trailing = "." + trailing
             token = token[:-1]
-        if not token or not _is_file_path(token):
+        end = _extend_path(text, m.start(), m.start() + len(token))
+        if end > m.start() + len(token):
+            token = text[m.start() : end]
+            while token.endswith("."):
+                trailing = "." + trailing
+                token = token[:-1]
+        replacement = _render_path_name(token)
+        if replacement is None:
             continue
-        segments = [s for s in token.split("/") if s]
-        if not segments:  # bare "/" or "~"
-            continue
-        name = segments[-1]
-        # A long hex run inside a name is a commit hash the name carries
-        # (release dir hermes-agent-<sha>): shorten it to 8 chars so the
-        # name stays readable, never remove it — the SHA pass runs after
-        # this one and must not find a hash we already replaced.
-        name = _HEX_RUN_RE.sub(lambda h: h.group(0)[:8], name)
-        replacement = f"`{name + '/' if _EXT_RE.search(name) is None else name}`{trailing}"
         out.append(text[pos:m.start()])
-        out.append(replacement)
-        pos = m.end()
+        out.append(replacement + trailing)
+        # ``end`` can sit before ``m.end()`` when trailing dots were
+        # stripped and re-appended after the replacement; the original
+        # dots must not render a second time.
+        pos = max(end, m.end())
     out.append(text[pos:])
     return "".join(out)
 
