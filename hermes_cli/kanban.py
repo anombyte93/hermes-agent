@@ -56,6 +56,46 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _board_search_context(args: argparse.Namespace) -> str:
+    """Describe the existing resolver's result, without choosing a board here."""
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        # kanban_db_path() honours the pinned database before any board
+        # selection, so a board slug here would be misleading.
+        return (
+            f"database {kb.kanban_db_path()} "
+            "(pinned by HERMES_KANBAN_DB; board selection ignored)"
+        )
+    board, source = kb.resolve_current_board_with_source()
+    if getattr(args, "board", None):
+        label = "--board"
+    elif source == kb.BOARD_SOURCE_CURRENT_FILE:
+        label = str(kb.current_board_path())
+    elif source == kb.BOARD_SOURCE_DEFAULT:
+        label = "built-in default"
+    else:
+        label = source
+    return f"board {board!r} (resolved from {label})"
+
+
+def _refusal_reason(
+    conn,
+    args: argparse.Namespace,
+    task_id: str,
+    verb: str,
+    **kwargs: Any,
+) -> str:
+    """Why ``verb`` was refused for ``task_id``, with the searched board."""
+    return kb.explain_refusal(
+        conn, task_id, verb,
+        unknown_context=_board_search_context(args),
+        **kwargs,
+    )
+
+
+def _task_not_found(args: argparse.Namespace, task_id: str) -> str:
+    return f"no such task: {task_id} on {_board_search_context(args)}"
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -1201,7 +1241,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            message = f"kanban: {exc}"
+            if str(exc).startswith("unknown task"):
+                message += f" on {_board_search_context(args)}"
+            print(message, file=sys.stderr)
             return 1
 
 
@@ -1656,16 +1699,8 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
         return None
     if os.environ.get("HERMES_KANBAN_DB", "").strip():
         return None
-    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
-    if env_board:
-        try:
-            normed = kb._normalize_board_slug(env_board)
-        except ValueError:
-            normed = None
-        if normed and kb.board_exists(normed):
-            return None
-    board = kb.get_current_board()
-    if board == kb.DEFAULT_BOARD:
+    board, source = kb.resolve_current_board_with_source()
+    if source != kb.BOARD_SOURCE_CURRENT_FILE or board == kb.DEFAULT_BOARD:
         return None
     return (
         f"kanban: no --board given; this card went to board {board!r} because "
@@ -1845,7 +1880,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
@@ -2015,7 +2050,7 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
+        print(_task_not_found(args, args.task_id), file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
     return 0
@@ -2033,7 +2068,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
     if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
+        print(_task_not_found(args, args.task_id), file=sys.stderr)
         return 1
     if model:
         label = f"{provider}:{model}" if provider else model
@@ -2051,11 +2086,10 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
             conn, args.task_id,
             reason=getattr(args, "reason", None),
         )
+        if not ok:
+            reason = _refusal_reason(conn, args, args.task_id, "reclaim")
     if not ok:
-        print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
-            file=sys.stderr,
-        )
+        print(f"cannot reclaim {args.task_id}: {reason}", file=sys.stderr)
         return 1
     print(f"Reclaimed {args.task_id}")
     return 0
@@ -2069,12 +2103,13 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
         )
+        if not ok:
+            reason = _refusal_reason(
+                conn, args, args.task_id, "reassign",
+                reclaim_requested=bool(getattr(args, "reclaim", False)),
+            )
     if not ok:
-        print(
-            f"cannot reassign {args.task_id} "
-            f"(unknown id, or still running — pass --reclaim to release first)",
-            file=sys.stderr,
-        )
+        print(f"cannot reassign {args.task_id}: {reason}", file=sys.stderr)
         return 1
     print(
         f"Reassigned {args.task_id} to "
@@ -2098,7 +2133,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
             if task is None:
-                print(f"no such task: {args.task}", file=sys.stderr)
+                print(_task_not_found(args, args.task), file=sys.stderr)
                 return 1
             diags_by_task = {
                 args.task: kd.compute_task_diagnostics(
@@ -2242,7 +2277,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             # Report why
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
-                print(f"no such task: {args.task_id}", file=sys.stderr)
+                print(_task_not_found(args, args.task_id), file=sys.stderr)
                 return 1
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
@@ -2312,7 +2347,7 @@ def _cmd_attachments(args: argparse.Namespace) -> int:
     """List a task's attachments."""
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         atts = kb.list_attachments(conn, args.task_id)
     if getattr(args, "json", False):
@@ -2444,15 +2479,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            expected_run_id = _worker_run_id_for(tid)
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                reason = kb.explain_complete_refusal(
+                    conn, tid, expected_run_id,
+                    unknown_context=_board_search_context(args),
+                )
+                print(f"cannot complete {tid}: {reason}", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2478,7 +2518,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             metadata=metadata,
         ):
             print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
+                f"cannot edit {args.task_id}: "
+                f"{_refusal_reason(conn, args, args.task_id, 'edit')}",
                 file=sys.stderr,
             )
             return 1
@@ -2494,17 +2535,28 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            if kb.get_task(conn, tid) is None:
+                # No card to comment on or block: say which board was searched
+                # instead of failing inside add_comment.
+                failed.append(tid)
+                detail = _refusal_reason(conn, args, tid, "block")
+                print(f"cannot block {tid}: {detail}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            expected_run_id = _worker_run_id_for(tid)
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                detail = _refusal_reason(
+                    conn, args, tid, "block", expected_run_id=expected_run_id,
+                )
+                print(f"cannot block {tid}: {detail}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
@@ -2744,7 +2796,8 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         for tid in ids:
             if not kb.archive_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot archive {tid}", file=sys.stderr)
+                detail = _refusal_reason(conn, args, tid, "archive")
+                print(f"cannot archive {tid}: {detail}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
@@ -3129,7 +3182,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,

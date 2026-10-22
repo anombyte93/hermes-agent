@@ -99,8 +99,39 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+STATUS_ORDER = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived")
+VALID_STATUSES = set(STATUS_ORDER)
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# Statuses ``complete_task`` accepts, and the terminal states a card cannot
+# leave by completing. Shared by the SQL guards, the parent gate and the
+# refusal explanation so they cannot drift apart.
+COMPLETE_ACCEPTED_STATUSES = ("running", "ready", "blocked", "review")
+TERMINAL_STATUSES = ("done", "archived")
+# The same single-source rule for the other verbs that can refuse a card. Each
+# tuple feeds both the SQL guard in kanban_db and the CLI refusal reason.
+RECLAIM_ACCEPTED_STATUSES = ("running", "ready", "blocked")
+BLOCK_ACCEPTED_STATUSES = ("running", "ready", "review")
+EDIT_ACCEPTED_STATUSES = ("done",)
+REASSIGN_REFUSED_STATUSES = ("running",)  # while a worker holds the claim
+ARCHIVE_REFUSED_STATUSES = ("archived",)
+REASSIGN_ACCEPTED_STATUSES = tuple(
+    s for s in STATUS_ORDER if s not in REASSIGN_REFUSED_STATUSES
+)
+ARCHIVE_ACCEPTED_STATUSES = tuple(
+    s for s in STATUS_ORDER if s not in ARCHIVE_REFUSED_STATUSES
+)
+
+
+def _sql_in_list(values) -> str:
+    """Render a tuple of trusted status constants as an SQL ``IN`` list body."""
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+_COMPLETE_ACCEPTED_SQL = _sql_in_list(COMPLETE_ACCEPTED_STATUSES)
+_RECLAIM_ACCEPTED_SQL = _sql_in_list(RECLAIM_ACCEPTED_STATUSES)
+_BLOCK_ACCEPTED_SQL = _sql_in_list(BLOCK_ACCEPTED_STATUSES)
+_ARCHIVE_REFUSED_SQL = _sql_in_list(ARCHIVE_REFUSED_STATUSES)
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -628,12 +659,31 @@ def get_current_board() -> str:
     with a best-effort warning — the dispatcher must never crash because a
     user hand-edited a file or removed a board directory.
     """
+    return resolve_current_board_with_source()[0]
+
+
+# Source labels returned by :func:`resolve_current_board_with_source`.
+BOARD_SOURCE_OVERRIDE = "board-override"
+BOARD_SOURCE_ENV = "HERMES_KANBAN_BOARD"
+BOARD_SOURCE_CURRENT_FILE = "current-file"
+BOARD_SOURCE_DEFAULT = "default"
+
+
+def resolve_current_board_with_source() -> tuple[str, str]:
+    """Return ``(slug, source)`` for the active board.
+
+    The one implementation of the resolution chain documented on
+    :func:`get_current_board`. ``source`` is one of ``BOARD_SOURCE_OVERRIDE``
+    (a scoped override such as ``--board``), ``BOARD_SOURCE_ENV``,
+    ``BOARD_SOURCE_CURRENT_FILE`` or ``BOARD_SOURCE_DEFAULT``. Callers that
+    only need the slug use :func:`get_current_board`.
+    """
     scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
     if scoped:
         try:
             normed = _normalize_board_slug(scoped)
             if normed and board_exists(normed):
-                return normed
+                return normed, BOARD_SOURCE_OVERRIDE
         except ValueError:
             pass
 
@@ -642,7 +692,7 @@ def get_current_board() -> str:
         try:
             normed = _normalize_board_slug(env)
             if normed and board_exists(normed):
-                return normed
+                return normed, BOARD_SOURCE_ENV
         except ValueError:
             pass
     try:
@@ -653,12 +703,12 @@ def get_current_board() -> str:
                 try:
                     normed = _normalize_board_slug(val)
                     if normed and board_exists(normed):
-                        return normed
+                        return normed, BOARD_SOURCE_CURRENT_FILE
                 except ValueError:
                     pass
     except OSError:
         pass
-    return DEFAULT_BOARD
+    return DEFAULT_BOARD, BOARD_SOURCE_DEFAULT
 
 
 def set_current_board(slug: str) -> Path:
@@ -3809,7 +3859,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
+        if (
+            row["claim_lock"] is not None
+            and row["status"] in REASSIGN_REFUSED_STATUSES
+        ):
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
@@ -4706,7 +4759,7 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"AND p.status NOT IN ({_sql_in_list(TERMINAL_STATUSES)}) LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -5248,7 +5301,7 @@ def reclaim_task(
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            f"WHERE id = ? AND status IN ({_RECLAIM_ACCEPTED_SQL}) "
             "AND claim_lock IS ?",
             (retry_status, task_id, prev_lock),
         )
@@ -5450,6 +5503,126 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def explain_complete_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int] = None,
+    *,
+    unknown_context: Optional[str] = None,
+) -> str:
+    """Say why :func:`complete_task` returned False for ``task_id``.
+
+    Read-only. The order is: unknown id, already terminal, unsatisfied
+    parents, unsupported status, stale run id, then a catch-all for a race.
+    A terminal card is reported as terminal even when a parent has since
+    reopened, because completing that parent would not make it completable.
+    ``unknown_context`` is appended to the unknown-id reason (for example the
+    board that was searched).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return _unknown_task_reason(unknown_context)
+    if task.status in TERMINAL_STATUSES:
+        return f"already terminal (status is {task.status})"
+    unsatisfied = []
+    for pid in parent_ids(conn, task_id):
+        parent = get_task(conn, pid)
+        if parent is not None and parent.status not in TERMINAL_STATUSES:
+            unsatisfied.append(parent.id)
+    if unsatisfied:
+        return f"unsatisfied parents: {', '.join(unsatisfied)}"
+    if task.status not in COMPLETE_ACCEPTED_STATUSES:
+        accepted = "/".join(COMPLETE_ACCEPTED_STATUSES)
+        hint = "Use `kanban archive` to drop a card."
+        if task.status == "triage":
+            hint = (
+                "Use `kanban specify` to turn it into a spec, "
+                "or `kanban archive` to drop it."
+            )
+        return f"status is {task.status}; complete accepts {accepted}. {hint}"
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        return (
+            f"run id mismatch (expected {expected_run_id}, "
+            f"current {task.current_run_id})"
+        )
+    return "task changed while completing; inspect its current state and retry"
+
+
+def _unknown_task_reason(unknown_context: Optional[str]) -> str:
+    reason = "unknown task id"
+    return f"{reason} on {unknown_context}" if unknown_context else reason
+
+
+# Statuses each verb accepts, for the generic refusal reason below. ``complete``
+# keeps its own richer explanation in :func:`explain_complete_refusal`.
+_VERB_ACCEPTED_STATUSES = {
+    "reclaim": RECLAIM_ACCEPTED_STATUSES,
+    "block": BLOCK_ACCEPTED_STATUSES,
+    "edit": EDIT_ACCEPTED_STATUSES,
+    "reassign": REASSIGN_ACCEPTED_STATUSES,
+    "archive": ARCHIVE_ACCEPTED_STATUSES,
+}
+# Verbs whose accepted set is "everything except a short refusal list"; naming
+# the full set would be noise, so only the status is reported.
+_VERBS_WITHOUT_ACCEPTED_LIST = {"archive"}
+
+
+def explain_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    verb: str,
+    expected_run_id: Optional[int] = None,
+    *,
+    unknown_context: Optional[str] = None,
+    reclaim_requested: bool = False,
+) -> str:
+    """Say why ``reclaim``/``reassign``/``edit``/``block``/``archive`` returned
+    False for ``task_id``. Read-only.
+
+    The order is: unknown id, already terminal, a status the verb does not
+    accept, then the verb's own remaining refusal (no active claim, stale run
+    id) and finally a catch-all for a race. Every status list comes from the
+    ``*_STATUSES`` constants that also build the verb's SQL guard.
+    """
+    accepted = _VERB_ACCEPTED_STATUSES[verb]
+    task = get_task(conn, task_id)
+    if task is None:
+        return _unknown_task_reason(unknown_context)
+    status = task.status
+    names_accepted = verb not in _VERBS_WITHOUT_ACCEPTED_LIST
+    suffix = f"; {verb} accepts {'/'.join(accepted)}" if names_accepted else ""
+    if verb == "reassign":
+        # Reassign is refused only while a worker holds the claim.
+        if status in REASSIGN_REFUSED_STATUSES and task.claim_lock is not None:
+            if reclaim_requested:
+                return (
+                    f"status is {status} and the claim could not be released; "
+                    "inspect its current state and retry"
+                )
+            return (
+                f"status is {status} (claimed by a worker); reassign accepts "
+                f"every status except {'/'.join(REASSIGN_REFUSED_STATUSES)}. "
+                "Pass --reclaim to release the claim first."
+            )
+        return "task changed during reassign; inspect its current state and retry"
+    if status in TERMINAL_STATUSES and status not in accepted:
+        return f"already terminal (status is {status}){suffix}"
+    if status not in accepted:
+        return f"status is {status}{suffix}"
+    if verb == "reclaim" and status != "running" and task.claim_lock is None:
+        return f"status is {status} but it has no active claim to reclaim"
+    if (
+        verb == "block"
+        and expected_run_id is not None
+        and task.current_run_id != expected_run_id
+    ):
+        return (
+            f"run id mismatch (expected {expected_run_id}, "
+            f"current {task.current_run_id})"
+        )
+    return f"task changed during {verb}; inspect its current state and retry"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5542,7 +5715,7 @@ def complete_task(
         prior_status = prior["status"] if prior else None
         if expected_run_id is None:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5553,13 +5726,13 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ({_COMPLETE_ACCEPTED_SQL})
                 """,
                 (result, now, task_id),
             )
         else:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5570,7 +5743,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ({_COMPLETE_ACCEPTED_SQL})
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -6313,7 +6486,7 @@ def edit_completed_task_result(
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if not row or row["status"] != "done":
+        if not row or row["status"] not in EDIT_ACCEPTED_STATUSES:
             return False
         conn.execute(
             "UPDATE tasks SET result = ? WHERE id = ?",
@@ -6450,7 +6623,7 @@ def block_task(
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status        = 'todo',
                        claim_lock    = NULL,
@@ -6458,7 +6631,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
+                   AND status IN ({_BLOCK_ACCEPTED_SQL})
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -6507,7 +6680,7 @@ def block_task(
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status        = 'triage',
                        claim_lock    = NULL,
@@ -6516,7 +6689,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
+                   AND status IN ({_BLOCK_ACCEPTED_SQL})
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6546,7 +6719,7 @@ def block_task(
         else:
             if expected_run_id is None:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE tasks
                        SET status        = 'blocked',
                            claim_lock    = NULL,
@@ -6556,13 +6729,13 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'review')
+                       AND status IN ({_BLOCK_ACCEPTED_SQL})
                     """,
                     (reason, kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE tasks
                        SET status        = 'blocked',
                            claim_lock    = NULL,
@@ -6572,7 +6745,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'review')
+                       AND status IN ({_BLOCK_ACCEPTED_SQL})
                        AND current_run_id = ?
                     """,
                     (reason, kind, recurrences, task_id, int(expected_run_id)),
@@ -7661,7 +7834,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            f"WHERE id = ? AND status NOT IN ({_ARCHIVE_REFUSED_SQL})",
             (task_id,),
         )
         if cur.rowcount != 1:
