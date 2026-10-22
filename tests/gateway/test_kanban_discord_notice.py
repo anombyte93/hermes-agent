@@ -372,3 +372,91 @@ def test_f4_paren_with_nothing_removed_stays():
     body = _render("completed", {"summary": "Merged (on request)."}).splitlines()[1]
     assert body == "Merged (on request)."
 
+
+# ------------------- #122 re-verify findings (t_78a6b5d2 FAIL samples)
+
+
+def test_directory_path_with_trailing_slash_renders_once():
+    # Known-red on c08baeba: a directory path ending in "/" matched
+    # without its trailing slash, so the leftover "/" rendered after the
+    # backticks ("logs are in `gateway/`/"). The slash belongs to the
+    # path and renders once inside it.
+    summary = (
+        "Rebased onto origin/main at 9e8d7c6b and pushed; logs are in "
+        "~/.hermes/logs/gateway/ and the report is /tmp/verify-report.md."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Rebased onto origin/main and pushed; logs are in `gateway/` "
+        "and the report is `verify-report.md`."
+    )
+
+
+def test_path_containing_a_sha_keeps_its_name():
+    # Known-red on c08baeba: the SHA pass ran before the path pass, so a
+    # hash inside a release-dir name was holed out ("`hermes-agent-/`")
+    # and the PR-link pass left "()" plus the owner prefix behind. Paths
+    # are replaced first, a hash inside a name is shortened to 8 chars,
+    # and an owner-qualified reference links with the owner dropped.
+    summary = (
+        "Merged anombyte93/hermes-agent PR #120 "
+        "(https://github.com/anombyte93/hermes-agent/pull/120) into "
+        "feat/110-112-on-deployed; the release dir "
+        "~/.hermes/releases/hermes-agent-07958b78faf05586e22117523fa8ae002a569de5/ "
+        "is ready."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Merged [hermes-agent #120](https://github.com/anombyte93/hermes-agent/pull/120) "
+        "into feat/110-112-on-deployed; the release dir "
+        "`hermes-agent-07958b78/` is ready."
+    )
+
+
+#          regression: the verifier's three OK samples stay OK (1, 3, 4)
+
+
+def test_pr_link_then_path_still_renders_clean():
+    # Verifier sample 1 (t_78a6b5d2): a PR URL, a "(head <sha>)" aside
+    # and a long path in one summary.
+    summary = (
+        "Opened https://github.com/anombyte93/moll-e/pull/307 "
+        "(head 4f2a1b3c5d7e9f0a1b2c3d4e5f6a7b8c9d0e4a3f) after editing "
+        "/home/anombyte/atlas/worktrees/moll-e/src/relay/gate.ts."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Opened [moll-e #307](https://github.com/anombyte93/moll-e/pull/307) "
+        "after editing `gate.ts`."
+    )
+
+
+def test_exact_head_sha_and_relative_test_path_still_render_clean():
+    # Verifier sample 3 (t_78a6b5d2): "at exact head <sha>" drops with
+    # its scaffold; a repo-relative test path renders by file name.
+    summary = (
+        "PASS on PR #121 at exact head "
+        "6e541234567890abcdef1234567890abcdefbd46: tests in "
+        "tests/gateway/test_kanban_discord_notice.py pass (43 passed)."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "PASS on PR #121: tests in `test_kanban_discord_notice.py` pass "
+        "(43 passed)."
+    )
+
+
+def test_two_paths_and_a_commit_sha_paren_still_render_clean():
+    # Verifier sample 4 (t_78a6b5d2): two paths plus a "(commit <sha>)"
+    # aside that the SHA removal empties.
+    summary = (
+        "Updated the config at ~/.config/atlas-vault/settings.toml and "
+        "restarted nothing; see /home/anombyte/notes/2026-10-22.md for "
+        "the diff (commit a1b2c3d4e5f)."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Updated the config at `settings.toml` and restarted nothing; "
+        "see `2026-10-22.md` for the diff."
+    )
+

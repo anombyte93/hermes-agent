@@ -99,8 +99,13 @@ _AT_HEAD_RE = re.compile(r"\b(?:exact\s+head|head|at)\s*" + _HOLE, re.IGNORECASE
 _ORPHAN_AT_RE = re.compile(r"\s*@\s*" + _HOLE)
 # Absolute (starting "~" or "/") or multi-segment file paths. Single-slash
 # candidates without a file extension (origin/main, feat/foo) look like branch
-# refs and are kept; the path filter below decides.
-_PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+")
+# refs and are kept; the path filter below decides. A trailing "/" belongs to
+# the path (a directory reference), so it is matched too and rendered once
+# inside the backticks instead of leaking after them.
+_PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+/?")
+# A long hex run inside a file name is a commit hash the name carries
+# (hermes-agent-<sha>); it is shortened to 8 chars, never removed.
+_HEX_RUN_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{8,40}(?![0-9A-Fa-f])")
 _EXT_RE = re.compile(r"\.\w{1,4}\Z")
 # A connector or comma run sitting between two holes went with them.
 _BETWEEN_HOLES_RE = re.compile(_HOLE + r"[\s,;]*(?:and|or|nor|but)?[\s,;]*(?=" + _HOLE + r")")
@@ -108,8 +113,11 @@ _BETWEEN_HOLES_RE = re.compile(_HOLE + r"[\s,;]*(?:and|or|nor|but)?[\s,;]*(?=" +
 _DANGLING_PREP_RE = re.compile(
     r"\s+(?:in|on|at|to|into|from|with|by|of|for|via|using)\s+(?=" + _HOLE + r")"
 )
-# "PR #N", "moll-e PR #N", "pull request #N" — an optional repo qualifier.
-_PR_REF_RE = re.compile(r"\b(?:(\w[\w.-]*)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b")
+# "PR #N", "moll-e PR #N", "anombyte93/hermes-agent PR #N", "pull request #N"
+# — an optional owner- or repo-qualified reference.
+_PR_REF_RE = re.compile(
+    r"\b(?:(\w[\w.-]*(?:/[\w.-]+)?)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b"
+)
 _PR_LABEL_RE = re.compile(r"^PR #(\d+)$")
 _HOLLOW_PAREN_RE = re.compile(r"\(([^()]*)\)")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -295,6 +303,11 @@ def _replace_paths(text: str) -> str:
         if not segments:  # bare "/" or "~"
             continue
         name = segments[-1]
+        # A long hex run inside a name is a commit hash the name carries
+        # (release dir hermes-agent-<sha>): shorten it to 8 chars so the
+        # name stays readable, never remove it — the SHA pass runs after
+        # this one and must not find a hash we already replaced.
+        name = _HEX_RUN_RE.sub(lambda h: h.group(0)[:8], name)
         replacement = f"`{name + '/' if _EXT_RE.search(name) is None else name}`{trailing}"
         out.append(text[pos:m.start()])
         out.append(replacement)
@@ -304,11 +317,17 @@ def _replace_paths(text: str) -> str:
 
 
 def _scrub(text: str) -> str:
-    """Drop SHAs (with their introductory words) and replace file paths
-    with their short names, then the words left dangling by the drops."""
-    text = _remove_with_scaffold(_SHA_INTRO_RE, text)
-    text = _remove_with_scaffold(_SHA_RE, text, keep=lambda t: not _is_sha(t))
+    """Replace file paths with their short names, then drop SHAs (with
+    their introductory words), then the words left dangling by the drops.
+
+    Paths are replaced FIRST so a hash inside a path (a release dir named
+    ``hermes-agent-<sha>``) is shortened as part of the name instead of
+    being holed out by the SHA pass and leaving a broken file name; the
+    SHA pass then runs outside backticks only, so a hash a path
+    replacement put inside code spans stays part of the name.
+    """
     text = _replace_paths(text)
+    text = _remove_shas_outside_code(text)
     text = _clean_hole_words(text)
     text = _drop_hollow_parens(text)
     text = _collapse_sentence(text)
@@ -319,14 +338,36 @@ def _scrub(text: str) -> str:
     return " ".join(text.split()).strip(" ,;:—–-&@")
 
 
+def _remove_shas_outside_code(text: str) -> str:
+    """Drop SHA tokens in the prose only, never inside ``backtick`` spans.
+
+    A path replacement can put a commit hash inside backticks (a release
+    dir named ``hermes-agent-07958b78``); that hash is part of the name
+    the reader needs, not machinery to scrub. Backticked text a worker
+    wrote themselves gets the same protection.
+    """
+    out: list[str] = []
+    for i, part in enumerate(text.split("`")):
+        if i % 2:  # inside a code span
+            out.append(part)
+        else:
+            part = _remove_with_scaffold(_SHA_INTRO_RE, part)
+            part = _remove_with_scaffold(_SHA_RE, part, keep=lambda t: not _is_sha(t))
+            out.append(part)
+    return "`".join(out)
+
+
 def _pr_ref_link(
     qual: Optional[str], number: str, repos: Mapping[str, Mapping[str, str]]
 ) -> Optional[tuple[str, str]]:
     """(label, url) for a PR reference, or None to leave it as written."""
     if qual:
         for owner_repo, numbers in repos.items():
-            if owner_repo.split("/", 1)[1] == qual.lower() and number in numbers:
-                return f"{qual} #{number}", numbers[number]
+            if owner_repo.split("/", 1)[1] == qual.lower().split("/", 1)[-1] and number in numbers:
+                # The link carries the owner; the label needs only the
+                # repo name, so "anombyte93/hermes-agent PR #120" renders
+                # as "hermes-agent #120", not "anombyte93/hermes-agent #120".
+                return f"{owner_repo.split('/', 1)[1]} #{number}", numbers[number]
         return None
     if len(repos) == 1:
         owner_repo, numbers = next(iter(repos.items()))
@@ -393,6 +434,18 @@ def plainwords_outcome(
                     seen.add(new_url)
             pieces = [(new_label, new_url)] if new_label else []
         for piece in pieces:
+            # A dropped duplicate can leave an opening paren at the end
+            # of the kept text and its partner after the link ("( ()");
+            # the pair goes, an aside that kept its words stays.
+            while out and piece[0] and out[-1][0].endswith("(") and (
+                piece[0].startswith(")") or piece[0].lstrip().startswith("()")
+            ):
+                out[-1] = (out[-1][0][: -1].rstrip(), out[-1][1])
+                if out and not out[-1][0]:
+                    out.pop()
+                piece = (piece[0].lstrip()[1:].lstrip(), piece[1])
+                if not piece[0]:
+                    break
             if out and piece[0] and out[-1][0]:
                 glue = out[-1][0][-1]
                 if not glue.isspace() and piece[0][0].isalnum():
