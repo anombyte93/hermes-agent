@@ -147,7 +147,7 @@ def test_pr_url_is_masked_link():
     summary = "Opened https://github.com/anombyte93/moll-e/pull/283 with tests."
     body = _render("completed", {"summary": summary}).splitlines()[1]
     assert body == (
-        "Opened [PR #283](https://github.com/anombyte93/moll-e/pull/283) with tests."
+        "Opened [moll-e #283](https://github.com/anombyte93/moll-e/pull/283) with tests."
     )
 
 
@@ -203,4 +203,152 @@ def test_message_stays_under_discord_limit():
     msg = _render("completed", {"summary": many}, title="T" * 5000)
     assert len(msg) < DISCORD_MESSAGE_LIMIT
     assert "\n-# t_21c201fb" in msg
+
+
+# ------------------------------------------- plain words (#112, card examples)
+
+
+_STACKED_SUMMARY = (
+    "Opened moll-e PR #305 (head 36778d0a4fbc9ae6ffc9ce53cf8440f7089eae26, "
+    "stacked on #302 @ ca5c51bc, which is still open)."
+)
+_REVERIFY_SUMMARY = (
+    "PASS on moll-e PR #304 re-verify at exact head "
+    "c324d57056432526a380efb42eded5cb29bb1cf5. Merge of origin/main is clean."
+)
+
+
+def test_stacked_pr_summary_reads_in_plain_words():
+    assert _render("completed", {"summary": _STACKED_SUMMARY}).splitlines()[1] == (
+        "Opened moll-e PR #305."
+    )
+
+
+def test_reverify_summary_drops_exact_head_sha():
+    assert _render("completed", {"summary": _REVERIFY_SUMMARY}).splitlines()[1] == (
+        "PASS on moll-e PR #304 re-verify. Merge of origin/main is clean."
+    )
+
+
+def test_pr_reference_links_when_url_present():
+    summary = _REVERIFY_SUMMARY.replace(
+        "c324d57056432526a380efb42eded5cb29bb1cf5.",
+        "c324d57056432526a380efb42eded5cb29bb1cf5 "
+        "https://github.com/anombyte93/moll-e/pull/304.",
+    )
+    # The prose reference becomes the masked link; the URL segment that
+    # trailed it was the same PR restated, so it is dropped (F1), not
+    # rendered again as a plain label.
+    assert _render("completed", {"summary": summary}).splitlines()[1] == (
+        "PASS on [moll-e #304](https://github.com/anombyte93/moll-e/pull/304) "
+        "re-verify. Merge of origin/main is clean."
+    )
+
+
+def test_plain_words_outcome_keeps_no_machinery():
+    for summary in (_STACKED_SUMMARY, _REVERIFY_SUMMARY):
+        body = _render("completed", {"summary": summary}).splitlines()[1]
+        assert "36778d0a" not in body
+        assert "c324d570" not in body
+        assert "ca5c51bc" not in body
+        assert "@" not in body
+        assert "()" not in body
+        assert "exact head" not in body
+
+
+def test_layout_lines_unchanged_by_plain_words():
+    msg = _render("completed", {"summary": _STACKED_SUMMARY}).splitlines()
+    assert msg[0] == "✅ **Verify: my-agents port of #332**"
+    assert msg[2] == "-# t_21c201fb · claude"
+
+
+def test_outcome_keeps_at_most_two_sentences():
+    summary = (
+        "First sentence lands the outcome. "
+        "Second sentence adds the check result and passes the gate. "
+        "Third sentence drones on about merge trees and should never appear."
+    )
+    assert clip_outcome(summary) == (
+        "First sentence lands the outcome. "
+        "Second sentence adds the check result and passes the gate."
+    )
+
+
+def test_paths_are_dropped_from_outcome():
+    summary = (
+        "Fixed the renderer in gateway/kanban_notice_discord.py and updated "
+        "~/atlas/worktrees/moll-e/docs; /tmp/build.log stays behind."
+    )
+    # Paths go, and so do the words they left dangling: the "in" that led
+    # into the first path and the ";" that only separated paths (F3).
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Fixed the renderer and updated stays behind."
+
+
+def test_branch_refs_survive_the_path_filter():
+    summary = "Merge of origin/main into feat/110-112-on-deployed is clean."
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Merge of origin/main into feat/110-112-on-deployed is clean."
+
+
+# ------------------------------- edge cases (review findings on #121, F1-F3)
+
+
+_DOUBLED_LABEL_SUMMARY = (
+    "Opened hermes-agent PR #121: "
+    "https://github.com/anombyte93/hermes-agent/pull/121 (head 30e81b5c...)."
+)
+
+
+def test_f1_pr_label_renders_once_not_twice():
+    # The prose reference becomes the masked link; the link segment that
+    # followed "PR #121:" was the same reference restated, so it goes with
+    # its introducing colon instead of rendering the label a second time.
+    body = _render("completed", {"summary": _DOUBLED_LABEL_SUMMARY}).splitlines()[1]
+    assert body == (
+        "Opened [hermes-agent #121]"
+        "(https://github.com/anombyte93/hermes-agent/pull/121)."
+    )
+
+
+def test_f2_pure_numbers_and_words_are_not_shas():
+    # A bare hex token is dropped only when it mixes hex letters and digits;
+    # a count ("10000000") and a word ("deadbeef") are not commits and stay.
+    assert _render("completed", {"summary": "Moved 10000000 rows"}).splitlines()[1] == (
+        "Moved 10000000 rows"
+    )
+    assert _render("completed", {"summary": "deadbeef module"}).splitlines()[1] == (
+        "deadbeef module"
+    )
+
+
+def test_f2_sha_intro_words_still_drop_the_sha():
+    # "head" / "at" / "@" / "commit" only ever introduce a SHA, so the token
+    # after them drops even when it is pure letters or pure digits.
+    summary = (
+        "Re-verified at head 1111111 and pushed commit aaaaaaa "
+        "(head 30e81b5c681fc31ab342ae32910a592992cb5f38)."
+    )
+    assert _render("completed", {"summary": summary}).splitlines()[1] == "Re-verified and pushed."
+
+
+def test_f3_no_dangling_connectors_or_emptied_parens():
+    # When paths are removed, the connectors between them and the
+    # parenthetical they emptied go too. A sentence whose whole content was
+    # the removed machinery carries no plain-words information, so it is
+    # dropped rather than padded with a synthesised file count.
+    summary = "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."
+    assert _render("completed", {"summary": summary}).splitlines()[1] == "Done."
+
+
+def test_f4_paren_with_nothing_removed_stays():
+    # Known-red on f84e7ffd: a parenthetical is dropped only when the
+    # path/SHA removal emptied it. "(see notes)" lost nothing, so it stays
+    # even though it starts with "see"; same for "in"/"on"/"at" asides.
+    body = _render("completed", {"summary": "Fixed 2 bugs (see notes). Shipped."}).splitlines()[1]
+    assert body == "Fixed 2 bugs (see notes). Shipped."
+    body = _render("completed", {"summary": "Approved it (in draft)."}).splitlines()[1]
+    assert body == "Approved it (in draft)."
+    body = _render("completed", {"summary": "Merged (on request)."}).splitlines()[1]
+    assert body == "Merged (on request)."
 
