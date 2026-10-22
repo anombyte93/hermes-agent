@@ -10367,26 +10367,37 @@ def _append_skill_rejected_event(
     task_id: str,
     assignee: str,
     missing_skills: list[str],
+    *,
+    lane: str = "ready",
 ) -> None:
     """Record a forced-skill refusal as a durable ``skill_rejected`` event,
     rate-limited to one event per unchanged refusal streak (#20).
+
+    The review lane uses ``review_unavailable`` with a named reason instead.
 
     A dispatch tick that rejects the same task for the same assignee and the
     same missing skill set appends nothing — the first event already says
     everything, and the default 60s dispatcher loop would otherwise spam an
     unbounded stream of identical rows. A changed assignee or skill set, or a
     fresh refusal after an intervening claim/spawn, IS a new refusal and is
-    recorded again. The payload is deliberately minimal — assignee and missing
-    skill names only; the task id is the event row's own identity.
+    recorded again. The payload contains the assignee and missing skill names,
+    plus a reason for review refusals; the task id is the event row's identity.
     """
+    event_kind = "review_unavailable" if lane == "review" else "skill_rejected"
+    payload = {"assignee": assignee, "missing_skills": sorted(missing_skills)}
+    if lane == "review":
+        payload["reason"] = (
+            f"Profile '{assignee}' cannot load required review skill(s): "
+            + ", ".join(sorted(missing_skills))
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
+            "WHERE task_id = ? AND kind IN (?, 'claimed', 'spawned') "
             "ORDER BY id DESC LIMIT 1",
-            (task_id,),
+            (task_id, event_kind),
         ).fetchone()
-        if row is not None and row["kind"] == "skill_rejected":
+        if row is not None and row["kind"] == event_kind:
             try:
                 prev = json.loads(row["payload"] or "{}")
             except Exception:
@@ -10400,8 +10411,8 @@ def _append_skill_rejected_event(
         _append_event(
             conn,
             task_id,
-            "skill_rejected",
-            {"assignee": assignee, "missing_skills": sorted(missing_skills)},
+            event_kind,
+            payload,
         )
 
 
@@ -10510,10 +10521,41 @@ def _note_nonspawnable(
         )
 
 
+def _worker_skill_scope(workspace_path: Optional[str]) -> Optional[str]:
+    """Directory a worker for this workspace would resolve project skills from.
+
+    The worker is spawned with ``TERMINAL_CWD=<workspace>``, so trusted
+    ``.hermes/skills`` / ``.agents/skills`` of the enclosing project checkout
+    are visible to it. Returns that project root (or the workspace itself
+    when it is not inside a checkout), or ``None`` when the workspace is not
+    an existing absolute directory (the worker would not pin it either).
+    """
+    if not workspace_path or not os.path.isabs(workspace_path):
+        return None
+    if not os.path.isdir(workspace_path):
+        return None
+    try:
+        from agent.skill_utils import find_project_root
+
+        root = find_project_root(Path(workspace_path))
+    except Exception:
+        root = None
+    return str(root) if root is not None else workspace_path
+
+
 def _missing_worker_skills(
-    skill_identifiers: Optional[list[str]], assignee: str
+    skill_identifiers: Optional[list[str]],
+    assignee: str,
+    workspace_cwd: Optional[str] = None,
 ) -> list[str]:
-    """Resolve forced skills in the assignee profile without mutating process env."""
+    """Resolve forced skills in the assignee profile as the worker would,
+    without mutating process env.
+
+    The profile home and, when ``workspace_cwd`` is given, the project start
+    directory are overridden through context-local overrides (never
+    ``os.environ``, which every thread shares), so trusted project-local
+    skills of the task workspace resolve as they do in the spawned worker.
+    """
     if not skill_identifiers:
         return []
 
@@ -10526,6 +10568,12 @@ def _missing_worker_skills(
         return list(dict.fromkeys(skill_identifiers))
 
     token = set_hermes_home_override(profile_home)
+    from agent.skill_utils import (
+        reset_project_cwd_override,
+        set_project_cwd_override,
+    )
+
+    cwd_token = set_project_cwd_override(workspace_cwd or None)
     try:
         import json
 
@@ -10547,6 +10595,7 @@ def _missing_worker_skills(
                 missing.append(name)
         return missing
     finally:
+        reset_project_cwd_override(cwd_token)
         reset_hermes_home_override(token)
 
 
@@ -10725,7 +10774,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, workspace_path FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10740,18 +10789,47 @@ def _dispatch_once_locked(
     # full budget. "Spawnable" mirrors the review loop's own gate
     # (assigned + real profile) so a review column full of human-pulled
     # control-plane lanes doesn't permanently tax ready throughput.
+    #
+    # A review whose assignee cannot load the mandatory ``sdlc-review`` skill
+    # is parked (the review loop skips it), so it must not hold the slot
+    # either: otherwise at ``max_in_progress=1`` one parked card would starve
+    # every ready card forever. The skill check is resolved ONCE per
+    # (assignee, project scope) per tick, here, and the review loop reuses
+    # the result: skill resolution reads the profile's skills tree and runs
+    # under the dispatch lock, so it must not scale with the card count.
+    try:
+        from hermes_cli.profiles import profile_exists as _rpe
+    except Exception:
+        _rpe = None  # type: ignore[assignment]
+
+    def _review_scope(row) -> tuple[str, Optional[str]]:
+        cwd = _worker_skill_scope(row["workspace_path"])
+        return (row["assignee"], cwd), cwd
+
+    review_missing: dict[tuple[str, Optional[str]], list[str]] = {}
+    for row in review_rows:
+        if not row["assignee"]:
+            continue
+        if _rpe is not None and not _rpe(row["assignee"]):
+            continue
+        key, cwd = _review_scope(row)
+        if key not in review_missing:
+            review_missing[key] = _missing_worker_skills(
+                ["sdlc-review"], row["assignee"], cwd
+            )
+
     def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+        # "Spawnable" = assigned, a real profile (or no profiles module —
+        # test stubs, exotic envs — matching the review loop's own
+        # fallback), and able to load the review skill.
+        for row in review_rows:
+            if not row["assignee"]:
+                continue
+            if _rpe is not None and not _rpe(row["assignee"]):
+                continue
+            if not review_missing.get(_review_scope(row)[0]):
+                return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
@@ -11038,6 +11116,17 @@ def _dispatch_once_locked(
             _note_nonspawnable(
                 conn, row["id"], row["assignee"], dry_run=dry_run, lane="review"
             )
+            continue
+        # Check the mandatory review skill in the worker's profile BEFORE
+        # claiming: an unavailable skill must not create a run or boot a
+        # worker that will fail (or silently review without its guidance).
+        missing_skills = review_missing.get(_review_scope(row)[0], [])
+        if missing_skills:
+            result.rejected_skills.append((row["id"], missing_skills))
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row["assignee"], missing_skills, lane="review"
+                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
