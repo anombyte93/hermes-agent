@@ -790,6 +790,57 @@ def test_review_uses_trusted_project_skills_of_task_workspace(
     assert "TERMINAL_CWD" not in os.environ
 
 
+@pytest.mark.parametrize("preset", [None, "/preset/workdir"])
+def test_missing_worker_skills_never_writes_process_env(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preset: str | None,
+) -> None:
+    """The workspace scope is a context-local override, not os.environ."""
+    import os
+
+    profile = _review_profile(kanban_home, "env-reviewer", with_skill=False)
+    ws = _project_with_review_skill(tmp_path)
+    (profile / "config.yaml").write_text(
+        f"skills:\n  trusted_project_dirs:\n    - {ws}\n", encoding="utf-8",
+    )
+    if preset is None:
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    else:
+        monkeypatch.setenv("TERMINAL_CWD", preset)
+
+    class GuardedEnviron(type(os.environ)):
+        def __setitem__(self, key, value):
+            raise AssertionError(f"os.environ write: {key}")
+
+        def __delitem__(self, key):
+            raise AssertionError(f"os.environ delete: {key}")
+
+        def pop(self, *args, **kwargs):
+            raise AssertionError("os.environ pop")
+
+        def setdefault(self, *args, **kwargs):
+            raise AssertionError("os.environ setdefault")
+
+        def update(self, *args, **kwargs):
+            raise AssertionError("os.environ update")
+
+    before = dict(os.environ)
+    guarded = GuardedEnviron.__new__(GuardedEnviron)
+    guarded.__dict__.update(os.environ.__dict__)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "environ", guarded)
+        # The workspace's own skill resolves, so the override was applied...
+        assert kb._missing_worker_skills(["sdlc-review"], "env-reviewer", str(ws)) == []
+        # ...and without it the same profile cannot load the skill.
+        assert kb._missing_worker_skills(["sdlc-review"], "env-reviewer") == [
+            "sdlc-review"
+        ]
+    assert dict(os.environ) == before
+    assert os.environ.get("TERMINAL_CWD") == preset
+
+
 def test_parked_review_is_parked_even_when_other_card_skills_resolve(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

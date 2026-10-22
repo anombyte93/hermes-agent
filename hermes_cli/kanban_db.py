@@ -10548,12 +10548,13 @@ def _missing_worker_skills(
     assignee: str,
     workspace_cwd: Optional[str] = None,
 ) -> list[str]:
-    """Resolve forced skills in the assignee profile as the worker would.
+    """Resolve forced skills in the assignee profile as the worker would,
+    without mutating process env.
 
-    The profile home is overridden for the duration of the call. When
-    ``workspace_cwd`` is given, ``TERMINAL_CWD`` is pinned to it as well (and
-    restored afterwards) so trusted project-local skills of the task workspace
-    resolve exactly as they do in the spawned worker.
+    The profile home and, when ``workspace_cwd`` is given, the project start
+    directory are overridden through context-local overrides (never
+    ``os.environ``, which every thread shares), so trusted project-local
+    skills of the task workspace resolve as they do in the spawned worker.
     """
     if not skill_identifiers:
         return []
@@ -10567,11 +10568,12 @@ def _missing_worker_skills(
         return list(dict.fromkeys(skill_identifiers))
 
     token = set_hermes_home_override(profile_home)
-    _cwd_set = False
-    _prev_cwd = os.environ.get("TERMINAL_CWD")
-    if workspace_cwd:
-        os.environ["TERMINAL_CWD"] = workspace_cwd
-        _cwd_set = True
+    from agent.skill_utils import (
+        reset_project_cwd_override,
+        set_project_cwd_override,
+    )
+
+    cwd_token = set_project_cwd_override(workspace_cwd or None)
     try:
         import json
 
@@ -10593,11 +10595,7 @@ def _missing_worker_skills(
                 missing.append(name)
         return missing
     finally:
-        if _cwd_set:
-            if _prev_cwd is None:
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prev_cwd
+        reset_project_cwd_override(cwd_token)
         reset_hermes_home_override(token)
 
 
