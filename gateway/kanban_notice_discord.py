@@ -110,9 +110,6 @@ _DANGLING_PREP_RE = re.compile(
 _PR_REF_RE = re.compile(r"\b(?:(\w[\w.-]*)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b")
 _PR_LABEL_RE = re.compile(r"^PR #(\d+)$")
 _HOLLOW_PAREN_RE = re.compile(r"\(([^()]*)\)")
-_PAREN_LEAD_WORDS = frozenset({"which", "who", "and", "but", "so", "stacked"})
-# Words that only ever introduce dropped machinery inside a parenthetical.
-_PAREN_SEE_WORDS = frozenset({"see", "including", "via", "using", "at", "in", "on"})
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _TYPO_FIX_RE = re.compile(r"\b(\w+) (?:at|@) \1\b")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:!?)])")
@@ -222,14 +219,14 @@ def _is_file_path(token: str) -> bool:
 
 
 def _paren_is_machinery(inner: str) -> bool:
-    """A parenthetical that only scaffolded dropped machinery goes too."""
+    """A parenthetical that only scaffolded dropped machinery goes too —
+    and only then: a hole (or nothing at all) left by the path/SHA drops is
+    the evidence. An aside the removal never touched, "(see notes)", keeps
+    its words however it starts (F4, #121 re-verify)."""
     s = inner.strip()
     if not s or _HOLE in s:
         return True
-    words = s.split()
-    if words[0].lower() in _PAREN_LEAD_WORDS or words[0].lower() in _PAREN_SEE_WORDS:
-        return True
-    return all(w.lower() in _PAREN_LEAD_WORDS | _PAREN_SEE_WORDS for w in words)
+    return False
 
 
 def _drop_hollow_parens(text: str) -> str:

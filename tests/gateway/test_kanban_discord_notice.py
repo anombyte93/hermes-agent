@@ -340,3 +340,15 @@ def test_f3_no_dangling_connectors_or_emptied_parens():
     summary = "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."
     assert _render("completed", {"summary": summary}).splitlines()[1] == "Done."
 
+
+def test_f4_paren_with_nothing_removed_stays():
+    # Known-red on f84e7ffd: a parenthetical is dropped only when the
+    # path/SHA removal emptied it. "(see notes)" lost nothing, so it stays
+    # even though it starts with "see"; same for "in"/"on"/"at" asides.
+    body = _render("completed", {"summary": "Fixed 2 bugs (see notes). Shipped."}).splitlines()[1]
+    assert body == "Fixed 2 bugs (see notes). Shipped."
+    body = _render("completed", {"summary": "Approved it (in draft)."}).splitlines()[1]
+    assert body == "Approved it (in draft)."
+    body = _render("completed", {"summary": "Merged (on request)."}).splitlines()[1]
+    assert body == "Merged (on request)."
+
