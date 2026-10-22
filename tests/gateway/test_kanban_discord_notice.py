@@ -274,15 +274,32 @@ def test_outcome_keeps_at_most_two_sentences():
     )
 
 
-def test_paths_are_dropped_from_outcome():
+def test_paths_render_as_file_names_not_deletions():
     summary = (
         "Fixed the renderer in gateway/kanban_notice_discord.py and updated "
         "~/atlas/worktrees/moll-e/docs; /tmp/build.log stays behind."
     )
-    # Paths go, and so do the words they left dangling: the "in" that led
-    # into the first path and the ";" that only separated paths (F3).
+    # A path is never deleted outright — that leaves dangling grammar
+    # (#121 live check). A file path becomes its file name in backticks,
+    # a directory path its last segment plus "/".
     body = _render("completed", {"summary": summary}).splitlines()[1]
-    assert body == "Fixed the renderer and updated stays behind."
+    assert body == (
+        "Fixed the renderer in `kanban_notice_discord.py` and updated "
+        "`docs/`; `build.log` stays behind."
+    )
+
+
+def test_proof_example_keeps_its_grammar():
+    # The exact live-check example (#121 proof msg 1562840413453164556):
+    # the path must not be deleted, and the sentence's trailing period
+    # must survive outside the backticks (it once made the file name
+    # look like a directory: `proof.py./`).
+    summary = (
+        "Proof: opened moll-e PR #305 "
+        "(head 36778d0a4fbc9ae6ffc9ce53cf8440f7089eae26) and wrote /home/x/proof.py."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Proof: opened moll-e PR #305 and wrote `proof.py`."
 
 
 def test_branch_refs_survive_the_path_filter():
@@ -333,12 +350,15 @@ def test_f2_sha_intro_words_still_drop_the_sha():
 
 
 def test_f3_no_dangling_connectors_or_emptied_parens():
-    # When paths are removed, the connectors between them and the
-    # parenthetical they emptied go too. A sentence whose whole content was
-    # the removed machinery carries no plain-words information, so it is
+    # Paths are replaced by their file names, so connectors and
+    # parentheticals keep their grammar. SHA removal can still empty a
+    # parenthetical ("(head <sha>)"), and a sentence whose whole content
+    # was removed machinery carries no plain-words information, so it is
     # dropped rather than padded with a synthesised file count.
-    summary = "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."
-    assert _render("completed", {"summary": summary}).splitlines()[1] == "Done."
+    body = _render(
+        "completed", {"summary": "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."}
+    ).splitlines()[1]
+    assert body == "Wrote `foo.py` and `y.md` (see `a.py`). Done."
 
 
 def test_f4_paren_with_nothing_removed_stays():
@@ -351,4 +371,157 @@ def test_f4_paren_with_nothing_removed_stays():
     assert body == "Approved it (in draft)."
     body = _render("completed", {"summary": "Merged (on request)."}).splitlines()[1]
     assert body == "Merged (on request)."
+
+
+# ------------------- #122 re-verify findings (t_78a6b5d2 FAIL samples)
+
+
+def test_directory_path_with_trailing_slash_renders_once():
+    # Known-red on c08baeba: a directory path ending in "/" matched
+    # without its trailing slash, so the leftover "/" rendered after the
+    # backticks ("logs are in `gateway/`/"). The slash belongs to the
+    # path and renders once inside it.
+    summary = (
+        "Rebased onto origin/main at 9e8d7c6b and pushed; logs are in "
+        "~/.hermes/logs/gateway/ and the report is /tmp/verify-report.md."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Rebased onto origin/main and pushed; logs are in `gateway/` "
+        "and the report is `verify-report.md`."
+    )
+
+
+def test_path_containing_a_sha_keeps_its_name():
+    # Known-red on c08baeba: the SHA pass ran before the path pass, so a
+    # hash inside a release-dir name was holed out ("`hermes-agent-/`")
+    # and the PR-link pass left "()" plus the owner prefix behind. Paths
+    # are replaced first, a hash inside a name is shortened to 8 chars,
+    # and an owner-qualified reference links with the owner dropped.
+    summary = (
+        "Merged anombyte93/hermes-agent PR #120 "
+        "(https://github.com/anombyte93/hermes-agent/pull/120) into "
+        "feat/110-112-on-deployed; the release dir "
+        "~/.hermes/releases/hermes-agent-07958b78faf05586e22117523fa8ae002a569de5/ "
+        "is ready."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Merged [hermes-agent #120](https://github.com/anombyte93/hermes-agent/pull/120) "
+        "into feat/110-112-on-deployed; the release dir "
+        "`hermes-agent-07958b78/` is ready."
+    )
+
+
+#          regression: the verifier's three OK samples stay OK (1, 3, 4)
+
+
+def test_pr_link_then_path_still_renders_clean():
+    # Verifier sample 1 (t_78a6b5d2): a PR URL, a "(head <sha>)" aside
+    # and a long path in one summary.
+    summary = (
+        "Opened https://github.com/anombyte93/moll-e/pull/307 "
+        "(head 4f2a1b3c5d7e9f0a1b2c3d4e5f6a7b8c9d0e4a3f) after editing "
+        "/home/anombyte/atlas/worktrees/moll-e/src/relay/gate.ts."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Opened [moll-e #307](https://github.com/anombyte93/moll-e/pull/307) "
+        "after editing `gate.ts`."
+    )
+
+
+def test_exact_head_sha_and_relative_test_path_still_render_clean():
+    # Verifier sample 3 (t_78a6b5d2): "at exact head <sha>" drops with
+    # its scaffold; a repo-relative test path renders by file name.
+    summary = (
+        "PASS on PR #121 at exact head "
+        "6e541234567890abcdef1234567890abcdefbd46: tests in "
+        "tests/gateway/test_kanban_discord_notice.py pass (43 passed)."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "PASS on PR #121: tests in `test_kanban_discord_notice.py` pass "
+        "(43 passed)."
+    )
+
+
+def test_two_paths_and_a_commit_sha_paren_still_render_clean():
+    # Verifier sample 4 (t_78a6b5d2): two paths plus a "(commit <sha>)"
+    # aside that the SHA removal empties.
+    summary = (
+        "Updated the config at ~/.config/atlas-vault/settings.toml and "
+        "restarted nothing; see /home/anombyte/notes/2026-10-22.md for "
+        "the diff (commit a1b2c3d4e5f)."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == (
+        "Updated the config at `settings.toml` and restarted nothing; "
+        "see `2026-10-22.md` for the diff."
+    )
+
+
+#        #122 re-verify finding (t_282ebddd): a path with spaces renders
+#        by its real file name, never cut at the first space
+
+
+def test_quoted_path_with_spaces_renders_whole():
+    # Known-red on 8858dc38: the path was cut at the first space and
+    # rendered as "`Client/` Reports/q3 summary.pdf" — the wrong name
+    # with the rest of the path left in the sentence. Inside quotes the
+    # path is taken whole, spaces included, and renders as its final
+    # segment (single quotes and backticks get the same treatment).
+    summary = (
+        "Copied the export to "
+        "\"/home/anombyte/Nextcloud/Client Reports/q3 summary.pdf\" "
+        "and emailed nobody."
+    )
+    body = _render("completed", {"summary": summary}).splitlines()[1]
+    assert body == "Copied the export to `q3 summary.pdf` and emailed nobody."
+    body = _render(
+        "completed",
+        {"summary": "Saved to '/home/anombyte/Notes/Week 43/plan notes.md' today."},
+    ).splitlines()[1]
+    assert body == "Saved to `plan notes.md` today."
+
+
+def test_unquoted_path_with_spaces_joins_by_segment_or_extension():
+    # Known-red on 8858dc38: the unquoted spaced path produced the same
+    # wrong name plus leftover text. An unquoted path continues past a
+    # space while the next token holds a further "/" segment or ends in
+    # a file extension the path so far lacks, so "~/Notes/Week 43/plan.md"
+    # is one path while prose after it ("today") stays.
+    assert clip_outcome("saved to ~/Notes/Week 43/plan.md today") == (
+        "saved to `plan.md` today"
+    )
+    assert clip_outcome(
+        "Saw the file at /tmp/my file.txt and stopped."
+    ) == "Saw the file at `my file.txt` and stopped."
+    # A directory path with spaces keeps its last segment plus "/".
+    assert clip_outcome("See the docs in ~/Hermes/current projects/notes.") == (
+        "See the docs in `notes/`."
+    )
+
+
+def test_spaced_path_prose_around_it_is_never_swallowed():
+    # The continuation stops at words: "and" is neither a further
+    # segment nor an extension, and a quoted title that is not a path
+    # keeps its words. A spaced path with no extension hints at all
+    # stays cut rather than eating the sentence after it.
+    body = _render(
+        "completed",
+        {"summary": "Attached the report at /home/x/reports/final draft.pdf for review."},
+    ).splitlines()[1]
+    assert body == "Attached the report at `final draft.pdf` for review."
+    body = _render(
+        "completed", {"summary": "Wrote a note called \"todo today\" and one called x.md."}
+    ).splitlines()[1]
+    assert body == "Wrote a note called \"todo today\" and one called x.md."
+    # A bare relative directory ("gateway/") is not a multi-segment path
+    # and stays as written, like "tests/gateway" before it.
+    body = _render(
+        "completed", {"summary": "Logs are in gateway/ and tests pass now."}
+    ).splitlines()[1]
+    assert body == "Logs are in gateway/ and tests pass now."
+
 

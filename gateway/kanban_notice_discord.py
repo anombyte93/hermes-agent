@@ -14,9 +14,11 @@ Rules:
 
 * line 1: one state marker, then the title in bold (Markdown-escaped);
 * line 2: the outcome in plain words — git SHAs (with any ``at`` /
-  ``exact`` / ``head`` / ``@`` scaffolding), absolute and ``~/`` paths,
-  the connectors those drops leave dangling, parentheses emptied by
-  them and sentences reduced to the removed machinery are removed;
+  ``exact`` / ``head`` / ``@`` scaffolding) are removed, but a file path
+  is never deleted outright (that leaves dangling grammar): it is
+  replaced by its file name in backticks, a directory path by its last
+  segment plus ``/``; parentheses emptied by the SHA drops and sentences
+  reduced to the removed machinery are removed;
   a bare hex token counts as a SHA only when it mixes letters and
   digits (counts like ``10000000`` and words like ``deadbeef`` stay),
   ``PR #N`` references render as ``repo #N`` once (a masked link when
@@ -97,8 +99,15 @@ _AT_HEAD_RE = re.compile(r"\b(?:exact\s+head|head|at)\s*" + _HOLE, re.IGNORECASE
 _ORPHAN_AT_RE = re.compile(r"\s*@\s*" + _HOLE)
 # Absolute (starting "~" or "/") or multi-segment file paths. Single-slash
 # candidates without a file extension (origin/main, feat/foo) look like branch
-# refs and are kept; the path filter below decides.
-_PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+")
+# refs and are kept; the path filter below decides. A trailing "/" belongs to
+# the path (a directory reference), so it is matched too and rendered once
+# inside the backticks instead of leaking after them. This regex matches ONE
+# space-free run; a path with spaces in it is grown from a match by
+# _extend_path (quoted paths never need it — a quote is taken whole).
+_PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+/?")
+# A long hex run inside a file name is a commit hash the name carries
+# (hermes-agent-<sha>); it is shortened to 8 chars, never removed.
+_HEX_RUN_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{8,40}(?![0-9A-Fa-f])")
 _EXT_RE = re.compile(r"\.\w{1,4}\Z")
 # A connector or comma run sitting between two holes went with them.
 _BETWEEN_HOLES_RE = re.compile(_HOLE + r"[\s,;]*(?:and|or|nor|but)?[\s,;]*(?=" + _HOLE + r")")
@@ -106,8 +115,11 @@ _BETWEEN_HOLES_RE = re.compile(_HOLE + r"[\s,;]*(?:and|or|nor|but)?[\s,;]*(?=" +
 _DANGLING_PREP_RE = re.compile(
     r"\s+(?:in|on|at|to|into|from|with|by|of|for|via|using)\s+(?=" + _HOLE + r")"
 )
-# "PR #N", "moll-e PR #N", "pull request #N" — an optional repo qualifier.
-_PR_REF_RE = re.compile(r"\b(?:(\w[\w.-]*)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b")
+# "PR #N", "moll-e PR #N", "anombyte93/hermes-agent PR #N", "pull request #N"
+# — an optional owner- or repo-qualified reference.
+_PR_REF_RE = re.compile(
+    r"\b(?:(\w[\w.-]*(?:/[\w.-]+)?)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b"
+)
 _PR_LABEL_RE = re.compile(r"^PR #(\d+)$")
 _HOLLOW_PAREN_RE = re.compile(r"\(([^()]*)\)")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -266,12 +278,139 @@ def _collapse_sentence(text: str) -> str:
     return " ".join(kept)
 
 
+_QUOTE_SPAN_RE = re.compile(
+    r"(\"[^\"]*\"|'[^']*'|`[^`]*`)"
+)
+# The extension of the continuation rule: ".ext" at the very end of the
+# next token, or followed only by closing punctuation.
+_EXT_END_RE = re.compile(r"\.[A-Za-z0-9]{1,8}(?:[)\]},;:.!?'\"]*\Z)")
+# Whitespace (never more than one space) between path tokens.
+_GAP_RE = re.compile(r" {1,2}")
+
+
+def _has_ext(token: str) -> bool:
+    return _EXT_END_RE.search(token) is not None
+
+
+def _extend_path(text: str, start: int, end: int, max_len: int = 120) -> int:
+    """Grow an unquoted path past spaces while the card's rule holds.
+
+    The path so far continues over a space when the next token is a
+    further segment (it contains "/"), or when the path so far has no
+    file extension and the next token ends in one (".pdf", ".md").
+    Stopping there keeps prose ("logs are in `gateway/` and the
+    report...") intact: "and" has no slash and no extension.
+    """
+    while end < len(text):
+        m = _GAP_RE.match(text, end)
+        if m is None:
+            break
+        tok_m = re.match(r"[\w~/.,+-]+", text[m.end() :])
+        if tok_m is None:
+            break
+        tok = tok_m.group(0)
+        if len(text[start : m.end()] + tok) > max_len:
+            break
+        if "/" in tok or (_EXT_END_RE.search(text[start:end]) is None and _has_ext(tok)):
+            end = m.end() + len(tok)
+            continue
+        break
+    return end
+
+
+def _render_path_name(token: str) -> Optional[str]:
+    """The rendered replacement for one whole path ``token``: its final
+    segment in backticks, plus ``/`` when that segment is a directory
+    (no file extension). Returns None when ``token`` is not a file path
+    (a branch ref like ``origin/main``) and must stay as written."""
+    if not token or not _is_file_path(token):
+        return None
+    segments = [s for s in token.split("/") if s]
+    if not segments:  # bare "/" or "~"
+        return None
+    name = segments[-1]
+    # A long hex run inside a name is a commit hash the name carries
+    # (release dir hermes-agent-<sha>): shorten it to 8 chars so the
+    # name stays readable, never remove it — the SHA pass runs after
+    # this one and must not find a hash we already replaced.
+    name = _HEX_RUN_RE.sub(lambda h: h.group(0)[:8], name)
+    return f"`{name + '/' if _EXT_RE.search(name) is None else name}`"
+
+
+def _replace_paths(text: str) -> str:
+    """Swap every file path for its short name (#121 live check).
+
+    Deleting a path outright leaves dangling grammar ("opened the PR and
+    wrote"). A file path becomes its file name in backticks; a directory
+    path becomes its last segment plus ``/``. Branch-looking refs
+    (``origin/main``, ``feat/foo``) are not paths and stay as written —
+    they carry information a phone reader wants.
+
+    A path inside quotes or backticks (``"``, ``'``, ```` `` ````) is
+    taken whole, spaces included: the quote already told the reader where
+    the path ends, so nothing is left over outside it (#122 re-verify).
+    An unquoted path grows past a space only while the next token is a
+    further segment or completes an extension (``~/Notes/Week 43/plan.md``);
+    prose around it is never swallowed.
+    """
+    out: list[str] = []
+    pos = 0
+    for m in _QUOTE_SPAN_RE.finditer(text):
+        quoted = m.group(1)
+        name = _render_path_name(quoted[1:-1])
+        if name is None:
+            continue
+        out.append(text[pos:m.start()])
+        out.append(name)
+        pos = m.end()
+    out.append(text[pos:])
+    text = "".join(out)
+
+    out = []
+    pos = 0
+    for m in _PATH_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        token = m.group(0)
+        # A sentence's trailing period is not part of the path; keep it
+        # after the replacement ("wrote /x/proof.py." -> "wrote
+        # `proof.py`."), it would otherwise make a file name look like a
+        # directory.
+        trailing = ""
+        while token.endswith("."):
+            trailing = "." + trailing
+            token = token[:-1]
+        end = _extend_path(text, m.start(), m.start() + len(token))
+        if end > m.start() + len(token):
+            token = text[m.start() : end]
+            while token.endswith("."):
+                trailing = "." + trailing
+                token = token[:-1]
+        replacement = _render_path_name(token)
+        if replacement is None:
+            continue
+        out.append(text[pos:m.start()])
+        out.append(replacement + trailing)
+        # ``end`` can sit before ``m.end()`` when trailing dots were
+        # stripped and re-appended after the replacement; the original
+        # dots must not render a second time.
+        pos = max(end, m.end())
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _scrub(text: str) -> str:
-    """Drop SHAs (with their introductory words) and file paths, then the
-    words left dangling by those drops."""
-    text = _remove_with_scaffold(_SHA_INTRO_RE, text)
-    text = _remove_with_scaffold(_SHA_RE, text, keep=lambda t: not _is_sha(t))
-    text = _remove_with_scaffold(_PATH_RE, text, keep=lambda t: not _is_file_path(t))
+    """Replace file paths with their short names, then drop SHAs (with
+    their introductory words), then the words left dangling by the drops.
+
+    Paths are replaced FIRST so a hash inside a path (a release dir named
+    ``hermes-agent-<sha>``) is shortened as part of the name instead of
+    being holed out by the SHA pass and leaving a broken file name; the
+    SHA pass then runs outside backticks only, so a hash a path
+    replacement put inside code spans stays part of the name.
+    """
+    text = _replace_paths(text)
+    text = _remove_shas_outside_code(text)
     text = _clean_hole_words(text)
     text = _drop_hollow_parens(text)
     text = _collapse_sentence(text)
@@ -282,14 +421,36 @@ def _scrub(text: str) -> str:
     return " ".join(text.split()).strip(" ,;:—–-&@")
 
 
+def _remove_shas_outside_code(text: str) -> str:
+    """Drop SHA tokens in the prose only, never inside ``backtick`` spans.
+
+    A path replacement can put a commit hash inside backticks (a release
+    dir named ``hermes-agent-07958b78``); that hash is part of the name
+    the reader needs, not machinery to scrub. Backticked text a worker
+    wrote themselves gets the same protection.
+    """
+    out: list[str] = []
+    for i, part in enumerate(text.split("`")):
+        if i % 2:  # inside a code span
+            out.append(part)
+        else:
+            part = _remove_with_scaffold(_SHA_INTRO_RE, part)
+            part = _remove_with_scaffold(_SHA_RE, part, keep=lambda t: not _is_sha(t))
+            out.append(part)
+    return "`".join(out)
+
+
 def _pr_ref_link(
     qual: Optional[str], number: str, repos: Mapping[str, Mapping[str, str]]
 ) -> Optional[tuple[str, str]]:
     """(label, url) for a PR reference, or None to leave it as written."""
     if qual:
         for owner_repo, numbers in repos.items():
-            if owner_repo.split("/", 1)[1] == qual.lower() and number in numbers:
-                return f"{qual} #{number}", numbers[number]
+            if owner_repo.split("/", 1)[1] == qual.lower().split("/", 1)[-1] and number in numbers:
+                # The link carries the owner; the label needs only the
+                # repo name, so "anombyte93/hermes-agent PR #120" renders
+                # as "hermes-agent #120", not "anombyte93/hermes-agent #120".
+                return f"{owner_repo.split('/', 1)[1]} #{number}", numbers[number]
         return None
     if len(repos) == 1:
         owner_repo, numbers = next(iter(repos.items()))
@@ -356,6 +517,18 @@ def plainwords_outcome(
                     seen.add(new_url)
             pieces = [(new_label, new_url)] if new_label else []
         for piece in pieces:
+            # A dropped duplicate can leave an opening paren at the end
+            # of the kept text and its partner after the link ("( ()");
+            # the pair goes, an aside that kept its words stays.
+            while out and piece[0] and out[-1][0].endswith("(") and (
+                piece[0].startswith(")") or piece[0].lstrip().startswith("()")
+            ):
+                out[-1] = (out[-1][0][: -1].rstrip(), out[-1][1])
+                if out and not out[-1][0]:
+                    out.pop()
+                piece = (piece[0].lstrip()[1:].lstrip(), piece[1])
+                if not piece[0]:
+                    break
             if out and piece[0] and out[-1][0]:
                 glue = out[-1][0][-1]
                 if not glue.isspace() and piece[0][0].isalnum():
@@ -448,8 +621,9 @@ def _first_sentences(visible: str, count: int = 2) -> tuple[int, bool]:
 def clip_outcome(text: str, limit: int = OUTCOME_LIMIT, budget: int = _SAFE_LIMIT) -> str:
     """Render ``text`` as one Discord line: masked links, clipped, no pings.
 
-    The plain-words pass (#112) runs first: git SHAs and file paths are
-    dropped with their scaffolding, and ``PR #N`` becomes ``repo #N`` when
+    The plain-words pass (#112) runs first: git SHAs are dropped with
+    their scaffolding, file paths are replaced by their short names,
+    and ``PR #N`` becomes ``repo #N`` when
     the outcome carries the repo's GitHub pull URL. ``limit`` bounds the
     *visible* length (link labels count, URLs do not); ``budget`` bounds
     the rendered length — links that would overflow it are emitted as
