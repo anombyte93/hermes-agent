@@ -1689,8 +1689,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
-def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
-    """Warn text when this call's board came only from ``<root>/kanban/current``.
+def _implicit_board(args: argparse.Namespace) -> Optional[str]:
+    """Board slug when this call's board came only from ``<root>/kanban/current``.
 
     That file is global: any session's ``boards switch`` (or a dashboard
     switch) rewrites it for every later caller with no ``--board`` and no
@@ -1705,6 +1705,13 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
     board, source = kb.resolve_current_board_with_source()
     if source != kb.BOARD_SOURCE_CURRENT_FILE or board == kb.DEFAULT_BOARD:
         return None
+    return board
+
+
+def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
+    board = _implicit_board(args)
+    if board is None:
+        return None
     return (
         f"kanban: no --board given; this card went to board {board!r} because "
         f"{kb.current_board_path()} (kanban/current, shared by every session) "
@@ -1713,7 +1720,45 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
     )
 
 
+def _require_explicit_board() -> "tuple[bool, str]":
+    """Return (flag value, config path consulted) for ``require_explicit_board``.
+
+    Fails closed: an unreadable config counts as ``True``. The path is the
+    one ``load_config`` reads (``hermes_cli.config.get_config_path``).
+    """
+    from hermes_cli.config import get_config_path
+
+    path = str(get_config_path())
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        value = cfg.get("kanban", {}).get("require_explicit_board", True)
+    except Exception:
+        value = True
+    return value is not False, path
+
+
+def _implicit_board_refusal(args: argparse.Namespace) -> Optional[str]:
+    """Fail closed unless config explicitly permits shared-current routing."""
+    board = _implicit_board(args)
+    if board is None:
+        return None
+    required, config_path = _require_explicit_board()
+    if not required:
+        return None
+    return (
+        f"kanban: refusing to use board {board!r} selected only by "
+        f"{kb.current_board_path()} (kanban/current, shared by every session). "
+        f"Pass --board {board}, export HERMES_KANBAN_BOARD={board}, or set "
+        f"kanban.require_explicit_board: false in {config_path} to proceed."
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1796,6 +1841,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
@@ -1816,6 +1865,9 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
+    implicit = _implicit_board_warning(args)
+    if implicit:
+        print(f"\u26a0  {implicit}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
     else:
@@ -2825,6 +2877,10 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile

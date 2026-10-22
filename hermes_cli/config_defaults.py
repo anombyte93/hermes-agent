@@ -2818,6 +2818,9 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Refuse CLI create/dispatch when only the shared kanban/current
+        # file selects a non-default board. False keeps legacy routing.
+        "require_explicit_board": True,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
