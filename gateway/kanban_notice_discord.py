@@ -14,11 +14,16 @@ Rules:
 
 * line 1: one state marker, then the title in bold (Markdown-escaped);
 * line 2: the outcome in plain words — git SHAs (with any ``at`` /
-  ``exact`` / ``head`` / ``@`` scaffolding), absolute and ``~/`` paths and
-  parentheses emptied by those drops are removed, ``PR #N`` references
-  render as ``repo #N`` (a masked link when the summary carries the repo's
-  GitHub pull URL), and at most the first two sentences are kept, cut at
-  a sentence or clause boundary never mid-word;
+  ``exact`` / ``head`` / ``@`` scaffolding), absolute and ``~/`` paths,
+  the connectors those drops leave dangling, parentheses emptied by
+  them and sentences reduced to the removed machinery are removed;
+  a bare hex token counts as a SHA only when it mixes letters and
+  digits (counts like ``10000000`` and words like ``deadbeef`` stay),
+  ``PR #N`` references render as ``repo #N`` once (a masked link when
+  the summary carries the repo's GitHub pull URL; a URL that only
+  restates an already-linked reference is dropped), and at most the
+  first two sentences are kept, cut at a sentence or clause boundary
+  never mid-word;
 * line 3: Discord subtext (``-# ``) with the card id, the assignee and the
   board only when it is not ``default``;
 * URLs never appear raw: a GitHub PR URL becomes ``[repo #N](url)`` and any
@@ -72,7 +77,13 @@ _CLAUSE_RE = re.compile(r"\s*(?:[,;:]|\s[—–-])(?=\s)")
 
 # --- plain-words pass (#112): machinery a phone reader does not want -------
 
-# A git SHA: 7 to 40 hex chars standing alone (never a decimal fraction).
+# Removed machinery is marked with a hole sentinel so later passes can see
+# what went missing and clean up the words it left dangling.
+_HOLE = "\x00"
+
+# A git SHA candidate: 7 to 40 hex chars standing alone (never a fraction).
+# Only a mixed token (a letter AND a digit) is taken for a SHA on its own;
+# pure numbers ("10000000") and pure words ("deadbeef") stay.
 _SHA_RE = re.compile(r"(?<![\d.])\b[0-9a-f]{7,40}\b")
 # The same SHA together with the words that only ever introduce one.
 _SHA_INTRO_RE = re.compile(
@@ -80,22 +91,33 @@ _SHA_INTRO_RE = re.compile(
     r"(?:0x\s*)?[0-9a-f]{7,40}\b",
     re.IGNORECASE,
 )
-# Trailing "at" / "head" / "exact head" left dangling before a removal point.
-_AT_HEAD_RE = re.compile(r"\b(?:exact\s+head|head|at)\s*\Z", re.IGNORECASE)
-# A dangling "@" (as in "stacked on #302 @ <sha>") immediately before a removal.
-_ORPHAN_AT_RE = re.compile(r"\s*@\s*\Z")
+# Trailing "at" / "head" / "exact head" left dangling beside a hole.
+_AT_HEAD_RE = re.compile(r"\b(?:exact\s+head|head|at)\s*" + _HOLE, re.IGNORECASE)
+# A dangling "@" (as in "stacked on #302 @ <sha>") immediately before a hole.
+_ORPHAN_AT_RE = re.compile(r"\s*@\s*" + _HOLE)
 # Absolute (starting "~" or "/") or multi-segment file paths. Single-slash
 # candidates without a file extension (origin/main, feat/foo) look like branch
 # refs and are kept; the path filter below decides.
 _PATH_RE = re.compile(r"(?<![\w~])(?:~/?|/?)[\w.-]+(?:/[\w.-]+)+")
 _EXT_RE = re.compile(r"\.\w{1,4}\Z")
+# A connector or comma run sitting between two holes went with them.
+_BETWEEN_HOLES_RE = re.compile(_HOLE + r"[\s,;]*(?:and|or|nor|but)?[\s,;]*(?=" + _HOLE + r")")
+# A preposition whose object was a hole ("renderer in <path>") goes too.
+_DANGLING_PREP_RE = re.compile(
+    r"\s+(?:in|on|at|to|into|from|with|by|of|for|via|using)\s+(?=" + _HOLE + r")"
+)
 # "PR #N", "moll-e PR #N", "pull request #N" — an optional repo qualifier.
 _PR_REF_RE = re.compile(r"\b(?:(\w[\w.-]*)\s+)?(?:PR|pr|pull request|pull)\s*#?(\d+)\b")
 _PR_LABEL_RE = re.compile(r"^PR #(\d+)$")
 _HOLLOW_PAREN_RE = re.compile(r"\(([^()]*)\)")
-_PAREN_CONNECTORS = frozenset({"which", "who", "and", "but", "so", "stacked"})
+_PAREN_LEAD_WORDS = frozenset({"which", "who", "and", "but", "so", "stacked"})
+# Words that only ever introduce dropped machinery inside a parenthetical.
+_PAREN_SEE_WORDS = frozenset({"see", "including", "via", "using", "at", "in", "on"})
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _TYPO_FIX_RE = re.compile(r"\b(\w+) (?:at|@) \1\b")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:!?)])")
+# A colon/comma left holding hands with the sentence's full stop.
+_ORPHAN_PUNCT_RE = re.compile(r"[\s,:;]+\s*(?=\.)")
 _GITHUB_PULL_URL_RE = re.compile(
     r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)(?:[/?#][^\s]*)?"
 )
@@ -164,26 +186,27 @@ def _pr_repos(segs: list[tuple[str, Optional[str]]]) -> dict[str, dict[str, str]
     return repos
 
 
+def _is_sha(token: str) -> bool:
+    """A SHA carries both hex letters and digits; "10000000" and "deadbeef"
+    are a count and a word, not commits, and stay."""
+    return any(c in "abcdef" for c in token.lower()) and any(c.isdigit() for c in token)
+
+
 def _remove_with_scaffold(
     rx: re.Pattern, text: str, keep=None
 ) -> str:
-    """Remove every ``rx`` match, absorbing a dangling ``at``/``head``/``@``
-    left beside the hole (``re-verify at <sha>``, ``#302 @ <sha>``)."""
+    """Remove every ``rx`` match, leaving a ``_HOLE`` sentinel that a later
+    pass trades for the dangling ``at``/``head``/``@`` scaffolding beside it
+    (``re-verify at <sha>``, ``#302 @ <sha>``) and the connectors between
+    holes.
+    """
     out: list[str] = []
     pos = 0
     for m in rx.finditer(text):
         if keep is not None and keep(m.group(0)):
             continue
-        start = m.start()
-        prefix = text[:start]
-        lead = _AT_HEAD_RE.search(prefix)
-        if lead:
-            start = lead.start()
-            prefix = text[:start]
-        at = _ORPHAN_AT_RE.search(prefix)
-        if at:
-            start = at.start()
-        out.append(text[pos:start])
+        out.append(text[pos : m.start()])
+        out.append(_HOLE)
         pos = m.end()
     out.append(text[pos:])
     return "".join(out)
@@ -201,11 +224,12 @@ def _is_file_path(token: str) -> bool:
 def _paren_is_machinery(inner: str) -> bool:
     """A parenthetical that only scaffolded dropped machinery goes too."""
     s = inner.strip()
-    if not s:
+    if not s or _HOLE in s:
         return True
-    if s[0] in ",;:&":
+    words = s.split()
+    if words[0].lower() in _PAREN_LEAD_WORDS or words[0].lower() in _PAREN_SEE_WORDS:
         return True
-    return s.split(None, 1)[0].lower() in _PAREN_CONNECTORS
+    return all(w.lower() in _PAREN_LEAD_WORDS | _PAREN_SEE_WORDS for w in words)
 
 
 def _drop_hollow_parens(text: str) -> str:
@@ -218,19 +242,47 @@ def _drop_hollow_parens(text: str) -> str:
     return text
 
 
-def _scrub(text: str) -> str:
-    """Drop SHAs (with their introductory words) and file paths."""
+def _clean_hole_words(text: str) -> str:
+    """Remove the words that only held removed machinery together: connectors
+    and commas between holes, and prepositions whose object was a hole."""
     prev = None
     while prev != text:
         prev = text
-        text = _remove_with_scaffold(_SHA_INTRO_RE, text)
-        text = _remove_with_scaffold(_SHA_RE, text)
-        text = _remove_with_scaffold(_PATH_RE, text, keep=lambda t: not _is_file_path(t))
-        text = _drop_hollow_parens(text)
-        text = _TYPO_FIX_RE.sub(r"\1", text)
-        text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
-        text = text.rstrip(" —–-,:;&@")
-    return " ".join(text.split())
+        text = _BETWEEN_HOLES_RE.sub(_HOLE, text)
+        text = _DANGLING_PREP_RE.sub("", text)
+        text = _AT_HEAD_RE.sub(_HOLE, text)
+        text = _ORPHAN_AT_RE.sub(_HOLE, text)
+    return text
+
+
+def _collapse_sentence(text: str) -> str:
+    """Drop a sentence the scrub emptied of content: when >=2 holes gutted it
+    down to a couple of filler words, what was removed WAS the sentence."""
+    kept = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        holes = sentence.count(_HOLE)
+        body = sentence.replace(_HOLE, " ")
+        words = [w for w in body.split() if any(ch.isalnum() for ch in w)]
+        if holes >= 2 and len(words) <= 2:
+            continue
+        kept.append(sentence)
+    return " ".join(kept)
+
+
+def _scrub(text: str) -> str:
+    """Drop SHAs (with their introductory words) and file paths, then the
+    words left dangling by those drops."""
+    text = _remove_with_scaffold(_SHA_INTRO_RE, text)
+    text = _remove_with_scaffold(_SHA_RE, text, keep=lambda t: not _is_sha(t))
+    text = _remove_with_scaffold(_PATH_RE, text, keep=lambda t: not _is_file_path(t))
+    text = _clean_hole_words(text)
+    text = _drop_hollow_parens(text)
+    text = _collapse_sentence(text)
+    text = text.replace(_HOLE, " ")
+    text = _TYPO_FIX_RE.sub(r"\1", text)
+    text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
+    text = _ORPHAN_PUNCT_RE.sub("", text)
+    return " ".join(text.split()).strip(" ,;:—–-&@")
 
 
 def _pr_ref_link(
@@ -283,7 +335,9 @@ def plainwords_outcome(
     A GitHub pull URL present anywhere in the outcome supplies the repo name,
     so ``PR #305`` plus the URL becomes the masked link ``moll-e #305``;
     without a URL the reference keeps the worker's own words. The same PR
-    is linked once — a later duplicate renders as its plain label.
+    is linked once — a duplicate link that only repeats an already-linked
+    reference (``PR #121: <url>``) is dropped with its introducing ``:``
+    rather than rendered as a second label.
     """
     repos = _pr_repos(segs)
     seen: set[str] = set()
@@ -295,17 +349,32 @@ def plainwords_outcome(
             new_label, new_url = _plain_link_label(label, url, repos)
             if new_url is not None:
                 if new_url in seen:
-                    new_url = None
+                    # Duplicate of an already-linked reference: when the
+                    # preceding prose ends with ':' or ',', the link was
+                    # only the reference restated, and both go.
+                    new_label, new_url = "", None
+                    if out and out[-1][1] is None and out[-1][0].rstrip().endswith((":", ",")):
+                        out[-1] = (out[-1][0].rstrip()[:-1].rstrip(), None)
                 else:
                     seen.add(new_url)
-            pieces = [(new_label, new_url)]
+            pieces = [(new_label, new_url)] if new_label else []
         for piece in pieces:
             if out and piece[0] and out[-1][0]:
                 glue = out[-1][0][-1]
                 if not glue.isspace() and piece[0][0].isalnum():
                     out.append((" ", None))
             out.append(piece)
-    return [(label, url) for label, url in out if label]
+    # Drop segments emptied by the duplicate fix, and a now-dangling colon
+    # at the end of the kept text.
+    out = [(label, url) for label, url in out if label]
+    while out and out[-1][1] is None and out[-1][0].rstrip().endswith((":", ",", " ")):
+        stripped = out[-1][0].rstrip().rstrip(":,").rstrip()
+        if not stripped:
+            out.pop()
+        else:
+            out[-1] = (stripped, None)
+            break
+    return out
 
 
 def _segments(text: str) -> list[tuple[str, Optional[str]]]:

@@ -236,9 +236,12 @@ def test_pr_reference_links_when_url_present():
         "c324d57056432526a380efb42eded5cb29bb1cf5 "
         "https://github.com/anombyte93/moll-e/pull/304.",
     )
+    # The prose reference becomes the masked link; the URL segment that
+    # trailed it was the same PR restated, so it is dropped (F1), not
+    # rendered again as a plain label.
     assert _render("completed", {"summary": summary}).splitlines()[1] == (
         "PASS on [moll-e #304](https://github.com/anombyte93/moll-e/pull/304) "
-        "re-verify moll-e #304. Merge of origin/main is clean."
+        "re-verify. Merge of origin/main is clean."
     )
 
 
@@ -276,12 +279,64 @@ def test_paths_are_dropped_from_outcome():
         "Fixed the renderer in gateway/kanban_notice_discord.py and updated "
         "~/atlas/worktrees/moll-e/docs; /tmp/build.log stays behind."
     )
+    # Paths go, and so do the words they left dangling: the "in" that led
+    # into the first path and the ";" that only separated paths (F3).
     body = _render("completed", {"summary": summary}).splitlines()[1]
-    assert body == "Fixed the renderer in and updated; stays behind."
+    assert body == "Fixed the renderer and updated stays behind."
 
 
 def test_branch_refs_survive_the_path_filter():
     summary = "Merge of origin/main into feat/110-112-on-deployed is clean."
     body = _render("completed", {"summary": summary}).splitlines()[1]
     assert body == "Merge of origin/main into feat/110-112-on-deployed is clean."
+
+
+# ------------------------------- edge cases (review findings on #121, F1-F3)
+
+
+_DOUBLED_LABEL_SUMMARY = (
+    "Opened hermes-agent PR #121: "
+    "https://github.com/anombyte93/hermes-agent/pull/121 (head 30e81b5c...)."
+)
+
+
+def test_f1_pr_label_renders_once_not_twice():
+    # The prose reference becomes the masked link; the link segment that
+    # followed "PR #121:" was the same reference restated, so it goes with
+    # its introducing colon instead of rendering the label a second time.
+    body = _render("completed", {"summary": _DOUBLED_LABEL_SUMMARY}).splitlines()[1]
+    assert body == (
+        "Opened [hermes-agent #121]"
+        "(https://github.com/anombyte93/hermes-agent/pull/121)."
+    )
+
+
+def test_f2_pure_numbers_and_words_are_not_shas():
+    # A bare hex token is dropped only when it mixes hex letters and digits;
+    # a count ("10000000") and a word ("deadbeef") are not commits and stay.
+    assert _render("completed", {"summary": "Moved 10000000 rows"}).splitlines()[1] == (
+        "Moved 10000000 rows"
+    )
+    assert _render("completed", {"summary": "deadbeef module"}).splitlines()[1] == (
+        "deadbeef module"
+    )
+
+
+def test_f2_sha_intro_words_still_drop_the_sha():
+    # "head" / "at" / "@" / "commit" only ever introduce a SHA, so the token
+    # after them drops even when it is pure letters or pure digits.
+    summary = (
+        "Re-verified at head 1111111 and pushed commit aaaaaaa "
+        "(head 30e81b5c681fc31ab342ae32910a592992cb5f38)."
+    )
+    assert _render("completed", {"summary": summary}).splitlines()[1] == "Re-verified and pushed."
+
+
+def test_f3_no_dangling_connectors_or_emptied_parens():
+    # When paths are removed, the connectors between them and the
+    # parenthetical they emptied go too. A sentence whose whole content was
+    # the removed machinery carries no plain-words information, so it is
+    # dropped rather than padded with a synthesised file count.
+    summary = "Wrote /home/x/foo.py and ~/x/y.md (see gateway/a.py). Done."
+    assert _render("completed", {"summary": summary}).splitlines()[1] == "Done."
 
