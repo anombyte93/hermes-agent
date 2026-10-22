@@ -1720,24 +1720,37 @@ def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
     )
 
 
+def _require_explicit_board() -> "tuple[bool, str]":
+    """Return (flag value, config path consulted) for ``require_explicit_board``.
+
+    Fails closed: an unreadable config counts as ``True``. The path is the
+    one ``load_config`` reads (``hermes_cli.config.get_config_path``).
+    """
+    from hermes_cli.config import get_config_path
+
+    path = str(get_config_path())
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        value = cfg.get("kanban", {}).get("require_explicit_board", True)
+    except Exception:
+        value = True
+    return value is not False, path
+
+
 def _implicit_board_refusal(args: argparse.Namespace) -> Optional[str]:
     """Fail closed unless config explicitly permits shared-current routing."""
     board = _implicit_board(args)
     if board is None:
         return None
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        require_explicit = cfg.get("kanban", {}).get("require_explicit_board", True)
-    except Exception:
-        require_explicit = True
-    if require_explicit is False:
+    required, config_path = _require_explicit_board()
+    if not required:
         return None
     return (
         f"kanban: refusing to use board {board!r} selected only by "
         f"{kb.current_board_path()} (kanban/current, shared by every session). "
         f"Pass --board {board}, export HERMES_KANBAN_BOARD={board}, or set "
-        "kanban.require_explicit_board: false in config.yaml to proceed."
+        f"kanban.require_explicit_board: false in {config_path} to proceed."
     )
 
 
@@ -1828,6 +1841,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
@@ -1848,6 +1865,9 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
+    implicit = _implicit_board_warning(args)
+    if implicit:
+        print(f"\u26a0  {implicit}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
     else:

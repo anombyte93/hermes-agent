@@ -404,6 +404,42 @@ class TestExplicitBoardRequired:
         json.loads(r.stdout)
         assert "kanban/current" not in r.stderr
 
+    def test_refusal_names_config_file_consulted(self, switched_home):
+        r = _cli(["create", "refused"])
+        assert r.returncode == 2
+        assert f"in {switched_home / 'config.yaml'} to proceed" in r.stderr
+
+    SWARM = ["swarm", "goal", "--worker", "dev:part", "--verifier", "dev", "--synthesizer", "dev"]
+
+    def test_swarm_refused_without_cards(self, switched_home):
+        r = _cli(self.SWARM + ["--json"])
+        assert r.returncode == 2, (r.stdout, r.stderr)
+        assert r.stdout == ""
+        assert "board 'other'" in r.stderr
+        assert str(switched_home / "config.yaml") in r.stderr
+        for board in ("default", "other"):
+            with kb.connect_closing(board=board) as conn:
+                assert kb.list_tasks(conn) == []
+
+    def test_swarm_with_board_flag_proceeds(self, switched_home):
+        r = _cli(["--board", "other"] + self.SWARM + ["--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        with kb.connect_closing(board="other") as conn:
+            assert len(kb.list_tasks(conn)) == 4
+        with kb.connect_closing(board="default") as conn:
+            assert kb.list_tasks(conn) == []
+
+    def test_swarm_opt_out_warns_and_proceeds(self, switched_home):
+        (switched_home / "config.yaml").write_text(
+            "kanban:\n  require_explicit_board: false\n", encoding="utf-8"
+        )
+        r = _cli(self.SWARM + ["--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        assert "board 'other'" in r.stderr
+        assert "kanban/current" in r.stderr
+
     @pytest.mark.parametrize("env_board", ["missing-board", "invalid/board"])
     def test_invalid_env_pin_does_not_bypass_refusal(self, switched_home, monkeypatch, env_board):
         monkeypatch.setenv("HERMES_KANBAN_BOARD", env_board)
