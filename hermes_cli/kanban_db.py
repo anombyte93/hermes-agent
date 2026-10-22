@@ -10521,10 +10521,40 @@ def _note_nonspawnable(
         )
 
 
+def _worker_skill_scope(workspace_path: Optional[str]) -> Optional[str]:
+    """Directory a worker for this workspace would resolve project skills from.
+
+    The worker is spawned with ``TERMINAL_CWD=<workspace>``, so trusted
+    ``.hermes/skills`` / ``.agents/skills`` of the enclosing project checkout
+    are visible to it. Returns that project root (or the workspace itself
+    when it is not inside a checkout), or ``None`` when the workspace is not
+    an existing absolute directory (the worker would not pin it either).
+    """
+    if not workspace_path or not os.path.isabs(workspace_path):
+        return None
+    if not os.path.isdir(workspace_path):
+        return None
+    try:
+        from agent.skill_utils import find_project_root
+
+        root = find_project_root(Path(workspace_path))
+    except Exception:
+        root = None
+    return str(root) if root is not None else workspace_path
+
+
 def _missing_worker_skills(
-    skill_identifiers: Optional[list[str]], assignee: str
+    skill_identifiers: Optional[list[str]],
+    assignee: str,
+    workspace_cwd: Optional[str] = None,
 ) -> list[str]:
-    """Resolve forced skills in the assignee profile without mutating process env."""
+    """Resolve forced skills in the assignee profile as the worker would.
+
+    The profile home is overridden for the duration of the call. When
+    ``workspace_cwd`` is given, ``TERMINAL_CWD`` is pinned to it as well (and
+    restored afterwards) so trusted project-local skills of the task workspace
+    resolve exactly as they do in the spawned worker.
+    """
     if not skill_identifiers:
         return []
 
@@ -10537,6 +10567,11 @@ def _missing_worker_skills(
         return list(dict.fromkeys(skill_identifiers))
 
     token = set_hermes_home_override(profile_home)
+    _cwd_set = False
+    _prev_cwd = os.environ.get("TERMINAL_CWD")
+    if workspace_cwd:
+        os.environ["TERMINAL_CWD"] = workspace_cwd
+        _cwd_set = True
     try:
         import json
 
@@ -10558,6 +10593,11 @@ def _missing_worker_skills(
                 missing.append(name)
         return missing
     finally:
+        if _cwd_set:
+            if _prev_cwd is None:
+                os.environ.pop("TERMINAL_CWD", None)
+            else:
+                os.environ["TERMINAL_CWD"] = _prev_cwd
         reset_hermes_home_override(token)
 
 
@@ -10736,7 +10776,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, workspace_path FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10751,18 +10791,47 @@ def _dispatch_once_locked(
     # full budget. "Spawnable" mirrors the review loop's own gate
     # (assigned + real profile) so a review column full of human-pulled
     # control-plane lanes doesn't permanently tax ready throughput.
+    #
+    # A review whose assignee cannot load the mandatory ``sdlc-review`` skill
+    # is parked (the review loop skips it), so it must not hold the slot
+    # either: otherwise at ``max_in_progress=1`` one parked card would starve
+    # every ready card forever. The skill check is resolved ONCE per
+    # (assignee, project scope) per tick, here, and the review loop reuses
+    # the result: skill resolution reads the profile's skills tree and runs
+    # under the dispatch lock, so it must not scale with the card count.
+    try:
+        from hermes_cli.profiles import profile_exists as _rpe
+    except Exception:
+        _rpe = None  # type: ignore[assignment]
+
+    def _review_scope(row) -> tuple[str, Optional[str]]:
+        cwd = _worker_skill_scope(row["workspace_path"])
+        return (row["assignee"], cwd), cwd
+
+    review_missing: dict[tuple[str, Optional[str]], list[str]] = {}
+    for row in review_rows:
+        if not row["assignee"]:
+            continue
+        if _rpe is not None and not _rpe(row["assignee"]):
+            continue
+        key, cwd = _review_scope(row)
+        if key not in review_missing:
+            review_missing[key] = _missing_worker_skills(
+                ["sdlc-review"], row["assignee"], cwd
+            )
+
     def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+        # "Spawnable" = assigned, a real profile (or no profiles module —
+        # test stubs, exotic envs — matching the review loop's own
+        # fallback), and able to load the review skill.
+        for row in review_rows:
+            if not row["assignee"]:
+                continue
+            if _rpe is not None and not _rpe(row["assignee"]):
+                continue
+            if not review_missing.get(_review_scope(row)[0]):
+                return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
@@ -11053,7 +11122,7 @@ def _dispatch_once_locked(
         # Check the mandatory review skill in the worker's profile BEFORE
         # claiming: an unavailable skill must not create a run or boot a
         # worker that will fail (or silently review without its guidance).
-        missing_skills = _missing_worker_skills(["sdlc-review"], row["assignee"])
+        missing_skills = review_missing.get(_review_scope(row)[0], [])
         if missing_skills:
             result.rejected_skills.append((row["id"], missing_skills))
             if not dry_run:

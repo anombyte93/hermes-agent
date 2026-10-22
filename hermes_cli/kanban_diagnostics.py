@@ -957,15 +957,21 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
 
 def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
     """A READY card cannot dispatch because its assignee cannot load one or
-    more force-requested skills.
+    more force-requested skills; or a REVIEW card is parked because its
+    assignee cannot load the mandatory review skill (``review_unavailable``).
 
     Dispatch deliberately remains fail-closed: the operator must install the
     skills, fix their identifiers, or reassign to a profile that can load them.
     The event is durable and this rule stays active for as long as the card is
     READY. Once a successful dispatch changes status, it auto-clears.
     """
-    if _task_field(task, "status") != "ready":
+    status = _task_field(task, "status")
+    if status not in {"ready", "review"}:
         return []
+    # A READY card is refused with ``skill_rejected``; a card parked in REVIEW
+    # (its assignee cannot load the mandatory ``sdlc-review`` skill) with
+    # ``review_unavailable``. Only the event matching the card's lane counts.
+    refusal_kind = "review_unavailable" if status == "review" else "skill_rejected"
 
     latest = None
     # A refusal is active only until the task contract/owner changes or a
@@ -973,7 +979,7 @@ def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
     # from diagnosing a card that was subsequently reclaimed back to READY.
     for ev in events:
         kind = _event_kind(ev)
-        if kind == "skill_rejected":
+        if kind == refusal_kind:
             latest = ev
         elif kind in {
             "assigned", "edited", "claimed", "spawned", "reclaimed",
@@ -984,7 +990,7 @@ def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
     rejected = [
         ev for ev in events
-        if _event_kind(ev) == "skill_rejected" and _event_ts(ev) == _event_ts(latest)
+        if _event_kind(ev) == refusal_kind and _event_ts(ev) == _event_ts(latest)
     ]
     payload = _parse_payload(latest)
     assignee = str(payload.get("assignee") or _task_field(task, "assignee") or "")
@@ -994,17 +1000,29 @@ def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
     missing = [str(name) for name in missing]
     ts = _event_ts(latest)
 
-    return [Diagnostic(
-        kind="skill_rejected",
-        severity="error",
-        title="Forced skills unavailable",
-        detail=(
+    if status == "review":
+        title = "Review skill unavailable"
+        detail = (
+            f"This task is parked in review because profile {assignee!r} "
+            f"cannot load the required review skill(s): {', '.join(missing)}. "
+            "No review worker is started. Install the skill in that profile, "
+            "or reassign the task to a profile that can load it; dispatch "
+            "resumes on the next tick."
+        )
+    else:
+        title = "Forced skills unavailable"
+        detail = (
             f"This task remains ready because assignee {assignee!r} cannot "
             f"load the forced skill(s): {', '.join(missing)}. Install or fix "
             "the requested skills, or reassign the task to a profile that "
             "can load them. The dispatcher will not silently weaken the "
             "requested skill contract."
-        ),
+        )
+    return [Diagnostic(
+        kind=refusal_kind,
+        severity="error",
+        title=title,
+        detail=detail,
         actions=[
             DiagnosticAction(
                 kind="reassign",
