@@ -5,8 +5,9 @@ task, a cron unblocks it, the worker re-blocks for the same reason, repeat
 forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 ``block_recurrences`` counter:
 
-* ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
-  never enter the human ``blocked`` bucket a cron would keep unblocking.
+* ``dependency`` blocks route to ``todo`` only while a parent is unfinished;
+  otherwise they land in the human ``blocked`` bucket.
+* Every kind participates in the same-cause recurrence limit.
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
@@ -84,6 +85,68 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("parent_status", [None, "done", "archived"])
+def test_dependency_without_unsatisfied_parents_stays_blocked(
+    kanban_home: Path, parent_status: str | None,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        if parent_status is not None:
+            parent = kb.create_task(conn, title="parent", assignee="worker")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status=? WHERE id=?", (parent_status, parent),
+                )
+            kb.link_tasks(conn, parent_id=parent, child_id=tid)
+
+        assert kb.block_task(conn, tid, reason="question", kind="dependency")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_reason == "question"
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "blocked"
+        assert not any(e.kind == "dependency_wait" for e in kb.list_events(conn, tid))
+
+
+@pytest.mark.parametrize("waiting_on_parent", [False, True])
+def test_repeated_dependency_block_routes_to_triage(
+    kanban_home: Path, waiting_on_parent: bool,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        parent = None
+        if waiting_on_parent:
+            parent = _running_task(conn, title="parent")
+            kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        assert kb.block_task(conn, tid, reason="wait", kind="dependency")
+
+        if parent is not None:
+            assert kb.complete_task(conn, parent, result="done")
+            kb.recompute_ready(conn)
+        else:
+            kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        if waiting_on_parent:
+            next_parent = kb.create_task(conn, title="next parent", assignee="worker")
+            kb.link_tasks(conn, parent_id=next_parent, child_id=tid)
+
+        assert kb.block_task(conn, tid, reason="wait", kind="dependency")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert task.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+        assert events
+        payload = events[-1].payload or {}
+        assert payload["kind"] == "dependency"
+        assert payload["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "triage"
+
+
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kbc.connect_closing() as conn:
@@ -91,6 +154,11 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         child = _running_task(conn, title="child")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
         kb.block_task(conn, child, reason="wait", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        events = [e for e in kb.list_events(conn, child) if e.kind == "dependency_wait"]
+        assert events
+        assert (events[-1].payload or {})["kind"] == "dependency"
+        kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
         with kb.write_txn(conn):
