@@ -90,6 +90,9 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
+# Dependency waits use todo only with an unfinished parent, without counting
+# recurrences. With no unfinished parent they block for a human and count
+# toward the same recurrence limit as other kinds.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Stamped onto legacy blocked rows during migration: their true cause is not
 # recoverable, so persist an explicit unknown label rather than guessing.
@@ -950,9 +953,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- larger boards.
     session_id           TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
+    -- NULL for legacy/un-typed blocks). ``dependency`` goes to ``todo`` only
+    -- with an unfinished parent; otherwise it goes to ``blocked`` for a human,
+    -- like the other kinds. Preserved across unblock so a re-block for
     -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
