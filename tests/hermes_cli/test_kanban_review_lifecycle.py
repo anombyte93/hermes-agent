@@ -35,8 +35,24 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for name in ("worker", "reviewer"):
+        _review_profile(home, name)
     kb.init_db()
     return home
+
+
+def _review_profile(home: Path, name: str, *, with_skill: bool = True) -> Path:
+    profile = home / "profiles" / name
+    profile.mkdir(parents=True, exist_ok=True)
+    if with_skill:
+        skill = profile / "skills" / "development" / "sdlc-review" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            "---\nname: sdlc-review\ndescription: Review a change.\n---\n"
+            "Verify the change against its acceptance criteria.\n",
+            encoding="utf-8",
+        )
+    return profile
 
 
 def _row(conn, tid):
@@ -525,6 +541,124 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
     assert task_id in [task[0] for task in result.spawned]
     assert captured == [["domain-specific-review", "sdlc-review"]]
+
+
+def test_review_dispatch_loads_skill_from_assignee_profile(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile = _review_profile(kanban_home, "review-specialist")
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    captured = []
+
+    def spawn(task, workspace):
+        token = set_hermes_home_override(profile)
+        try:
+            prompt, loaded, missing = build_preloaded_skills_prompt(task.skills)
+        finally:
+            reset_hermes_home_override(token)
+        assert prompt
+        assert loaded == ["sdlc-review"]
+        assert missing == []
+        captured.append(list(task.skills))
+        return None
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="available reviewer", assignee="review-specialist",
+            skills=["sdlc-review"],
+        )
+        assert kb.request_review(conn, tid, summary="ready")
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert [item[0] for item in result.spawned] == [tid]
+        assert captured == [["sdlc-review"]]
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id is not None
+        assert not _events(conn, tid, "review_unavailable")
+
+
+@pytest.mark.parametrize("unavailable", ["absent", "disabled"])
+@pytest.mark.parametrize("recovery", ["profile", "assignee"])
+def test_review_dispatch_missing_skill_stays_in_review_without_a_run(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unavailable: str,
+    recovery: str,
+) -> None:
+    import os
+
+    from hermes_constants import get_hermes_home
+
+    profile_name = "reviewer-without-skill"
+    profile = _review_profile(
+        kanban_home, profile_name, with_skill=unavailable == "disabled",
+    )
+    if unavailable == "disabled":
+        (profile / "config.yaml").write_text(
+            "skills:\n  disabled:\n    - sdlc-review\n", encoding="utf-8",
+        )
+    # A skill loadable by the dispatcher must not leak into the assignee.
+    skill = kanban_home / "skills" / "sdlc-review" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: sdlc-review\n---\nReview.\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    captured = []
+
+    def spawn(task, workspace):
+        captured.append((task.assignee, list(task.skills or [])))
+        return None
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review safely", assignee=profile_name)
+        assert kb.request_review(conn, tid, summary="implementation ready")
+        before_runs = kb.list_runs(conn, tid)
+        before_events = _events(conn, tid)
+
+        preview = kb.dispatch_once(conn, dry_run=True, spawn_fn=spawn)
+        assert not preview.spawned
+        assert _events(conn, tid) == before_events
+
+        for _ in range(3):
+            result = kb.dispatch_once(conn, spawn_fn=spawn)
+            assert not result.spawned
+            assert not result.crashed
+            assert not result.auto_blocked
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "review"
+            assert task.assignee == profile_name
+            assert task.current_run_id is None
+            assert task.claim_lock is None
+            assert task.worker_pid is None
+            assert kb.list_runs(conn, tid) == before_runs
+            assert get_hermes_home() == kanban_home
+            assert os.environ["HERMES_HOME"] == str(kanban_home)
+
+        assert captured == []
+        events = _events(conn, tid, "review_unavailable")
+        assert len(events) == 1
+        assert events[0][1] is not None
+        reason = events[0][1]["reason"]
+        assert "sdlc-review" in reason
+        assert profile_name in reason
+        assert not _events(conn, tid, "crashed")
+        assert not _events(conn, tid, "claimed")
+
+        if recovery == "profile":
+            _review_profile(kanban_home, profile_name)
+            (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+        else:
+            assert kb.assign_task(conn, tid, "reviewer")
+
+        resumed = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert [item[0] for item in resumed.spawned] == [tid]
+        expected_profile = profile_name if recovery == "profile" else "reviewer"
+        assert captured == [(expected_profile, ["sdlc-review"])]
+        assert kb.get_task(conn, tid).status == "running"
+        assert len(kb.list_runs(conn, tid)) == len(before_runs) + 1
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(

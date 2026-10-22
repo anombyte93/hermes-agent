@@ -10367,26 +10367,37 @@ def _append_skill_rejected_event(
     task_id: str,
     assignee: str,
     missing_skills: list[str],
+    *,
+    lane: str = "ready",
 ) -> None:
     """Record a forced-skill refusal as a durable ``skill_rejected`` event,
     rate-limited to one event per unchanged refusal streak (#20).
+
+    The review lane uses ``review_unavailable`` with a named reason instead.
 
     A dispatch tick that rejects the same task for the same assignee and the
     same missing skill set appends nothing — the first event already says
     everything, and the default 60s dispatcher loop would otherwise spam an
     unbounded stream of identical rows. A changed assignee or skill set, or a
     fresh refusal after an intervening claim/spawn, IS a new refusal and is
-    recorded again. The payload is deliberately minimal — assignee and missing
-    skill names only; the task id is the event row's own identity.
+    recorded again. The payload contains the assignee and missing skill names,
+    plus a reason for review refusals; the task id is the event row's identity.
     """
+    event_kind = "review_unavailable" if lane == "review" else "skill_rejected"
+    payload = {"assignee": assignee, "missing_skills": sorted(missing_skills)}
+    if lane == "review":
+        payload["reason"] = (
+            f"Profile '{assignee}' cannot load required review skill(s): "
+            + ", ".join(sorted(missing_skills))
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
+            "WHERE task_id = ? AND kind IN (?, 'claimed', 'spawned') "
             "ORDER BY id DESC LIMIT 1",
-            (task_id,),
+            (task_id, event_kind),
         ).fetchone()
-        if row is not None and row["kind"] == "skill_rejected":
+        if row is not None and row["kind"] == event_kind:
             try:
                 prev = json.loads(row["payload"] or "{}")
             except Exception:
@@ -10400,8 +10411,8 @@ def _append_skill_rejected_event(
         _append_event(
             conn,
             task_id,
-            "skill_rejected",
-            {"assignee": assignee, "missing_skills": sorted(missing_skills)},
+            event_kind,
+            payload,
         )
 
 
@@ -11038,6 +11049,17 @@ def _dispatch_once_locked(
             _note_nonspawnable(
                 conn, row["id"], row["assignee"], dry_run=dry_run, lane="review"
             )
+            continue
+        # Check the mandatory review skill in the worker's profile BEFORE
+        # claiming: an unavailable skill must not create a run or boot a
+        # worker that will fail (or silently review without its guidance).
+        missing_skills = _missing_worker_skills(["sdlc-review"], row["assignee"])
+        if missing_skills:
+            result.rejected_skills.append((row["id"], missing_skills))
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row["assignee"], missing_skills, lane="review"
+                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

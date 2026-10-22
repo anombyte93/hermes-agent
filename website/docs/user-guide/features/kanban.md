@@ -244,6 +244,8 @@ kanban:
                                    # for human-only review boards.
 ```
 
+If the assignee profile cannot load `sdlc-review`, the card stays in `review` without a worker run; a deduplicated `review_unavailable` event names the profile and missing skill, and dispatch resumes once the profile can load it or the card is reassigned to one that can.
+
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the
