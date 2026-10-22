@@ -6391,8 +6391,9 @@ def block_task(
     * ``dependency`` — while a parent is unfinished, the task goes to ``todo``
       so ``recompute_ready`` promotes it automatically once its parents finish.
       With no unfinished parents it lands in ``blocked`` for a human instead
-      of immediately re-entering the work pool. Dependency blocks participate
-      in the same recurrence limit as every other kind.
+      of immediately re-entering the work pool. A genuine wait never counts
+      toward the recurrence limit (it holds in ``todo`` and cannot spin); only
+      the parentless path counts recurrences and escalates to ``triage``.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -6444,18 +6445,12 @@ def block_task(
             else 0
         )
 
-        # Count every kind before routing, including genuine dependency waits.
-        # Preserve the existing same-kind definition of a recurring cause.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
-
         # Only wait in todo when there is actually an unfinished parent.
         # Otherwise recompute_ready would immediately re-promote the task.
-        if (
-            kind == "dependency"
-            and recurrences < BLOCK_RECURRENCE_LIMIT
-            and not _parents_satisfied(conn, task_id)
-        ):
+        # A genuine wait holds in todo until a parent finishes, so it cannot
+        # spin and is neither counted nor limited: the counter is carried
+        # over unchanged.
+        if kind == "dependency" and not _parents_satisfied(conn, task_id):
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6468,8 +6463,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, prev_recurrences, task_id) if expected_run_id is None
+                else (kind, prev_recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6501,6 +6496,11 @@ def block_task(
                 reason=reason,
             )
             return True
+
+        # Parentless paths (and every other kind) count recurrences. Preserve
+        # the existing same-kind definition of a recurring cause.
+        same_cause = prev_kind == kind
+        recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
