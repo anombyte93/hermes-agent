@@ -298,9 +298,12 @@ _SPECS = [
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
-             help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
-                  "parents finish, no human); 'needs_input'/'capability' go to "
-                  "blocked for a human; 'transient' marks a maybe-flaky failure. "
+             help="Typed block reason. 'dependency' only when this card has an "
+                  "unfinished parent card (it waits in todo and is auto-promoted "
+                  "when the parents finish); with none it lands in blocked for a "
+                  "human. A question for whoever filed the card is "
+                  "kind='needs_input'. 'needs_input'/'capability' go to blocked "
+                  "for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),

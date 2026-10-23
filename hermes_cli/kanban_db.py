@@ -90,6 +90,9 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
+# Dependency waits use todo only with an unfinished parent, without counting
+# recurrences. With no unfinished parent they block for a human and count
+# toward the same recurrence limit as other kinds.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Stamped onto legacy blocked rows during migration: their true cause is not
 # recoverable, so persist an explicit unknown label rather than guessing.
@@ -950,9 +953,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- larger boards.
     session_id           TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
+    -- NULL for legacy/un-typed blocks). ``dependency`` goes to ``todo`` only
+    -- with an unfinished parent; otherwise it goes to ``blocked`` for a human,
+    -- like the other kinds. Preserved across unblock so a re-block for
     -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
@@ -3499,6 +3502,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            parents_satisfied=_parents_satisfied(conn, task_id),
         )
         sql = f"""
                 UPDATE tasks
@@ -3522,7 +3526,7 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        if event_kind == "dependency_wait":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
             return True
@@ -3532,13 +3536,13 @@ def block_task(
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, parents_satisfied: bool,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
-    ``dependency`` never enters the human ``blocked`` bucket: it waits in
-    ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Every other kind counts unblock-loop
+    ``dependency`` waits in ``todo`` only while a parent is unfinished;
+    otherwise it lands in ``blocked`` for a human. A genuine wait cannot spin
+    and keeps the recurrence counter unchanged. Other paths count unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
@@ -3546,8 +3550,9 @@ def _route_block(
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
-    if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+    if kind == "dependency" and not parents_satisfied:
+        set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+        return "todo", "dependency_wait", set_sql, (kind, prev_recurrences), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
