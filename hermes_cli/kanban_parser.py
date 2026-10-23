@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import secrets
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -60,7 +61,9 @@ def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
     The two forms are alternatives; both at once is refused, never a silent
     pick. An explicitly given empty ``--reason ""`` counts as given, so it never
     silently yields to the positional words. Returns None when there is no
-    conflict.
+    conflict. The text names the two forms by label only and never echoes a
+    reason value: a reason can carry a secret, and the ``/kanban`` reply goes
+    back to a chat surface (review r1 of the #133 Codex fix).
     """
     if flag is None:
         return None
@@ -71,7 +74,8 @@ def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
     hint = ("; with --reason the only trailing words allowed are task ids (t_...)"
             if verb in _BULK_REASON_VERBS else "")
     return (f"pass the reason either as trailing words or as --reason, not both "
-            f"(positional: {' '.join(text)!r}; --reason: {flag.strip()!r}){hint}")
+            f"({len(text)} trailing reason word(s) and --reason were both given; "
+            f"reason text is not shown){hint}")
 
 
 def ids_not_task_ids(verb: str, ids) -> Optional[str]:
@@ -87,9 +91,28 @@ def ids_not_task_ids(verb: str, ids) -> Optional[str]:
     bad = [w for w in (ids or ()) if not _TASK_ID_RE.match(w)]
     if not bad:
         return None
-    return (f"--ids takes task ids only (t_...), and {' '.join(bad)!r} is not one; "
-            f"nothing was changed. A reason is never read after --ids: pass it with "
-            f"--reason, or put the words before --ids")
+    return f"{len(bad)} word(s) after --ids are not task ids; {_IDS_ONLY_HINT}"
+
+
+# Shared tail of every ``--ids`` refusal. Never echoes the offending word: it is
+# usually a misplaced reason, and a reason can carry a secret.
+_IDS_ONLY_HINT = ("--ids takes task ids only (t_...), and the offending text is not "
+                  "shown; nothing was changed. A reason is never read after --ids: "
+                  "pass it with --reason, or put the words before --ids")
+
+
+def task_id_word(value: str) -> str:
+    """argparse ``type`` for ``--ids``: refuse a non-id word per occurrence.
+
+    argparse keeps only the LAST ``--ids`` occurrence, so a check on the parsed
+    namespace misses a reason hidden in an earlier one
+    (``schedule T --ids U "later" --ids V``). Validating every word as it is
+    read closes that before any replacement (review r1 of the #133 Codex fix).
+    ``ArgumentTypeError`` keeps argparse from echoing the value.
+    """
+    if not _TASK_ID_RE.match(value):
+        raise argparse.ArgumentTypeError(f"a word is not a task id; {_IDS_ONLY_HINT}")
+    return value
 
 
 def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
@@ -119,7 +142,11 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
         leaf = self._name_parser_map[parser_name]
         # parse_known_intermixed_args raises TypeError for parsers holding
         # subparsers or REMAINDER/PARSER positionals; these four verbs have none.
+        arg_strings, unshield = _shield_after_separator(arg_strings)
         subnamespace, extras = leaf.parse_known_intermixed_args(arg_strings, None)
+        for key, value in vars(subnamespace).items():
+            setattr(subnamespace, key, unshield(value))
+        extras = unshield(extras)
         for key, value in vars(subnamespace).items():
             setattr(namespace, key, value)
         conflict = reason_usage_error(parser_name, getattr(subnamespace, "reason", None),
@@ -132,6 +159,38 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
             if not hasattr(namespace, unrecognized):
                 setattr(namespace, unrecognized, [])
             getattr(namespace, unrecognized).extend(extras)
+
+
+def _shield_after_separator(arg_strings):
+    """Keep every token after the first ``--`` positional under intermixed parsing.
+
+    On Python 3.11 ``parse_known_intermixed_args`` loses a leading ``--``: its
+    first pass (positionals suppressed) consumes the separator, so
+    ``schedule -- T --ids U --reason X`` parsed ``--ids``/``--reason`` as
+    options and scheduled U too (review r1 of the #133 Codex fix). It also
+    drops a later literal ``--``. Each token after the separator is swapped for
+    an opaque placeholder that can never look like an option, the separator
+    itself stays (so an option right before it still cannot take a value from
+    past it), and ``unshield`` maps a parsed value (a string or a list of
+    them) back to the original words. Returns ``(arg_strings, unshield)``; with
+    no separator both are no-ops.
+    """
+    if "--" not in arg_strings:
+        return arg_strings, lambda value: value
+    cut = arg_strings.index("--")
+    tail = arg_strings[cut + 1:]
+    nonce = secrets.token_hex(8)
+    originals = {f"\x00kanban-arg-{nonce}-{i}\x00": word for i, word in enumerate(tail)}
+    shielded = arg_strings[:cut + 1] + list(originals)
+
+    def unshield(value):
+        if isinstance(value, str):
+            return originals.get(value, value)
+        if isinstance(value, list):
+            return [originals.get(v, v) if isinstance(v, str) else v for v in value]
+        return value
+
+    return shielded, unshield
 
 
 def _add_commands(sub: argparse._SubParsersAction, specs) -> None:
@@ -182,7 +241,7 @@ def _triage_sweep_args(verb: str, Verb: str, noun: str):
 
 
 def _bulk_ids(verb: str):
-    return _arg("--ids", nargs="+",
+    return _arg("--ids", nargs="+", type=task_id_word,
                 help=f"Additional task ids to {verb} with the same reason (bulk mode). "
                      "Every word up to the next option is read as a task id; a word "
                      "that is not a task id (t_...) is refused before any change.")

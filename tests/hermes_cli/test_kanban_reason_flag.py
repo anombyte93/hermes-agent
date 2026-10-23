@@ -221,8 +221,10 @@ def test_positional_plus_reason_flag_is_usage_error(
         tid = kb.create_task(conn, title="dup")  # no parents -> ready
     out = kc.run_slash(f'{verb} {tid} "positional text" --reason "flag text"')
     assert "usage error" in out, out
-    # The error names BOTH competing forms so the user sees the conflict.
-    assert "positional text" in out and "flag text" in out, out
+    # The error names BOTH competing forms by label, never by value (a reason
+    # can carry a secret; review r1 of the Codex fix, finding 1).
+    assert "trailing words" in out and "--reason" in out, out
+    assert "positional text" not in out and "flag text" not in out, out
     # Nothing was mutated: the error precedes any handler run.
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
@@ -339,7 +341,8 @@ def test_reason_after_ids_is_refused_before_any_change(
         events_before = {tid: len(kb.list_events(conn, tid)) for tid in (first, second)}
     out = kc.run_slash(f'{verb} {first} --ids {second} "text after ids"')
     assert "usage error" in out, out
-    assert "text after ids" in out and "--reason" in out, out
+    assert "--ids" in out and "--reason" in out, out
+    assert "text after ids" not in out, out  # never echoed (finding 1)
     with kbc.connect_closing() as conn:
         for tid in (first, second):
             task = kb.get_task(conn, tid)
@@ -372,7 +375,9 @@ def test_reason_after_ids_refused_on_direct_namespace(kanban_home: Path, capsys)
                             ids=[second, "text after ids"], reason=[],
                             _reason_opt=None, kind=None)
     assert kc._cmd_block(ns) == 2
-    assert "text after ids" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--ids" in err and "--reason" in err, err
+    assert "text after ids" not in err, err  # never echoed (finding 1)
     with kbc.connect_closing() as conn:
         for tid in (first, second):
             assert kb.get_task(conn, tid).status == "ready"
@@ -429,9 +434,154 @@ def test_empty_reason_flag_plus_positional_is_usage_error(
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f'{verb} {tid} "positional text" --reason ""')
     assert "usage error" in out, out
-    assert "positional text" in out, out
+    assert "trailing words" in out and "--reason" in out, out
+    assert "positional text" not in out, out  # never echoed (finding 1)
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "ready"
         assert len(kb.list_events(conn, tid)) == events_before
         assert not _comments(conn, tid)
+
+
+# ---------------------------------------------------------------------------
+# Review r1 of the Codex fix (hermes-agent-133-r1), finding 1: usage errors
+# never echo reason values. A reason can carry a secret, and the /kanban reply
+# goes back to a chat surface. The control secret is a shape the existing
+# redactor strips, proving the test would catch a real token.
+# ---------------------------------------------------------------------------
+
+# Synthetic, assembled at runtime so no token-shaped literal sits in the file.
+_SYNTHETIC_SECRET = "ghp_" + "Synth3ticR3viewT0ken" + "0123456789abcdef"
+
+
+def test_synthetic_secret_is_a_shape_the_redactor_strips() -> None:
+    from agent.redact import redact_sensitive_text
+
+    assert _SYNTHETIC_SECRET not in redact_sensitive_text(_SYNTHETIC_SECRET, force=True)
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+def test_conflict_error_never_echoes_reason_values(kanban_home: Path, verb: str) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="leak")  # no parents -> ready
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f'{verb} {tid} "rotate {_SYNTHETIC_SECRET}" --reason cleanflagvalue')
+    assert "usage error" in out, out
+    # The conflict is named by its labels ...
+    assert "trailing words" in out and "--reason" in out, out
+    # ... never by the values themselves.
+    assert _SYNTHETIC_SECRET not in out, out
+    assert "rotate" not in out and "cleanflagvalue" not in out, out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert len(kb.list_events(conn, tid)) == events_before
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote"])
+def test_ids_refusal_never_echoes_reason_values(kanban_home: Path, verb: str) -> None:
+    with kbc.connect_closing() as conn:
+        first, second = _bulk_pair(conn, verb)
+    out = kc.run_slash(f'{verb} {first} --ids {second} "rotate {_SYNTHETIC_SECRET}"')
+    assert "usage error" in out, out
+    assert "--ids" in out and "--reason" in out, out
+    assert _SYNTHETIC_SECRET not in out and "rotate" not in out, out
+
+
+def test_direct_namespace_conflict_never_echoes_reason_values(kanban_home: Path, capsys) -> None:
+    import argparse
+
+    with kbc.connect_closing() as conn:
+        first, second = _make_ready_tasks(conn, "dn-a", "dn-b")
+    ns = argparse.Namespace(kanban_action="schedule", task_id=first, ids=None,
+                            reason=["rotate", _SYNTHETIC_SECRET], _reason_opt="cleanflagvalue")
+    assert kc._cmd_schedule(ns) == 2
+    ns = argparse.Namespace(kanban_action="block", task_id=first,
+                            ids=[second, f"rotate {_SYNTHETIC_SECRET}"], reason=[],
+                            _reason_opt=None, kind=None)
+    assert kc._cmd_block(ns) == 2
+    err = capsys.readouterr().err
+    assert "--reason" in err and "--ids" in err, err
+    assert _SYNTHETIC_SECRET not in err and "rotate" not in err and "cleanflagvalue" not in err, err
+    with kbc.connect_closing() as conn:
+        for tid in (first, second):
+            assert kb.get_task(conn, tid).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Review r1 of the Codex fix, finding 2: a leading ``--`` keeps every later
+# token positional. Intermixed parsing on Python 3.11 dropped the separator,
+# so ``schedule -- T --ids U --reason X`` scheduled U too.
+# ---------------------------------------------------------------------------
+
+
+def _leaf_namespace(argv: list[str]):
+    import argparse
+
+    from hermes_cli.kanban_parser import build_parser
+
+    wrap = argparse.ArgumentParser(prog="wrap", add_help=False)
+    parser = build_parser(wrap.add_subparsers(dest="_top"))
+    return parser.parse_args(argv)
+
+
+def test_leading_double_dash_keeps_later_tokens_positional_in_parser() -> None:
+    ns = _leaf_namespace(["schedule", "--", "t_a", "--ids", "t_b", "--reason", "maintenance"])
+    assert ns.task_id == "t_a"
+    assert ns.ids is None
+    assert ns._reason_opt is None
+    assert ns.reason == ["--ids", "t_b", "--reason", "maintenance"]
+
+
+def test_double_dash_after_options_keeps_intermixed_reason_in_parser() -> None:
+    ns = _leaf_namespace(["block", "t_a", "--kind", "dependency", "--", "--not-an-option", "--"])
+    assert ns.task_id == "t_a" and ns.kind == "dependency"
+    assert ns.reason == ["--not-an-option", "--"]
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule"])
+def test_leading_double_dash_targets_only_the_first_task(kanban_home: Path, verb: str) -> None:
+    with kbc.connect_closing() as conn:
+        first, second = _make_ready_tasks(conn, f"dd-{verb}-a", f"dd-{verb}-b")
+        events_before = len(kb.list_events(conn, second))
+    out = kc.run_slash(f"{verb} -- {first} --ids {second} --reason maintenance")
+    assert "usage error" not in out, out
+    expected = f"--ids {second} --reason maintenance"
+    status = "blocked" if verb == "block" else "scheduled"
+    label = "BLOCKED" if verb == "block" else "SCHEDULED"
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, first)
+        assert task is not None and task.status == status
+        assert f"{label}: {expected}" in _comments(conn, first)
+        assert _event_payloads(conn, first, status)[-1].get("reason") == expected
+        other = kb.get_task(conn, second)
+        assert other is not None and other.status == "ready"
+        assert len(kb.list_events(conn, second)) == events_before
+        assert not _comments(conn, second)
+
+
+# ---------------------------------------------------------------------------
+# Review r1 of the Codex fix, finding 3: a repeated --ids cannot hide a reason
+# placed after the first one (argparse keeps only the last occurrence).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote"])
+def test_repeated_ids_cannot_bypass_the_refusal(kanban_home: Path, verb: str) -> None:
+    with kbc.connect_closing() as conn:
+        first, second = _bulk_pair(conn, verb)
+        third = (kb.create_task(conn, title=f"{verb}-c", initial_status="blocked",
+                                block_reason="held") if verb == "promote"
+                 else _make_ready_tasks(conn, f"{verb}-c")[0])
+        tids = (first, second, third)
+        before = {tid: kb.get_task(conn, tid).status for tid in tids}
+        events_before = {tid: len(kb.list_events(conn, tid)) for tid in tids}
+    out = kc.run_slash(f'{verb} {first} --ids {second} "later please" --ids {third}')
+    assert "usage error" in out, out
+    assert "--ids" in out and "--reason" in out, out
+    assert "later please" not in out, out
+    with kbc.connect_closing() as conn:
+        for tid in tids:
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == before[tid], (tid, task.status)
+            assert len(kb.list_events(conn, tid)) == events_before[tid]
+            assert not _comments(conn, tid)
