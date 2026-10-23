@@ -250,9 +250,10 @@ def _joined_words(words) -> Optional[str]:
 def _require_reason(args: argparse.Namespace) -> tuple[Optional[str], int]:
     """Resolve the reason from ``--reason`` or the trailing positional words (#125).
 
-    The parser already refuses both forms at once and a non-id word after
-    ``--ids`` (``reason_usage_error``); the checks are repeated here, before
-    any change, for callers that build the Namespace directly. With
+    This is where both forms at once is refused (``reason_usage_error``),
+    before any change; parse failures keep the parser's one fixed refusal.
+    The non-id word after ``--ids`` the parser already refuses is checked
+    again here for callers that build the Namespace directly. With
     ``--reason`` (even empty) on a bulk verb, id-shaped trailing words are
     extra task ids (``_bulk_ids`` folds them in), not reason text. Verbs whose
     reason is required (``block``, ``request-changes``) handle "neither given"

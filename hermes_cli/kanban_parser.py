@@ -9,8 +9,11 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import contextvars
+import functools
 import re
 import secrets
+import sys
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -36,6 +39,8 @@ def _cmd(name: str, args=(), *, children=None, **parser_kw):
 # reachable by overriding how the subparsers action dispatches into the leaf
 # parser.
 _REASON_INTERMIXED_VERBS = frozenset({"block", "schedule", "promote", "request-changes"})
+# Verbs whose calls never echo a caller word on a parse failure (review r4).
+_PROTECTED_VERBS = _REASON_INTERMIXED_VERBS
 # Bulk verbs: with ``--reason``, id-shaped trailing words are extra task ids
 # (``block T1 T2 --reason "..."``, the #125 failing call 1).
 _BULK_REASON_VERBS = frozenset({"block", "schedule", "promote"})
@@ -114,24 +119,12 @@ def task_id_word(value: str) -> str:
     namespace misses a reason hidden in an earlier one
     (``schedule T --ids U "later" --ids V``). Validating every word as it is
     read closes that before any replacement (review r1 of the #133 Codex fix).
-    ``ArgumentTypeError`` keeps argparse from echoing the value.
+    The failure surfaces as the fixed protected-verb refusal
+    (``_ProtectedVerbRefusal``), never with the word.
     """
     if not _is_task_id(value):
-        raise argparse.ArgumentTypeError(f"a word is not a task id; {_IDS_ONLY_HINT}")
+        raise argparse.ArgumentTypeError("not a task id")
     return value
-
-
-def unrecognized_args_error(prog: str, extras) -> str:
-    """Usage-error text for leftover arguments: a count and the verb, nothing else.
-
-    Echoes NO word the caller supplied, not even an option-looking label:
-    ``--reasn '--<secret>'`` makes a reason value look like an option, and on
-    Python 3.11 the reason after a typo'd flag lands in the extras (reviews r2
-    and r3 of #133). ``prog`` is the leaf parser's own name
-    (``/kanban block``), never caller text.
-    """
-    return (f"unrecognized arguments: {len(extras)} word(s) not shown; "
-            f"see {prog} --help")
 
 
 def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
@@ -139,20 +132,92 @@ def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[s
     return ids_not_task_ids(verb, ids) or reason_conflict(verb, words, flag)
 
 
+# Set while a kanban parse whose argv names a protected verb runs; holds the
+# verb named in the refusal. One context-local value covers every parser of the
+# tree (kanban, the leaf, any nested group) for the duration of that parse.
+_REFUSING_AS: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "kanban_refusing_as", default=None)
+
+
+def invalid_arguments_refusal(verb: str) -> str:
+    """The ONE message for every argparse failure on a protected-verb call.
+
+    ``verb`` is a subcommand name from the parser's own table, never caller
+    text, so the message carries no word the caller supplied.
+    """
+    return f"kanban {verb}: invalid arguments; see --help"
+
+
+def _resolved_verb(parser: argparse.ArgumentParser, args: list) -> str:
+    """The subcommand the call names (first argv word in the verb table), else
+    the first protected verb in argv. Always a fixed name, never caller text."""
+    verbs = {name for action in parser._actions
+             if isinstance(action, argparse._SubParsersAction) for name in action.choices}
+    named = [word for word in args if isinstance(word, str) and word in verbs]
+    if named:
+        return named[0]
+    return next(word for word in args if isinstance(word, str) and word in _PROTECTED_VERBS)
+
+
+class _ProtectedVerbRefusal:
+    """Mixin for every parser in the kanban tree: the one refusal choke point.
+
+    When argv names one of the four protected verbs anywhere, ANY argparse
+    failure, at ANY level of the tree, becomes ``invalid_arguments_refusal``
+    with exit code 2 (an ``ArgumentError`` carrying it when ``exit_on_error``
+    is off, as in ``run_slash``): an ``ArgumentError`` such as a surplus
+    ``--help=VALUE`` or a bad ``--ids`` word, leftovers after the verb, and
+    leftovers at the ``kanban`` level before it. argparse's own messages quote
+    caller words, and a reason can carry a secret (review r4 of #133). Every
+    failure path ends in ``error()``, or in ``parse_known_args`` returning
+    leftovers or raising, so those two methods are the whole choke point.
+    """
+
+    def parse_known_args(self, args=None, namespace=None):
+        args = sys.argv[1:] if args is None else list(args)
+        if _REFUSING_AS.get() is not None or not any(
+                isinstance(word, str) and word in _PROTECTED_VERBS for word in args):
+            return super().parse_known_args(args, namespace)
+        token = _REFUSING_AS.set(_resolved_verb(self, args))
+        try:
+            try:
+                namespace, extras = super().parse_known_args(args, namespace)
+            except argparse.ArgumentError:
+                extras = True
+            if extras:
+                self.error("")
+            return namespace, extras
+        finally:
+            _REFUSING_AS.reset(token)
+
+    def error(self, message):
+        verb = _REFUSING_AS.get()
+        if verb is None:
+            return super().error(message)
+        refusal = invalid_arguments_refusal(verb)
+        if not self.exit_on_error:
+            raise argparse.ArgumentError(None, refusal)
+        self.exit(2, refusal + "\n")
+
+
+@functools.lru_cache(maxsize=None)
+def _refusing_parser_class(cls: type) -> type:
+    if issubclass(cls, _ProtectedVerbRefusal):
+        return cls
+    return type(f"Kanban{cls.__name__}", (_ProtectedVerbRefusal, cls), {})
+
+
 class _KanbanSubParsersAction(argparse._SubParsersAction):
     """Dispatches the #125 verbs through ``parse_known_intermixed_args``.
 
     Every other verb parses exactly as before (``parse_known_args``), so no
     other verb's accepted syntax changes. Mirrors the stdlib ``__call__``:
-    parse into a fresh subnamespace and copy it onto the caller's namespace.
-    Leftover strings are refused here by count and verb only
-    (``unrecognized_args_error``), never handed to the top-level parser, whose
-    "unrecognized arguments" error echoes them verbatim: on Python 3.11 they
-    include the reason after a typo'd flag (reviews r2 and r3 of #133). Leftovers are
-    NOT re-parsed without intermixing: that would report the trailing reason
-    words as unrecognized next to the genuinely bad option, i.e. the #125
-    symptom. ArgumentError (``exit_on_error=False`` in
-    ``run_slash``) propagates unchanged.
+    parse into a fresh subnamespace, copy it onto the caller's namespace and
+    hand leftovers up exactly as the stdlib does; the kanban-level
+    ``_ProtectedVerbRefusal`` refuses them with the one fixed message. Leftovers
+    are NOT re-parsed without intermixing: that would report the trailing
+    reason words as unrecognized next to the genuinely bad option, i.e. the
+    #125 symptom.
     """
 
     def __call__(self, parser, namespace, values, option_string=None):
@@ -167,20 +232,10 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
         arg_strings, unshield = _shield_after_separator(arg_strings)
         subnamespace, extras = leaf.parse_known_intermixed_args(arg_strings, None)
         for key, value in vars(subnamespace).items():
-            setattr(subnamespace, key, unshield(value))
-        extras = unshield(extras)
+            setattr(namespace, key, unshield(value))
         if extras:
-            # Refused here, by count and verb only, instead of being forwarded
-            # to the top-level parser, whose error echoes every extra verbatim
-            # (reviews r2 and r3 of #133). Nothing has been changed yet.
-            leaf.error(unrecognized_args_error(leaf.prog, extras))
-        for key, value in vars(subnamespace).items():
-            setattr(namespace, key, value)
-        conflict = reason_usage_error(parser_name, getattr(subnamespace, "reason", None),
-                                      getattr(subnamespace, "_reason_opt", None),
-                                      getattr(subnamespace, "ids", None))
-        if conflict:
-            leaf.error(conflict)  # usage + message on stderr, exit 2
+            vars(namespace).setdefault(argparse._UNRECOGNIZED_ARGS_ATTR, [])
+            getattr(namespace, argparse._UNRECOGNIZED_ARGS_ATTR).extend(unshield(extras))
 
 
 def _shield_after_separator(arg_strings):
@@ -666,9 +721,8 @@ _SPECS = [
 ]
 
 
-def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
-    """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
-    kanban_parser = parent_subparsers.add_parser(
+def _add_kanban_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    return parent_subparsers.add_parser(
         "kanban",
         help="Multi-profile collaboration board (tasks, links, comments)",
         description="Durable SQLite-backed task board shared across Hermes profiles. "
@@ -677,6 +731,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                     "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban "
                     "or docs/hermes-kanban-v1-spec.pdf for the full design.",
     )
+
+
+def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
+    # The kanban parser (and so every parser below it: add_subparsers defaults
+    # to the parent's class) carries the protected-verb refusal.
+    parent_class = parent_subparsers._parser_class
+    parent_subparsers._parser_class = _refusing_parser_class(parent_class)
+    try:
+        kanban_parser = _add_kanban_parser(parent_subparsers)
+    finally:
+        parent_subparsers._parser_class = parent_class
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
     # file, then "default" (kanban_db.get_current_board()).

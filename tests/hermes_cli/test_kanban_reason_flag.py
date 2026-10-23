@@ -18,6 +18,7 @@ rejected, and none of them accept ``--reason`` like ``reclaim``/``unblock``/
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,17 @@ def _event_payloads(conn, tid: str, kind: str) -> list[dict]:
         e.payload or {}
         for e in kb.list_events(conn, tid) if e.kind == kind
     ]
+
+
+def _refusal(verb: str) -> str:
+    """The one fixed parse-failure message for a protected verb (review r4)."""
+    return f"kanban {verb}: invalid arguments; see --help"
+
+
+# The handler's refusal when a positional reason and --reason are both given.
+# It is checked before any change; parsing itself succeeds (review r4 moved the
+# check out of the parser so that parse failures have one message).
+_CONFLICT = "pass the reason either as trailing words or as --reason, not both"
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +232,12 @@ def test_positional_plus_reason_flag_is_usage_error(
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="dup")  # no parents -> ready
     out = kc.run_slash(f'{verb} {tid} "positional text" --reason "flag text"')
-    assert "usage error" in out, out
+    assert _CONFLICT in out, out
     # The error names BOTH competing forms by label, never by value (a reason
     # can carry a secret; review r1 of the Codex fix, finding 1).
     assert "trailing words" in out and "--reason" in out, out
     assert "positional text" not in out and "flag text" not in out, out
-    # Nothing was mutated: the error precedes any handler run.
+    # Nothing was mutated: the handler refuses before any change.
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
         assert task is not None
@@ -266,7 +278,7 @@ def test_schedule_non_id_words_with_reason_flag_is_usage_error(kanban_home: Path
     with kbc.connect_closing() as conn:
         tid = _make_ready_tasks(conn, "single")[0]
     out = kc.run_slash(f'schedule {tid} --reason "later" "also positional"')
-    assert "usage error" in out, out
+    assert _CONFLICT in out, out
 
 
 # ---------------------------------------------------------------------------
@@ -289,12 +301,12 @@ def test_request_changes_without_any_reason_is_an_error(kanban_home: Path) -> No
 
 def test_unknown_option_is_still_a_usage_error(kanban_home: Path) -> None:
     """Intermixed parsing must not swallow a genuinely unknown option: it is
-    refused as unrecognized (by count, never by its text) and nothing is mutated."""
+    refused with the one fixed message, never by its text, and nothing is mutated."""
     with kbc.connect_closing() as conn:
         tid = _make_ready_tasks(conn, "bogus")[0]
     out = kc.run_slash(f'block {tid} "a reason" --bogus')
     assert "usage error" in out, out
-    assert "unrecognized arguments: 1 word(s) not shown; see /kanban block --help" in out, out
+    assert out.splitlines()[-1] == _refusal("block"), out
     assert "--bogus" not in out, out
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
@@ -434,7 +446,7 @@ def test_empty_reason_flag_plus_positional_is_usage_error(
         tid = kb.create_task(conn, title="empty-flag")  # no parents -> ready
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f'{verb} {tid} "positional text" --reason ""')
-    assert "usage error" in out, out
+    assert _CONFLICT in out, out
     assert "trailing words" in out and "--reason" in out, out
     assert "positional text" not in out, out  # never echoed (finding 1)
     with kbc.connect_closing() as conn:
@@ -467,7 +479,7 @@ def test_conflict_error_never_echoes_reason_values(kanban_home: Path, verb: str)
         tid = kb.create_task(conn, title="leak")  # no parents -> ready
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f'{verb} {tid} "rotate {_SYNTHETIC_SECRET}" --reason cleanflagvalue')
-    assert "usage error" in out, out
+    assert _CONFLICT in out, out
     # The conflict is named by its labels ...
     assert "trailing words" in out and "--reason" in out, out
     # ... never by the values themselves.
@@ -484,7 +496,7 @@ def test_ids_refusal_never_echoes_reason_values(kanban_home: Path, verb: str) ->
         first, second = _bulk_pair(conn, verb)
     out = kc.run_slash(f'{verb} {first} --ids {second} "rotate {_SYNTHETIC_SECRET}"')
     assert "usage error" in out, out
-    assert "--ids" in out and "--reason" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     assert _SYNTHETIC_SECRET not in out and "rotate" not in out, out
 
 
@@ -578,7 +590,7 @@ def test_repeated_ids_cannot_bypass_the_refusal(kanban_home: Path, verb: str) ->
         events_before = {tid: len(kb.list_events(conn, tid)) for tid in tids}
     out = kc.run_slash(f'{verb} {first} --ids {second} "later please" --ids {third}')
     assert "usage error" in out, out
-    assert "--ids" in out and "--reason" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     assert "later please" not in out, out
     with kbc.connect_closing() as conn:
         for tid in tids:
@@ -590,8 +602,8 @@ def test_repeated_ids_cannot_bypass_the_refusal(kanban_home: Path, verb: str) ->
 
 # ---------------------------------------------------------------------------
 # Review r2 (hermes-agent-133-r2), finding 1: an unknown option on an
-# intermixed verb is refused by a word count and the verb, never by its text
-# (r3 dropped the option label too). On Python 3.11 ``parse_known_intermixed_args`` leaves the reason
+# intermixed verb is refused without its text (since r4: the one fixed
+# refusal). On Python 3.11 ``parse_known_intermixed_args`` leaves the reason
 # after a typo'd flag (``--reasn "rotate <secret>"``) in the extras, and the
 # stdlib echoed every extra into the /kanban reply.
 # ---------------------------------------------------------------------------
@@ -620,7 +632,7 @@ def test_unknown_option_typo_never_echoes_the_reason(
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"{verb} {tid} --reasn 'rotate {secret}'")
     assert "usage error" in out, out
-    assert "unrecognized arguments:" in out and "word(s) not shown" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     assert "--reasn" not in out and secret not in out and "rotate" not in out, out
     with kbc.connect_closing() as conn:
         _assert_untouched(conn, tid, status, events_before)
@@ -632,7 +644,7 @@ def test_unknown_option_with_attached_value_shows_nothing_of_it(kanban_home: Pat
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"block {tid} 'held up' --token={_R2_CONTROL_SECRET} -x{_R2_CONTROL_SECRET}")
     assert "usage error" in out, out
-    assert "unrecognized arguments: 2 word(s) not shown" in out, out
+    assert out.splitlines()[-1] == _refusal("block"), out
     assert "--token" not in out and "-x" not in out and _R2_CONTROL_SECRET not in out, out
     with kbc.connect_closing() as conn:
         _assert_untouched(conn, tid, "ready", events_before)
@@ -667,7 +679,7 @@ def test_reason_left_in_extras_is_never_echoed(
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"{verb} {tid} --reasn 'rotate {_R2_CONTROL_SECRET}' tail")
     assert "usage error" in out, out
-    assert "unrecognized arguments: 3 word(s) not shown" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     for word in ("--reasn", _R2_CONTROL_SECRET, "rotate", "tail"):
         assert word not in out, (word, out)
     with kbc.connect_closing() as conn:
@@ -696,7 +708,7 @@ def test_newline_id_after_repeated_ids_is_refused_before_any_change(
         events_before = {tid: len(kb.list_events(conn, tid)) for tid in tids}
     out = kc.run_slash(f"{verb} {first} --ids '{second}\n' --ids {third} --reason maintenance")
     assert "usage error" in out, out
-    assert "--ids" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     assert "maintenance" not in out, out
     with kbc.connect_closing() as conn:
         for tid in tids:
@@ -710,7 +722,7 @@ def test_newline_id_as_trailing_word_is_not_an_extra_id(kanban_home: Path, verb:
         before = {tid: kb.get_task(conn, tid).status for tid in (first, second)}
         events_before = {tid: len(kb.list_events(conn, tid)) for tid in (first, second)}
     out = kc.run_slash(f"{verb} {first} '{second}\n' --reason maintenance")
-    assert "usage error" in out, out
+    assert _CONFLICT in out, out
     with kbc.connect_closing() as conn:
         for tid in (first, second):
             _assert_untouched(conn, tid, before[tid], events_before[tid])
@@ -749,8 +761,8 @@ def test_direct_namespace_newline_id_is_refused(kanban_home: Path, capsys) -> No
 # Review r3 (hermes-agent-133-r3), finding 1: an unknown-argument refusal on an
 # intermixed verb echoes NO word the caller supplied, not even an option-looking
 # label: ``--reasn '--SYNTHETIC_SECRET_123'`` is a long-option-shaped reason
-# value, and r2's label filter displayed it whole. The refusal names the verb
-# and a word count only.
+# value, and r2's label filter displayed it whole. Since r4 the refusal is the
+# one fixed message, naming the verb only.
 # ---------------------------------------------------------------------------
 
 # Every part of the reviewer's control value; none may reach the reply.
@@ -776,8 +788,7 @@ def test_unrecognized_args_echo_no_caller_word(
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"{verb} {tid} " + _R3_CONTROLS[control].format(secret=secret))
     assert "usage error" in out, out
-    assert "unrecognized arguments:" in out and "word(s) not shown" in out, out
-    assert f"see /kanban {verb} --help" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     for part in _R3_SECRET_PARTS:
         assert part not in out, (part, out)
     # Not even the option-looking label the caller typed.
@@ -798,20 +809,130 @@ def test_unrecognized_args_echo_no_caller_word_with_py311_extras(
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"{verb} {tid} --reasn '--{_R2_CONTROL_SECRET}' tail")
     assert "usage error" in out, out
-    assert "word(s) not shown" in out and f"see /kanban {verb} --help" in out, out
+    assert out.splitlines()[-1] == _refusal(verb), out
     for part in _R3_SECRET_PARTS + ("--reasn", "tail"):
         assert part not in out, (part, out)
     with kbc.connect_closing() as conn:
         _assert_untouched(conn, tid, status, events_before)
 
 
-def test_unrecognized_args_helper_shows_count_and_verb_only() -> None:
-    from hermes_cli.kanban_parser import unrecognized_args_error
+def test_refusal_helper_is_fixed_per_verb() -> None:
+    from hermes_cli.kanban_parser import invalid_arguments_refusal
 
-    extras = ["--reasn", f"--{_R2_CONTROL_SECRET}", f"--tok={_R2_CONTROL_SECRET}",
-              f"-x{_R2_CONTROL_SECRET}", "-", "--", "plain"]
-    msg = unrecognized_args_error("/kanban block", extras)
-    assert msg == ("unrecognized arguments: 7 word(s) not shown; "
-                   "see /kanban block --help"), msg
-    assert unrecognized_args_error("/kanban promote", ["--bogus"]) == (
-        "unrecognized arguments: 1 word(s) not shown; see /kanban promote --help")
+    for verb in ("block", "schedule", "promote", "request-changes"):
+        assert invalid_arguments_refusal(verb) == _refusal(verb)
+
+
+# ---------------------------------------------------------------------------
+# Review r4 (hermes-agent-133-r4), round 5: one choke point. Whenever argv
+# names one of the four protected verbs, ANY argparse failure at ANY level of
+# the kanban parser tree (an ArgumentError such as a surplus ``--help=VALUE``,
+# leftovers at the leaf, leftovers at the parent ``kanban`` level before the
+# verb) is replaced by ONE fixed, token-free message with exit code 2, on both
+# surfaces: the ``hermes kanban`` CLI streams and the ``/kanban`` reply.
+# ---------------------------------------------------------------------------
+
+_R4_CONTROLS = {
+    # r4 finding 1: argparse raises ArgumentError for the surplus value.
+    "r4 surplus help value": "request-changes t_a --help={secret}",
+    # r4 finding 2: a leftover at the parent (kanban) level, before the verb.
+    "r4 parent-level leftover": "--{secret} request-changes t_a --reason clean",
+    # r3: an option-shaped value after a typo'd flag.
+    "r3 option-shaped value": "request-changes t_a --reasn '--{secret}'",
+}
+
+_REFUSAL = _refusal("request-changes")
+
+
+def _cli(argv: list[str]):
+    """Parse ``hermes <argv>`` through the real CLI parser and entry helper.
+
+    Returns the exit code; the parser always exits here. Read the streams
+    with ``capsys``.
+    """
+    from hermes_cli import main as hermes_main
+
+    parser, subparsers = _cli_parser()
+    with pytest.raises(SystemExit) as exc:
+        hermes_main._parse_cli_args(parser, subparsers, argv)
+    return exc.value.code
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_parser():
+    """The full ``hermes`` parser, built once: building it is the slow part."""
+    from hermes_cli import main as hermes_main
+
+    return hermes_main._build_cli_parser()
+
+
+@pytest.mark.parametrize("control", sorted(_R4_CONTROLS))
+def test_protected_verb_cli_refusal_is_fixed_and_token_free(
+    kanban_home: Path, capsys, control: str
+) -> None:
+    import shlex
+
+    argv = ["kanban"] + shlex.split(_R4_CONTROLS[control].format(secret=_R2_CONTROL_SECRET))
+    code = _cli(argv)
+    captured = capsys.readouterr()
+    streams = captured.out + captured.err
+    assert _R2_CONTROL_SECRET not in streams, streams
+    assert code == 2, code
+    assert captured.err.strip() == _REFUSAL, captured.err
+    assert captured.out == "", captured.out
+
+
+@pytest.mark.parametrize("control", sorted(_R4_CONTROLS))
+def test_protected_verb_slash_refusal_is_fixed_and_token_free(
+    kanban_home: Path, control: str
+) -> None:
+    out = kc.run_slash(_R4_CONTROLS[control].format(secret=_R2_CONTROL_SECRET))
+    assert _R2_CONTROL_SECRET not in out, out
+    assert "usage error" in out, out
+    assert out.splitlines()[-1] == _REFUSAL, out
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+@pytest.mark.parametrize("tail", [
+    "--help={secret}",              # ArgumentError: surplus value
+    "--reason",                     # ArgumentError: missing value
+    "--reasn '--{secret}'",         # leaf leftovers
+    "--ids '{secret}'",             # ArgumentTypeError from the --ids type
+])
+def test_every_parse_failure_on_a_protected_verb_is_the_one_refusal(
+    kanban_home: Path, capsys, verb: str, tail: str
+) -> None:
+    import shlex
+
+    rest = f"{verb} t_a " + tail.format(secret=_R2_CONTROL_SECRET)
+    refusal = f"kanban {verb}: invalid arguments; see --help"
+    out = kc.run_slash(rest)
+    assert _R2_CONTROL_SECRET not in out and out.splitlines()[-1] == refusal, out
+    assert _cli(["kanban"] + shlex.split(rest)) == 2
+    captured = capsys.readouterr()
+    assert _R2_CONTROL_SECRET not in captured.out + captured.err
+    assert captured.err.strip() == refusal, captured.err
+
+
+def test_protected_verb_anywhere_in_argv_refuses_with_the_resolved_verb(
+    kanban_home: Path, capsys
+) -> None:
+    """A protected verb ANYWHERE in argv arms the refusal; it names the verb
+    the call resolved to (a fixed subcommand name, never caller text)."""
+    rest = f"unblock t_a --reason request-changes --{_R2_CONTROL_SECRET}"
+    out = kc.run_slash(rest)
+    assert _R2_CONTROL_SECRET not in out, out
+    assert out.splitlines()[-1] == "kanban unblock: invalid arguments; see --help", out
+    assert _cli(["kanban"] + rest.split()) == 2
+    captured = capsys.readouterr()
+    assert _R2_CONTROL_SECRET not in captured.out + captured.err
+    assert captured.err.strip() == "kanban unblock: invalid arguments; see --help"
+
+
+def test_protected_verb_help_still_prints(kanban_home: Path, capsys) -> None:
+    """``--help`` is not a failure: it still prints the verb's help, exit 0."""
+    out = kc.run_slash("request-changes --help")
+    assert "--reason REASON" in out and "invalid arguments" not in out, out
+    assert _cli(["kanban", "request-changes", "--help"]) == 0
+    captured = capsys.readouterr()
+    assert "--reason REASON" in captured.out and "invalid arguments" not in captured.out
