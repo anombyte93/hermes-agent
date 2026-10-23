@@ -72,8 +72,9 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
         return kb.DispatchResult()
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
-    # No explicit config → the derived default must flow through.
-    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: None)
+    # No explicit config (the board-scope default profile config.yaml is
+    # absent) → the derived default must flow through.
+    assert not (kanban_home / "config.yaml").exists()
     monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
@@ -93,7 +94,8 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
         return kb.DispatchResult()
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
-    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
+    # Board-scope caps come from the default profile's config.yaml (#124).
+    (kanban_home / "config.yaml").write_text("kanban:\n  max_in_progress: 7\n", encoding="utf-8")
     monkeypatch.setattr(
         kbd, "derive_default_max_in_progress",
         lambda sample=None: pytest.fail("derived default must not be consulted"),
@@ -107,23 +109,33 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     assert captured.get("max_in_progress") == 7
 
 
-def test_configured_max_in_progress_parsing(monkeypatch):
-    import hermes_cli.config as cfgmod
-
+def test_configured_max_in_progress_parsing():
     cases = [
         ({"kanban": {"max_in_progress": 4}}, 4),
         ({"kanban": {"max_in_progress": "5"}}, 5),
-        ({"kanban": {"max_in_progress": 0}}, None),
+        ({"kanban": {"max_in_progress": 0}}, 0),  # 0 stays 0 (review r2 P1-3)
         ({"kanban": {"max_in_progress": -2}}, None),
         ({"kanban": {"max_in_progress": "lots"}}, None),
         ({"kanban": {}}, None),
         ({}, None),
     ]
     for config, expected in cases:
-        monkeypatch.setattr(
-            cfgmod, "load_config_readonly", lambda c=config: c
-        )
-        assert kbd.configured_max_in_progress() == expected, config
+        section = config.get("kanban", {})
+        assert kbd.configured_max_in_progress(section) == expected, config
+
+
+def test_configured_max_in_progress_reads_default_profile_config(tmp_path, monkeypatch):
+    """With no section passed it resolves board-scope: the DEFAULT profile's
+    config, even when a sticky profile's config sets something else (#124)."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "evo").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "evo"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (root / "config.yaml").write_text("kanban:\n  max_in_progress: 4\n", encoding="utf-8")
+    (root / "profiles" / "evo" / "config.yaml").write_text(
+        "kanban:\n  max_in_progress: 9\n", encoding="utf-8",
+    )
+    assert kbd.configured_max_in_progress() == 4
 
 
 # ---------------------------------------------------------------------------
