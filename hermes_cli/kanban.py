@@ -254,6 +254,26 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+def _add_subcommand_board_arguments(
+    parser: argparse.ArgumentParser, board_help: str,
+) -> None:
+    """Accept the shared selector at every level, preserving local board args."""
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        # Aliases reference the same parser; register the flag only once.
+        for child in dict.fromkeys(action.choices.values()):
+            if not any(
+                arg.dest == "board" or "--board" in arg.option_strings
+                for arg in child._actions
+            ):
+                child.add_argument(
+                    "--board", default=argparse.SUPPRESS, metavar="<slug>",
+                    help=board_help,
+                )
+            _add_subcommand_board_arguments(child, board_help)
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -275,7 +295,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # writes to that board's DB. When omitted, resolves via the
     # HERMES_KANBAN_BOARD env var, then the persisted current-board
     # file, then "default". See kanban_db.get_current_board().
-    kanban_parser.add_argument(
+    board_argument = kanban_parser.add_argument(
         "--board",
         default=None,
         metavar="<slug>",
@@ -283,7 +303,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Board slug to operate on. Defaults to the current board "
             "(set via `hermes kanban boards switch <slug>` or the "
             "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards list` "
-            "to see all boards."
+            "to see all boards. May be given before or after subcommands; "
+            "the last explicit value wins."
         ),
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
@@ -1099,6 +1120,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # Suppressed child defaults leave an earlier --board intact when omitted.
+    _add_subcommand_board_arguments(kanban_parser, board_argument.help)
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
