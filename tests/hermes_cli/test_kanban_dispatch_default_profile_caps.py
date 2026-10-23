@@ -17,7 +17,8 @@ the dashboard nudge), re-resolved on every call:
 3. a missing default config.yaml is an empty user layer (managed still applies);
 4. an unreadable/unparseable default config.yaml refuses spawning (no cache,
    no backup recovery, never the invoking profile's caps);
-5. integer caps are nonnegative ints and ``0`` stays ``0``;
+5. integer caps are nonnegative ints and ``0`` stays ``0`` (scalars, named
+   assignee caps and group ``max`` alike);
 6. warnings name keys only, never a value read from any profile;
 7. managed provenance only where a valid managed value contributed.
 """
@@ -25,7 +26,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -832,6 +836,8 @@ def test_invalid_managed_scalar_keeps_the_valid_user_scalar(
         ("  default_assignee: ${H124_WHO}\n", "default_assignee"),
         ("  max_in_progress_by_assignee:\n    evo: null\n", "max_in_progress_by_assignee.evo"),
         ("  max_in_progress_by_assignee:\n    evo: {}\n", "max_in_progress_by_assignee.evo"),
+        ("  max_in_progress_by_assignee:\n    evo: -1\n", "max_in_progress_by_assignee.evo"),
+        ("  assignee_groups:\n    gpu0:\n      members: [evo]\n      max: -1\n", "assignee_groups.gpu0"),
         ("  assignee_groups:\n    gpu0: null\n", "assignee_groups.gpu0"),
         ("  assignee_groups:\n    gpu0: {}\n", "assignee_groups.gpu0"),
     ],
@@ -919,13 +925,193 @@ def test_dashboard_explicit_max_overrides_configured_max_spawn(sticky_profile_ho
     assert len(r.json()["spawned"]) == 1, r.json()
 
 
-def test_dashboard_nudge_button_sends_no_max_override():
-    """The board's "nudge dispatch" button must not pin ``?max=8`` over the
-    configured ``max_spawn``."""
-    js = (Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js")
-    text = js.read_text(encoding="utf-8")
-    assert "/dispatch?max=" not in text
-    assert "${API}/dispatch`" in text, "nudge call not found"
+# Review r4 P2: the nudge test exercises the real dashboard callback. The
+# harness loads the shipped ``index.js`` under node with a minimal hook
+# renderer and stub SDK, renders ``KanbanPage`` until its ``BoardToolbar`` is
+# on screen, renders that toolbar, clicks the "Nudge dispatcher" button and
+# prints every ``SDK.fetchJSON`` request the click made.
+_NUDGE_HARNESS = r"""
+"use strict";
+const fs = require("fs");
+const vm = require("vm");
+const [, , jsPath, BOARD] = process.argv;
+const calls = [];
+let slots = [], idx = 0, effects = [], dirty = false;
+function changed(prev, deps) {
+  return !prev || !deps || deps.length !== prev.length
+    || deps.some(function (d, k) { return !Object.is(d, prev[k]); });
+}
+const hooks = {
+  useState(init) {
+    const i = idx++;
+    if (!(i in slots)) slots[i] = typeof init === "function" ? init() : init;
+    return [slots[i], function (v) {
+      slots[i] = typeof v === "function" ? v(slots[i]) : v; dirty = true;
+    }];
+  },
+  useEffect(fn, deps) {
+    const i = idx++;
+    if (changed(slots[i], deps)) { slots[i] = deps; effects.push(fn); }
+  },
+  useMemo(fn, deps) {
+    const i = idx++;
+    if (!slots[i] || changed(slots[i].deps, deps)) slots[i] = { deps: deps, value: fn() };
+    return slots[i].value;
+  },
+  useCallback(fn, deps) { return hooks.useMemo(function () { return fn; }, deps); },
+  useRef(init) { const i = idx++; if (!(i in slots)) slots[i] = { current: init }; return slots[i]; },
+};
+function createElement(type, props) {
+  const children = Array.prototype.slice.call(arguments, 2);
+  return { type: type, props: Object.assign({}, props || {}, { children: children }) };
+}
+class Component { constructor(props) { this.props = props; this.state = {}; } setState() {} }
+const React = Object.assign({ createElement: createElement, Component: Component }, hooks);
+const components = {};
+["Card", "CardContent", "Badge", "Button", "Input", "Label", "Select", "SelectOption"]
+  .forEach(function (n) { components[n] = { [n]: function () { return null; } }[n]; });
+function respond(url) {
+  const path = url.split("?")[0];
+  if (path.endsWith("/config")) return { render_markdown: true };
+  if (path.endsWith("/boards")) return { boards: [{ slug: BOARD, name: BOARD }], current: BOARD };
+  if (path.endsWith("/board")) return { columns: [], tenants: [], assignees: [], latest_event_id: 0 };
+  return {};
+}
+const SDK = {
+  React: React, hooks: hooks, components: components,
+  utils: { cn: function () { return ""; }, timeAgo: function () { return ""; } },
+  fetchJSON: function (url, opts) {
+    calls.push({ url: url, method: (opts && opts.method) || "GET" });
+    return Promise.resolve(respond(url));
+  },
+  buildWsUrl: function () { return new Promise(function () {}); },
+};
+let page = null;
+const store = { "hermes.kanban.selectedBoard": BOARD };
+const noop = function () {};
+const window = {
+  __HERMES_PLUGIN_SDK__: SDK,
+  __HERMES_PLUGINS__: { register: function (name, comp) { if (name === "kanban") page = comp; } },
+  localStorage: {
+    getItem: function (k) { return k in store ? store[k] : null; },
+    setItem: function (k, v) { store[k] = String(v); },
+    removeItem: function (k) { delete store[k]; },
+  },
+  addEventListener: noop, removeEventListener: noop,
+};
+const ctx = {
+  window: window, console: console, setTimeout: setTimeout, clearTimeout: clearTimeout,
+  setInterval: setInterval, clearInterval: clearInterval, URLSearchParams: URLSearchParams,
+  WebSocket: function () {},
+};
+vm.runInNewContext(fs.readFileSync(jsPath, "utf8"), ctx, { filename: jsPath });
+if (!page) throw new Error("kanban page did not register");
+function find(node, pred) {
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const n of node) { const hit = find(n, pred); if (hit) return hit; }
+    return null;
+  }
+  if (pred(node)) return node;
+  return find(node.props && node.props.children, pred);
+}
+function text(node) {
+  if (node == null || node === false) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(text).join("");
+  return text(node.props && node.props.children);
+}
+const settle = function () { return new Promise(function (r) { setImmediate(r); }); };
+(async function () {
+  let toolbar = null;
+  for (let pass = 0; pass < 25 && !toolbar; pass++) {
+    idx = 0; effects = []; dirty = false;
+    const tree = page();
+    effects.forEach(function (fn) { fn(); });
+    for (let k = 0; k < 5; k++) await settle();
+    toolbar = find(tree, function (n) {
+      return typeof n.type === "function" && n.type.name === "BoardToolbar";
+    });
+  }
+  if (!toolbar) throw new Error("BoardToolbar never rendered");
+  const button = find(toolbar.type(toolbar.props), function (n) {
+    return n.type === components.Button && text(n.props.children) === "Nudge dispatcher";
+  });
+  if (!button) throw new Error("Nudge dispatcher button not found");
+  const before = calls.length;
+  button.props.onClick();
+  await settle();
+  process.stdout.write(JSON.stringify({ requests: calls.slice(before) }));
+  process.exit(0);
+})().catch(function (e) { process.stderr.write(String(e && e.stack || e)); process.exit(3); });
+"""
+
+_DASHBOARD_JS = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+_NUDGE_BOARD = "example"
+
+
+def _click_nudge(js_path: Path, tmp_path: Path) -> list:
+    """Every request the real "Nudge dispatcher" click sends, as
+    ``[(method, path, query_dict), ...]``."""
+    from urllib.parse import parse_qs, urlsplit
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to run the dashboard bundle")
+    harness = tmp_path / "nudge_harness.js"
+    harness.write_text(_NUDGE_HARNESS, encoding="utf-8")
+    proc = subprocess.run(
+        [node, str(harness), str(js_path), _NUDGE_BOARD],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = []
+    for req in json.loads(proc.stdout)["requests"]:
+        parts = urlsplit(req["url"])
+        out.append((req["method"], parts.path, parse_qs(parts.query)))
+    return out
+
+
+def _assert_nudge_sends_no_max(requests: list) -> None:
+    posts = [r for r in requests if r[0] == "POST"]
+    assert len(posts) == 1, requests
+    _method, path, query = posts[0]
+    assert path == "/api/plugins/kanban/dispatch", requests
+    assert "max" not in query, f"nudge pinned a max override: {requests}"
+    assert query.get("board") == [_NUDGE_BOARD], f"selected board lost: {requests}"
+
+
+def test_dashboard_nudge_button_sends_no_max_override(tmp_path):
+    """r4 P2: the board's "Nudge dispatcher" button, clicked in the shipped
+    bundle, POSTs ``/dispatch`` with the selected board and no ``max`` so the
+    configured ``max_spawn`` holds."""
+    _assert_nudge_sends_no_max(_click_nudge(_DASHBOARD_JS, tmp_path))
+
+
+@pytest.mark.parametrize(
+    "new, why",
+    [
+        # The reviewer's r4 mutation: ``?max=8`` appended after the template.
+        ('withBoard(`${API}/dispatch` + "?max=8", board)', "max override"),
+        # The pre-#124 implementation.
+        ("withBoard(`${API}/dispatch?max=8`, board)", "max override"),
+        # The selected board must survive the click too.
+        ("`${API}/dispatch`", "selected board lost"),
+    ],
+    ids=["reviewer-append-mutation", "old-max-8-implementation", "board-dropped"],
+)
+def test_nudge_check_catches_a_wrong_request(tmp_path, new, why):
+    """Known-red controls for the test above: the same click on a bundle whose
+    nudge sends ``max=8`` (or drops the board) must fail
+    ``_assert_nudge_sends_no_max``."""
+    old = "withBoard(`${API}/dispatch`, board)"
+    src = _DASHBOARD_JS.read_text(encoding="utf-8")
+    assert src.count(old) == 1, "nudge call site moved; update the control"
+    mutated = tmp_path / "index.js"
+    mutated.write_text(src.replace(old, new), encoding="utf-8")
+    requests = _click_nudge(mutated, tmp_path)
+    with pytest.raises(AssertionError, match=why):
+        _assert_nudge_sends_no_max(requests)
 
 
 # ---------------------------------------------------------------------------
@@ -975,8 +1161,6 @@ def test_cli_warnings_carry_key_names_only(sticky_profile_home, monkeypatch, cap
 
 def test_dashboard_json_carries_key_names_only(sticky_profile_home, dashboard_client, monkeypatch):
     _secret_profiles(sticky_profile_home, monkeypatch)
-    import json
-
     _plugin, client = dashboard_client
     with kbc.connect_closing() as conn:
         _seed(conn, running=0, ready=1)
@@ -1037,3 +1221,82 @@ def test_managed_partial_group_override_is_managed(sticky_profile_home, managed_
         assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
     out = capsys.readouterr().out
     assert "  assignee_groups.gpu0: max 1 [evo,kimi] (managed scope)" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Review r4 P1 — a literal 0 named or group cap is a cap, never "uncapped"
+# ---------------------------------------------------------------------------
+
+_ZERO_NAMED_AND_GROUP = (
+    "kanban:\n  max_in_progress_by_assignee:\n    evo: 0\n    kimi: 4\n"
+    "  assignee_groups:\n    gpu0:\n      members: [qwen]\n      max: 0\n"
+)
+
+
+def _caps_layer(root: Path, managed: Path, layer: str, body: str) -> None:
+    """Write ``body`` (a ``kanban:`` section) into the user or managed layer;
+    the user file always carries global headroom of 20."""
+    if layer == "user":
+        _write_cfg(root / "config.yaml", body.replace("kanban:\n", "kanban:\n  max_in_progress: 20\n", 1))
+    else:
+        _write_cfg(managed / "config.yaml", body)
+        _write_cfg(root / "config.yaml", "kanban:\n  max_in_progress: 20\n")
+
+
+@pytest.mark.parametrize("layer", ["user", "managed"])
+def test_zero_named_and_group_caps_survive_every_path(
+    sticky_profile_home, managed_dir, monkeypatch, layer,
+):
+    """r4 P1, the reviewer's probe: ``max_in_progress_by_assignee: {evo: 0}``
+    and a group ``max: 0`` were dropped in both layers. Both now reach
+    ``dispatch_once`` as ``0`` on every path, unwarned."""
+    _caps_layer(sticky_profile_home, managed_dir, layer, _ZERO_NAMED_AND_GROUP)
+    got = _kwargs_on_every_path(monkeypatch)
+    assert {p: (kw["max_in_progress_by_assignee"], kw["assignee_groups"]) for p, kw in got.items()} == {
+        p: ({"evo": 0, "kimi": 4}, {"gpu0": {"members": ["qwen"], "max": 0}}) for p in got
+    }
+    warning = _warning()
+    assert "max_in_progress_by_assignee.evo" not in warning, warning
+    assert "assignee_groups.gpu0" not in warning, warning
+
+
+@pytest.mark.parametrize("layer", ["user", "managed"])
+def test_zero_named_cap_blocks_that_profile_while_others_spawn(
+    sticky_profile_home, managed_dir, capsys, layer,
+):
+    """r4 P1 dispatch control: ``evo: 0`` with nothing running and global
+    headroom 20 defers evo; kimi (no named cap) still spawns."""
+    _caps_layer(
+        sticky_profile_home, managed_dir, layer,
+        "kanban:\n  max_in_progress_by_assignee:\n    evo: 0\n",
+    )
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        _seed(conn, running=0, ready=1, assignee="kimi")
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert _spawned_for(out, "evo") == 0, out
+    assert _deferred(out, "evo", 0, 0) == 1, out
+    assert _spawned_for(out, "kimi") == 1, out
+    assert "Spawned:      1" in out, out
+
+
+@pytest.mark.parametrize("layer", ["user", "managed"])
+def test_zero_group_max_blocks_its_members_while_others_spawn(
+    sticky_profile_home, managed_dir, capsys, layer,
+):
+    """r4 P1 dispatch control: group ``gpu0`` (members evo) with ``max: 0``
+    defers evo at the group cap; kimi (outside the group) still spawns."""
+    _caps_layer(
+        sticky_profile_home, managed_dir, layer,
+        "kanban:\n  assignee_groups:\n    gpu0:\n      members: [evo]\n      max: 0\n",
+    )
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        _seed(conn, running=0, ready=1, assignee="kimi")
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert _spawned_for(out, "evo") == 0, out
+    assert out.count("Deferred (evo at group:gpu0 cap 0, 0 running):") == 1, out
+    assert _spawned_for(out, "kimi") == 1, out
+    assert "Spawned:      1" in out, out

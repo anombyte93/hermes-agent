@@ -1757,14 +1757,17 @@ def configured_max_in_progress(kanban_cfg: Optional[Mapping[str, Any]] = None) -
         return None
 
 
-def parse_assignee_caps(raw: Any) -> dict[str, int]:
-    """Normalise per-assignee caps to ``{assignee: positive int}``.
+def parse_assignee_caps(raw: Any, *, minimum: int = 0) -> dict[str, int]:
+    """Normalise per-assignee caps to ``{assignee: int >= minimum}``.
 
     Accepts the ``kanban.max_in_progress_by_assignee`` mapping (``{evo: 2}``)
-    or the CLI's repeated ``NAME=N`` strings (later pairs win). Invalid entries
-    (empty name, non-integer, bool, below 1) are dropped rather than raising:
-    a typo must not brick dispatch, and a dropped entry falls back to the
-    scalar ``max_in_progress_per_profile``.
+    or the CLI's repeated ``NAME=N`` strings (later pairs win). A cap of ``0``
+    is kept: it means "spawn nothing for this assignee", never "uncapped"
+    (#124 review r4). Invalid entries (empty name, non-integer, bool, below
+    ``minimum``) are dropped rather than raising: a typo must not brick
+    dispatch, and a dropped entry falls back to the scalar
+    ``max_in_progress_per_profile``. Non-cap maps parsed with this helper
+    (``max_runtime_by_assignee`` seconds) pass ``minimum=1``.
     """
     pairs: list[tuple[Any, Any]] = []
     if isinstance(raw, Mapping):
@@ -1783,7 +1786,7 @@ def parse_assignee_caps(raw: Any) -> dict[str, int]:
             ival = int(str(value).strip())
         except (TypeError, ValueError):
             continue
-        if ival >= 1:
+        if ival >= minimum:
             caps[name] = ival
     return caps
 
@@ -1806,9 +1809,10 @@ def parse_assignee_groups(raw: Any) -> dict[str, dict]:
     Profiles that share one GPU / local model server are capped together: the
     group's running count is the host-wide sum over its members. ``members``
     is a list of profile names (a comma-separated string is accepted);
-    duplicates and blanks are dropped, order is kept. A group with no valid
-    member or no positive integer ``max`` is dropped — a config typo must
-    never brick dispatch.
+    duplicates and blanks are dropped, order is kept. ``max: 0`` is kept and
+    spawns nothing for any member (#124 review r4: zero is a cap, never
+    "uncapped"). A group with no valid member or no non-negative integer
+    ``max`` is dropped — a config typo must never brick dispatch.
     """
     if not isinstance(raw, Mapping):
         return {}
@@ -1817,7 +1821,7 @@ def parse_assignee_groups(raw: Any) -> dict[str, dict]:
         name = str(name).strip() if name is not None else ""
         if not name or not isinstance(spec, Mapping):
             continue
-        cap = _strict_int(spec.get("max"), minimum=1)
+        cap = _strict_int(spec.get("max"), minimum=0)
         raw_members = spec.get("members")
         if isinstance(raw_members, str):
             raw_members = raw_members.split(",")
@@ -1884,7 +1888,9 @@ def configured_max_runtime_by_assignee() -> dict[str, int]:
     config cannot be read: no config means creation is unchanged.
     """
     # Board-level: profile value when set, else the root config (see kanban_board_setting).
-    raw = parse_assignee_caps(_kb.kanban_board_setting("max_runtime_by_assignee", {}))
+    raw = parse_assignee_caps(
+        _kb.kanban_board_setting("max_runtime_by_assignee", {}), minimum=1,
+    )
     out: dict[str, int] = {}
     for name, seconds in raw.items():
         try:

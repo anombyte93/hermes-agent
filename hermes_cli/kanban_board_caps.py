@@ -13,10 +13,10 @@ call it every tick), by one declared rule:
    ``max_in_progress_by_assignee`` name, or one field of one
    ``assignee_groups`` group.
 2. Board caps are literal values and nothing here expands a ``${...}``
-   reference. Integer caps are literal YAML integers (``max_spawn``,
-   ``max_in_progress``, ``max_in_progress_per_profile`` >= 0; per-assignee and
-   group ``max`` >= 1); ``default_assignee`` and group members are literal
-   names. Each entry or group is validated ON ITS OWN, in its own layer: an
+   reference. Integer caps are literal YAML integers >= 0 (``max_spawn``,
+   ``max_in_progress``, ``max_in_progress_per_profile``, each
+   ``max_in_progress_by_assignee`` entry and each group ``max``);
+   ``default_assignee`` and group members are literal names. Each entry or group is validated ON ITS OWN, in its own layer: an
    invalid one (a reference, a string or bool where an int belongs, ``null``,
    ``{}``) is dropped and named in the warning, and every valid entry, managed
    or user, is kept.
@@ -27,7 +27,9 @@ call it every tick), by one declared rule:
    the reason in the warning. Nothing is cached and no backup is consulted;
    the next tick reads the file again. The invoking profile's caps are never
    a fallback.
-5. ``0`` stays ``0`` (spawn nothing / run nothing).
+5. ``0`` stays ``0`` (spawn nothing / run nothing), for the scalar caps,
+   one named assignee cap and one group's ``max`` alike; zero is never
+   read as "uncapped".
 6. Warnings name KEYS only, never a value read from any profile. The invoking
    profile's caps are read raw (never expanded) and validated by rule 2 only
    to name the keys that differ.
@@ -163,7 +165,7 @@ def _literal_group(spec: Any) -> Optional[Dict[str, Any]]:
         return None
     out: Dict[str, Any] = {}
     if "max" in spec:
-        out["max"] = _literal_int(spec["max"], 1)
+        out["max"] = _literal_int(spec["max"], 0)
         if out["max"] is None:
             return None
     if "members" in spec:
@@ -200,7 +202,7 @@ def _valid_layer(raw: Dict[str, Any]) -> tuple:
                 if key == "assignee_groups":
                     clean = _literal_group(entry)
                 else:
-                    clean = _literal_int(entry, 1)
+                    clean = _literal_int(entry, 0)
                 if clean_name is None or clean is None:
                     invalid.append(f"{key}.{name}")
                 else:

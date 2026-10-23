@@ -68,11 +68,20 @@ def test_parse_assignee_caps_accepts_mapping_and_cli_pairs():
 
 
 @pytest.mark.parametrize("raw", [
-    None, {}, [], "evo=2", {"evo": 0}, {"evo": -1}, {"evo": "x"}, {"": 2},
-    ["evo"], ["=2"], ["evo=0"], ["evo=two"], {"evo": True},
+    None, {}, [], "evo=2", {"evo": -1}, {"evo": "x"}, {"": 2},
+    ["evo"], ["=2"], ["evo=-1"], ["evo=two"], {"evo": True},
 ])
 def test_parse_assignee_caps_drops_invalid_entries(raw):
     assert kbd.parse_assignee_caps(raw) == {}
+
+
+def test_parse_assignee_caps_keeps_zero_as_a_cap():
+    """#124 review r4 P1: ``evo: 0`` means "spawn nothing for evo"; dropping it
+    left evo uncapped. Zero is kept from the config map and from CLI pairs."""
+    assert kbd.parse_assignee_caps({"evo": 0, "kimi": 4}) == {"evo": 0, "kimi": 4}
+    assert kbd.parse_assignee_caps(["evo=0"]) == {"evo": 0}
+    # Non-cap maps (max_runtime_by_assignee seconds) still require >= 1.
+    assert kbd.parse_assignee_caps({"evo": 0, "kimi": 600}, minimum=1) == {"kimi": 600}
 
 
 # ---------------------------------------------------------------------------
