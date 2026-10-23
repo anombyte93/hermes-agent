@@ -6157,9 +6157,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
-    when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
+    ``scratch`` workspaces are removed; Hermes-created ``worktree`` workspaces
+    are removed only when provably free of work (clean tree, every commit
+    reachable from a remote-tracking ref). Caller-owned worktrees and ``dir``
+    workspaces are intentionally preserved.
     """
     try:
         row = conn.execute(
@@ -6230,12 +6231,18 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+_KANBAN_WORKTREE_OWNER_FILE = "hermes-kanban-owner"
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
 
-    Mirrors the safety judgment of the CLI startup pruner
+    Requires creation proof in the linked checkout's private Git directory;
+    a canonical path or a task-like branch alone does not establish ownership.
+    Legacy worktrees without proof are preserved. Mirrors the safety judgment
+    of the CLI startup pruner
     (``cli._prune_stale_worktrees``): removal requires a clean working tree
     AND every commit reachable from a remote-tracking ref. Any doubt — dirty
     files, unpushed commits, unresolvable repo, failing git — preserves the
@@ -6276,6 +6283,12 @@ def _cleanup_worktree_workspace(
                 task_id, expected_branch, actual_branch or "<detached>", wp,
             )
             return
+        git_dir = _git_dir(wp)
+        if git_dir is None or git_dir == common:
+            return
+        owner = git_dir / _KANBAN_WORKTREE_OWNER_FILE
+        if owner.is_symlink() or owner.read_text(encoding="utf-8") != os.path.abspath(wp):
+            return  # missing/unreadable proof is also preserved by the outer guard
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -6412,8 +6425,10 @@ _SCRATCH_TIP_SENTINEL_NAME = ".scratch_tip_shown"
 
 _SCRATCH_TIP_MESSAGE = (
     "scratch workspaces are ephemeral — they're deleted when the task "
-    "completes. Use --workspace worktree: (git worktree) or "
-    "--workspace dir:/abs/path (existing dir) to preserve worker output."
+    "completes. With --workspace worktree:<path>, Hermes-created managed "
+    "worktrees are removed when clean and fully pushed; caller-created "
+    "worktrees are preserved. Use --workspace dir:/abs/path to reuse an "
+    "existing checkout as-is and keep worker output."
 )
 
 
@@ -6454,8 +6469,8 @@ def _maybe_emit_scratch_tip(
     """Emit the first-use scratch-workspace tip exactly once per install.
 
     Called from the dispatcher right after a scratch workspace is
-    materialized. No-op for ``worktree`` / ``dir`` workspaces (they're
-    preserved by design) and no-op after the sentinel exists.
+    materialized. No-op for ``worktree`` / ``dir`` workspaces and after the
+    sentinel exists; their distinct lifecycles are explained in the tip.
     """
     if (workspace_kind or "scratch") != "scratch":
         return
@@ -8119,6 +8134,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
     try:
         _require_worktree_branch(target, branch_name)
+        # Only a successful creation confers cleanup ownership. Reusing an
+        # existing checkout returns above without stamping it, even at the
+        # canonical path. Keep proof out of the working tree (and its status)
+        # and bind it to this path so moved/replaced checkouts fail closed.
+        git_dir = _git_dir(target)
+        if git_dir is None or git_dir == repo_common:
+            raise RuntimeError(f"cannot record worktree ownership for {target}")
+        with (git_dir / _KANBAN_WORKTREE_OWNER_FILE).open("x", encoding="utf-8") as owner:
+            owner.write(os.path.abspath(target))
     except Exception as validation_error:
         remove_result = subprocess.run(
             [
