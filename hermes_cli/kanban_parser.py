@@ -9,6 +9,8 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import re
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -22,6 +24,88 @@ def _arg(*flags: str, **kw):
 def _cmd(name: str, args=(), *, children=None, **parser_kw):
     """``children`` = ``(dest, [specs])`` for a nested subparser group."""
     return (name, parser_kw, tuple(args), children)
+
+
+# Verbs whose trailing positional reason (``nargs="*"``) must keep working when
+# it lands AFTER an option string. argparse's greedy first positional chunk
+# consumes the chunk empty and rejects the leftovers ("unrecognized arguments"),
+# which is exactly the #125 symptom. ``parse_known_intermixed_args`` on the
+# leaf parser splits positional/optional parsing into two passes so the words
+# after ``--ids``/``--kind``/``--reason`` land in ``reason`` — it is only
+# reachable by overriding how the subparsers action dispatches into the leaf
+# parser.
+_REASON_INTERMIXED_VERBS = frozenset({"block", "schedule", "promote", "request-changes"})
+# Bulk verbs: with ``--reason``, id-shaped trailing words are extra task ids
+# (``block T1 T2 --reason "..."``, the #125 failing call 1).
+_BULK_REASON_VERBS = frozenset({"block", "schedule", "promote"})
+# ``t_`` + id chars, the shape minted by kanban_db.new_task_id; deliberately
+# loose so other ``t_...`` shapes (e.g. imported boards) still count as ids.
+_TASK_ID_RE = re.compile(r"^t_[a-z0-9_:\-\.]+$", re.IGNORECASE)
+
+
+def reason_extra_ids(verb: str, words, flag: Optional[str]) -> list[str]:
+    """Trailing words that are extra task ids rather than reason text.
+
+    Only when ``--reason`` carries the reason and the verb is a bulk verb;
+    otherwise trailing words are the (legacy) positional reason.
+    """
+    if not (flag or "").strip() or verb not in _BULK_REASON_VERBS:
+        return []
+    return [w for w in (words or ()) if _TASK_ID_RE.match(w)]
+
+
+def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
+    """Usage-error text when a positional reason AND ``--reason`` are both given.
+
+    The two forms are alternatives; both at once is refused, never a silent
+    pick. Returns None when there is no conflict.
+    """
+    if not (flag or "").strip():
+        return None
+    ids = reason_extra_ids(verb, words, flag)
+    text = [w for w in (words or ()) if w not in ids]
+    if not text:
+        return None
+    hint = ("; with --reason the only trailing words allowed are task ids (t_...)"
+            if verb in _BULK_REASON_VERBS else "")
+    return (f"pass the reason either as trailing words or as --reason, not both "
+            f"(positional: {' '.join(text)!r}; --reason: {flag.strip()!r}){hint}")
+
+
+class _KanbanSubParsersAction(argparse._SubParsersAction):
+    """Dispatches the #125 verbs through ``parse_known_intermixed_args``.
+
+    Every other verb parses exactly as before (``parse_known_args``), so no
+    other verb's accepted syntax changes. Mirrors the stdlib ``__call__``:
+    parse into a fresh subnamespace, copy it onto the caller's namespace, and
+    hand leftover strings to the top-level parser as unrecognized arguments.
+    Leftovers are NOT re-parsed without intermixing: that would report the
+    trailing reason words as unrecognized next to the genuinely bad option,
+    i.e. the #125 symptom. ArgumentError (``exit_on_error=False`` in
+    ``run_slash``) propagates unchanged.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if not values or values[0] not in _REASON_INTERMIXED_VERBS:
+            return super().__call__(parser, namespace, values, option_string)
+        parser_name, arg_strings = values[0], values[1:]
+        if self.dest is not argparse.SUPPRESS:
+            setattr(namespace, self.dest, parser_name)
+        leaf = self._name_parser_map[parser_name]
+        # parse_known_intermixed_args raises TypeError for parsers holding
+        # subparsers or REMAINDER/PARSER positionals; these four verbs have none.
+        subnamespace, extras = leaf.parse_known_intermixed_args(arg_strings, None)
+        for key, value in vars(subnamespace).items():
+            setattr(namespace, key, value)
+        conflict = reason_conflict(parser_name, getattr(subnamespace, "reason", None),
+                                   getattr(subnamespace, "_reason_opt", None))
+        if conflict:
+            leaf.error(conflict)  # usage + message on stderr, exit 2
+        if extras:
+            unrecognized = argparse._UNRECOGNIZED_ARGS_ATTR
+            if not hasattr(namespace, unrecognized):
+                setattr(namespace, unrecognized, [])
+            getattr(namespace, unrecognized).extend(extras)
 
 
 def _add_commands(sub: argparse._SubParsersAction, specs) -> None:
@@ -40,6 +124,15 @@ def _json_flag(**kw):
 
 def _reason(help: str):
     return _arg("--reason", help=help)
+
+
+def _reason_opt(help: str):
+    """``--reason`` for verbs that ALSO take trailing positional reason words.
+
+    Stored on a distinct dest so handlers can reject "both forms at once"
+    instead of silently picking one (#125).
+    """
+    return _arg("--reason", dest="_reason_opt", help=help)
 
 
 def _run_state_args(type_help: str):
@@ -295,7 +388,10 @@ _SPECS = [
     ], help="Edit recovery fields on an already-completed task"),
     _cmd("block", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
+        _arg("reason", nargs="*",
+             help="Reason (also appended as a comment). May sit anywhere after the "
+                  "task id, including after --ids/--kind. Prefer --reason; words here "
+                  "are only a reason when no --reason flag was given."),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
@@ -303,11 +399,18 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _reason_opt("Reason (also appended as a comment). Quote multi-word reasons. "
+                    "May sit anywhere; with this form extra task ids may also be "
+                    "given positionally (block T1 T2 --reason \"...\")."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        _arg("reason", nargs="*",
+             help="Reason/timing note (also appended as a comment). May sit anywhere "
+                  "after the task id, including after --ids. Prefer --reason."),
         _bulk_ids("schedule"),
+        _reason_opt("Reason/timing note (also appended as a comment). Quote multi-word "
+                    "reasons."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
@@ -322,7 +425,14 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="*",
+             help="Concrete changes required before re-review. Required; also "
+                  "acceptable via --reason. May sit after options."),
+        _reason_opt("Concrete changes required before re-review (alternative to the "
+                    "positional words). Quote multi-word reasons."),
+    ],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
@@ -330,8 +440,13 @@ _SPECS = [
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
     _cmd("promote", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+        _arg("reason", nargs="*",
+             help="Audit-trail reason (recorded on the task_events row). May sit "
+                  "anywhere after the task id, including after --ids. Prefer "
+                  "--reason."),
         _bulk_ids("promote"),
+        _reason_opt("Audit-trail reason (recorded on the task_events row). Quote "
+                    "multi-word reasons."),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
@@ -455,6 +570,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                     "via `hermes kanban boards switch <slug>` or the "
                                     "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
                                     "list` to see all boards.")
-    _add_commands(kanban_parser.add_subparsers(dest="kanban_action"), _SPECS)
+    # ``action=`` (not a ``parsers_class`` kwarg) swaps the subparsers action
+    # class on every argparse generation; see _KanbanSubParsersAction.
+    _add_commands(
+        kanban_parser.add_subparsers(dest="kanban_action", action=_KanbanSubParsersAction),
+        _SPECS,
+    )
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
