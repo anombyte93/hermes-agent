@@ -1,0 +1,50 @@
+{
+ "started_at": 1788692816.199186,
+ "codex_bin": "/home/anombyte/.npm-global/bin/codex",
+ "steps": {
+  "p1_start_and_store": {
+   "thread_id": "01a07666-66b6-7c02-8cd2-c520f2529f0a",
+   "resumed": false,
+   "error": null,
+   "final_text": "STORED"
+  },
+  "persisted_record": {
+   "thread_id": "01a07666-66b6-7c02-8cd2-c520f2529f0a",
+   "cwd": "/home/anombyte/.cache/tmp/codex-continuity-probe-aydbub7c/workspace",
+   "model": "",
+   "permission_profile": "read-only",
+   "owner_pid": 3836843,
+   "owner_boot_id": "31f4b81c-c1d9-4108-bbe4-3c98a1c5c6ac",
+   "owner_host_id": "6cfeda08157f420d8c4ec51ef5214bc2",
+   "claimed_at": 1788692821.2118595,
+   "released_at": 1788692831.79256,
+   "version": 1,
+   "note": ""
+  },
+  "p2_restart_recall": {
+   "thread_id": "01a07666-66b6-7c02-8cd2-c520f2529f0a",
+   "same_thread": true,
+   "resumed_flag": true,
+   "nonce_recalled": true,
+   "error": null,
+   "final_text": "NONCE-E5D9163D0B8A"
+  },
+  "n1_separate_session": {
+   "thread_id": "01a07666-dc05-7d91-a808-2d69448ed1c3",
+   "distinct_thread": true,
+   "resumed_flag": false,
+   "nonce_leaked": false,
+   "final_text": "NO_TOKEN_KNOWN"
+  },
+  "n2_fabricated_id": {
+   "fabricated_thread_id": "3c018e02-b350-4ade-a9b1-246252297227",
+   "refused": true,
+   "refusal": "CodexThreadResumeError: codex refused to resume saved thread 3c018e02-b350-4ade-a9b1-246252297227: codex app-server error -32600: no rollout found for thread id 3c018e02-b350-4ade-a9b1-246252297227. The conversation's codex context is unavailable; not silently starting a different thread."
+  }
+ },
+ "verdict": "PASS",
+ "nonce": "NONCE-E5D9163D0B8A",
+ "session_id": "probe-64c820ff",
+ "tmp": "/home/anombyte/.cache/tmp/codex-continuity-probe-aydbub7c",
+ "ended_at": 1788692866.3552299
+}

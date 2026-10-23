@@ -1,0 +1,49 @@
+{
+ "codex_version_note": "run against the codex on PATH; record it",
+ "expected_digits": "605716",
+ "image_path": "/home/anombyte/.cache/tmp/codex-image-seam-y6d9zkck/token.png",
+ "image_bytes": 672,
+ "built_turn_input": [
+  {
+   "type": "text",
+   "text": "Answer with ONE line only.\nIf an image was attached to this message, reply exactly: IMAGE_RECEIVED <the digits you see, no spaces>\nIf no image was attached to this message, reply exactly: NO_IMAGE\nDo not guess digits. If you cannot see an image, say NO_IMAGE."
+  },
+  {
+   "type": "localImage",
+   "path": "/home/anombyte/.cache/tmp/codex-image-seam-y6d9zkck/token.png"
+  }
+ ],
+ "request_carries_localImage": true,
+ "thread_id": "01a076d2-6bd4-7322-849d-9494e99164c0",
+ "runtime": {
+  "model": "gpt-6-astra",
+  "model_applied": true,
+  "sandbox": "readOnly",
+  "approval_policy": "never",
+  "permissions_applied": true,
+  "unconfirmed": []
+ },
+ "error": null,
+ "model_self_report": {
+  "final_text": "IMAGE_RECEIVED 625716",
+  "claims_image_received": true,
+  "claims_no_image": false,
+  "digits_correct": false,
+  "note": "self-report only; not evidence about delivery"
+ },
+ "rollout_evidence": {
+  "rollout_path": "/home/anombyte/.codex/sessions/2026/09/06/rollout-2026-09-06T21-04-56-01a076d2-6bd4-7322-849d-9494e99164c0.jsonl",
+  "input_image_parts": 1,
+  "bytes_identical": true,
+  "sha256_on_disk": "f6143aeae0e06f808fa32438dafb2e34b31e768b131ec176910be386c5af8ebe",
+  "sha256_in_rollout": "f6143aeae0e06f808fa32438dafb2e34b31e768b131ec176910be386c5af8ebe",
+  "detail": "high",
+  "content_item_kinds": [
+   "user.text",
+   "user.text",
+   "user.image",
+   "user.text"
+  ]
+ },
+ "verdict": "IMAGE_DELIVERED_TO_MODEL"
+}

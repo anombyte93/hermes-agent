@@ -162,17 +162,25 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
-    def test_thread_start_passes_cwd_only(self):
-        """thread/start carries cwd. We intentionally do NOT pass `permissions`
-        on this codex version (experimentalApi-gated + requires matching
-        config.toml [permissions] table). Letting codex use its default
-        (read-only unless user configures otherwise) is the documented path."""
+    def test_thread_start_sends_real_permission_fields(self):
+        """thread/start carries cwd AND the real permission protocol fields.
+
+        The old `permissions: {type: profile, id: ...}` shape (codex 0.130,
+        experimentalApi-gated + config.toml [permissions] prerequisite) is
+        still NOT sent — it does not exist on this schema. What replaced it is
+        `sandbox` (SandboxMode) + `approvalPolicy` (AskForApproval), which are
+        stable, non-experimental fields on ThreadStartParams. Sending nothing
+        was the hermes-agent#41 defect: the record said one profile and codex
+        ran another.
+        """
         client = FakeClient()
         s = make_session(client, permission_profile="workspace-write")
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
-        assert "permissions" not in params  # see session.ensure_started() comment
+        assert params["sandbox"] == "workspace-write"
+        assert params["approvalPolicy"] == "on-request"
+        assert "permissions" not in params  # the removed experimental shape
 
     def test_close_idempotent(self):
         client = FakeClient()

@@ -1,0 +1,14 @@
+docs(codex): integration contract + handback for thread continuity
+
+- deliverables/integration-contract.md: the exact minimal API the Evo service
+  adapter needs (constructor params, new surface, ownership rules, where the
+  state and the reservation lock live, named limitations).
+- deliverables/codex-thread-continuity-handback.md: commits, evidence index,
+  ACTUALLY_USED / DISCOVERED / UNTOUCHED / MISSING / FRICTION, residual
+  UNKNOWNs.
+- deliverables/evidence/: RED baseline, green runs, both falsification runs
+  (reservation removed, boot-only comparison restored), and both live codex
+  probe artifacts.
+
+The .commit-msg-*.txt files are the message bodies used for these commits,
+kept because the sandbox blocked their removal as a burst deletion.

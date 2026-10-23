@@ -1,0 +1,22 @@
+fix(codex): durable exact thread continuity across process restart
+
+CodexAppServerSession.ensure_started() unconditionally called thread/start on
+each new object, so a Hermes session that survived a process restart came back
+with a brand new Codex thread and lost everything the user had said, even
+though codex had persisted the rollout and supports thread/resume.
+
+- codex_thread_continuity: durable record (thread id + cwd/model/permission
+  profile + owner pid/boot id) in the session row's model_config JSON via the
+  existing atomic patch_session_model_config merge; no schema change.
+- Reservation, not check-then-act: a per-session flock is taken BEFORE the
+  record is read and held for the object's lifetime, so two processes racing
+  on one session cannot both conclude "no owner, start fresh".
+- Foreign hosts fail closed: an unreleased record from another boot cannot be
+  probed, so it is refused rather than assumed dead. Same-host dead pids
+  (crash) and explicit releases remain legitimate takeovers.
+- ensure_started() is resume-first and never silently falls back to
+  thread/start; refusals raise and run_turn surfaces them as TurnResult.error
+  with should_retire. A start we cannot persist aborts before the user turn.
+- close() releases ownership, keeping the thread id for the next process.
+
+Compaction and event projection are untouched.

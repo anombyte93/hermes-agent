@@ -711,6 +711,7 @@ def run_codex_app_server_turn(
 
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
+        _HERMES_TO_CODEX_PERMISSION_PROFILE,
         _ServerRequestRouting,
     )
 
@@ -758,6 +759,27 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        # Durable thread continuity: the same Hermes session must come back
+        # to the SAME codex thread after a process restart (service restart,
+        # gateway respawn, crash recovery). build_session_continuity returns
+        # None for ephemeral agents with no session DB, which preserves the
+        # previous fresh-thread-per-process behaviour for them.
+        from agent.transports.codex_thread_continuity import (
+            build_session_continuity,
+        )
+
+        codex_permission_profile = _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
+            os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
+            "workspace-write",
+        )
+        requested_model = str(getattr(agent, "model", "") or "")
+        continuity = build_session_continuity(
+            agent,
+            cwd=cwd,
+            permission_profile=codex_permission_profile,
+            model=requested_model,
+        )
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
@@ -766,6 +788,8 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            continuity=continuity,
+            model=requested_model,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the

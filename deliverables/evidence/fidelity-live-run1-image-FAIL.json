@@ -1,0 +1,76 @@
+{
+ "started_at": 1788699516.5015233,
+ "codex_bin": "/home/anombyte/.npm-global/bin/codex",
+ "requested_model": "gpt-6-astra",
+ "requested_permission_profile": "read-only",
+ "steps": {
+  "f1_runtime_fidelity": {
+   "thread_id": "01a076cc-a3df-7353-a71a-89f9dda25402",
+   "codex_reported_model": "gpt-6-astra",
+   "requested_model": "gpt-6-astra",
+   "model_matches_request": true,
+   "model_applied": true,
+   "codex_reported_sandbox": "readOnly",
+   "codex_reported_approval_policy": "never",
+   "permissions_applied": true,
+   "unconfirmed_fields": []
+  },
+  "f2_local_image_read": {
+   "image_path": "/home/anombyte/.cache/tmp/codex-fidelity-probe-nt1gzd5r/token.png",
+   "expected_digits": "410131",
+   "digits_read_back": false,
+   "error": null,
+   "final_text": "STORED 121212"
+  },
+  "f3_native_compaction": {
+   "compacted": true,
+   "error": null
+  },
+  "persisted_record": {
+   "thread_id": "01a076cc-a3df-7353-a71a-89f9dda25402",
+   "cwd": "/home/anombyte/.cache/tmp/codex-fidelity-probe-nt1gzd5r/workspace",
+   "model": "gpt-6-astra",
+   "permission_profile": "read-only",
+   "owner_pid": 3587784,
+   "owner_boot_id": "31f4b81c-c1d9-4108-bbe4-3c98a1c5c6ac",
+   "owner_host_id": "6cfeda08157f420d8c4ec51ef5214bc2",
+   "claimed_at": 1788699520.7312896,
+   "released_at": 1788699590.5309002,
+   "version": 1,
+   "note": "",
+   "model_applied": true,
+   "permissions_applied": true,
+   "sandbox": "readOnly",
+   "approval_policy": "never"
+  },
+  "f4_second_process_resume_after_compaction": {
+   "child_pid": 3637058,
+   "this_pid": 3587784,
+   "distinct_process": true,
+   "thread_id": "01a076cc-a3df-7353-a71a-89f9dda25402",
+   "same_thread": true,
+   "resumed_flag": true,
+   "child_runtime": {
+    "model": "gpt-6-astra",
+    "model_applied": true,
+    "sandbox": "readOnly",
+    "approval_policy": "never",
+    "permissions_applied": true,
+    "unconfirmed": []
+   },
+   "nonce_recalled_after_compaction": true,
+   "error": null,
+   "final_text": "NONCE-6737381475",
+   "child_stderr_tail": ""
+  }
+ },
+ "verdict": "FAIL",
+ "codex_version": "codex-cli 0.153.4",
+ "nonce": "NONCE-6737381475",
+ "image_digits": "410131",
+ "image_path": "/home/anombyte/.cache/tmp/codex-fidelity-probe-nt1gzd5r/token.png",
+ "image_bytes": 313,
+ "session_id": "fidelity-bdc0e7c8",
+ "tmp": "/home/anombyte/.cache/tmp/codex-fidelity-probe-nt1gzd5r",
+ "ended_at": 1788699609.1657593
+}

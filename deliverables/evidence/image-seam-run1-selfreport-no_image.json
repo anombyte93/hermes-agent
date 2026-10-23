@@ -1,0 +1,30 @@
+{
+ "expected_digits": "432384",
+ "image_path": "/home/anombyte/.cache/tmp/codex-image-seam-o7jc0wyb/token.png",
+ "image_bytes": 313,
+ "built_turn_input": [
+  {
+   "type": "text",
+   "text": "Answer with ONE line only.\nIf an image was attached to this message, reply exactly: IMAGE_RECEIVED <the digits you see, no spaces>\nIf no image was attached to this message, reply exactly: NO_IMAGE\nDo not guess digits. If you cannot see an image, say NO_IMAGE."
+  },
+  {
+   "type": "localImage",
+   "path": "/home/anombyte/.cache/tmp/codex-image-seam-o7jc0wyb/token.png"
+  }
+ ],
+ "thread_id": "01a076ce-f206-7572-9c09-4178d4a69b15",
+ "runtime": {
+  "model": "gpt-6-astra",
+  "model_applied": true,
+  "sandbox": "readOnly",
+  "approval_policy": "never",
+  "permissions_applied": true,
+  "unconfirmed": []
+ },
+ "final_text": "NO_IMAGE",
+ "error": null,
+ "model_says_image_received": false,
+ "model_says_no_image": true,
+ "digits_correct": false,
+ "verdict": "IMAGE_NEVER_ARRIVED"
+}

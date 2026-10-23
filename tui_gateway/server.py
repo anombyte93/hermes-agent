@@ -2984,6 +2984,21 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+
+        # Shared-conversation mode (opt-in per profile; see
+        # tui_gateway/shared_conversation.py). Returns None — one cached config
+        # read — for every profile that has not enabled it, so ordinary
+        # sessions take exactly the path they always did.
+        try:
+            from tui_gateway import shared_conversation
+
+            shared = shared_conversation.maybe_dispatch(_rid, method, _params, t)
+        except Exception:
+            logger.debug("shared_conversation dispatch hook failed", exc_info=True)
+            shared = None
+        if shared is not None:
+            return shared
+
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 

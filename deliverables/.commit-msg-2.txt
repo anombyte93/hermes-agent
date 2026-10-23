@@ -1,0 +1,16 @@
+test(codex): behavioural + live proof for durable thread continuity
+
+- test_codex_thread_continuity.py: 21 behavioural tests driving the real
+  CodexAppServerSession and the real SessionDB (temp file). Positive control
+  (same session, new process, exact id resumed) plus negative controls:
+  fresh session gets a fresh thread, fabricated id refused, live concurrent
+  owner refused, foreign-host owner fails closed, identity mismatch refused,
+  unreadable store refused, unwritable store aborts before the user turn.
+- Real cross-process controls, not sequential fakes: one test reads the
+  record back from an actual second python process; another races six
+  concurrent OS processes on one session and asserts exactly one winner
+  (_continuity_race_child.py). With the reservation removed, all six win —
+  the gate has been seen to fail.
+- codex_continuity_live_probe.py: opt-in script that spawns REAL codex
+  app-server twice and proves nonce recall across restart, session
+  isolation, and codex's own refusal of a fabricated thread id.

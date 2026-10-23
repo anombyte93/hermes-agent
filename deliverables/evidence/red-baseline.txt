@@ -1,0 +1,416 @@
+FFFFFFFFFFFF.                                                            [100%]
+=================================== FAILURES ===================================
+_ TestRestartResumesExactThread.test_same_session_new_process_resumes_exact_thread_id _
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestRestartResumesExactThread object at 0x7f07e64bf610>
+db = <hermes_state.SessionDB object at 0x7f07e4d58c20>
+
+    def test_same_session_new_process_resumes_exact_thread_id(self, db):
+        """Hayden resumes the same conversation after a service restart."""
+        sid = _session_row(db, "sess-restart")
+    
+        # --- process 1: fresh session, fresh thread
+        client1 = FakeClient(next_thread_id="thread-REAL-abc123")
+>       s1 = make_session(client1, continuity=make_continuity(db, sid))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:156: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d59fd0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d5a510>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+_____ TestRestartResumesExactThread.test_record_persists_runtime_identity ______
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestRestartResumesExactThread object at 0x7f07e558cf50>
+db = <hermes_state.SessionDB object at 0x7f07e4cfd310>
+
+    def test_record_persists_runtime_identity(self, db):
+        sid = _session_row(db, "sess-identity")
+        client = FakeClient(next_thread_id="thread-ident")
+>       s = make_session(
+            client,
+            continuity=make_continuity(db, sid, model="gpt-5-codex"),
+            permission_profile="workspace-write",
+        )
+
+tests/agent/transports/test_codex_thread_continuity.py:177: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4cfd6d0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4cfd950>
+kwargs = {'permission_profile': 'workspace-write'}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+_____ TestRestartResumesExactThread.test_model_config_lineage_is_preserved _____
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestRestartResumesExactThread object at 0x7f07e568be10>
+db = <hermes_state.SessionDB object at 0x7f07e4cfdd10>
+
+    def test_model_config_lineage_is_preserved(self, db):
+        """Continuity must merge into model_config, not clobber it."""
+        sid = _session_row(db, "sess-merge")
+        db.patch_session_model_config(sid, {"lineage_marker": "keep-me"})
+        client = FakeClient(next_thread_id="thread-merge")
+>       make_session(client, continuity=make_continuity(db, sid)).ensure_started()
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:198: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4cfe5d0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4cfe850>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+_________ TestNegativeControls.test_fresh_session_gets_a_fresh_thread __________
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestNegativeControls object at 0x7f07e558ce10>
+db = <hermes_state.SessionDB object at 0x7f07e4cfd090>
+
+    def test_fresh_session_gets_a_fresh_thread(self, db):
+        """An independent session cannot recall the other conversation."""
+        sid_a = _session_row(db, "sess-a")
+>       make_session(
+            FakeClient(next_thread_id="thread-A"),
+            continuity=make_continuity(db, sid_a),
+        ).ensure_started()
+
+tests/agent/transports/test_codex_thread_continuity.py:212: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d36c40>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d37490>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+___ TestNegativeControls.test_fabricated_thread_id_is_refused_not_restarted ____
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestNegativeControls object at 0x7f07e558d090>
+db = <hermes_state.SessionDB object at 0x7f07e4cfcf50>
+
+    def test_fabricated_thread_id_is_refused_not_restarted(self, db):
+        """codex refuses the saved id → explicit error, never a silent start."""
+        sid = _session_row(db, "sess-fabricated")
+        db.patch_session_model_config(sid, {
+            THREAD_RECORD_KEY: CodexThreadRecord(
+                thread_id="00000000-dead-beef-0000-000000000000",
+                cwd=CWD,
+                permission_profile="workspace-write",
+                owner_pid=0,
+                version=1,
+            ).to_dict()
+        })
+        client = FakeClient(known_threads=set(), next_thread_id="thread-fallback")
+>       s = make_session(client, continuity=make_continuity(db, sid))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:239: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d36fd0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d80050>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+__________ TestNegativeControls.test_live_concurrent_owner_is_refused __________
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestNegativeControls object at 0x7f07e55fc050>
+db = <hermes_state.SessionDB object at 0x7f07e4cfefd0>
+
+    def test_live_concurrent_owner_is_refused(self, db):
+        sid = _session_row(db, "sess-owner")
+        db.patch_session_model_config(sid, {
+            THREAD_RECORD_KEY: CodexThreadRecord(
+                thread_id="thread-owned",
+                cwd=CWD,
+                permission_profile="workspace-write",
+                owner_pid=os.getppid(),  # a real, live, different process
+                owner_boot_id=_current_boot_id(),
+                claimed_at=1.0,
+                version=1,
+            ).to_dict()
+        })
+        client = FakeClient(known_threads={"thread-owned"})
+>       s = make_session(client, continuity=make_continuity(db, sid))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:259: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e543d6d0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e543d910>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+________ TestNegativeControls.test_dead_owner_is_a_legitimate_takeover _________
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestNegativeControls object at 0x7f07e55fc180>
+db = <hermes_state.SessionDB object at 0x7f07e4cff250>
+
+    def test_dead_owner_is_a_legitimate_takeover(self, db):
+        """Crash recovery: the previous owner died without releasing."""
+        sid = _session_row(db, "sess-crash")
+        db.patch_session_model_config(sid, {
+            THREAD_RECORD_KEY: CodexThreadRecord(
+                thread_id="thread-crashed",
+                cwd=CWD,
+                permission_profile="workspace-write",
+                owner_pid=_dead_pid(),
+                owner_boot_id=_current_boot_id(),
+                claimed_at=1.0,
+                version=1,
+            ).to_dict()
+        })
+        client = FakeClient(known_threads={"thread-crashed"})
+>       s = make_session(client, continuity=make_continuity(db, sid))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:280: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d209e0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d20c00>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+____________ TestNegativeControls.test_identity_mismatch_is_refused ____________
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestNegativeControls object at 0x7f07e55a6d50>
+db = <hermes_state.SessionDB object at 0x7f07e4cff4d0>
+
+    def test_identity_mismatch_is_refused(self, db):
+        sid = _session_row(db, "sess-mismatch")
+        db.patch_session_model_config(sid, {
+            THREAD_RECORD_KEY: CodexThreadRecord(
+                thread_id="thread-elsewhere",
+                cwd="/some/other/project",
+                permission_profile="workspace-write",
+                version=1,
+            ).to_dict()
+        })
+        client = FakeClient(known_threads={"thread-elsewhere"})
+>       s = make_session(client, continuity=make_continuity(db, sid))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:295: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d21480>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d216a0>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+___ TestNegativeControls.test_unreadable_store_refuses_rather_than_starting ____
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestNegativeControls object at 0x7f07e56b6030>
+db = <hermes_state.SessionDB object at 0x7f07e4cff750>
+
+    def test_unreadable_store_refuses_rather_than_starting(self, db):
+        sid = _session_row(db, "sess-broken-store")
+    
+        class BrokenStore:
+            def load(self):
+                raise CodexThreadPersistenceError("db unavailable")
+    
+            def save(self, record):
+                raise CodexThreadPersistenceError("db unavailable")
+    
+            def clear(self):
+                raise CodexThreadPersistenceError("db unavailable")
+    
+        continuity = CodexThreadContinuity(
+            BrokenStore(), cwd=CWD, permission_profile="workspace-write"
+        )
+        client = FakeClient()
+>       s = make_session(client, continuity=continuity)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:317: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d00d50>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d00c50>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+_____________ TestOwnershipLifecycle.test_close_releases_ownership _____________
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestOwnershipLifecycle object at 0x7f07e558d6d0>
+db = <hermes_state.SessionDB object at 0x7f07e4cff9d0>
+
+    def test_close_releases_ownership(self, db):
+        sid = _session_row(db, "sess-release")
+        client = FakeClient(next_thread_id="thread-rel")
+>       s = make_session(client, continuity=make_continuity(db, sid))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:331: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e4d01550>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e4d01350>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+____ TestOwnershipLifecycle.test_resume_reclaims_ownership_for_this_process ____
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestOwnershipLifecycle object at 0x7f07e558d810>
+db = <hermes_state.SessionDB object at 0x7f07e4cffc50>
+
+    def test_resume_reclaims_ownership_for_this_process(self, db):
+        sid = _session_row(db, "sess-reclaim")
+>       make_session(
+            FakeClient(next_thread_id="thread-rc"),
+            continuity=make_continuity(db, sid),
+        ).ensure_started()
+
+tests/agent/transports/test_codex_thread_continuity.py:343: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e53964e0>
+continuity = <agent.transports.codex_thread_continuity.CodexThreadContinuity object at 0x7f07e53965d0>
+kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+_ TestOwnershipLifecycle.test_no_continuity_keeps_legacy_fresh_thread_behaviour _
+
+self = <tests.agent.transports.test_codex_thread_continuity.TestOwnershipLifecycle object at 0x7f07e55fc770>
+
+    def test_no_continuity_keeps_legacy_fresh_thread_behaviour(self):
+        """Ephemeral agents (no session DB) are unchanged."""
+        client = FakeClient(next_thread_id="thread-ephemeral")
+>       s = make_session(client, continuity=None)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/transports/test_codex_thread_continuity.py:364: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+client = <tests.agent.transports.test_codex_thread_continuity.FakeClient object at 0x7f07e53976b0>
+continuity = None, kwargs = {}
+
+    def make_session(client: FakeClient, continuity=None, **kwargs):
+>       return CodexAppServerSession(
+            cwd=CWD,
+            client_factory=lambda **kw: client,
+            continuity=continuity,
+            **kwargs,
+        )
+E       TypeError: CodexAppServerSession.__init__() got an unexpected keyword argument 'continuity'
+
+tests/agent/transports/test_codex_thread_continuity.py:116: TypeError
+=========================== short test summary info ============================
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestRestartResumesExactThread::test_same_session_new_process_resumes_exact_thread_id
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestRestartResumesExactThread::test_record_persists_runtime_identity
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestRestartResumesExactThread::test_model_config_lineage_is_preserved
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestNegativeControls::test_fresh_session_gets_a_fresh_thread
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestNegativeControls::test_fabricated_thread_id_is_refused_not_restarted
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestNegativeControls::test_live_concurrent_owner_is_refused
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestNegativeControls::test_dead_owner_is_a_legitimate_takeover
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestNegativeControls::test_identity_mismatch_is_refused
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestNegativeControls::test_unreadable_store_refuses_rather_than_starting
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestOwnershipLifecycle::test_close_releases_ownership
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestOwnershipLifecycle::test_resume_reclaims_ownership_for_this_process
+FAILED tests/agent/transports/test_codex_thread_continuity.py::TestOwnershipLifecycle::test_no_continuity_keeps_legacy_fresh_thread_behaviour
+12 failed, 1 passed in 4.03s
