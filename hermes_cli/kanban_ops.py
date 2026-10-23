@@ -60,11 +60,15 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
+    # semantics as the gateway dispatch path. Board caps are BOARD-SCOPE
+    # (#124): they come from the default profile's config so they hold
+    # whichever profile runs dispatch, not just --profile default.
+    from hermes_cli.kanban_board_caps import board_scope_kanban_caps
+
+    _kanban_cfg, caps_source, caps_warning = board_scope_kanban_caps()
+    if caps_warning:
+        print(f"warning: {caps_warning}", file=sys.stderr)
     try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
@@ -141,6 +145,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    if args.dry_run:
+        print(f"Caps source: {caps_source}")
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
@@ -210,6 +216,19 @@ def stranded_warning(task_ids, *, now: int, state: dict, enabled: bool):
         f"assignee is not a Hermes profile. {ids}. Reassign with `hermes kanban assign <id> "
         f"<profile>` (see `hermes kanban assignees`) or park them with `hermes kanban block`."
     )
+
+
+def _daemon_scope_assignee_caps(args: argparse.Namespace) -> dict:
+    """By-assignee caps for the deprecated standalone daemon (#124): board-scope
+    config caps with explicit ``--max-per-assignee`` still winning per name."""
+    from hermes_cli.kanban_board_caps import board_scope_kanban_caps
+
+    cfg, _source, warning = board_scope_kanban_caps()
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    caps = kbd.parse_assignee_caps(cfg.get("max_in_progress_by_assignee"))
+    caps.update(kbd.parse_assignee_caps(getattr(args, "max_per_assignee", None)))
+    return caps
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -326,9 +345,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             on_tick=_on_tick,
-            max_in_progress_by_assignee=kbd.parse_assignee_caps(
-                getattr(args, "max_per_assignee", None)
-            ),
+            max_in_progress_by_assignee=_daemon_scope_assignee_caps(args),
         )
     finally:
         if pidfile:
