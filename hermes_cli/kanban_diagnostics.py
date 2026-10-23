@@ -995,6 +995,23 @@ def _rule_skill_rejected(task, events, runs, now, cfg) -> list[Diagnostic]:
     payload = _parse_payload(latest)
     assignee = str(payload.get("assignee") or _task_field(task, "assignee") or "")
     missing = payload.get("missing_skills") or []
+    if status == "review" and not missing and payload.get("reason"):
+        ts = _event_ts(latest)
+        return [Diagnostic(
+            kind="review_unavailable",
+            severity="warning",
+            title="Independent reviewer required",
+            detail=str(payload["reason"]),
+            actions=[DiagnosticAction(
+                kind="reassign",
+                label="Assign an independent reviewer",
+                payload={"current_assignee": assignee},
+            )],
+            first_seen_at=ts,
+            last_seen_at=ts,
+            count=len(rejected),
+            data={"assignee": assignee},
+        )]
     if not isinstance(missing, list) or not missing:
         return []
     missing = [str(name) for name in missing]

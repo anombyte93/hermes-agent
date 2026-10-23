@@ -1203,6 +1203,8 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # auto = dispatcher review; parent = explicitly approved by the parent/human.
+    review_mode: str = "auto"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1302,6 +1304,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            review_mode=row["review_mode"] if "review_mode" in keys else "auto",
         )
 
 
@@ -1493,7 +1496,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    review_mode          TEXT NOT NULL DEFAULT 'auto'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2697,6 +2701,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # worker via --skills. NULL is fine for existing rows.
         _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
 
+    if "review_mode" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_mode", "review_mode TEXT NOT NULL DEFAULT 'auto'"
+        )
+
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
         # NULL = fall through to the dispatcher-level ``kanban.failure_limit``
@@ -3312,6 +3321,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    review_mode: str = "auto",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3336,6 +3346,9 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
+    ``review_mode='parent'`` leaves a review handoff for explicit parent/human
+    approval. The default ``auto`` permits an independent assigned reviewer.
+
     ``model_override`` / ``provider_override`` pin the worker to a specific
     model (and optionally its provider) without touching the profile's
     config — passed to the worker as ``-m <model> [--provider <name>]``.
@@ -3355,6 +3368,8 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    if review_mode not in ("auto", "parent"):
+        raise ValueError("review_mode must be 'auto' or 'parent'")
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3629,8 +3644,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, block_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, block_reason, review_mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3657,6 +3672,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         block_reason if task_status == "blocked" else None,
+                        review_mode,
                     ),
                 )
                 for pid in parents:
@@ -3686,6 +3702,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "review_mode": review_mode,
                     },
                 )
                 if task_status == "blocked":
@@ -4891,12 +4908,27 @@ def claim_task(
     return claimed
 
 
+def _review_authored_by(conn: sqlite3.Connection, task_id: str, profile: str) -> bool:
+    """Compare immutable implementation-run profiles, not mutable assignments.
+
+    Review retries are not implementations. Synthetic ready-to-review handoffs
+    have no implementation worker and use status=review_requested.
+    """
+    rows = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND profile = ? "
+        "AND status != 'review_requested'",
+        (task_id, profile),
+    ).fetchall()
+    return any(_retry_status_for_run(conn, task_id, row["id"]) != "review" for row in rows)
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4908,12 +4940,27 @@ def claim_review_task(
 
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
+
+    ``expected_assignee`` is the automatic-dispatch preflight guard: it rejects
+    a changed assignment, a parent-owned review, or an implementation author
+    atomically with the claim. Omit it for an explicit manual claim.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     default_max_runtime = configured_default_max_runtime()
     with write_txn(conn):
+        # Automatic dispatch binds preflight to the assignment it checked.
+        # Manual parent/human claims remain explicit and backwards compatible.
+        if expected_assignee is not None:
+            candidate = get_task(conn, task_id)
+            if (
+                candidate is None
+                or candidate.assignee != expected_assignee
+                or candidate.review_mode != "auto"
+                or _review_authored_by(conn, task_id, expected_assignee)
+            ):
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -10369,6 +10416,7 @@ def _append_skill_rejected_event(
     missing_skills: list[str],
     *,
     lane: str = "ready",
+    reason: Optional[str] = None,
 ) -> None:
     """Record a forced-skill refusal as a durable ``skill_rejected`` event,
     rate-limited to one event per unchanged refusal streak (#20).
@@ -10386,7 +10434,7 @@ def _append_skill_rejected_event(
     event_kind = "review_unavailable" if lane == "review" else "skill_rejected"
     payload = {"assignee": assignee, "missing_skills": sorted(missing_skills)}
     if lane == "review":
-        payload["reason"] = (
+        payload["reason"] = reason or (
             f"Profile '{assignee}' cannot load required review skill(s): "
             + ", ".join(sorted(missing_skills))
         )
@@ -10406,6 +10454,7 @@ def _append_skill_rejected_event(
                 isinstance(prev, dict)
                 and prev.get("assignee") == assignee
                 and sorted(prev.get("missing_skills") or []) == sorted(missing_skills)
+                and prev.get("reason") == payload.get("reason")
             ):
                 return
         _append_event(
@@ -10775,7 +10824,7 @@ def _dispatch_once_locked(
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee, workspace_path FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
+            "WHERE status = 'review' AND claim_lock IS NULL AND review_mode = 'auto' "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
@@ -10794,7 +10843,7 @@ def _dispatch_once_locked(
     # is parked (the review loop skips it), so it must not hold the slot
     # either: otherwise at ``max_in_progress=1`` one parked card would starve
     # every ready card forever. The skill check is resolved ONCE per
-    # (assignee, project scope) per tick, here, and the review loop reuses
+    # (assignee, project scope, forced skills) per tick, here, and the review loop reuses
     # the result: skill resolution reads the profile's skills tree and runs
     # under the dispatch lock, so it must not scale with the card count.
     try:
@@ -10802,12 +10851,32 @@ def _dispatch_once_locked(
     except Exception:
         _rpe = None  # type: ignore[assignment]
 
-    def _review_scope(row) -> tuple[str, Optional[str]]:
+    def _review_scope(row):
         cwd = _worker_skill_scope(row["workspace_path"])
-        return (row["assignee"], cwd), cwd
+        candidate = get_task(conn, row["id"])
+        skills = tuple(dict.fromkeys([
+            *((candidate.skills if candidate else None) or []), "sdlc-review"
+        ]))
+        return (row["assignee"], cwd, skills), cwd
 
-    review_missing: dict[tuple[str, Optional[str]], list[str]] = {}
+    review_missing: dict[tuple[str, Optional[str], tuple[str, ...]], list[str]] = {}
+    review_authors = {
+        row["id"] for row in review_rows
+        if row["assignee"] and _review_authored_by(conn, row["id"], row["assignee"])
+    }
     for row in review_rows:
+        # Refusals are diagnosed before ready work consumes the shared budget.
+        # Otherwise a full ready queue can hide a parked review indefinitely.
+        if row["id"] in review_authors:
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row["assignee"], [], lane="review",
+                    reason=(
+                        f"Profile '{row['assignee']}' authored an implementation run; "
+                        "assign an independent reviewer or await parent approval."
+                    ),
+                )
+            continue
         if not row["assignee"]:
             continue
         if _rpe is not None and not _rpe(row["assignee"]):
@@ -10815,14 +10884,23 @@ def _dispatch_once_locked(
         key, cwd = _review_scope(row)
         if key not in review_missing:
             review_missing[key] = _missing_worker_skills(
-                ["sdlc-review"], row["assignee"], cwd
+                list(key[2]), row["assignee"], cwd
             )
+        missing_skills = review_missing[key]
+        if missing_skills:
+            result.rejected_skills.append((row["id"], missing_skills))
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row["assignee"], missing_skills, lane="review"
+                )
 
     def _any_spawnable_review() -> bool:
         # "Spawnable" = assigned, a real profile (or no profiles module —
         # test stubs, exotic envs — matching the review loop's own
         # fallback), and able to load the review skill.
         for row in review_rows:
+            if row["id"] in review_authors:
+                continue
             if not row["assignee"]:
                 continue
             if _rpe is not None and not _rpe(row["assignee"]):
@@ -11104,6 +11182,8 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if row["id"] in review_authors:
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -11122,11 +11202,6 @@ def _dispatch_once_locked(
         # worker that will fail (or silently review without its guidance).
         missing_skills = review_missing.get(_review_scope(row)[0], [])
         if missing_skills:
-            result.rejected_skills.append((row["id"], missing_skills))
-            if not dry_run:
-                _append_skill_rejected_event(
-                    conn, row["id"], row["assignee"], missing_skills, lane="review"
-                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -11153,7 +11228,9 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn, row["id"], ttl_seconds=ttl_seconds, expected_assignee=row["assignee"]
+        )
         if claimed is None:
             continue
         try:
