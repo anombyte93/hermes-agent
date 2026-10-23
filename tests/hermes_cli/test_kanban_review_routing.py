@@ -207,3 +207,130 @@ def test_missing_review_skill_is_diagnostic_not_crash(home, missing):
         assert len(notices) == 1
         assert missing in notices[0].payload["missing_skills"]
         assert "reviewer" in notices[0].payload["reason"]
+
+
+@pytest.mark.parametrize("parked", ["parent", "author", "sdlc-review", "domain-review"])
+def test_spawnable_review_probe_excludes_parked_cards(home, parked):
+    with kb.connect() as conn:
+        kwargs = {"reviewer": "reviewer"}
+        if parked == "parent":
+            kwargs["review_mode"] = "parent"
+        elif parked == "author":
+            kwargs["reviewer"] = None
+        elif parked == "sdlc-review":
+            (home / "profiles" / "reviewer" / "skills" / parked / "SKILL.md").unlink()
+        else:
+            kwargs["skills"] = [parked]
+        tid, _ = handoff(conn, **kwargs)
+        before = (kb.list_runs(conn, tid), kb.list_events(conn, tid))
+        assert kb.get_task(conn, tid).status == "review"
+        assert kb.has_spawnable_review(conn) is False
+        assert (kb.list_runs(conn, tid), kb.list_events(conn, tid)) == before
+        preview = kb.dispatch_once(conn, dry_run=True)
+        assert not preview.spawned
+
+
+def test_spawnable_review_probe_finds_independent_review_among_parked_cards(home):
+    with kb.connect() as conn:
+        handoff(conn, review_mode="parent", reviewer="reviewer")
+        handoff(conn)
+        tid, _ = handoff(conn, reviewer="reviewer")
+        assert kb.has_spawnable_review(conn) is True
+        preview = kb.dispatch_once(conn, dry_run=True)
+        assert [item[0] for item in preview.spawned] == [tid]
+        review = kb.claim_review_task(conn, tid, expected_assignee="reviewer")
+        assert review is not None
+        assert kb.has_spawnable_review(conn) is False
+
+
+def test_spawnable_review_probe_caches_skills_per_scope_not_between_probes(home, monkeypatch):
+    calls = []
+    real_missing = kb._missing_worker_skills
+
+    def missing(skills, assignee, cwd):
+        calls.append((skills, assignee, cwd))
+        return real_missing(skills, assignee, cwd)
+
+    monkeypatch.setattr(kb, "_missing_worker_skills", missing)
+    with kb.connect() as conn:
+        for _ in range(3):
+            handoff(conn, reviewer="reviewer", skills=["domain-review"])
+        assert kb.has_spawnable_review(conn) is False
+        assert calls == [(["domain-review", "sdlc-review"], "reviewer", None)]
+        skill = home / "profiles" / "reviewer" / "skills" / "domain-review" / "SKILL.md"
+        skill.parent.mkdir()
+        skill.write_text("---\nname: domain-review\ndescription: Review.\n---\nReview.\n")
+        assert kb.has_spawnable_review(conn) is True
+        assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("board_state", ["empty", "parked", "spawnable"])
+async def test_gateway_stuck_warning_only_for_spawnable_review(home, monkeypatch, caplog, board_state):
+    import logging
+    from types import SimpleNamespace
+
+    from gateway import kanban_watchers as watchers
+    from hermes_cli import config
+
+    with kb.connect() as conn:
+        if board_state == "parked":
+            handoff(conn, review_mode="parent", reviewer="reviewer")
+            handoff(conn)
+            handoff(conn, reviewer="reviewer", skills=["domain-review"])
+        elif board_state == "spawnable":
+            handoff(conn, reviewer="reviewer")
+        assert len(kb.list_tasks(conn, status="review")) == {
+            "empty": 0, "parked": 3, "spawnable": 1,
+        }[board_state]
+
+    runner = SimpleNamespace(_running=True, _release_kanban_dispatcher_lock=lambda: None)
+    ticks = []
+
+    def stalled_dispatch(conn, **kwargs):
+        ticks.append(kwargs["board"])
+        return SimpleNamespace(spawned=[])
+
+    async def inline(func, *args):
+        return func(*args)
+
+    async def sleep(delay):
+        if delay == 1 and len(ticks) >= 7:
+            runner._running = False
+
+    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {
+        "dispatch_interval_seconds": 1, "auto_decompose": False,
+    }})
+    monkeypatch.delenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", raising=False)
+    monkeypatch.setattr(kb, "list_boards", lambda **kw: [{"slug": kb.DEFAULT_BOARD}])
+    monkeypatch.setattr(kb, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(kb, "dispatch_once", stalled_dispatch)
+    monkeypatch.setattr(watchers, "_acquire_singleton_lock", lambda path: (None, "held"))
+    monkeypatch.setattr(watchers, "_kanban_dispatch_allowed", lambda: True)
+    monkeypatch.setattr(watchers, "_to_thread_process_service", inline)
+    monkeypatch.setattr(watchers.asyncio, "sleep", sleep)
+    with caplog.at_level(logging.WARNING, logger=watchers.__name__):
+        await watchers.GatewayKanbanWatchersMixin._kanban_dispatcher_watcher(runner)
+    assert len(ticks) == 7
+    assert "unexpected watcher error" not in caplog.text
+    warnings = [record for record in caplog.records if "kanban dispatcher stuck" in record.message]
+    assert len(warnings) == (1 if board_state == "spawnable" else 0)
+
+
+@pytest.mark.parametrize("surface", ["worker", "tool", "reviewer"])
+def test_review_handoff_guidance_explains_omitted_reviewer(surface):
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools.kanban_tools import KANBAN_REQUEST_REVIEW_SCHEMA
+
+    schema = KANBAN_REQUEST_REVIEW_SCHEMA
+    text = {
+        "worker": KANBAN_GUIDANCE,
+        "tool": schema["description"],
+        "reviewer": schema["parameters"]["properties"]["reviewer"]["description"],
+    }[surface]
+    assert "independent reviewer" in text
+    assert "omit `reviewer`" in text
+    assert "waits in `review`" in text
+    assert "parent or human" in text
+    assert "no self-review" in text
+    assert "reviewer" not in schema["parameters"]["required"]

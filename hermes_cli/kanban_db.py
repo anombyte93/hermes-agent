@@ -10049,26 +10049,33 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    """Return whether an unclaimed automatic review has an eligible assignee.
 
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
+    Health telemetry must ignore parent-owned reviews, implementation authors
+    and missing-skill parks, just like the dispatcher's review preflight. This
+    is a read-only probe; skill resolution is cached per scope for this call.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee, workspace_path FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND review_mode = 'auto'"
     ).fetchall()
     if not rows:
         return False
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        return True
+        profile_exists = None  # type: ignore[assignment]
+    review_missing: dict[tuple[str, Optional[str], tuple[str, ...]], list[str]] = {}
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _review_authored_by(conn, row["id"], row["assignee"]):
+            continue
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        key = _review_skill_scope(conn, row)
+        if key not in review_missing:
+            review_missing[key] = _missing_worker_skills(list(key[2]), key[0], key[1])
+        if not review_missing[key]:
             return True
     return False
 
@@ -10648,6 +10655,19 @@ def _missing_worker_skills(
         reset_hermes_home_override(token)
 
 
+def _review_skill_scope(
+    conn: sqlite3.Connection, row: sqlite3.Row,
+) -> tuple[str, Optional[str], tuple[str, ...]]:
+    """Shared profile/project/forced-skill scope for review dispatch and health."""
+    cwd = _worker_skill_scope(row["workspace_path"])
+    candidate = get_task(conn, row["id"])
+    forced_skills: list[str] = (candidate.skills if candidate else None) or []
+    skills = tuple(dict.fromkeys([
+        *forced_skills, "sdlc-review"
+    ]))
+    return row["assignee"], cwd, skills
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -10851,14 +10871,6 @@ def _dispatch_once_locked(
     except Exception:
         _rpe = None  # type: ignore[assignment]
 
-    def _review_scope(row):
-        cwd = _worker_skill_scope(row["workspace_path"])
-        candidate = get_task(conn, row["id"])
-        skills = tuple(dict.fromkeys([
-            *((candidate.skills if candidate else None) or []), "sdlc-review"
-        ]))
-        return (row["assignee"], cwd, skills), cwd
-
     review_missing: dict[tuple[str, Optional[str], tuple[str, ...]], list[str]] = {}
     review_authors = {
         row["id"] for row in review_rows
@@ -10881,10 +10893,10 @@ def _dispatch_once_locked(
             continue
         if _rpe is not None and not _rpe(row["assignee"]):
             continue
-        key, cwd = _review_scope(row)
+        key = _review_skill_scope(conn, row)
         if key not in review_missing:
             review_missing[key] = _missing_worker_skills(
-                list(key[2]), row["assignee"], cwd
+                list(key[2]), key[0], key[1]
             )
         missing_skills = review_missing[key]
         if missing_skills:
@@ -10905,7 +10917,7 @@ def _dispatch_once_locked(
                 continue
             if _rpe is not None and not _rpe(row["assignee"]):
                 continue
-            if not review_missing.get(_review_scope(row)[0]):
+            if not review_missing.get(_review_skill_scope(conn, row)):
                 return True
         return False
 
@@ -11200,7 +11212,7 @@ def _dispatch_once_locked(
         # Check the mandatory review skill in the worker's profile BEFORE
         # claiming: an unavailable skill must not create a run or boot a
         # worker that will fail (or silently review without its guidance).
-        missing_skills = review_missing.get(_review_scope(row)[0], [])
+        missing_skills = review_missing.get(_review_skill_scope(conn, row), [])
         if missing_skills:
             continue
         if _per_profile_cap is not None:

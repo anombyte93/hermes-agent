@@ -1960,7 +1960,12 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
         "NOT a blocker — it never counts toward unblock-loop detection, so a "
         "task can cycle through review across follow-ups without ever being "
         "falsely escalated to triage. Use this instead of blocking with a "
-        "free-form 'review-required:' reason."
+        "free-form 'review-required:' reason. On default auto-review cards, "
+        "name an independent reviewer profile. If you omit `reviewer` while "
+        "still assigned as the author, the card waits in `review` for an "
+        "independent reviewer or parent or human approval; no self-review "
+        "starts and no reviewer is auto-selected. Parent-owned review cards "
+        "wait for explicit parent or human review instead."
     ),
     "parameters": {
         "type": "object",
@@ -1980,8 +1985,12 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "reviewer": {
                 "type": "string",
                 "description": (
-                    "Optional reviewer profile. When provided, the task is "
-                    "reassigned to that profile before review dispatch."
+                    "An independent reviewer profile to assign before automatic "
+                    "review dispatch. Optional for parent or human review. If "
+                    "you omit `reviewer` while still assigned as the author on "
+                    "a default auto-review card, it waits in `review` for "
+                    "reassignment or parent or human approval; no self-review "
+                    "starts and no reviewer is auto-selected."
                 ),
             },
             "metadata": {
