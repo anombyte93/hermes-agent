@@ -41,7 +41,13 @@ _REASON_INTERMIXED_VERBS = frozenset({"block", "schedule", "promote", "request-c
 _BULK_REASON_VERBS = frozenset({"block", "schedule", "promote"})
 # ``t_`` + id chars, the shape minted by kanban_db.new_task_id; deliberately
 # loose so other ``t_...`` shapes (e.g. imported boards) still count as ids.
-_TASK_ID_RE = re.compile(r"^t_[a-z0-9_:\-\.]+$", re.IGNORECASE)
+# Always applied with ``fullmatch``: ``match`` with ``$`` accepts a final
+# newline, so ``"t_b\n"`` passed every check (review r2 of #133).
+_TASK_ID_RE = re.compile(r"t_[a-z0-9_:\-\.]+", re.IGNORECASE)
+
+
+def _is_task_id(word) -> bool:
+    return isinstance(word, str) and _TASK_ID_RE.fullmatch(word) is not None
 
 
 def reason_extra_ids(verb: str, words, flag: Optional[str]) -> list[str]:
@@ -52,7 +58,7 @@ def reason_extra_ids(verb: str, words, flag: Optional[str]) -> list[str]:
     """
     if flag is None or verb not in _BULK_REASON_VERBS:
         return []
-    return [w for w in (words or ()) if _TASK_ID_RE.match(w)]
+    return [w for w in (words or ()) if _is_task_id(w)]
 
 
 def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
@@ -88,7 +94,7 @@ def ids_not_task_ids(verb: str, ids) -> Optional[str]:
     """
     if verb not in _BULK_REASON_VERBS:
         return None
-    bad = [w for w in (ids or ()) if not _TASK_ID_RE.match(w)]
+    bad = [w for w in (ids or ()) if not _is_task_id(w)]
     if not bad:
         return None
     return f"{len(bad)} word(s) after --ids are not task ids; {_IDS_ONLY_HINT}"
@@ -110,9 +116,43 @@ def task_id_word(value: str) -> str:
     read closes that before any replacement (review r1 of the #133 Codex fix).
     ``ArgumentTypeError`` keeps argparse from echoing the value.
     """
-    if not _TASK_ID_RE.match(value):
+    if not _is_task_id(value):
         raise argparse.ArgumentTypeError(f"a word is not a task id; {_IDS_ONLY_HINT}")
     return value
+
+
+# An unknown option's label: ``-x`` or ``--name`` (the part before any ``=``).
+# Anything else (plain words, attached values, odd or very long tokens) is only
+# counted, since the reason after a typo'd flag lands in the extras on Python
+# 3.11 and a reason can carry a secret (review r2 of #133).
+_OPTION_LABEL_RE = re.compile(r"--?[A-Za-z][A-Za-z0-9_-]{0,31}")
+
+
+def _option_label(word: str) -> Optional[str]:
+    if not word.startswith("-") or word in {"-", "--"}:
+        return None
+    label = word[:2] if not word.startswith("--") else word.split("=", 1)[0]
+    return label if _OPTION_LABEL_RE.fullmatch(label) else None
+
+
+def unrecognized_args_error(extras) -> str:
+    """Usage-error text for leftover arguments: option labels and a count only.
+
+    Never echoes a value: ``--reasn "rotate <secret>"`` reports ``--reasn`` and
+    "1 other word(s)", ``--token=<secret>`` reports ``--token``.
+    """
+    labels, hidden = [], 0
+    for word in extras:
+        label = _option_label(word) if isinstance(word, str) else None
+        if label is None:
+            hidden += 1
+        else:
+            labels.append(label)
+    text = " ".join(labels)
+    if hidden:
+        tail = f"{hidden} other word(s); their text is not shown"
+        text = f"{text} ({tail})" if text else tail
+    return f"unrecognized arguments: {text}"
 
 
 def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
@@ -125,11 +165,14 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
 
     Every other verb parses exactly as before (``parse_known_args``), so no
     other verb's accepted syntax changes. Mirrors the stdlib ``__call__``:
-    parse into a fresh subnamespace, copy it onto the caller's namespace, and
-    hand leftover strings to the top-level parser as unrecognized arguments.
-    Leftovers are NOT re-parsed without intermixing: that would report the
-    trailing reason words as unrecognized next to the genuinely bad option,
-    i.e. the #125 symptom. ArgumentError (``exit_on_error=False`` in
+    parse into a fresh subnamespace and copy it onto the caller's namespace.
+    Leftover strings are refused here by option label and count
+    (``unrecognized_args_error``), never handed to the top-level parser, whose
+    "unrecognized arguments" error echoes them verbatim: on Python 3.11 they
+    include the reason after a typo'd flag (review r2 of #133). Leftovers are
+    NOT re-parsed without intermixing: that would report the trailing reason
+    words as unrecognized next to the genuinely bad option, i.e. the #125
+    symptom. ArgumentError (``exit_on_error=False`` in
     ``run_slash``) propagates unchanged.
     """
 
@@ -147,6 +190,11 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
         for key, value in vars(subnamespace).items():
             setattr(subnamespace, key, unshield(value))
         extras = unshield(extras)
+        if extras:
+            # Refused here, by label and count, instead of being forwarded to
+            # the top-level parser, whose error echoes every extra verbatim
+            # (review r2 of #133). Nothing has been changed yet.
+            leaf.error(unrecognized_args_error(extras))
         for key, value in vars(subnamespace).items():
             setattr(namespace, key, value)
         conflict = reason_usage_error(parser_name, getattr(subnamespace, "reason", None),
@@ -154,11 +202,6 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
                                       getattr(subnamespace, "ids", None))
         if conflict:
             leaf.error(conflict)  # usage + message on stderr, exit 2
-        if extras:
-            unrecognized = argparse._UNRECOGNIZED_ARGS_ATTR
-            if not hasattr(namespace, unrecognized):
-                setattr(namespace, unrecognized, [])
-            getattr(namespace, unrecognized).extend(extras)
 
 
 def _shield_after_separator(arg_strings):

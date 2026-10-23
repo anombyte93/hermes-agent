@@ -585,3 +585,174 @@ def test_repeated_ids_cannot_bypass_the_refusal(kanban_home: Path, verb: str) ->
             assert task is not None and task.status == before[tid], (tid, task.status)
             assert len(kb.list_events(conn, tid)) == events_before[tid]
             assert not _comments(conn, tid)
+
+
+# ---------------------------------------------------------------------------
+# Review r2 (hermes-agent-133-r2), finding 1: an unknown option on an
+# intermixed verb is refused by its option label and a word count, never by
+# its value. On Python 3.11 ``parse_known_intermixed_args`` leaves the reason
+# after a typo'd flag (``--reasn "rotate <secret>"``) in the extras, and the
+# stdlib echoed every extra into the /kanban reply.
+# ---------------------------------------------------------------------------
+
+# The reviewer's literal control value, assembled at runtime like _SYNTHETIC_SECRET.
+_R2_CONTROL_SECRET = "SYNTHETIC_" + "SECRET_" + "123"
+
+
+def _assert_untouched(conn, tid: str, status: str, events_before: int) -> None:
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == status, (tid, task and task.status)
+    assert len(kb.list_events(conn, tid)) == events_before
+    assert not _comments(conn, tid)
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+@pytest.mark.parametrize("secret", [_R2_CONTROL_SECRET, _SYNTHETIC_SECRET])
+def test_unknown_option_typo_never_echoes_the_reason(
+    kanban_home: Path, verb: str, secret: str
+) -> None:
+    """The reviewer's control, on every intermixed verb: a typo before the
+    reason names ``--reasn`` and nothing it was given."""
+    with kbc.connect_closing() as conn:
+        tid = _bulk_pair(conn, verb)[0]
+        status = kb.get_task(conn, tid).status
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f"{verb} {tid} --reasn 'rotate {secret}'")
+    assert "usage error" in out, out
+    assert "unrecognized arguments: --reasn" in out, out
+    assert secret not in out and "rotate" not in out, out
+    with kbc.connect_closing() as conn:
+        _assert_untouched(conn, tid, status, events_before)
+
+
+def test_unknown_option_with_attached_value_shows_only_its_label(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _make_ready_tasks(conn, "attached")[0]
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f"block {tid} 'held up' --token={_R2_CONTROL_SECRET} -x{_R2_CONTROL_SECRET}")
+    assert "usage error" in out, out
+    assert "--token" in out and "-x" in out, out
+    assert _R2_CONTROL_SECRET not in out, out
+    with kbc.connect_closing() as conn:
+        _assert_untouched(conn, tid, "ready", events_before)
+
+
+def _py311_intermixed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any interpreter return what Python 3.11 returns for an unknown
+    option followed by reason words: the words land in the extras, not in
+    ``reason``. Keeps the control meaningful on interpreters (3.12+) whose
+    intermixed parser already routes them to ``reason``."""
+    import argparse
+
+    original = argparse.ArgumentParser.parse_known_intermixed_args
+
+    def py311_like(self, args=None, namespace=None):
+        ns, extras = original(self, args, namespace)
+        if extras and getattr(ns, "reason", None):
+            extras, ns.reason = list(extras) + list(ns.reason), []
+        return ns, extras
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_known_intermixed_args", py311_like)
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+def test_reason_left_in_extras_is_never_echoed(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    _py311_intermixed(monkeypatch)
+    with kbc.connect_closing() as conn:
+        tid = _bulk_pair(conn, verb)[0]
+        status = kb.get_task(conn, tid).status
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f"{verb} {tid} --reasn 'rotate {_R2_CONTROL_SECRET}' tail")
+    assert "usage error" in out, out
+    assert "--reasn" in out, out
+    assert "2 other word(s)" in out, out
+    assert _R2_CONTROL_SECRET not in out and "rotate" not in out and "tail" not in out, out
+    with kbc.connect_closing() as conn:
+        _assert_untouched(conn, tid, status, events_before)
+
+
+def test_unrecognized_label_helper_never_returns_values() -> None:
+    from hermes_cli.kanban_parser import unrecognized_args_error
+
+    msg = unrecognized_args_error(
+        ["--reasn", f"rotate {_R2_CONTROL_SECRET}", f"--tok={_R2_CONTROL_SECRET}",
+         f"-x{_R2_CONTROL_SECRET}", "-", "--", "--" + "a" * 80, "--weird\nflag"]
+    )
+    assert msg.startswith("unrecognized arguments: --reasn --tok -x"), msg
+    assert _R2_CONTROL_SECRET not in msg and "rotate" not in msg and "aaaa" not in msg, msg
+    assert "weird" not in msg, msg
+    assert "5 other word(s)" in msg, msg
+    assert unrecognized_args_error(["--bogus"]) == "unrecognized arguments: --bogus"
+
+
+# ---------------------------------------------------------------------------
+# Review r2, finding 2: every task-id check is a full match. ``re.match`` with
+# ``$`` accepted a final newline, so a quoted ``"t_b\n"`` after ``--ids``
+# passed the per-word check; with a repeated ``--ids`` argparse then kept only
+# the last occurrence and the first and third tasks were scheduled.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote"])
+def test_newline_id_after_repeated_ids_is_refused_before_any_change(
+    kanban_home: Path, verb: str
+) -> None:
+    with kbc.connect_closing() as conn:
+        first, second = _bulk_pair(conn, verb)
+        third = (kb.create_task(conn, title=f"{verb}-c", initial_status="blocked",
+                                block_reason="held") if verb == "promote"
+                 else _make_ready_tasks(conn, f"{verb}-c")[0])
+        tids = (first, second, third)
+        before = {tid: kb.get_task(conn, tid).status for tid in tids}
+        events_before = {tid: len(kb.list_events(conn, tid)) for tid in tids}
+    out = kc.run_slash(f"{verb} {first} --ids '{second}\n' --ids {third} --reason maintenance")
+    assert "usage error" in out, out
+    assert "--ids" in out, out
+    assert "maintenance" not in out, out
+    with kbc.connect_closing() as conn:
+        for tid in tids:
+            _assert_untouched(conn, tid, before[tid], events_before[tid])
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote"])
+def test_newline_id_as_trailing_word_is_not_an_extra_id(kanban_home: Path, verb: str) -> None:
+    with kbc.connect_closing() as conn:
+        first, second = _bulk_pair(conn, verb)
+        before = {tid: kb.get_task(conn, tid).status for tid in (first, second)}
+        events_before = {tid: len(kb.list_events(conn, tid)) for tid in (first, second)}
+    out = kc.run_slash(f"{verb} {first} '{second}\n' --reason maintenance")
+    assert "usage error" in out, out
+    with kbc.connect_closing() as conn:
+        for tid in (first, second):
+            _assert_untouched(conn, tid, before[tid], events_before[tid])
+
+
+def test_task_id_checks_are_full_matches() -> None:
+    import argparse
+
+    from hermes_cli.kanban_parser import ids_not_task_ids, reason_extra_ids, task_id_word
+
+    for word in ("t_b\n", "t_b\nrotate", "t_b "):
+        with pytest.raises(argparse.ArgumentTypeError):
+            task_id_word(word)
+        assert ids_not_task_ids("schedule", [word]) is not None
+        assert reason_extra_ids("schedule", [word], "maintenance") == []
+    assert task_id_word("t_b") == "t_b"
+    assert ids_not_task_ids("schedule", ["t_b"]) is None
+    assert reason_extra_ids("schedule", ["t_b"], "maintenance") == ["t_b"]
+
+
+def test_direct_namespace_newline_id_is_refused(kanban_home: Path, capsys) -> None:
+    import argparse
+
+    with kbc.connect_closing() as conn:
+        first, second = _make_ready_tasks(conn, "nl-a", "nl-b")
+        events_before = {tid: len(kb.list_events(conn, tid)) for tid in (first, second)}
+    ns = argparse.Namespace(kanban_action="schedule", task_id=first, ids=[f"{second}\n"],
+                            reason=[], _reason_opt="maintenance")
+    assert kc._cmd_schedule(ns) == 2
+    with kbc.connect_closing() as conn:
+        for tid in (first, second):
+            _assert_untouched(conn, tid, "ready", events_before[tid])
