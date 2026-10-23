@@ -2664,6 +2664,8 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        # Exact hostnames/SSH aliases for direct scp/rsync upload findings only.
+        "tirith_trusted_hosts": [],
         "website_blocklist": {
             "enabled": False,
             "domains": [],
