@@ -509,7 +509,8 @@ def test_active_pr_guard_honours_newer_requeue(
 
         clock[0] += 10
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, event_kind)
+            payload = {"manual": True} if event_kind == "reclaimed" else None
+            kb._append_event(conn, tid, event_kind, payload)
         assert kb.check_respawn_guard(conn, tid) is None
 
         # A later own PR comment must re-arm the guard. Neither an older
@@ -585,6 +586,86 @@ def test_active_pr_guard_still_holds_builder_crashed_after_own_pr(
         # Reassignment must not erase the prior worker's PR evidence.
         kb.assign_task(conn, tid, "reviewer")
         assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_still_holds_after_automatic_claim_expiry(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="expired builder", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 12345)
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        clock[0] += 10
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (clock[0] - 1, tid),
+            )
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        reclaimed = [e for e in kb.list_events(conn, tid) if e.kind == "reclaimed"]
+        assert len(reclaimed) == 1
+        assert reclaimed[0].created_at == clock[0]
+        assert reclaimed[0].payload["worker_pid"] == 12345
+        assert reclaimed[0].payload.get("manual") is not True
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("payload", [None, {"manual": False}, {"manual": "true"}, {"manual": 1}])
+def test_active_pr_guard_ignores_nonmanual_reclaims(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, payload: dict | None,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="nonmanual reclaim", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "reclaimed", payload)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (None, "recent_success"),
+        ({"manual": False}, "recent_success"),
+        ({"manual": "true"}, "recent_success"),
+        ({"manual": 1}, "recent_success"),
+        ({"manual": True}, None),
+    ],
+)
+def test_recent_success_guard_only_honours_manual_reclaims(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+    payload: dict | None, expected: str | None,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="completed builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="implementation complete")
+        assert kb.check_respawn_guard(conn, tid) == "recent_success"
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "reclaimed", payload)
+        assert kb.check_respawn_guard(conn, tid) == expected
 
 
 def test_active_pr_guard_real_reclaim_lifts_own_pr_guard(
