@@ -1217,13 +1217,14 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 
 @router.post("/dispatch")
-def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
+def dispatch(dry_run: bool = Query(False), max_n: Optional[int] = Query(None, alias="max"), board: Optional[str] = Query(None)):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
 
     Applies the same board-scope caps as every other dispatcher (#124): the
-    default profile's ``kanban`` capacity keys, with ``max`` as the explicit
-    spawn cap. An unreadable default config spawns nothing
-    (``board_caps_warning`` says why)."""
+    default profile's ``kanban`` capacity keys. An omitted ``max`` is no
+    override: the configured ``max_spawn`` (``0`` included) applies; an
+    explicit ``max`` is the operator's spawn cap. An unreadable default config
+    spawns nothing (``board_caps_warning`` says why; key names only)."""
     from hermes_cli import kanban_board_caps as kbcaps
 
     caps = kbcaps.read_board_caps()

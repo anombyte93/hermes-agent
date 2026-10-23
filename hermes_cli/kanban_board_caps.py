@@ -9,11 +9,17 @@ call it every tick), by one declared rule:
 
 1. The board caps are the six :data:`BOARD_CAP_KEYS` under ``kanban:`` in the
    DEFAULT profile's ``config.yaml``, read as raw YAML, with the managed-scope
-   overlay applied on top (managed wins at the leaf).
-2. Board-cap values are literal YAML values. A ``${VAR}`` reference in a
-   board-cap key is NOT expanded: that key is invalid, a warning names it,
-   and it is ignored. The caps never depend on the invoker's environment or
-   secret scope.
+   overlay applied on top. Managed wins per entry: a scalar, one
+   ``max_in_progress_by_assignee`` name, or one field of one
+   ``assignee_groups`` group.
+2. Board caps are literal values and nothing here expands a ``${...}``
+   reference. Integer caps are literal YAML integers (``max_spawn``,
+   ``max_in_progress``, ``max_in_progress_per_profile`` >= 0; per-assignee and
+   group ``max`` >= 1); ``default_assignee`` and group members are literal
+   names. Each entry or group is validated ON ITS OWN, in its own layer: an
+   invalid one (a reference, a string or bool where an int belongs, ``null``,
+   ``{}``) is dropped and named in the warning, and every valid entry, managed
+   or user, is kept.
 3. A missing default ``config.yaml`` is an empty user layer; the managed
    overlay still applies.
 4. An unreadable or unparseable default ``config.yaml`` refuses spawning for
@@ -21,8 +27,12 @@ call it every tick), by one declared rule:
    the reason in the warning. Nothing is cached and no backup is consulted;
    the next tick reads the file again. The invoking profile's caps are never
    a fallback.
-5. ``max_spawn``, ``max_in_progress`` and ``max_in_progress_per_profile`` share
-   one parser: a nonnegative integer, ``0`` kept as ``0`` (spawn nothing).
+5. ``0`` stays ``0`` (spawn nothing / run nothing).
+6. Warnings name KEYS only, never a value read from any profile. The invoking
+   profile's caps are read raw (never expanded) and validated by rule 2 only
+   to name the keys that differ.
+7. A value is labelled managed only when a valid managed value contributed
+   to it; ``null`` / ``{}`` placeholders leave the user's value user-scoped.
 
 Everything else under ``kanban:`` (intervals, failure limits, alerts, worker
 containment) is runtime config of the process running the dispatcher and keeps
@@ -30,7 +40,6 @@ resolving from that process's profile.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, Optional
@@ -55,8 +64,6 @@ SOURCE_CLI_ASSIGNEE = "--max-per-assignee"
 SOURCE_DERIVED = "memory-derived default"
 SOURCE_REFUSED = "spawning refused"
 
-_ENV_REF = re.compile(r"\$\{[^}]+\}")
-
 
 class _Unreadable(Exception):
     """The default profile's config.yaml cannot be turned into board caps."""
@@ -68,7 +75,7 @@ class BoardCaps:
 
     ``section`` holds the valid :data:`BOARD_CAP_KEYS` values (default file
     with the managed overlay applied); ``managed`` names the values the
-    managed scope set (``key`` or ``key.name``). ``warning`` is one line or
+    managed scope contributed to (``key`` or ``key.name``). ``warning`` is one line or
     ``None``. ``spawn_refused`` is True when the default config is unreadable.
     """
 
@@ -107,9 +114,10 @@ def _cap_keys(doc: Any, what: str) -> Dict[str, Any]:
     return {k: kanban[k] for k in BOARD_CAP_KEYS if k in kanban}
 
 
-def _read_default_caps(path: Path) -> Optional[Dict[str, Any]]:
-    """ONE read of the default config's raw board-cap keys; ``None`` when the
-    file does not exist; raises :class:`_Unreadable` on any other failure."""
+def _read_raw_caps(path: Path) -> Optional[Dict[str, Any]]:
+    """ONE raw read (no ``${...}`` expansion) of a config file's board-cap
+    keys; ``None`` when the file does not exist; raises :class:`_Unreadable`
+    on any other failure."""
     from hermes_cli import config as cfgmod
 
     try:
@@ -134,14 +142,113 @@ def _managed_caps() -> Dict[str, Any]:
         return {}
 
 
+def _literal_int(value: Any, minimum: int) -> Optional[int]:
+    """``value`` when it is a literal YAML int >= ``minimum`` (never a bool or
+    a string), else ``None``."""
+    return value if type(value) is int and value >= minimum else None
+
+
+def _literal_name(value: Any) -> Optional[str]:
+    """A non-empty literal name (no ``${...}``), stripped, else ``None``."""
+    if isinstance(value, str) and "${" not in value:
+        return value.strip() or None
+    return None
+
+
+def _literal_group(spec: Any) -> Optional[Dict[str, Any]]:
+    """One layer's valid fields of one group (``max`` and/or ``members``), or
+    ``None`` when the group is invalid in that layer (a bad field, ``null``,
+    ``{}``)."""
+    if not isinstance(spec, dict) or not spec:
+        return None
+    out: Dict[str, Any] = {}
+    if "max" in spec:
+        out["max"] = _literal_int(spec["max"], 1)
+        if out["max"] is None:
+            return None
+    if "members" in spec:
+        raw = spec["members"]
+        raw = raw.split(",") if isinstance(raw, str) else raw
+        if not isinstance(raw, list):
+            return None
+        members: list = []
+        for member in raw:
+            name = _literal_name(member)
+            if name is None:
+                return None
+            if name not in members:
+                members.append(name)
+        if not members:
+            return None
+        out["members"] = members
+    return out or None
+
+
+def _valid_layer(raw: Dict[str, Any]) -> tuple:
+    """``(valid, invalid_keys)`` for one layer's raw board-cap keys (rule 2):
+    each scalar, assignee entry and group is checked on its own."""
+    valid: Dict[str, Any] = {}
+    invalid: list = []
+    for key, value in raw.items():
+        if key in _NAMED_KEYS:
+            if not isinstance(value, dict) or not value:
+                invalid.append(key)
+                continue
+            entries: Dict[str, Any] = {}
+            for name, entry in value.items():
+                clean_name = _literal_name(name)
+                if key == "assignee_groups":
+                    clean = _literal_group(entry)
+                else:
+                    clean = _literal_int(entry, 1)
+                if clean_name is None or clean is None:
+                    invalid.append(f"{key}.{name}")
+                else:
+                    entries[clean_name] = clean
+            if entries:
+                valid[key] = entries
+            continue
+        clean = _literal_name(value) if key == "default_assignee" else _literal_int(value, 0)
+        if clean is None:
+            invalid.append(key)
+        else:
+            valid[key] = clean
+    return valid, invalid
+
+
+def _merge(user: Dict[str, Any], managed: Dict[str, Any]) -> tuple:
+    """``(section, managed_keys, incomplete_groups)``: two VALID layers merged
+    per entry (managed wins; a group merges per field). ``managed_keys`` names
+    exactly what a managed value contributed to (rule 7). A group left
+    without both ``members`` and ``max`` is dropped and named."""
+    section = {k: dict(v) if isinstance(v, dict) else v for k, v in user.items()}
+    managed_keys = set()
+    for key, value in managed.items():
+        if key == "assignee_groups":
+            groups = section.setdefault(key, {})
+            for name, spec in value.items():
+                groups[name] = {**groups.get(name, {}), **spec}
+                managed_keys.add(f"{key}.{name}")
+        elif key == "max_in_progress_by_assignee":
+            section.setdefault(key, {}).update(value)
+            managed_keys.update(f"{key}.{name}" for name in value)
+        else:
+            section[key] = value
+            managed_keys.add(key)
+    groups = section.get("assignee_groups", {})
+    incomplete = [f"assignee_groups.{name}" for name in groups
+                  if not {"members", "max"} <= set(groups[name])]
+    for key in incomplete:
+        del groups[key.split(".", 1)[1]]
+    return section, managed_keys, incomplete
+
+
 def read_board_caps() -> BoardCaps:
     """Resolve the board-scope caps now (see the module docstring). Never raises."""
-    from hermes_cli.config import _deep_merge
-
     path: Any = "default profile config.yaml"
     try:
         path = default_profile_config_path()
-        user = _read_default_caps(path)
+        user = _read_raw_caps(path)
     except Exception as exc:  # rule 4: fail closed, never the invoker's caps
         reason = str(exc) if isinstance(exc, _Unreadable) else type(exc).__name__
         return BoardCaps(
@@ -155,27 +262,17 @@ def read_board_caps() -> BoardCaps:
     source = f"{SOURCE_DEFAULT} ({path})"
     if user is None:  # rule 3: no default config is an empty user layer
         user, source = {}, f"{SOURCE_DEFAULT} ({path} missing: no user caps)"
-    managed = _managed_caps()
-    section = _deep_merge(user, managed)
-    managed_keys = set()
-    for key, value in managed.items():
-        if value is None:  # _deep_merge keeps the user value under a managed None
-            continue
-        managed_keys.add(key)
-        if key in _NAMED_KEYS and isinstance(value, dict):
-            managed_keys.update(f"{key}.{name}" for name in value)
-    # rule 2: a ${VAR} anywhere in a key's value (nested too) invalidates that key
-    ignored = sorted(k for k in section if _ENV_REF.search(repr(section[k])))
-    for key in ignored:
-        del section[key]
+    user_valid, user_invalid = _valid_layer(user)
+    managed_valid, managed_invalid = _valid_layer(_managed_caps())
+    section, managed_keys, incomplete = _merge(user_valid, managed_valid)
+    invalid = sorted(set(user_invalid + managed_invalid + incomplete))
     warnings = []
-    if ignored:
+    if invalid:  # rule 6: key names only
         warnings.append(
-            "kanban: board caps take literal values only; ignoring "
-            + ", ".join(ignored)
-            + " (a ${VAR} reference is not expanded)"
+            "kanban: ignoring invalid board caps (literal integers and names "
+            "only; a ${...} reference is never expanded): " + ", ".join(invalid)
         )
-    mismatch = _mismatch_line(section, path)
+    mismatch = _mismatch_line(section, managed_valid, path)
     if mismatch:
         warnings.append(mismatch)
     return BoardCaps(
@@ -216,30 +313,33 @@ def _same_path(a: Path, b: Path) -> bool:
         return str(a) == str(b)
 
 
-def _mismatch_line(section: Dict[str, Any], default_path: Path) -> Optional[str]:
-    """One line naming every board cap whose PARSED value differs between the
-    board caps and the invoking profile's own config, or ``None`` when they
-    agree or the invoker is the default profile. Informational only."""
+def _mismatch_line(
+    section: Dict[str, Any], managed: Dict[str, Any], default_path: Path,
+) -> Optional[str]:
+    """One line naming (KEYS only, rule 6) every board cap that differs from
+    the invoking profile's own raw caps under the same managed overlay, or
+    ``None`` when they agree or the invoker is the default profile.
+    Informational only."""
     try:
-        from hermes_cli.config import get_config_path, load_config_readonly
+        from hermes_cli.config import get_config_path
 
-        if _same_path(get_config_path(), default_path):
+        invoking_path = get_config_path()
+        if _same_path(invoking_path, default_path):
             return None
-        invoking = (load_config_readonly() or {}).get("kanban")
-        invoking = invoking if isinstance(invoking, dict) else {}
+        raw = _read_raw_caps(invoking_path) or {}
     except Exception:
         return None
-    ours, theirs = parse_caps(section), parse_caps(invoking)
-    diffs = [
-        f"{key} default={ours[key]!r} invoking={theirs[key]!r}"
-        for key in BOARD_CAP_KEYS
-        if ours[key] != theirs[key]
-    ]
+    theirs = _merge(_valid_layer(raw)[0], managed)[0]
+
+    def value(caps: Dict[str, Any], key: str) -> Any:  # an empty map is unset
+        return (caps.get(key) or None) if key in _NAMED_KEYS else caps.get(key)
+
+    diffs = [key for key in BOARD_CAP_KEYS if value(section, key) != value(theirs, key)]
     if not diffs:
         return None
     return (
         "kanban: invoking profile caps differ from default profile caps ("
-        + "; ".join(diffs)
+        + ", ".join(diffs)
         + f"); board caps taken from the default profile config ({default_path})"
     )
 

@@ -10,12 +10,16 @@ hold whichever profile runs a dispatcher. The declared rule (see
 the dashboard nudge), re-resolved on every call:
 
 1. the six board-cap keys from the DEFAULT profile's raw config.yaml, then the
-   managed-scope overlay (managed wins);
-2. literal values only: a ``${VAR}`` board-cap key is warned and ignored;
+   managed-scope overlay (managed wins per entry);
+2. literal values only, each entry or group validated on its own: an invalid
+   one (``${...}``, ``null``, ``{}``, a string int) is dropped and its key
+   named, every valid entry (managed or user) is kept;
 3. a missing default config.yaml is an empty user layer (managed still applies);
 4. an unreadable/unparseable default config.yaml refuses spawning (no cache,
    no backup recovery, never the invoking profile's caps);
-5. integer caps are nonnegative ints and ``0`` stays ``0``.
+5. integer caps are nonnegative ints and ``0`` stays ``0``;
+6. warnings name keys only, never a value read from any profile;
+7. managed provenance only where a valid managed value contributed.
 """
 from __future__ import annotations
 
@@ -433,7 +437,7 @@ def _kwargs_on_every_path(monkeypatch) -> dict:
         return out
     plugin = _load_dashboard_plugin()
     monkeypatch.setattr(plugin.kbd, "dispatch_once", capture)
-    plugin.dispatch(dry_run=True, max_n=8, board=None)
+    plugin.dispatch(dry_run=True, max_n=None, board=None)  # ``max`` omitted
     out["dashboard"] = captured[-1]
     return out
 
@@ -536,9 +540,9 @@ def test_zero_integer_caps_stay_zero_on_every_path(sticky_profile_home, monkeypa
     )
     got = _kwargs_on_every_path(monkeypatch)
     for path, kw in got.items():
-        expect_spawn = 8 if path == "dashboard" else 0  # the nudge's explicit ?max=
+        # r3 P1-2: an omitted dashboard ``max`` is no override; ``0`` holds there too.
         assert (kw["max_spawn"], kw["max_in_progress"], kw["max_in_progress_per_profile"]) == (
-            expect_spawn, 0, 0,
+            0, 0, 0,
         ), (path, kw)
 
 
@@ -686,3 +690,350 @@ def test_dry_run_summary_labels_managed_values_managed(sticky_profile_home, mana
     assert "  max_in_progress: 20 (default profile config)" in out, out
     assert "  max_in_progress_by_assignee.evo: 2 (managed scope)" in out, out
     assert "  max_in_progress_by_assignee.kimi: 4 (default profile config)" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Review r3 P1-1 — an invalid entry is dropped on its own; valid ones stay
+# ---------------------------------------------------------------------------
+
+
+def _warning() -> str:
+    from hermes_cli import kanban_board_caps as kbcaps
+
+    return kbcaps.read_board_caps().warning or ""
+
+
+def test_reference_entry_keeps_valid_managed_and_user_assignee_caps(
+    sticky_profile_home, managed_dir, monkeypatch, capsys,
+):
+    """r3 P1-1, the reviewer's case: user ``cloud: ${CAP}`` plus managed
+    ``evo: 2`` resolved to ``{}``, so a saturated evo spawned. Only ``cloud``
+    is invalid: managed ``evo: 2`` and user ``kimi: 4`` stay on every path,
+    the CLI defers both evo cards, and the warning names only the key."""
+    root = sticky_profile_home
+    monkeypatch.setenv("H124_CAP", "7")
+    _write_cfg(managed_dir / "config.yaml", "kanban:\n  max_in_progress_by_assignee:\n    evo: 2\n")
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_in_progress: 20\n"
+        "  max_in_progress_by_assignee:\n    cloud: ${H124_CAP}\n    kimi: 4\n",
+    )
+    got = _kwargs_on_every_path(monkeypatch)
+    assert {p: kw["max_in_progress_by_assignee"] for p, kw in got.items()} == {
+        p: {"evo": 2, "kimi": 4} for p in got
+    }
+    warning = _warning()
+    assert "max_in_progress_by_assignee.cloud" in warning, warning
+    assert "H124_CAP" not in warning, warning
+
+
+def test_reference_entry_does_not_unblock_a_saturated_managed_cap(
+    sticky_profile_home, managed_dir, capsys,
+):
+    """The production consequence of r3 P1-1: evo is at its managed cap of 2,
+    so both ready evo cards must defer despite the user's ``${CAP}`` entry."""
+    root = sticky_profile_home
+    _write_cfg(managed_dir / "config.yaml", "kanban:\n  max_in_progress_by_assignee:\n    evo: 2\n")
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_in_progress: 20\n  max_in_progress_by_assignee:\n    cloud: ${H124_CAP}\n",
+    )
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=2, ready=2)
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert _spawned_for(out, "evo") == 0, out
+    assert _deferred(out, "evo", 2, 2) == 2, out
+
+
+def test_reference_group_keeps_valid_user_and_managed_groups(
+    sticky_profile_home, managed_dir, monkeypatch,
+):
+    """A ``${...}`` member invalidates that one group; the user's valid group
+    and the managed group both stay."""
+    root = sticky_profile_home
+    _write_cfg(
+        managed_dir / "config.yaml",
+        "kanban:\n  assignee_groups:\n    gpu2:\n      members: [qwen]\n      max: 1\n",
+    )
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  assignee_groups:\n"
+        "    gpu0:\n      members: [evo, kimi]\n      max: 1\n"
+        "    gpu1:\n      members:\n        - evo\n        - ${H124_WHO}\n      max: 2\n",
+    )
+    got = _kwargs_on_every_path(monkeypatch)
+    assert {p: kw["assignee_groups"] for p, kw in got.items()} == {
+        p: {
+            "gpu0": {"members": ["evo", "kimi"], "max": 1},
+            "gpu2": {"members": ["qwen"], "max": 1},
+        }
+        for p in got
+    }
+    warning = _warning()
+    assert "assignee_groups.gpu1" in warning and "H124_WHO" not in warning, warning
+
+
+def test_reference_in_managed_group_keeps_valid_managed_and_user_groups(
+    sticky_profile_home, managed_dir, monkeypatch,
+):
+    """r3 P1-1 for managed groups: a managed ``${...}`` group max is dropped
+    on its own; the managed valid group and the user's group both stay."""
+    root = sticky_profile_home
+    monkeypatch.setenv("H124_GMAX", "9")
+    _write_cfg(
+        managed_dir / "config.yaml",
+        "kanban:\n  assignee_groups:\n"
+        "    gpu1:\n      members: [kimi]\n      max: ${H124_GMAX}\n"
+        "    gpu2:\n      members: [qwen]\n      max: 1\n",
+    )
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  assignee_groups:\n    gpu0:\n      members: [evo]\n      max: 1\n",
+    )
+    got = _kwargs_on_every_path(monkeypatch)
+    assert {p: kw["assignee_groups"] for p, kw in got.items()} == {
+        p: {
+            "gpu0": {"members": ["evo"], "max": 1},
+            "gpu2": {"members": ["qwen"], "max": 1},
+        }
+        for p in got
+    }
+    warning = _warning()
+    assert "assignee_groups.gpu1" in warning, warning
+    assert "H124_GMAX" not in warning, warning
+
+
+def test_invalid_managed_scalar_keeps_the_valid_user_scalar(
+    sticky_profile_home, managed_dir, monkeypatch,
+):
+    """Managed ``max_spawn: ${X}`` is dropped on its own: the user's literal
+    ``max_spawn: 3`` and the managed ``max_in_progress: 5`` both apply."""
+    root = sticky_profile_home
+    _write_cfg(
+        managed_dir / "config.yaml",
+        "kanban:\n  max_spawn: ${H124_SPAWN}\n  max_in_progress: 5\n",
+    )
+    _write_cfg(root / "config.yaml", "kanban:\n  max_spawn: 3\n")
+    got = _kwargs_on_every_path(monkeypatch)
+    assert {p: (kw["max_spawn"], kw["max_in_progress"]) for p, kw in got.items()} == {
+        p: (3, 5) for p in got
+    }
+    assert "max_spawn" in _warning()
+
+
+@pytest.mark.parametrize(
+    "body, invalid_key",
+    [
+        ("  max_spawn: '3'\n", "max_spawn"),          # a string is not a literal int
+        ("  max_spawn: true\n", "max_spawn"),         # nor is a bool
+        ("  max_spawn: null\n", "max_spawn"),
+        ("  max_in_progress_per_profile: -1\n", "max_in_progress_per_profile"),
+        ("  default_assignee: ${H124_WHO}\n", "default_assignee"),
+        ("  max_in_progress_by_assignee:\n    evo: null\n", "max_in_progress_by_assignee.evo"),
+        ("  max_in_progress_by_assignee:\n    evo: {}\n", "max_in_progress_by_assignee.evo"),
+        ("  assignee_groups:\n    gpu0: null\n", "assignee_groups.gpu0"),
+        ("  assignee_groups:\n    gpu0: {}\n", "assignee_groups.gpu0"),
+    ],
+)
+def test_each_invalid_entry_is_dropped_and_named(sticky_profile_home, body, invalid_key):
+    """Literal non-negative integers only (names for ``default_assignee`` and
+    group members): each invalid entry is dropped and its key named, while
+    the valid ``kimi: 4`` beside it is kept."""
+    from hermes_cli import kanban_board_caps as kbcaps
+
+    root = sticky_profile_home
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_in_progress: 20\n" + body.replace(
+            "  max_in_progress_by_assignee:\n", "  max_in_progress_by_assignee:\n    kimi: 4\n",
+        ) + ("" if "max_in_progress_by_assignee" in body
+             else "  max_in_progress_by_assignee:\n    kimi: 4\n"),
+    )
+    caps = kbcaps.read_board_caps()
+    kw = kbcaps.dispatch_caps(caps).kwargs
+    assert kw["max_in_progress_by_assignee"] == {"kimi": 4}, kw
+    assert kw["max_in_progress"] == 20
+    assert invalid_key in (caps.warning or ""), caps.warning
+    top = invalid_key.split(".")[0]
+    if top in ("max_spawn", "max_in_progress_per_profile", "default_assignee"):
+        assert kw[top] is None, kw
+    if top == "assignee_groups":
+        assert kw["assignee_groups"] == {}, kw
+
+
+# ---------------------------------------------------------------------------
+# Review r3 P1-2 — an omitted dashboard ``max`` is no override
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dashboard_client(sticky_profile_home):
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    plugin = _load_dashboard_plugin()
+    app = FastAPI()
+    app.include_router(plugin.router, prefix="/api/plugins/kanban")
+    return plugin, TestClient(app)
+
+
+def test_dashboard_omitted_max_keeps_configured_zero_with_global_headroom(
+    sticky_profile_home, dashboard_client,
+):
+    """r3 P1-2, the reviewer's case: ``max_spawn: 0`` with global headroom 20
+    and no ``max`` parameter must spawn nothing (head spawned under 8)."""
+    _plugin, client = dashboard_client
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_spawn: 0\n  max_in_progress: 20\n")
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=2)
+    r = client.post("/api/plugins/kanban/dispatch?dry_run=true")
+    assert r.status_code == 200, r.text
+    assert r.json()["spawned"] == [], r.json()
+
+
+def test_dashboard_omitted_max_uses_configured_max_spawn(sticky_profile_home, dashboard_client, monkeypatch):
+    plugin, client = dashboard_client
+    captured: list = []
+    monkeypatch.setattr(
+        plugin.kbd, "dispatch_once",
+        lambda conn, **kw: (captured.append(dict(kw)), kb.DispatchResult())[1],
+    )
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_spawn: 2\n  max_in_progress: 20\n")
+    assert client.post("/api/plugins/kanban/dispatch").status_code == 200
+    assert captured[-1]["max_spawn"] == 2
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_in_progress: 20\n")
+    assert client.post("/api/plugins/kanban/dispatch").status_code == 200
+    assert captured[-1]["max_spawn"] is None  # unset: no spawn cap, like the CLI
+
+
+def test_dashboard_explicit_max_overrides_configured_max_spawn(sticky_profile_home, dashboard_client):
+    """An explicit ``?max=`` is the operator's override, zero config included."""
+    _plugin, client = dashboard_client
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_spawn: 0\n  max_in_progress: 20\n")
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=2)
+    r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=1")
+    assert r.status_code == 200, r.text
+    assert len(r.json()["spawned"]) == 1, r.json()
+
+
+def test_dashboard_nudge_button_sends_no_max_override():
+    """The board's "nudge dispatch" button must not pin ``?max=8`` over the
+    configured ``max_spawn``."""
+    js = (Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js")
+    text = js.read_text(encoding="utf-8")
+    assert "/dispatch?max=" not in text
+    assert "${API}/dispatch`" in text, "nudge call not found"
+
+
+# ---------------------------------------------------------------------------
+# Review r3 P1-3 — diagnostics never carry a value read from any profile
+# ---------------------------------------------------------------------------
+
+_SYNTHETIC_PRIVATE = "h124-synthetic-private-marker"
+_DEFAULT_LITERAL = "h124literalname"
+
+
+def _secret_profiles(root: Path, monkeypatch) -> None:
+    monkeypatch.setenv("H124_PRIVATE", _SYNTHETIC_PRIVATE)
+    _write_cfg(
+        root / "config.yaml",
+        f"kanban:\n  default_assignee: {_DEFAULT_LITERAL}\n  max_in_progress: 20\n"
+        "  max_in_progress_by_assignee:\n    evo: ${env:H124_PRIVATE}\n    kimi: 4\n",
+    )
+    _write_cfg(
+        root / "profiles" / "evo" / "config.yaml",
+        "kanban:\n  default_assignee: ${env:H124_PRIVATE}\n  max_in_progress: 11\n"
+        "  max_in_progress_by_assignee:\n    kimi: ${H124_PRIVATE}\n",
+    )
+
+
+def _assert_clean(text: str) -> None:
+    assert _SYNTHETIC_PRIVATE not in text, text
+    assert "H124_PRIVATE" not in text, text
+    assert _DEFAULT_LITERAL not in text, text
+    assert "invoking=" not in text and "default=" not in text, text
+
+
+def test_cli_warnings_carry_key_names_only(sticky_profile_home, monkeypatch, capsys):
+    """r3 P1-3: an invoking ``default_assignee: ${env:PRIVATE}`` was expanded
+    and printed in the difference warning. The invoking profile is now read
+    raw and warnings name keys only."""
+    _secret_profiles(sticky_profile_home, monkeypatch)
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr()
+    assert "profile caps differ" in out.err, out.err
+    for key in ("default_assignee", "max_in_progress", "max_in_progress_by_assignee"):
+        assert key in out.err, out.err
+    _assert_clean(out.err)
+    assert _SYNTHETIC_PRIVATE not in out.out, out.out
+
+
+def test_dashboard_json_carries_key_names_only(sticky_profile_home, dashboard_client, monkeypatch):
+    _secret_profiles(sticky_profile_home, monkeypatch)
+    import json
+
+    _plugin, client = dashboard_client
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+    r = client.post("/api/plugins/kanban/dispatch?dry_run=true")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "profile caps differ" in body["board_caps_warning"], body
+    _assert_clean(body["board_caps_warning"])
+    assert _SYNTHETIC_PRIVATE not in json.dumps(body), body
+
+
+# ---------------------------------------------------------------------------
+# Review r3 P2-4 — managed provenance only where a managed value contributed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("placeholder", ["null", "{}"])
+def test_managed_placeholders_leave_user_values_user_scoped(
+    sticky_profile_home, managed_dir, capsys, placeholder,
+):
+    """r3 P2-4: managed ``gpu0: null`` / ``gpu0: {}`` (and the same for an
+    assignee entry and a scalar) leave the user's values unchanged, so their
+    provenance stays the default profile config."""
+    root = sticky_profile_home
+    _write_cfg(
+        managed_dir / "config.yaml",
+        f"kanban:\n  max_spawn: null\n  assignee_groups:\n    gpu0: {placeholder}\n"
+        f"  max_in_progress_by_assignee:\n    evo: {placeholder}\n",
+    )
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_spawn: 5\n  max_in_progress: 20\n"
+        "  max_in_progress_by_assignee:\n    evo: 2\n"
+        "  assignee_groups:\n    gpu0:\n      members: [evo, kimi]\n      max: 1\n",
+    )
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert "  max_spawn: 5 (default profile config)" in out, out
+    assert "  max_in_progress_by_assignee.evo: 2 (default profile config)" in out, out
+    assert "  assignee_groups.gpu0: max 1 [evo,kimi] (default profile config)" in out, out
+    assert "managed scope" not in out, out
+
+
+def test_managed_partial_group_override_is_managed(sticky_profile_home, managed_dir, capsys):
+    """A managed field that does contribute (``max: 1`` over the user's
+    ``gpu0``) wins at the field and labels the group managed."""
+    root = sticky_profile_home
+    _write_cfg(managed_dir / "config.yaml", "kanban:\n  assignee_groups:\n    gpu0:\n      max: 1\n")
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_in_progress: 20\n"
+        "  assignee_groups:\n    gpu0:\n      members: [evo, kimi]\n      max: 3\n",
+    )
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert "  assignee_groups.gpu0: max 1 [evo,kimi] (managed scope)" in out, out
