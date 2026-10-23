@@ -288,13 +288,14 @@ def test_request_changes_without_any_reason_is_an_error(kanban_home: Path) -> No
 
 
 def test_unknown_option_is_still_a_usage_error(kanban_home: Path) -> None:
-    """Intermixed parsing must not swallow a genuinely unknown option: it reaches
-    the top-level parser as unrecognized and nothing is mutated."""
+    """Intermixed parsing must not swallow a genuinely unknown option: it is
+    refused as unrecognized (by count, never by its text) and nothing is mutated."""
     with kbc.connect_closing() as conn:
         tid = _make_ready_tasks(conn, "bogus")[0]
     out = kc.run_slash(f'block {tid} "a reason" --bogus')
     assert "usage error" in out, out
-    assert "unrecognized arguments: --bogus" in out, out
+    assert "unrecognized arguments: 1 word(s) not shown; see /kanban block --help" in out, out
+    assert "--bogus" not in out, out
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "ready"
@@ -589,8 +590,8 @@ def test_repeated_ids_cannot_bypass_the_refusal(kanban_home: Path, verb: str) ->
 
 # ---------------------------------------------------------------------------
 # Review r2 (hermes-agent-133-r2), finding 1: an unknown option on an
-# intermixed verb is refused by its option label and a word count, never by
-# its value. On Python 3.11 ``parse_known_intermixed_args`` leaves the reason
+# intermixed verb is refused by a word count and the verb, never by its text
+# (r3 dropped the option label too). On Python 3.11 ``parse_known_intermixed_args`` leaves the reason
 # after a typo'd flag (``--reasn "rotate <secret>"``) in the extras, and the
 # stdlib echoed every extra into the /kanban reply.
 # ---------------------------------------------------------------------------
@@ -612,27 +613,27 @@ def test_unknown_option_typo_never_echoes_the_reason(
     kanban_home: Path, verb: str, secret: str
 ) -> None:
     """The reviewer's control, on every intermixed verb: a typo before the
-    reason names ``--reasn`` and nothing it was given."""
+    reason is refused without echoing ``--reasn`` or anything it was given."""
     with kbc.connect_closing() as conn:
         tid = _bulk_pair(conn, verb)[0]
         status = kb.get_task(conn, tid).status
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"{verb} {tid} --reasn 'rotate {secret}'")
     assert "usage error" in out, out
-    assert "unrecognized arguments: --reasn" in out, out
-    assert secret not in out and "rotate" not in out, out
+    assert "unrecognized arguments:" in out and "word(s) not shown" in out, out
+    assert "--reasn" not in out and secret not in out and "rotate" not in out, out
     with kbc.connect_closing() as conn:
         _assert_untouched(conn, tid, status, events_before)
 
 
-def test_unknown_option_with_attached_value_shows_only_its_label(kanban_home: Path) -> None:
+def test_unknown_option_with_attached_value_shows_nothing_of_it(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         tid = _make_ready_tasks(conn, "attached")[0]
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"block {tid} 'held up' --token={_R2_CONTROL_SECRET} -x{_R2_CONTROL_SECRET}")
     assert "usage error" in out, out
-    assert "--token" in out and "-x" in out, out
-    assert _R2_CONTROL_SECRET not in out, out
+    assert "unrecognized arguments: 2 word(s) not shown" in out, out
+    assert "--token" not in out and "-x" not in out and _R2_CONTROL_SECRET not in out, out
     with kbc.connect_closing() as conn:
         _assert_untouched(conn, tid, "ready", events_before)
 
@@ -666,25 +667,11 @@ def test_reason_left_in_extras_is_never_echoed(
         events_before = len(kb.list_events(conn, tid))
     out = kc.run_slash(f"{verb} {tid} --reasn 'rotate {_R2_CONTROL_SECRET}' tail")
     assert "usage error" in out, out
-    assert "--reasn" in out, out
-    assert "2 other word(s)" in out, out
-    assert _R2_CONTROL_SECRET not in out and "rotate" not in out and "tail" not in out, out
+    assert "unrecognized arguments: 3 word(s) not shown" in out, out
+    for word in ("--reasn", _R2_CONTROL_SECRET, "rotate", "tail"):
+        assert word not in out, (word, out)
     with kbc.connect_closing() as conn:
         _assert_untouched(conn, tid, status, events_before)
-
-
-def test_unrecognized_label_helper_never_returns_values() -> None:
-    from hermes_cli.kanban_parser import unrecognized_args_error
-
-    msg = unrecognized_args_error(
-        ["--reasn", f"rotate {_R2_CONTROL_SECRET}", f"--tok={_R2_CONTROL_SECRET}",
-         f"-x{_R2_CONTROL_SECRET}", "-", "--", "--" + "a" * 80, "--weird\nflag"]
-    )
-    assert msg.startswith("unrecognized arguments: --reasn --tok -x"), msg
-    assert _R2_CONTROL_SECRET not in msg and "rotate" not in msg and "aaaa" not in msg, msg
-    assert "weird" not in msg, msg
-    assert "5 other word(s)" in msg, msg
-    assert unrecognized_args_error(["--bogus"]) == "unrecognized arguments: --bogus"
 
 
 # ---------------------------------------------------------------------------
@@ -756,3 +743,75 @@ def test_direct_namespace_newline_id_is_refused(kanban_home: Path, capsys) -> No
     with kbc.connect_closing() as conn:
         for tid in (first, second):
             _assert_untouched(conn, tid, "ready", events_before[tid])
+
+
+# ---------------------------------------------------------------------------
+# Review r3 (hermes-agent-133-r3), finding 1: an unknown-argument refusal on an
+# intermixed verb echoes NO word the caller supplied, not even an option-looking
+# label: ``--reasn '--SYNTHETIC_SECRET_123'`` is a long-option-shaped reason
+# value, and r2's label filter displayed it whole. The refusal names the verb
+# and a word count only.
+# ---------------------------------------------------------------------------
+
+# Every part of the reviewer's control value; none may reach the reply.
+_R3_SECRET_PARTS = ("SYNTHETIC", "SECRET", "_123", "Synth3tic", "R3view", "T0ken")
+
+_R3_CONTROLS = {
+    "option-shaped value": "--reasn '--{secret}'",
+    "attached long value": "--reasn={secret}",
+    "attached short value": "-x{secret}",
+    "plain typo": "--reasn {secret}",
+}
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+@pytest.mark.parametrize("control", sorted(_R3_CONTROLS))
+@pytest.mark.parametrize("secret", [_R2_CONTROL_SECRET, _SYNTHETIC_SECRET])
+def test_unrecognized_args_echo_no_caller_word(
+    kanban_home: Path, verb: str, control: str, secret: str
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _bulk_pair(conn, verb)[0]
+        status = kb.get_task(conn, tid).status
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f"{verb} {tid} " + _R3_CONTROLS[control].format(secret=secret))
+    assert "usage error" in out, out
+    assert "unrecognized arguments:" in out and "word(s) not shown" in out, out
+    assert f"see /kanban {verb} --help" in out, out
+    for part in _R3_SECRET_PARTS:
+        assert part not in out, (part, out)
+    # Not even the option-looking label the caller typed.
+    assert "--reasn" not in out and "-x" not in out, out
+    with kbc.connect_closing() as conn:
+        _assert_untouched(conn, tid, status, events_before)
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+def test_unrecognized_args_echo_no_caller_word_with_py311_extras(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    """Same refusal when the reason lands in the extras, as on Python 3.11."""
+    _py311_intermixed(monkeypatch)
+    with kbc.connect_closing() as conn:
+        tid = _bulk_pair(conn, verb)[0]
+        status = kb.get_task(conn, tid).status
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f"{verb} {tid} --reasn '--{_R2_CONTROL_SECRET}' tail")
+    assert "usage error" in out, out
+    assert "word(s) not shown" in out and f"see /kanban {verb} --help" in out, out
+    for part in _R3_SECRET_PARTS + ("--reasn", "tail"):
+        assert part not in out, (part, out)
+    with kbc.connect_closing() as conn:
+        _assert_untouched(conn, tid, status, events_before)
+
+
+def test_unrecognized_args_helper_shows_count_and_verb_only() -> None:
+    from hermes_cli.kanban_parser import unrecognized_args_error
+
+    extras = ["--reasn", f"--{_R2_CONTROL_SECRET}", f"--tok={_R2_CONTROL_SECRET}",
+              f"-x{_R2_CONTROL_SECRET}", "-", "--", "plain"]
+    msg = unrecognized_args_error("/kanban block", extras)
+    assert msg == ("unrecognized arguments: 7 word(s) not shown; "
+                   "see /kanban block --help"), msg
+    assert unrecognized_args_error("/kanban promote", ["--bogus"]) == (
+        "unrecognized arguments: 1 word(s) not shown; see /kanban promote --help")

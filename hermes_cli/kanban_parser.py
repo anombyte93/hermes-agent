@@ -121,38 +121,17 @@ def task_id_word(value: str) -> str:
     return value
 
 
-# An unknown option's label: ``-x`` or ``--name`` (the part before any ``=``).
-# Anything else (plain words, attached values, odd or very long tokens) is only
-# counted, since the reason after a typo'd flag lands in the extras on Python
-# 3.11 and a reason can carry a secret (review r2 of #133).
-_OPTION_LABEL_RE = re.compile(r"--?[A-Za-z][A-Za-z0-9_-]{0,31}")
+def unrecognized_args_error(prog: str, extras) -> str:
+    """Usage-error text for leftover arguments: a count and the verb, nothing else.
 
-
-def _option_label(word: str) -> Optional[str]:
-    if not word.startswith("-") or word in {"-", "--"}:
-        return None
-    label = word[:2] if not word.startswith("--") else word.split("=", 1)[0]
-    return label if _OPTION_LABEL_RE.fullmatch(label) else None
-
-
-def unrecognized_args_error(extras) -> str:
-    """Usage-error text for leftover arguments: option labels and a count only.
-
-    Never echoes a value: ``--reasn "rotate <secret>"`` reports ``--reasn`` and
-    "1 other word(s)", ``--token=<secret>`` reports ``--token``.
+    Echoes NO word the caller supplied, not even an option-looking label:
+    ``--reasn '--<secret>'`` makes a reason value look like an option, and on
+    Python 3.11 the reason after a typo'd flag lands in the extras (reviews r2
+    and r3 of #133). ``prog`` is the leaf parser's own name
+    (``/kanban block``), never caller text.
     """
-    labels, hidden = [], 0
-    for word in extras:
-        label = _option_label(word) if isinstance(word, str) else None
-        if label is None:
-            hidden += 1
-        else:
-            labels.append(label)
-    text = " ".join(labels)
-    if hidden:
-        tail = f"{hidden} other word(s); their text is not shown"
-        text = f"{text} ({tail})" if text else tail
-    return f"unrecognized arguments: {text}"
+    return (f"unrecognized arguments: {len(extras)} word(s) not shown; "
+            f"see {prog} --help")
 
 
 def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
@@ -166,10 +145,10 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
     Every other verb parses exactly as before (``parse_known_args``), so no
     other verb's accepted syntax changes. Mirrors the stdlib ``__call__``:
     parse into a fresh subnamespace and copy it onto the caller's namespace.
-    Leftover strings are refused here by option label and count
+    Leftover strings are refused here by count and verb only
     (``unrecognized_args_error``), never handed to the top-level parser, whose
     "unrecognized arguments" error echoes them verbatim: on Python 3.11 they
-    include the reason after a typo'd flag (review r2 of #133). Leftovers are
+    include the reason after a typo'd flag (reviews r2 and r3 of #133). Leftovers are
     NOT re-parsed without intermixing: that would report the trailing reason
     words as unrecognized next to the genuinely bad option, i.e. the #125
     symptom. ArgumentError (``exit_on_error=False`` in
@@ -191,10 +170,10 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
             setattr(subnamespace, key, unshield(value))
         extras = unshield(extras)
         if extras:
-            # Refused here, by label and count, instead of being forwarded to
-            # the top-level parser, whose error echoes every extra verbatim
-            # (review r2 of #133). Nothing has been changed yet.
-            leaf.error(unrecognized_args_error(extras))
+            # Refused here, by count and verb only, instead of being forwarded
+            # to the top-level parser, whose error echoes every extra verbatim
+            # (reviews r2 and r3 of #133). Nothing has been changed yet.
+            leaf.error(unrecognized_args_error(leaf.prog, extras))
         for key, value in vars(subnamespace).items():
             setattr(namespace, key, value)
         conflict = reason_usage_error(parser_name, getattr(subnamespace, "reason", None),
