@@ -53,16 +53,18 @@ def _create_card(title, assignee="evo"):
         conn.close()
 
 
-def _age_task_and_archive_event(task_id, seconds):
-    """Stamp a card (and its archived event, if any) ``seconds`` into the past."""
+def _age_task_and_archive_event(task_id, created_ago, archived_ago=None):
+    """Stamp a card ``created_ago`` seconds into the past and its archived event
+    (if any) ``archived_ago`` seconds into the past (default: same as created)."""
     from hermes_cli import kanban_db_connect as kbc
-    stamp = int(time.time()) - seconds
+    now = int(time.time())
+    archived_ago = created_ago if archived_ago is None else archived_ago
     conn = kbc.connect()
     try:
-        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (stamp, task_id))
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - created_ago, task_id))
         conn.execute(
             "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'archived'",
-            (stamp, task_id))
+            (now - archived_ago, task_id))
         conn.commit()
     finally:
         conn.close()
@@ -116,7 +118,8 @@ def test_create_unrelated_title_has_no_duplicates(worker_env):
 
 
 def test_create_flags_card_archived_an_hour_ago(worker_env):
-    """(c) A same-subject card archived an hour ago is flagged."""
+    """(c) A same-subject card archived an hour ago is flagged, even though it was
+    CREATED three days ago: freshness is the archived event, not created_at."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
@@ -126,7 +129,7 @@ def test_create_flags_card_archived_an_hour_ago(worker_env):
         kb.archive_task(conn, gone)
     finally:
         conn.close()
-    _age_task_and_archive_event(gone, 3600)
+    _age_task_and_archive_event(gone, created_ago=3 * 24 * 3600, archived_ago=3600)
 
     d = json.loads(kt._handle_create({
         "title": "Fix gitleaks gate in test_notify_needs",
@@ -148,7 +151,8 @@ def test_create_ignores_card_archived_two_days_ago(worker_env):
         kb.archive_task(conn, gone)
     finally:
         conn.close()
-    _age_task_and_archive_event(gone, 2 * 24 * 3600)
+    _age_task_and_archive_event(gone, created_ago=3 * 24 * 3600,
+                                archived_ago=2 * 24 * 3600)
 
     d = json.loads(kt._handle_create({
         "title": "Fix gitleaks gate in test_notify_needs",
@@ -167,6 +171,27 @@ def test_create_excludes_workers_own_card(worker_env):
     }))
     assert d["ok"] is True
     assert worker_env not in [c["task_id"] for c in d["possible_duplicates"]]
+
+
+def test_own_task_scope_never_reveals_inaccessible_peer(worker_env, tmp_path):
+    """Under ``kanban.worker_scope: own_task`` a worker may not read any other card,
+    so kanban_create must not leak one through possible_duplicates: the list is
+    always empty, and creation still succeeds."""
+    from tools import kanban_tools as kt
+    (tmp_path / ".hermes" / "config.yaml").write_text(
+        "kanban:\n  worker_scope: own_task\n", encoding="utf-8")
+    peer = _create_card("Fix gitleaks gate in test_notify_needs", assignee="coder")
+    # Control: the peer really is inaccessible to this worker.
+    shown = json.loads(kt._handle_show({"task_id": peer}))
+    assert "own_task" in shown.get("error", "")
+
+    out = kt._handle_create({
+        "title": "Fix gitleaks gate in test_notify_needs", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["possible_duplicates"] == []
+    assert peer not in out  # no id, title echo or status of the peer card
+    assert _get_task(d["task_id"]).title == "Fix gitleaks gate in test_notify_needs"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +244,46 @@ def test_create_defaults_blank_assignee_to_worker_profile(worker_env):
     assert _get_task(blank["task_id"]).assignee == "test-worker"
 
 
+def test_schema_does_not_require_assignee():
+    """The schema must not require ``assignee``: the deferred-call validator rejects
+    a missing required field before the handler (and its worker default) runs."""
+    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
+    params = KANBAN_CREATE_SCHEMA["parameters"]
+    assert params["required"] == ["title"]
+    desc = params["properties"]["assignee"]["description"]
+    assert "own profile" in desc and "orchestrator" in desc.lower()
+
+
+def test_omitted_assignee_passes_deferred_validation_and_defaults(worker_env):
+    """End to end through the deferred tool_call path: the same
+    validate_deferred_call_args model_tools/tool_executor run, then registry
+    dispatch. A worker's omitted assignee validates and lands on its own profile."""
+    import tools.kanban_tools  # noqa: F401  (registers kanban_create)
+    from tools.registry import registry
+    from tools.tool_search import validate_deferred_call_args
+
+    args = {"title": "Follow-up from deferred call"}
+    assert validate_deferred_call_args("kanban_create", dict(args)) is None
+    d = json.loads(registry.dispatch("kanban_create", dict(args)))
+    assert d["ok"] is True
+    assert _get_task(d["task_id"]).assignee == "test-worker"
+
+
+def test_omitted_assignee_still_refused_for_orchestrator_after_validation(
+        monkeypatch, worker_env):
+    """Schema validation now admits the omission; the handler keeps the hard
+    requirement for orchestrators (no HERMES_KANBAN_TASK)."""
+    import tools.kanban_tools  # noqa: F401
+    from tools.registry import registry
+    from tools.tool_search import validate_deferred_call_args
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    args = {"title": "Orchestrated child"}
+    assert validate_deferred_call_args("kanban_create", dict(args)) is None
+    out = registry.dispatch("kanban_create", dict(args))
+    assert "assignee is required" in (out if isinstance(out, str) else json.dumps(out))
+
+
 def test_create_explicit_assignee_still_wins(worker_env):
     from tools import kanban_tools as kt
     d = json.loads(kt._handle_create({
@@ -237,16 +302,44 @@ def test_create_still_requires_assignee_for_orchestrators(monkeypatch, worker_en
 
 
 # ---------------------------------------------------------------------------
-# Prompt rule 6 carries the dedupe ideas (invariant, not wording)
+# Prompt rule 6: accurate dedupe guidance (sequence, not keywords)
 # ---------------------------------------------------------------------------
 
-def test_followup_rule_carries_dedupe_and_lane_default():
-    """Rule 6 must tell workers to (1) re-check the remote before filing a
-    follow-up, (2) look for an existing card and link/comment instead, and
-    (3) default the assignee to their own profile, not a paid lane."""
+def _rule_6() -> str:
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert "git fetch" in KANBAN_GUIDANCE          # remote re-check
-    assert "origin/" in KANBAN_GUIDANCE            # ...against the base branch
-    assert "possible_duplicates" in KANBAN_GUIDANCE  # board search signal
-    assert "kanban_link" in KANBAN_GUIDANCE        # link instead of filing
-    assert "own profile" in KANBAN_GUIDANCE        # assignee default
+    start = KANBAN_GUIDANCE.index("6. **If follow-up work appears")
+    end = KANBAN_GUIDANCE.index("7. **", start)
+    return KANBAN_GUIDANCE[start:end]
+
+
+def test_rule_6_checks_fetched_base_before_filing_a_failure_follow_up():
+    """Fetch, then inspect origin/<base> itself for a fix to the failing paths
+    (log + diff against the fetched ref), then comment instead of filing. Re-running
+    the step in the current checkout cannot see a fix that only exists upstream."""
+    rule = _rule_6()
+    fetch = rule.index("`git fetch origin`")
+    log = rule.index("`git log --oneline HEAD..origin/<base> -- <failing paths>`")
+    diff = rule.index("`git diff HEAD origin/<base> -- <failing paths>`")
+    comment_instead = rule.index("comment instead of filing")
+    assert fetch < log < diff < comment_instead
+    assert "re-run the failing step" not in rule
+
+
+def test_rule_6_describes_possible_duplicates_as_post_create_advice():
+    """possible_duplicates arrives after the card exists: the rule must say so,
+    and route the duplicate to the orchestrator (comment on the new card + final
+    summary), not claim the response prevents creation."""
+    rule = _rule_6()
+    returned = rule.index("`possible_duplicates`")
+    after = rule.index("after the card is created", returned)
+    comment = rule.index("`kanban_comment` on the new card", after)
+    summary = rule.index("final summary", comment)
+    assert returned < after < comment < summary
+    assert "does not prevent creation" in rule
+    assert "new card id" in rule and "duplicate ids" in rule
+    assert "retire" in rule
+    assert "instead of filing a new card" not in rule  # the old pre-create claim
+
+
+def test_rule_6_keeps_lane_default():
+    assert "own profile" in _rule_6()

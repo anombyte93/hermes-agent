@@ -1136,9 +1136,11 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        return _ok(task_id=new_tid, **landed,
-                   possible_duplicates=_possible_duplicates(
-                       kb, conn, str(title).strip(), self_tid, new_tid),
+        # Under ``worker_scope: own_task`` the worker may not read any other card, so
+        # the advisory scan must not hand it peer ids/titles/statuses: always empty.
+        duplicates = ([] if _worker_own_task_scope() is not None
+                      else _possible_duplicates(kb, conn, str(title).strip(), self_tid, new_tid))
+        return _ok(task_id=new_tid, **landed, possible_duplicates=duplicates,
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 

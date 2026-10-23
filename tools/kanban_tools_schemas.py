@@ -357,18 +357,21 @@ KANBAN_CREATE_SCHEMA = _schema(
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
         "tasks on its next tick and spawns the assigned profiles. "
-        "Returns ``possible_duplicates`` (advisory, creation still "
-        "succeeds): recent same-board cards whose title overlaps this "
-        "one — before acting on a new follow-up, check that list, and "
-        "link/comment on an existing card instead of duplicating it."
+        "Returns ``possible_duplicates``: recent same-board cards whose "
+        "title overlaps this one. It is post-create advice — the new card "
+        "already exists. If it is non-empty, comment on the new card naming "
+        "the likely duplicate ids and report the new card id and those ids "
+        "in your final summary so the orchestrator can retire one."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
         "assignee": _prop("string", (
                 "Profile name that should execute this task "
                 "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                "Required — tasks without an assignee are never "
-                "dispatched."
+                "A dispatcher-spawned worker may omit it: the card "
+                "defaults to the worker's own profile. Orchestrators "
+                "must always name it — without a worker task the "
+                "call is refused."
         )),
         "body": _prop("string", (
                 "Opening post: full spec, acceptance criteria, "
@@ -487,7 +490,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "to a different one. Requires 'model'."
         )),
     },
-    ["title", "assignee"],
+    ["title"],
 )
 
 KANBAN_UNBLOCK_SCHEMA = _schema(
