@@ -356,7 +356,11 @@ KANBAN_CREATE_SCHEMA = _schema(
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. "
+        "Returns ``possible_duplicates`` (advisory, creation still "
+        "succeeds): recent same-board cards whose title overlaps this "
+        "one — before acting on a new follow-up, check that list, and "
+        "link/comment on an existing card instead of duplicating it."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
