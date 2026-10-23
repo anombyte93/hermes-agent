@@ -558,6 +558,18 @@ _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
 _CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
 
+# --- Follow-up dedupe (#126): advisory possible_duplicates on kanban_create ---
+DUPLICATE_TITLE_OVERLAP = 0.6
+_DUPLICATE_WINDOW_SECONDS = 24 * 3600
+
+
+def _title_overlap(a: str, b: str) -> float:
+    """Jaccard similarity of lowercase word tokens; 0.0 when neither has tokens."""
+    ta, tb = set(a.lower().split()), set(b.lower().split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
     """``{name: getattr(obj, name)}``; every value None when ``obj`` is None."""
@@ -1072,6 +1084,13 @@ def _handle_create(args: dict, **kw) -> str:
     _reject_delegated_child_mutation("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
+    # A dispatcher worker filing a follow-up may omit the assignee: the card
+    # defaults to the worker's own profile instead of erroring (or drifting to a
+    # paid frontier lane nobody chose). Orchestrators keep the hard requirement —
+    # fan-out always names its specialist.
+    if (not (assignee and str(assignee).strip())
+            and os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker()):
+        assignee = os.environ.get("HERMES_PROFILE") or None
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
@@ -1117,7 +1136,45 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
+        # Under ``worker_scope: own_task`` the worker may not read any other card, so
+        # the advisory scan must not hand it peer ids/titles/statuses: always empty.
+        duplicates = ([] if _worker_own_task_scope() is not None
+                      else _possible_duplicates(kb, conn, str(title).strip(), self_tid, new_tid))
+        return _ok(task_id=new_tid, **landed, possible_duplicates=duplicates,
+                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+
+
+def _possible_duplicates(kb, conn, title: str, self_tid: Optional[str],
+                         new_tid: str) -> list[dict[str, Any]]:
+    """Advisory same-subject cards for a just-created follow-up (#126): same board,
+    title token overlap over ``DUPLICATE_TITLE_OVERLAP``, created or archived within the
+    last ``_DUPLICATE_WINDOW_SECONDS``, excluding the creator's own card. Never raises —
+    a dedupe hint must not fail the create it decorates."""
+    try:
+        cutoff = int(time.time()) - _DUPLICATE_WINDOW_SECONDS
+        candidates: list[tuple[Any, int]] = []
+        for task in kb.list_tasks(conn, include_archived=True):
+            if task.id == self_tid or task.id == new_tid or task.id is None:
+                continue
+            # Freshness: created in the window, or (archived) with its archived
+            # event in the window — the event, not created_at, is when it left.
+            fresh = task.created_at >= cutoff
+            if not fresh and task.status == "archived":
+                ev = next((e for e in kb.list_events(conn, task.id)
+                           if e.kind == "archived"), None)
+                fresh = ev is not None and ev.created_at >= cutoff
+            if not fresh:
+                continue
+            if _title_overlap(title, task.title or "") > DUPLICATE_TITLE_OVERLAP:
+                candidates.append((task, task.created_at))
+        # Newest first: the card a duplicated worker most likely meant.
+        candidates.sort(key=lambda pair: pair[1], reverse=True)
+        return [{"task_id": task.id, "title": task.title, "status": task.status,
+                 "assignee": task.assignee, "archived": task.status == "archived"}
+                for task, _ in candidates]
+    except Exception:
+        logger.exception("kanban_create duplicate scan failed")
+        return []
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:
