@@ -9867,9 +9867,13 @@ def check_respawn_guard(
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A GitHub PR URL appears in a recent comment by this task's current
+        assignee or a prior run's profile (within ``_RESPAWN_GUARD_PR_WINDOW``
+        seconds). Re-spawning risks a duplicate PR unless an explicit re-queue
+        is newer than the newest such comment. Other authors' links are context,
+        not evidence that this task opened a PR (including ready-lane verifiers).
+        Authors identify profiles, not runs: same-profile cross-task comments
+        cannot be distinguished and conservatively retain the guard.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9877,7 +9881,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9950,21 +9954,36 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', 'unblocked', 'reclaimed') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. Only own-worker PR links are duplicate-work signals. Comments store
+    # profile names (kanban_comment's HERMES_PROFILE), not task/run identities.
+    # Preserve evidence from prior assignees that actually ran this task, too.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "AND (author = ? OR author IN ("
+        "SELECT profile FROM task_runs WHERE task_id = ?)) "
+        "ORDER BY created_at DESC, id DESC",
+        (task_id, pr_cutoff, row["assignee"], task_id),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            requeued_after = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at > ? "
+                "AND kind IN ('status', 'promoted', 'promoted_manual', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, c["created_at"]),
+            ).fetchone()
+            # Newest own PR comment is authoritative: don't let an old link
+            # veto a deliberate resume, or an old requeue clear a newer PR.
+            return None if requeued_after else "active_pr"
 
     return None
 

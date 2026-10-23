@@ -491,6 +491,142 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+@pytest.mark.parametrize(
+    "event_kind", ["status", "promoted", "promoted_manual", "unblocked", "reclaimed"]
+)
+def test_active_pr_guard_honours_newer_requeue(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, event_kind: str,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="resume builder", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Draft: https://github.com/example/repo/pull/123",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, event_kind)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # A later own PR comment must re-arm the guard. Neither an older
+        # requeue nor a newer non-PR comment may hide the newest PR signal.
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Updated https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        kb.add_comment(conn, tid, author="worker", body="Still working.")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_ignores_other_comment_authors(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="builder", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="parent",
+            body="Context: https://github.com/example/repo/pull/123",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_allows_ready_verifier_with_parent_pr_link(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Verify builder PR", assignee="reviewer", created_by="parent",
+        )
+        kb.add_comment(
+            conn, tid, author="parent",
+            body="Review https://github.com/example/repo/pull/123",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, tid) is None
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in result.spawned]
+        assert tid not in dict(result.respawn_guarded)
+
+
+def test_active_pr_guard_still_holds_builder_crashed_after_own_pr(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crashed builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        # Model crash recovery, not an intentional reclaim: no requeue event.
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (tid,),
+            )
+            kb._append_event(conn, tid, "crashed")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Reassignment must not erase the prior worker's PR evidence.
+        kb.assign_task(conn, tid, "reviewer")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_real_reclaim_lifts_own_pr_guard(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reclaim builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        assert kb.reclaim_task(conn, tid, reason="parent supplied input")
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_real_manual_promotion_lifts_guard_after_success(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="promote builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="initial implementation")
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        clock[0] += 10
+        assert kb.promote_task(conn, tid, actor="parent") == (True, None)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
