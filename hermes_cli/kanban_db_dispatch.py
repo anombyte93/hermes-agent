@@ -1740,18 +1740,27 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
-def configured_max_in_progress() -> Optional[int]:
-    """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
+def _board_cap_section() -> dict:
+    """The board-scope cap section (#124): the six capacity keys resolved from
+    the DEFAULT profile's effective config, whichever profile runs this."""
+    from hermes_cli.kanban_board_caps import read_board_caps
+    return read_board_caps().section
+
+
+def configured_max_in_progress(kanban_cfg: Optional[Mapping[str, Any]] = None) -> Optional[int]:
+    """``kanban.max_in_progress`` (board-scope), or None when unset/invalid.
 
     Shared so every dispatch entry point agrees on "explicitly configured": a
     positive integer wins, anything else falls through to the derived default.
+    ``kanban_cfg`` parses an already-resolved section; omitted, the board-scope
+    caps are read from the default profile's config (#124).
     """
     try:
-        from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
+        cfg = _board_cap_section() if kanban_cfg is None else kanban_cfg
+        raw = (cfg or {}).get("max_in_progress")
     except Exception:
         return None
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return None
     try:
         ival = int(raw)
@@ -1873,21 +1882,23 @@ def _kanban_config_readonly() -> Optional[dict]:
 
 
 def configured_per_assignee_caps() -> tuple[Optional[int], dict[str, int]]:
-    """``(kanban.max_in_progress_per_profile, kanban.max_in_progress_by_assignee)``
-    from config. Read per tick by the standalone daemon (config load is
-    mtime-cached) so operators can retune a saturated local model without a
-    restart (#83)."""
-    kanban_cfg = _kanban_config_readonly()
-    if kanban_cfg is None:
+    """``(kanban.max_in_progress_per_profile, kanban.max_in_progress_by_assignee)``,
+    board-scope: from the default profile's config (#124), re-read on every
+    call so operators can retune a saturated local model without a restart (#83)."""
+    try:
+        kanban_cfg = _board_cap_section()
+    except Exception:
         return None, {}
     scalar = _positive_int(kanban_cfg.get("max_in_progress_per_profile"), None)
     return scalar, parse_assignee_caps(kanban_cfg.get("max_in_progress_by_assignee"))
 
 
 def configured_assignee_groups() -> dict[str, dict]:
-    """``kanban.assignee_groups`` from config, normalised; re-read every daemon tick."""
-    kanban_cfg = _kanban_config_readonly()
-    return parse_assignee_groups(kanban_cfg.get("assignee_groups")) if kanban_cfg else {}
+    """``kanban.assignee_groups`` (board-scope, default profile's config), normalised."""
+    try:
+        return parse_assignee_groups(_board_cap_section().get("assignee_groups"))
+    except Exception:
+        return {}
 
 
 def configured_capped_alert() -> Optional[tuple[int, list[str]]]:
@@ -1926,10 +1937,10 @@ def default_max_runtime_for(assignee: Optional[str]) -> Optional[int]:
 
 
 def configured_max_spawn() -> Optional[int]:
-    """``kanban.max_spawn`` from config, or None when unset/invalid."""
+    """``kanban.max_spawn`` (board-scope, default profile's config), or None
+    when unset/invalid."""
     try:
-        from hermes_cli.config import load_config_readonly
-        raw = ((load_config_readonly() or {}).get("kanban", {}) or {}).get("max_spawn")
+        raw = _board_cap_section().get("max_spawn")
     except Exception:
         return None
     return _positive_int(raw, None)
@@ -3264,15 +3275,23 @@ def run_daemon(
 
     Calls :func:`dispatch_once` every ``interval`` seconds; exits cleanly on
     SIGINT / SIGTERM so it is systemd-friendly. ``stop_event`` and ``on_tick``
-    are test hooks. Each tick resolves ``kanban.max_in_progress`` exactly like
-    the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
-    daemon must not be the one uncapped entry point.
+    are test hooks. Each tick resolves the six board-scope caps exactly like
+    the gateway dispatcher and ``hermes kanban dispatch`` — from ONE read of
+    the default profile's effective config (#124) — so the standalone daemon
+    is never the one uncapped entry point. ``max_spawn`` and
+    ``max_in_progress_by_assignee`` are EXPLICIT operator overrides only; the
+    config caps are never frozen into them.
     """
     import threading
+
+    from hermes_cli import kanban_board_caps as _kbcaps
 
     if stop_event is None:
         stop_event = threading.Event()
     cli_assignee_caps = parse_assignee_caps(max_in_progress_by_assignee)
+    warn_caps = _kbcaps.WarnOnChange(
+        lambda line: print(f"warning: {line}", file=sys.stderr, flush=True)
+    )
 
     def _handle(_signum, _frame):
         stop_event.set()
@@ -3288,27 +3307,24 @@ def run_daemon(
 
     while not stop_event.is_set():
         try:
-            # Re-resolved every tick (config load is mtime-cached) so operator
-            # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
-            # Per-profile caps re-resolve every tick too (#83). Explicit CLI
-            # caps win per assignee; an explicit ``--max`` wins over
-            # ``kanban.max_spawn``, otherwise the config value is live.
-            per_profile, by_assignee = configured_per_assignee_caps()
-            by_assignee.update(cli_assignee_caps)
-            tick_max_spawn = max_spawn if max_spawn is not None else configured_max_spawn()
-            # GPU-sharing groups and the long-wait alert are live too.
-            groups = configured_assignee_groups()
+            # Board caps re-resolve every tick (#83, #124) so operator edits to
+            # the default profile's config apply without a restart. Explicit
+            # CLI caps win per assignee; an explicit ``--max`` wins over
+            # ``kanban.max_spawn``; an unreadable default config keeps the last
+            # good caps or refuses to spawn (never the invoking profile's caps).
+            caps = _kbcaps.read_board_caps()
+            warn_caps(caps.warning)
+            resolved = _kbcaps.dispatch_caps(
+                caps, cli_max=max_spawn, cli_assignee_caps=cli_assignee_caps,
+                kbd=sys.modules[__name__],
+            )
+            # The long-wait alert is runtime config of this process: live too.
             capped_alert = configured_capped_alert()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=tick_max_spawn,
-                    max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
-                    max_in_progress_per_profile=per_profile,
-                    max_in_progress_by_assignee=by_assignee,
-                    assignee_groups=groups,
+                    **resolved.kwargs,
                 )
                 if capped_alert is not None:
                     _run_capped_alert(conn, *capped_alert)

@@ -11,7 +11,7 @@ import contextlib
 import os
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
@@ -31,7 +31,11 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings. Runtime keys (interval, failure limit,
+    stale timeout, orphan reconcile) are read once at boot from the gateway's
+    own profile (restart to apply); the six board-scope capacity keys are
+    replaced every tick from the default profile's config (#124, see
+    :meth:`_KanbanDispatcher.refresh_board_caps`)."""
 
     interval: float
     max_spawn: Any
@@ -140,6 +144,23 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        from hermes_cli.kanban_board_caps import WarnOnChange
+        self._warn_caps = WarnOnChange(logger.warning)
+
+    def refresh_board_caps(self) -> None:
+        """Replace the six board-scope caps with the default profile's (#124).
+
+        A board is shared by every profile, so whichever gateway holds the
+        dispatcher lock must enforce the board's caps, not its own profile's,
+        and an edit must apply on the next tick rather than at restart. An
+        unreadable default config keeps the last good caps or refuses to spawn
+        (``max_spawn=0``); it never falls back to this gateway's own caps.
+        """
+        from hermes_cli import kanban_board_caps as kbcaps
+
+        caps = kbcaps.read_board_caps()
+        self._warn_caps(caps.warning)
+        self.settings = replace(self.settings, **kbcaps.dispatch_caps(caps).kwargs)
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -215,6 +236,12 @@ class _KanbanDispatcher:
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+        try:
+            self.refresh_board_caps()
+        except Exception:
+            # read_board_caps never raises; this guards the settings swap only.
+            # Keep the previous tick's caps rather than dispatching uncapped.
+            logger.exception("kanban dispatcher: board caps refresh failed; keeping previous caps")
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
