@@ -29,6 +29,11 @@ def isolated_kanban_home(monkeypatch):
     yield test_home
 
 
+def _write_config(home: str, body: str) -> None:
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write(body)
+
+
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
     """#33488: hermes kanban dispatch must pass kanban.max_in_progress from
     config to dispatch_once. Without this, the global concurrency cap is
@@ -37,17 +42,15 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     from hermes_cli import kanban_db
     from hermes_cli import kanban_db_dispatch as kbd
 
-    # Configure max_in_progress in the loaded config.
-    fake_config = {
-        "kanban": {
-            "max_in_progress": 3,
-            "max_spawn": 5,
-            "default_assignee": "default",
-            "max_in_progress_per_profile": 2,
-        }
-    }
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config", lambda: fake_config
+    # Configure the caps in the board-scope config: the default profile's
+    # config.yaml (#124), here the sandbox root HERMES_HOME itself.
+    _write_config(
+        isolated_kanban_home,
+        "kanban:\n"
+        "  max_in_progress: 3\n"
+        "  max_spawn: 5\n"
+        "  default_assignee: default\n"
+        "  max_in_progress_per_profile: 2\n",
     )
 
     captured = {}
@@ -79,8 +82,7 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     from hermes_cli import kanban_db
     from hermes_cli import kanban_db_dispatch as kbd
 
-    fake_config = {"kanban": {"max_spawn": 10}}
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+    _write_config(isolated_kanban_home, "kanban:\n  max_spawn: 10\n")
 
     captured = {}
     monkeypatch.setattr(

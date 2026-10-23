@@ -185,9 +185,11 @@ class GatewayKanbanWatchersMixin:
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
 
-        Config is read once at boot (restart to apply), except the auto-decompose
-        toggle which is re-read every tick. The env var is an escape hatch to
-        disable without editing YAML.
+        Runtime config is read once at boot (restart to apply), except the
+        auto-decompose toggle which is re-read every tick. The six board-scope
+        capacity keys come from the default profile's config and are re-read
+        every tick (#124). The env var is an escape hatch to disable without
+        editing YAML.
         """
         try:
             from hermes_cli.config import load_config as _load_config
@@ -243,7 +245,11 @@ class GatewayKanbanWatchersMixin:
         if boot is None:
             return
         _load_config, _kb, kanban_cfg = boot
-        settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
+        # Board-scope caps (#124) are seeded from the default profile's caps,
+        # sanitized by the shared parser (never this gateway's own capacity
+        # keys); _KanbanDispatcher.tick_once re-reads them every tick.
+        from hermes_cli.kanban_board_caps import read_board_caps
+        settings = _resolve_dispatcher_settings(kanban_cfg, _kb, board_caps=read_board_caps())
         interval = settings.interval
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
