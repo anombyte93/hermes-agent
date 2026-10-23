@@ -32,7 +32,7 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
-from hermes_cli.kanban_parser import reason_conflict, reason_extra_ids
+from hermes_cli.kanban_parser import reason_extra_ids, reason_usage_error
 
 
 # --- Flag parsing helpers ---
@@ -250,21 +250,23 @@ def _joined_words(words) -> Optional[str]:
 def _require_reason(args: argparse.Namespace) -> tuple[Optional[str], int]:
     """Resolve the reason from ``--reason`` or the trailing positional words (#125).
 
-    The parser already refuses both forms at once (``reason_conflict``); the
-    check is repeated here for callers that build the Namespace directly.
-    With ``--reason`` on a bulk verb, id-shaped trailing words are extra task
-    ids (``_bulk_ids`` folds them in), not reason text. Verbs whose reason is
-    required (``block``, ``request-changes``) handle "neither given" (None).
+    The parser already refuses both forms at once and a non-id word after
+    ``--ids`` (``reason_usage_error``); the checks are repeated here, before
+    any change, for callers that build the Namespace directly. With
+    ``--reason`` (even empty) on a bulk verb, id-shaped trailing words are
+    extra task ids (``_bulk_ids`` folds them in), not reason text. Verbs whose
+    reason is required (``block``, ``request-changes``) handle "neither given"
+    (None).
     """
-    flag = _stripped_or_none(getattr(args, "_reason_opt", None))
+    raw_flag = getattr(args, "_reason_opt", None)
     words = list(getattr(args, "reason", None) or [])
     verb = getattr(args, "kanban_action", None) or "kanban"
-    if flag is None:
+    usage = reason_usage_error(verb, words, raw_flag, getattr(args, "ids", None))
+    if usage:
+        return None, _err(f"kanban {verb}: {usage}", 2)
+    if raw_flag is None:
         return _joined_words(words), 0
-    conflict = reason_conflict(verb, words, flag)
-    if conflict:
-        return None, _err(f"kanban {verb}: {conflict}", 2)
-    return flag, 0
+    return _stripped_or_none(raw_flag), 0
 
 
 def _stripped_or_none(value: Optional[str]) -> Optional[str]:

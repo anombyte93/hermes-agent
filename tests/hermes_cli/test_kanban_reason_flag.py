@@ -313,3 +313,125 @@ def test_other_verbs_parse_unchanged(kanban_home: Path) -> None:
         for tid in (first, second):
             task = kb.get_task(conn, tid)
             assert task is not None and task.status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Review r1 finding 1: a reason placed after --ids is read as a task id by
+# --ids (nargs="+"). The call is refused before any change, never a partial
+# change that drops the reason, and --help says so.
+# ---------------------------------------------------------------------------
+
+
+def _bulk_pair(conn, verb: str) -> list[str]:
+    if verb == "promote":  # promote moves todo/blocked tasks
+        return [kb.create_task(conn, title=f"{verb}-{n}", initial_status="blocked",
+                               block_reason="held") for n in ("a", "b")]
+    return _make_ready_tasks(conn, f"{verb}-a", f"{verb}-b")
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote"])
+def test_reason_after_ids_is_refused_before_any_change(
+    kanban_home: Path, verb: str
+) -> None:
+    with kbc.connect_closing() as conn:
+        first, second = _bulk_pair(conn, verb)
+        before = {tid: kb.get_task(conn, tid).status for tid in (first, second)}
+        events_before = {tid: len(kb.list_events(conn, tid)) for tid in (first, second)}
+    out = kc.run_slash(f'{verb} {first} --ids {second} "text after ids"')
+    assert "usage error" in out, out
+    assert "text after ids" in out and "--reason" in out, out
+    with kbc.connect_closing() as conn:
+        for tid in (first, second):
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == before[tid], (tid, task.status)
+            assert len(kb.list_events(conn, tid)) == events_before[tid]
+            assert not _comments(conn, tid)
+
+
+def test_schedule_reason_after_ids_never_schedules_without_reason(kanban_home: Path) -> None:
+    """The reviewer's exact case: base scheduled both tasks with reason=None."""
+    with kbc.connect_closing() as conn:
+        first, second = _make_ready_tasks(conn, "later-a", "later-b")
+    out = kc.run_slash(f'schedule {first} --ids {second} "later please"')
+    assert "usage error" in out, out
+    assert "cannot schedule later please" not in out, out
+    with kbc.connect_closing() as conn:
+        for tid in (first, second):
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == "ready"
+            assert not _event_payloads(conn, tid, "scheduled")
+
+
+def test_reason_after_ids_refused_on_direct_namespace(kanban_home: Path, capsys) -> None:
+    """Callers that build the Namespace directly hit the same refusal."""
+    import argparse
+
+    with kbc.connect_closing() as conn:
+        first, second = _make_ready_tasks(conn, "ns-a", "ns-b")
+    ns = argparse.Namespace(kanban_action="block", task_id=first,
+                            ids=[second, "text after ids"], reason=[],
+                            _reason_opt=None, kind=None)
+    assert kc._cmd_block(ns) == 2
+    assert "text after ids" in capsys.readouterr().err
+    with kbc.connect_closing() as conn:
+        for tid in (first, second):
+            assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_reason_before_ids_and_reason_flag_with_ids_still_work(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        a, b, c, d = _make_ready_tasks(conn, "pre-a", "pre-b", "flag-a", "flag-b")
+    out = kc.run_slash(f'block {a} "before ids" --ids {b}')
+    assert "usage error" not in out, out
+    out = kc.run_slash(f'block {c} --ids {d} --reason "flag with ids"')
+    assert "usage error" not in out, out
+    with kbc.connect_closing() as conn:
+        for tid, why in ((a, "before ids"), (b, "before ids"),
+                         (c, "flag with ids"), (d, "flag with ids")):
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == "blocked"
+            assert task.block_reason == why
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote"])
+def test_help_says_reason_after_ids_is_refused(kanban_home: Path, verb: str) -> None:
+    out = kc.run_slash(f"{verb} -h")
+    flat = " ".join(out.split())
+    assert "including after --ids" not in flat, out
+    assert "not after --ids" in flat, out
+    assert "refused before any change" in flat, out
+
+
+# ---------------------------------------------------------------------------
+# Review r1 finding 2: the usage line names the flag's value REASON
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+def test_usage_line_shows_reason_metavar(kanban_home: Path, verb: str) -> None:
+    out = kc.run_slash(f"{verb} -h")
+    assert "_REASON_OPT" not in out, out
+    assert "--reason REASON" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Review r1 finding 3: an explicitly given empty --reason beside a positional
+# reason is the both-forms usage error, never silently ignored
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule", "promote", "request-changes"])
+def test_empty_reason_flag_plus_positional_is_usage_error(
+    kanban_home: Path, verb: str
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="empty-flag")  # no parents -> ready
+        events_before = len(kb.list_events(conn, tid))
+    out = kc.run_slash(f'{verb} {tid} "positional text" --reason ""')
+    assert "usage error" in out, out
+    assert "positional text" in out, out
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert len(kb.list_events(conn, tid)) == events_before
+        assert not _comments(conn, tid)

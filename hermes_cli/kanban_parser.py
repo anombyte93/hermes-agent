@@ -46,10 +46,10 @@ _TASK_ID_RE = re.compile(r"^t_[a-z0-9_:\-\.]+$", re.IGNORECASE)
 def reason_extra_ids(verb: str, words, flag: Optional[str]) -> list[str]:
     """Trailing words that are extra task ids rather than reason text.
 
-    Only when ``--reason`` carries the reason and the verb is a bulk verb;
+    Only when ``--reason`` was given (even empty) and the verb is a bulk verb;
     otherwise trailing words are the (legacy) positional reason.
     """
-    if not (flag or "").strip() or verb not in _BULK_REASON_VERBS:
+    if flag is None or verb not in _BULK_REASON_VERBS:
         return []
     return [w for w in (words or ()) if _TASK_ID_RE.match(w)]
 
@@ -58,9 +58,11 @@ def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
     """Usage-error text when a positional reason AND ``--reason`` are both given.
 
     The two forms are alternatives; both at once is refused, never a silent
-    pick. Returns None when there is no conflict.
+    pick. An explicitly given empty ``--reason ""`` counts as given, so it never
+    silently yields to the positional words. Returns None when there is no
+    conflict.
     """
-    if not (flag or "").strip():
+    if flag is None:
         return None
     ids = reason_extra_ids(verb, words, flag)
     text = [w for w in (words or ()) if w not in ids]
@@ -70,6 +72,29 @@ def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
             if verb in _BULK_REASON_VERBS else "")
     return (f"pass the reason either as trailing words or as --reason, not both "
             f"(positional: {' '.join(text)!r}; --reason: {flag.strip()!r}){hint}")
+
+
+def ids_not_task_ids(verb: str, ids) -> Optional[str]:
+    """Usage-error text when a word after ``--ids`` is not a task id.
+
+    ``--ids`` (``nargs="+"``) reads every word up to the next option as a task
+    id, so a reason placed after it lands there. Refusing it before any change
+    beats the alternative: a partial change on the real ids that drops the
+    reason (review r1 of #133). Returns None when every word is id-shaped.
+    """
+    if verb not in _BULK_REASON_VERBS:
+        return None
+    bad = [w for w in (ids or ()) if not _TASK_ID_RE.match(w)]
+    if not bad:
+        return None
+    return (f"--ids takes task ids only (t_...), and {' '.join(bad)!r} is not one; "
+            f"nothing was changed. A reason is never read after --ids: pass it with "
+            f"--reason, or put the words before --ids")
+
+
+def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
+    """Every reason/ids usage error for the #125 verbs, checked before any change."""
+    return ids_not_task_ids(verb, ids) or reason_conflict(verb, words, flag)
 
 
 class _KanbanSubParsersAction(argparse._SubParsersAction):
@@ -97,8 +122,9 @@ class _KanbanSubParsersAction(argparse._SubParsersAction):
         subnamespace, extras = leaf.parse_known_intermixed_args(arg_strings, None)
         for key, value in vars(subnamespace).items():
             setattr(namespace, key, value)
-        conflict = reason_conflict(parser_name, getattr(subnamespace, "reason", None),
-                                   getattr(subnamespace, "_reason_opt", None))
+        conflict = reason_usage_error(parser_name, getattr(subnamespace, "reason", None),
+                                      getattr(subnamespace, "_reason_opt", None),
+                                      getattr(subnamespace, "ids", None))
         if conflict:
             leaf.error(conflict)  # usage + message on stderr, exit 2
         if extras:
@@ -132,7 +158,7 @@ def _reason_opt(help: str):
     Stored on a distinct dest so handlers can reject "both forms at once"
     instead of silently picking one (#125).
     """
-    return _arg("--reason", dest="_reason_opt", help=help)
+    return _arg("--reason", dest="_reason_opt", metavar="REASON", help=help)
 
 
 def _run_state_args(type_help: str):
@@ -156,7 +182,10 @@ def _triage_sweep_args(verb: str, Verb: str, noun: str):
 
 
 def _bulk_ids(verb: str):
-    return _arg("--ids", nargs="+", help=f"Additional task ids to {verb} with the same reason (bulk mode)")
+    return _arg("--ids", nargs="+",
+                help=f"Additional task ids to {verb} with the same reason (bulk mode). "
+                     "Every word up to the next option is read as a task id; a word "
+                     "that is not a task id (t_...) is refused before any change.")
 
 
 _TASK_ID = _arg("task_id")
@@ -389,9 +418,11 @@ _SPECS = [
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*",
-             help="Reason (also appended as a comment). May sit anywhere after the "
-                  "task id, including after --ids/--kind. Prefer --reason; words here "
-                  "are only a reason when no --reason flag was given."),
+             help="Reason (also appended as a comment). May sit after the task id "
+                  "or after --kind, but not after --ids: --ids reads those words as "
+                  "task ids and the call is refused before any change. Prefer "
+                  "--reason; words here are only a reason when no --reason flag "
+                  "was given."),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
@@ -401,13 +432,15 @@ _SPECS = [
                   "triage to break unblock loops. Omit for a generic block."),
         _reason_opt("Reason (also appended as a comment). Quote multi-word reasons. "
                     "May sit anywhere; with this form extra task ids may also be "
-                    "given positionally (block T1 T2 --reason \"...\")."),
+                    "given positionally (block T1 T2 --reason \"...\"). An empty "
+                    "--reason beside positional reason words is refused."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*",
-             help="Reason/timing note (also appended as a comment). May sit anywhere "
-                  "after the task id, including after --ids. Prefer --reason."),
+             help="Reason/timing note (also appended as a comment). May sit after "
+                  "the task id, but not after --ids: --ids reads those words as task "
+                  "ids and the call is refused before any change. Prefer --reason."),
         _bulk_ids("schedule"),
         _reason_opt("Reason/timing note (also appended as a comment). Quote multi-word "
                     "reasons."),
@@ -442,8 +475,9 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*",
              help="Audit-trail reason (recorded on the task_events row). May sit "
-                  "anywhere after the task id, including after --ids. Prefer "
-                  "--reason."),
+                  "after the task id or after --dry-run/--json, but not after --ids: "
+                  "--ids reads those words as task ids and the call is refused before "
+                  "any change. Prefer --reason."),
         _bulk_ids("promote"),
         _reason_opt("Audit-trail reason (recorded on the task_events row). Quote "
                     "multi-word reasons."),
