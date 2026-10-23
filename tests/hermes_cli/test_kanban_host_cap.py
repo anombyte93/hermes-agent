@@ -113,7 +113,7 @@ def test_configured_max_in_progress_parsing():
     cases = [
         ({"kanban": {"max_in_progress": 4}}, 4),
         ({"kanban": {"max_in_progress": "5"}}, 5),
-        ({"kanban": {"max_in_progress": 0}}, None),
+        ({"kanban": {"max_in_progress": 0}}, 0),  # 0 stays 0 (review r2 P1-3)
         ({"kanban": {"max_in_progress": -2}}, None),
         ({"kanban": {"max_in_progress": "lots"}}, None),
         ({"kanban": {}}, None),

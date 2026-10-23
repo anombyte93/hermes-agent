@@ -245,15 +245,11 @@ class GatewayKanbanWatchersMixin:
         if boot is None:
             return
         _load_config, _kb, kanban_cfg = boot
-        # Board-scope caps (#124) come from the default profile's config, not
-        # this gateway's; seeding them here keeps the boot log truthful, and
-        # _KanbanDispatcher.tick_once re-reads them every tick.
-        try:
-            from hermes_cli.kanban_board_caps import read_board_caps
-            kanban_cfg = {**kanban_cfg, **read_board_caps().section}
-        except Exception:
-            logger.exception("kanban dispatcher: board caps unavailable at boot; first tick retries")
-        settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
+        # Board-scope caps (#124) are seeded from the default profile's caps,
+        # sanitized by the shared parser (never this gateway's own capacity
+        # keys); _KanbanDispatcher.tick_once re-reads them every tick.
+        from hermes_cli.kanban_board_caps import read_board_caps
+        settings = _resolve_dispatcher_settings(kanban_cfg, _kb, board_caps=read_board_caps())
         interval = settings.interval
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).

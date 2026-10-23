@@ -4,14 +4,18 @@
 which resolves the invoking (sticky) profile's config.yaml — so a dispatch run
 without ``--profile default`` ignored ``kanban.max_in_progress_by_assignee``
 and over-spawned. A board's caps describe the board's shared capacity and must
-hold whichever profile runs a dispatcher. The six board-scope keys therefore
-come from the DEFAULT profile's EFFECTIVE config (defaults + file + env
-expansion + managed overlay, one read per resolution) on every dispatch path:
-the CLI ``dispatch`` verb, the standalone daemon (re-read every tick), the
-gateway's embedded dispatcher (re-read every tick) and the dashboard nudge.
-An unreadable default config keeps the last good caps (in-process, else the
-default profile's last-known-good backup) and otherwise refuses to spawn; it
-never falls back to the invoking profile's caps.
+hold whichever profile runs a dispatcher. The declared rule (see
+``hermes_cli/kanban_board_caps.py``), on every dispatch path (the CLI
+``dispatch`` verb, the standalone daemon, the gateway's embedded dispatcher and
+the dashboard nudge), re-resolved on every call:
+
+1. the six board-cap keys from the DEFAULT profile's raw config.yaml, then the
+   managed-scope overlay (managed wins);
+2. literal values only: a ``${VAR}`` board-cap key is warned and ignored;
+3. a missing default config.yaml is an empty user layer (managed still applies);
+4. an unreadable/unparseable default config.yaml refuses spawning (no cache,
+   no backup recovery, never the invoking profile's caps);
+5. integer caps are nonnegative ints and ``0`` stays ``0``.
 """
 from __future__ import annotations
 
@@ -165,7 +169,8 @@ def _drive_real_daemon(monkeypatch, on_call, *, max_per_assignee=None, max_n=Non
     capturing ``dispatch_once``; ``on_call(n, kwargs)`` returns True to stop."""
     calls: list = []
     stop = threading.Event()
-    real_run_daemon = kbd.run_daemon
+    # A test may drive the daemon twice: always wrap the real loop, never a wrapper.
+    real_run_daemon = getattr(kbd.run_daemon, "_real", kbd.run_daemon)
 
     def fake_dispatch_once(conn, **kwargs):
         calls.append(dict(kwargs))
@@ -174,7 +179,11 @@ def _drive_real_daemon(monkeypatch, on_call, *, max_per_assignee=None, max_n=Non
         return kb.DispatchResult()
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
-    monkeypatch.setattr(kbd, "run_daemon", lambda **kw: real_run_daemon(stop_event=stop, **kw))
+    def run_daemon(**kw):
+        return real_run_daemon(stop_event=stop, **kw)
+
+    run_daemon._real = real_run_daemon
+    monkeypatch.setattr(kbd, "run_daemon", run_daemon)
     args = argparse.Namespace(
         force=True, interval=0.01, max=max_n, failure_limit=kbd.DEFAULT_FAILURE_LIMIT,
         max_per_assignee=max_per_assignee, pidfile=None, verbose=False,
@@ -353,14 +362,18 @@ def test_default_config_broken_after_first_read_keeps_its_caps(
 
 
 # ---------------------------------------------------------------------------
-# Finding 5 — unreadable default: keep last good caps, else refuse to spawn
+# Rule 4 — an unreadable default config refuses to spawn (fail closed)
 # ---------------------------------------------------------------------------
 
 
 def test_unreadable_default_with_uncapped_invoker_refuses_to_spawn(sticky_profile_home, capsys):
-    """No last good caps exist (fresh process, no backup) and the invoking
-    profile sets no caps: spawning is refused, never run uncapped."""
+    """An unparseable default config refuses to spawn; it never runs on the
+    invoking profile's (absent) caps. r2 P2-4 (removal): the backup recovery
+    path is gone, so a last-known-good backup under ``backups/config/`` is
+    not consulted either."""
     root = sticky_profile_home
+    backup = root / "backups" / "config" / "config.yaml.good.20261023-000000"
+    _write_cfg(backup, "kanban:\n  max_in_progress: 20\n  max_in_progress_by_assignee:\n    evo: 2\n")
     _write_cfg(root / "config.yaml", "kanban: [unclosed\n")
     _write_cfg(root / "profiles" / "evo" / "config.yaml", "model: local\n")
     with kbc.connect_closing() as conn:
@@ -372,63 +385,264 @@ def test_unreadable_default_with_uncapped_invoker_refuses_to_spawn(sticky_profil
     assert "unreadable" in out.err, out.err
     assert "refusing to spawn" in out.err, out.err
     assert "invoking profile" not in out.err.split("unreadable", 1)[1], out.err
+    assert "backup" not in out.out + out.err, out
 
 
-def test_unreadable_default_keeps_in_process_last_good_caps(sticky_profile_home, capsys):
+# ---------------------------------------------------------------------------
+# Every dispatch path, captured: what each one hands ``dispatch_once``
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def managed_dir(tmp_path, monkeypatch):
+    """A managed scope directory (``HERMES_MANAGED_DIR``), caches cleared."""
+    from hermes_cli import managed_scope
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    yield managed
+    managed_scope.invalidate_managed_cache()
+
+
+def _kwargs_on_every_path(monkeypatch) -> dict:
+    """``{path: kwargs}`` each dispatcher passes to ``dispatch_once`` right now:
+    the CLI verb, the standalone daemon, the gateway's per-tick refresh and
+    the dashboard nudge (when FastAPI is installed)."""
+    from gateway import kanban_watchers_dispatcher as kwd
+
+    captured: list = []
+
+    def capture(conn, **kw):
+        captured.append(dict(kw))
+        return kb.DispatchResult()
+
+    out: dict = {}
+    monkeypatch.setattr(kbd, "dispatch_once", capture)
+    monkeypatch.setattr(kwd._kbd(), "dispatch_once", capture)
+    kanban_ops._cmd_dispatch(_dispatch_args())
+    out["cli"] = captured[-1]
+    out["daemon"] = _drive_real_daemon(monkeypatch, lambda n, kw: True)[0]
+    monkeypatch.setattr(kwd._kbd(), "dispatch_once", capture)
+    kwd._KanbanDispatcher(kb, kwd._resolve_dispatcher_settings({}, kb)).tick_once()
+    out["gateway"] = captured[-1]
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        return out
+    plugin = _load_dashboard_plugin()
+    monkeypatch.setattr(plugin.kbd, "dispatch_once", capture)
+    plugin.dispatch(dry_run=True, max_n=8, board=None)
+    out["dashboard"] = captured[-1]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Review r2 P2-4 — no last-good cache: a broken default refuses on every path
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_default_refuses_on_every_path_even_after_a_good_read(
+    sticky_profile_home, managed_dir, monkeypatch, capsys,
+):
+    """r2 P2-4: managed ``evo: 2`` resolves once, then the default YAML breaks
+    and managed policy tightens to ``evo: 1``. Head kept forwarding the cached
+    ``2`` and kept spawning. Now nothing is cached: every path refuses to
+    spawn (``max_spawn=0``) until the file is fixed."""
     root = sticky_profile_home
-    cfg = root / "config.yaml"
-    _write_cfg(cfg, "kanban:\n  max_in_progress: 20\n  max_in_progress_by_assignee:\n    evo: 2\n")
-    _write_cfg(root / "profiles" / "evo" / "config.yaml", "model: local\n")
-    with kbc.connect_closing() as conn:
-        _seed(conn, running=2, ready=2)
-    assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
-    capsys.readouterr()
-    _write_cfg(cfg, "kanban: [unclosed\n")
-    assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
-    out = capsys.readouterr()
-    assert _spawned_for(out.out, "evo") == 0, out.out
-    assert _deferred(out.out, "evo", 2, 2) == 2, out.out
-    assert "keeping the last good board caps" in out.err, out.err
-
-
-def test_unreadable_default_recovers_default_profiles_backup(sticky_profile_home, capsys):
-    """A fresh process recovers the default profile's last-known-good backup
-    (the copy the normal config loader keeps under ``backups/config/``)."""
-    root = sticky_profile_home
-    backup = root / "backups" / "config" / "config.yaml.good.20261023-000000"
-    _write_cfg(backup, "kanban:\n  max_in_progress: 20\n  max_in_progress_by_assignee:\n    evo: 2\n")
+    _write_cfg(managed_dir / "config.yaml", "kanban:\n  max_in_progress_by_assignee:\n    evo: 2\n")
+    _write_cfg(root / "config.yaml", "kanban:\n  max_in_progress: 20\n")
+    first = _kwargs_on_every_path(monkeypatch)
+    assert {p: kw["max_in_progress_by_assignee"] for p, kw in first.items()} == {
+        p: {"evo": 2} for p in first
+    }
+    _write_cfg(managed_dir / "config.yaml", "kanban:\n  max_in_progress_by_assignee:\n    evo: 1\n")
     _write_cfg(root / "config.yaml", "kanban: [unclosed\n")
-    _write_cfg(root / "profiles" / "evo" / "config.yaml", "model: local\n")
-    with kbc.connect_closing() as conn:
-        _seed(conn, running=2, ready=2)
-        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
-    out = capsys.readouterr()
-    assert _spawned_for(out.out, "evo") == 0, out.out
-    assert _deferred(out.out, "evo", 2, 2) == 2, out.out
-    assert "last-known-good backup" in out.out, out.out
+    capsys.readouterr()
+    after = _kwargs_on_every_path(monkeypatch)
+    assert {p: kw["max_spawn"] for p, kw in after.items()} == {p: 0 for p in after}
+    err = capsys.readouterr().err
+    assert "unreadable" in err and "refusing to spawn" in err, err
 
 
 # ---------------------------------------------------------------------------
-# Non-blocking 1 — equivalent representations are not a mismatch
+# Review r2 P1-1 — a missing default config is an empty user layer + managed
 # ---------------------------------------------------------------------------
 
 
-def test_identical_env_templated_caps_do_not_warn(sticky_profile_home, monkeypatch, capsys):
+def test_missing_default_config_still_applies_managed_caps_on_every_path(
+    sticky_profile_home, managed_dir, monkeypatch, capsys,
+):
+    """r2 P1-1: no default config.yaml in a fresh process. Head treated that as
+    empty caps and dropped managed ``evo: 2`` on all four paths."""
     root = sticky_profile_home
-    monkeypatch.setenv("H124_EVO_CAP", "2")
-    body = "kanban:\n  max_in_progress_by_assignee:\n    evo: ${H124_EVO_CAP}\n"
-    _write_cfg(root / "config.yaml", body)
-    _write_cfg(root / "profiles" / "evo" / "config.yaml", body)
-    with kbc.connect_closing() as conn:
-        _seed(conn, running=2, ready=1)
-        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
-    out = capsys.readouterr()
-    assert "differ" not in out.err, out.err
-    assert _deferred(out.out, "evo", 2, 2) == 1, out.out
+    assert not (root / "config.yaml").exists()
+    _write_cfg(managed_dir / "config.yaml", "kanban:\n  max_in_progress_by_assignee:\n    evo: 2\n")
+    got = _kwargs_on_every_path(monkeypatch)
+    assert {p: kw["max_in_progress_by_assignee"] for p, kw in got.items()} == {
+        p: {"evo": 2} for p in got
+    }
+    assert all(kw["max_spawn"] != 0 for p, kw in got.items()), got
 
 
 # ---------------------------------------------------------------------------
-# Non-blocking 2 — the summary reports effective values and their real sources
+# Review r2 P1-2 — literal values only: ${VAR} is never expanded
+# ---------------------------------------------------------------------------
+
+
+def test_env_reference_in_board_cap_is_ignored_whatever_the_invokers_env(
+    sticky_profile_home, monkeypatch, capsys,
+):
+    """r2 P1-2: the same ``${CAP}`` yielded ``evo: 2`` or ``evo: 10`` depending
+    on the invoker's environment. A ``${VAR}`` board-cap key is now invalid:
+    warned and ignored, so every path resolves the same caps under any env."""
+    root = sticky_profile_home
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_in_progress: 20\n  default_assignee: ${H124_WHO}\n"
+        "  max_in_progress_by_assignee:\n    evo: ${H124_CAP}\n",
+    )
+    seen = []
+    for cap in ("2", "10"):
+        monkeypatch.setenv("H124_CAP", cap)
+        monkeypatch.setenv("H124_WHO", f"who{cap}")
+        capsys.readouterr()
+        got = _kwargs_on_every_path(monkeypatch)
+        seen.append({
+            p: (kw["max_in_progress_by_assignee"], kw["default_assignee"], kw["max_in_progress"])
+            for p, kw in got.items()
+        })
+        err = capsys.readouterr().err
+        assert "max_in_progress_by_assignee" in err and "${" in err, err
+        assert "default_assignee" in err, err
+    assert seen[0] == seen[1], seen
+    assert all(v == ({}, None, 20) for v in seen[0].values()), seen
+
+
+# ---------------------------------------------------------------------------
+# Review r2 P1-3 — one integer parser: 0 stays 0 on every path
+# ---------------------------------------------------------------------------
+
+
+def test_zero_integer_caps_stay_zero_on_every_path(sticky_profile_home, monkeypatch):
+    """r2 P1-3: the gateway refresh turned ``max_spawn: 0`` into ``None``
+    (uncapped). ``max_spawn``, ``max_in_progress`` and
+    ``max_in_progress_per_profile`` share one parser that keeps ``0``."""
+    root = sticky_profile_home
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_spawn: 0\n  max_in_progress: 0\n  max_in_progress_per_profile: 0\n",
+    )
+    got = _kwargs_on_every_path(monkeypatch)
+    for path, kw in got.items():
+        expect_spawn = 8 if path == "dashboard" else 0  # the nudge's explicit ?max=
+        assert (kw["max_spawn"], kw["max_in_progress"], kw["max_in_progress_per_profile"]) == (
+            expect_spawn, 0, 0,
+        ), (path, kw)
+
+
+def test_gateway_refresh_zero_max_spawn_refuses_with_global_headroom(sticky_profile_home):
+    """r2 P1-3, the reviewer's case: ``max_spawn: 0`` with global headroom of 20
+    must refuse spawning through the gateway refresh, not permit 20."""
+    from gateway import kanban_watchers_dispatcher as kwd
+
+    root = sticky_profile_home
+    _write_cfg(root / "config.yaml", "kanban:\n  max_spawn: 0\n  max_in_progress: 20\n")
+    dispatcher = kwd._KanbanDispatcher(kb, kwd._resolve_dispatcher_settings({}, kb))
+    dispatcher.refresh_board_caps()
+    assert dispatcher.settings.max_spawn == 0
+    with kbc.connect_closing() as conn:
+        may_spawn, _budget = kbd._tick_spawn_budget(
+            conn, kb.DispatchResult(), max_spawn=dispatcher.settings.max_spawn,
+            max_in_progress=dispatcher.settings.max_in_progress, board=None,
+        )
+    assert may_spawn is False
+
+
+def test_zero_per_profile_cap_defers_every_assignee(sticky_profile_home, capsys):
+    """``max_in_progress_per_profile: 0`` means no profile may start a worker;
+    it must not read as "no per-profile cap"."""
+    root = sticky_profile_home
+    _write_cfg(root / "config.yaml", "kanban:\n  max_in_progress: 20\n  max_in_progress_per_profile: 0\n")
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert "Spawned:      0" in out, out
+    assert _deferred(out, "evo", 0, 0) == 1, out
+
+
+# ---------------------------------------------------------------------------
+# Review r2 P2-5 — gateway boot seeds sanitized caps (boot-to-tick)
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_boot_to_tick_seeds_sanitized_default_profile_caps(sticky_profile_home, monkeypatch):
+    """r2 P2-5: ``default_assignee: 123`` in the default config (which the
+    common parser ignores) crashed the gateway bootstrap with
+    ``AttributeError`` before the loop started. Boot must seed the sanitized
+    ``dispatch_caps()`` values (never the gateway's own capacity keys) and the
+    first tick must dispatch with them."""
+    import asyncio
+
+    from gateway import kanban_watchers as kw
+    from gateway import kanban_watchers_dispatcher as kwd
+
+    root = sticky_profile_home
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  default_assignee: 123\n  max_spawn: 0\n  max_in_progress: 20\n"
+        "  max_in_progress_by_assignee:\n    evo: 2\n",
+    )
+    _write_cfg(
+        root / "profiles" / "evo" / "config.yaml",
+        "kanban:\n  auto_decompose: false\n  dispatch_interval_seconds: 1\n"
+        "  default_assignee: kimi\n  max_spawn: 9\n"
+        "  max_in_progress_by_assignee:\n    kimi: 9\n",
+    )
+    captured: list = []
+    boot_settings: list = []
+    monkeypatch.setattr(
+        kwd._kbd(), "dispatch_once",
+        lambda conn, **k: (captured.append(dict(k)), kb.DispatchResult())[1],
+    )
+    monkeypatch.setattr(kwd._kbd(), "reap_worker_zombies", lambda: [])
+
+    async def inline(fn, *args):
+        return fn(*args)
+
+    monkeypatch.setattr(kw, "_to_thread_process_service", inline)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(kw.asyncio, "sleep", lambda _d: real_sleep(0))
+
+    class RecordingDispatcher(kwd._KanbanDispatcher):
+        def __init__(self, kb_mod, settings):
+            boot_settings.append(settings)
+            super().__init__(kb_mod, settings)
+
+    monkeypatch.setattr(kw, "_KanbanDispatcher", RecordingDispatcher)
+
+    class Runner(kw.GatewayKanbanWatchersMixin):
+        _running = True
+
+        async def _sleep_between_ticks(self, interval):
+            self._running = False
+
+    asyncio.run(asyncio.wait_for(Runner()._kanban_dispatcher_watcher(), timeout=30))
+    assert boot_settings, "the dispatcher loop never started"
+    seeded = boot_settings[0]
+    assert (seeded.default_assignee, seeded.max_spawn, seeded.max_in_progress) == (None, 0, 20)
+    assert seeded.max_in_progress_by_assignee == {"evo": 2}
+    assert seeded.interval == 1.0  # runtime keys still come from the gateway's own profile
+    assert captured, "the first tick never dispatched"
+    first = captured[0]
+    assert (first["default_assignee"], first["max_spawn"], first["max_in_progress"]) == (None, 0, 20)
+    assert first["max_in_progress_by_assignee"] == {"evo": 2}
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking — the summary reports effective values and their real sources
 # ---------------------------------------------------------------------------
 
 
@@ -448,4 +662,27 @@ def test_dry_run_summary_reports_effective_caps_and_sources(sticky_profile_home,
     assert "  max_spawn: 3 (--max)" in out, out
     assert "  max_in_progress: 20 (default profile config)" in out, out
     assert "  max_in_progress_by_assignee.evo: 1 (--max-per-assignee)" in out, out
+    assert "  max_in_progress_by_assignee.kimi: 4 (default profile config)" in out, out
+
+
+def test_dry_run_summary_labels_managed_values_managed(sticky_profile_home, managed_dir, capsys):
+    """r2 non-blocking: managed-overlay values were labelled "default profile
+    config". Each value now carries its own provenance."""
+    root = sticky_profile_home
+    _write_cfg(
+        managed_dir / "config.yaml",
+        "kanban:\n  max_spawn: 3\n  max_in_progress_by_assignee:\n    evo: 2\n",
+    )
+    _write_cfg(
+        root / "config.yaml",
+        "kanban:\n  max_spawn: 5\n  max_in_progress: 20\n"
+        "  max_in_progress_by_assignee:\n    evo: 9\n    kimi: 4\n",
+    )
+    with kbc.connect_closing() as conn:
+        _seed(conn, running=0, ready=1)
+        assert kanban_ops._cmd_dispatch(_dispatch_args()) == 0
+    out = capsys.readouterr().out
+    assert "  max_spawn: 3 (managed scope)" in out, out
+    assert "  max_in_progress: 20 (default profile config)" in out, out
+    assert "  max_in_progress_by_assignee.evo: 2 (managed scope)" in out, out
     assert "  max_in_progress_by_assignee.kimi: 4 (default profile config)" in out, out

@@ -61,10 +61,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour the six board-scope caps (kanban.default_assignee, max_in_progress,
     # max_in_progress_per_profile, max_in_progress_by_assignee, assignee_groups,
     # max_spawn) with the same semantics as every other dispatcher. They are
-    # BOARD-SCOPE (#124): resolved from the default profile's effective config
+    # BOARD-SCOPE (#124): resolved from the default profile's config + managed overlay
     # so they hold whichever profile runs dispatch. Explicit --max and
-    # --max-per-assignee still win; an unreadable default config keeps the last
-    # good caps or refuses to spawn, never falling back to this profile's caps.
+    # --max-per-assignee still win; an unreadable default config refuses to
+    # spawn, never falling back to this profile's caps.
     from hermes_cli import kanban_board_caps as kbcaps
 
     caps = kbcaps.read_board_caps()
@@ -88,7 +88,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         except kbd.BoardDispatchLockedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-    # Refused spawning (no known-good board caps) exits non-zero so scripts notice.
+    # Refused spawning (unreadable default config) exits non-zero so scripts notice.
     rc = 1 if caps.spawn_refused else 0
     if getattr(args, "json", False):
         _print_json({

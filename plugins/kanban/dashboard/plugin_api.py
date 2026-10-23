@@ -1222,8 +1222,8 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
 
     Applies the same board-scope caps as every other dispatcher (#124): the
     default profile's ``kanban`` capacity keys, with ``max`` as the explicit
-    spawn cap. An unreadable default config with no known-good caps spawns
-    nothing (``board_caps_warning`` says why)."""
+    spawn cap. An unreadable default config spawns nothing
+    (``board_caps_warning`` says why)."""
     from hermes_cli import kanban_board_caps as kbcaps
 
     caps = kbcaps.read_board_caps()

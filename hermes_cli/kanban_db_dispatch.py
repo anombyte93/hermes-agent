@@ -1740,33 +1740,21 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
-def _board_cap_section() -> dict:
-    """The board-scope cap section (#124): the six capacity keys resolved from
-    the DEFAULT profile's effective config, whichever profile runs this."""
-    from hermes_cli.kanban_board_caps import read_board_caps
-    return read_board_caps().section
-
-
 def configured_max_in_progress(kanban_cfg: Optional[Mapping[str, Any]] = None) -> Optional[int]:
     """``kanban.max_in_progress`` (board-scope), or None when unset/invalid.
 
     Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
-    ``kanban_cfg`` parses an already-resolved section; omitted, the board-scope
-    caps are read from the default profile's config (#124).
+    nonnegative integer wins (``0`` stays ``0``), anything else falls through
+    to the derived default. ``kanban_cfg`` parses an already-resolved section;
+    omitted, the board-scope caps are read from the default profile (#124).
     """
+    from hermes_cli import kanban_board_caps as kbcaps
+
     try:
-        cfg = _board_cap_section() if kanban_cfg is None else kanban_cfg
-        raw = (cfg or {}).get("max_in_progress")
+        cfg = kbcaps.read_board_caps().section if kanban_cfg is None else kanban_cfg
+        return kbcaps.parse_caps(dict(cfg or {}))["max_in_progress"]
     except Exception:
         return None
-    if raw is None or isinstance(raw, bool):
-        return None
-    try:
-        ival = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return ival if ival >= 1 else None
 
 
 def parse_assignee_caps(raw: Any) -> dict[str, int]:
@@ -1881,26 +1869,6 @@ def _kanban_config_readonly() -> Optional[dict]:
         return None
 
 
-def configured_per_assignee_caps() -> tuple[Optional[int], dict[str, int]]:
-    """``(kanban.max_in_progress_per_profile, kanban.max_in_progress_by_assignee)``,
-    board-scope: from the default profile's config (#124), re-read on every
-    call so operators can retune a saturated local model without a restart (#83)."""
-    try:
-        kanban_cfg = _board_cap_section()
-    except Exception:
-        return None, {}
-    scalar = _positive_int(kanban_cfg.get("max_in_progress_per_profile"), None)
-    return scalar, parse_assignee_caps(kanban_cfg.get("max_in_progress_by_assignee"))
-
-
-def configured_assignee_groups() -> dict[str, dict]:
-    """``kanban.assignee_groups`` (board-scope, default profile's config), normalised."""
-    try:
-        return parse_assignee_groups(_board_cap_section().get("assignee_groups"))
-    except Exception:
-        return {}
-
-
 def configured_capped_alert() -> Optional[tuple[int, list[str]]]:
     """``kanban.capped_alert`` from config, normalised; None when off/invalid."""
     kanban_cfg = _kanban_config_readonly()
@@ -1934,16 +1902,6 @@ def default_max_runtime_for(assignee: Optional[str]) -> Optional[int]:
     if not assignee:
         return None
     return configured_max_runtime_by_assignee().get(assignee)
-
-
-def configured_max_spawn() -> Optional[int]:
-    """``kanban.max_spawn`` (board-scope, default profile's config), or None
-    when unset/invalid."""
-    try:
-        raw = _board_cap_section().get("max_spawn")
-    except Exception:
-        return None
-    return _positive_int(raw, None)
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
@@ -2725,8 +2683,10 @@ def _dispatch_once_locked(
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
         # workloads from melting a single profile's local model / API quota / browser pool while leaving
         # other profiles idle.
+        # 0 is a cap of zero, not "no cap" (#124 review r2: one integer parser, 0 stays 0).
         isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
+        and not isinstance(max_in_progress_per_profile, bool)
+        and max_in_progress_per_profile >= 0
     ) else None
     # Named per-assignee caps override the scalar for those profiles only (#83): a single-GPU local
     # profile can be held at 2 while cloud profiles keep fanning out.
@@ -3277,7 +3237,7 @@ def run_daemon(
     SIGINT / SIGTERM so it is systemd-friendly. ``stop_event`` and ``on_tick``
     are test hooks. Each tick resolves the six board-scope caps exactly like
     the gateway dispatcher and ``hermes kanban dispatch`` — from ONE read of
-    the default profile's effective config (#124) — so the standalone daemon
+    the default profile's config (#124, ``kanban_board_caps``) — so the standalone daemon
     is never the one uncapped entry point. ``max_spawn`` and
     ``max_in_progress_by_assignee`` are EXPLICIT operator overrides only; the
     config caps are never frozen into them.
@@ -3310,8 +3270,8 @@ def run_daemon(
             # Board caps re-resolve every tick (#83, #124) so operator edits to
             # the default profile's config apply without a restart. Explicit
             # CLI caps win per assignee; an explicit ``--max`` wins over
-            # ``kanban.max_spawn``; an unreadable default config keeps the last
-            # good caps or refuses to spawn (never the invoking profile's caps).
+            # ``kanban.max_spawn``; an unreadable default config refuses to
+            # spawn this tick (never the invoking profile's caps).
             caps = _kbcaps.read_board_caps()
             warn_caps(caps.warning)
             resolved = _kbcaps.dispatch_caps(

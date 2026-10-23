@@ -2162,7 +2162,9 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         from hermes_cli.config_backups import load_newest_good_backup
         raw_good = load_newest_good_backup(config_path)
         if raw_good is not None:
-            lkg = effective_config_from_raw(raw_good)
+            normalized = _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good))
+            expanded_good: Dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
+            lkg, _ = _merge_managed_overlay(expanded_good)
             fallback = "last-known-good-backup"
     _warn_config_parse_failure(
         config_path, exc, fallback=fallback if lkg is not None else "defaults")
@@ -2176,17 +2178,6 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         # loads don't re-parse; fixing the file changes the signature and reloads normally.
         _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
     return lkg_copy
-
-
-def effective_config_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """The effective config ``load_config()`` serves for an already-parsed user file: defaults
-    merged under it, then the canonicalize -> env-expand -> managed-overlay pipeline. For readers
-    that must resolve ANOTHER profile's config.yaml (e.g. board-scope kanban caps, #124) with the
-    same semantics, holding their own single snapshot of the file and its read error."""
-    normalized = _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw))
-    expanded: Dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
-    merged, _ = _merge_managed_overlay(expanded)
-    return merged
 
 
 def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:

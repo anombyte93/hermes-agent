@@ -1,37 +1,39 @@
 """Board-scope kanban dispatch caps (#124).
 
 A kanban board lives under the Hermes root and is shared by every profile on
-the host, so its concurrency caps must hold whichever profile runs a
-dispatcher — the CLI ``dispatch`` verb, the standalone daemon, the gateway's
-embedded dispatcher or the dashboard's dispatch nudge. The board-scope source
-is the DEFAULT profile's ``config.yaml``, resolved through the same effective
-pipeline ``load_config()`` applies (schema defaults, ``${VAR}`` expansion and
-the managed-scope overlay), from ONE read of the file per resolution.
+the host, so its capacity caps must not depend on which profile runs a
+dispatcher: the CLI ``dispatch`` verb, the standalone daemon, the gateway's
+embedded dispatcher or the dashboard's dispatch nudge. Every one of them
+resolves the caps through :func:`read_board_caps`, fresh on every call (loops
+call it every tick), by one declared rule:
 
-Loops call :func:`read_board_caps` every tick, so an edit to the default
-profile's config applies on the next tick. When that file cannot be read or
-parsed, the caps fail safe, in order:
+1. The board caps are the six :data:`BOARD_CAP_KEYS` under ``kanban:`` in the
+   DEFAULT profile's ``config.yaml``, read as raw YAML, with the managed-scope
+   overlay applied on top (managed wins at the leaf).
+2. Board-cap values are literal YAML values. A ``${VAR}`` reference in a
+   board-cap key is NOT expanded: that key is invalid, a warning names it,
+   and it is ignored. The caps never depend on the invoker's environment or
+   secret scope.
+3. A missing default ``config.yaml`` is an empty user layer; the managed
+   overlay still applies.
+4. An unreadable or unparseable default ``config.yaml`` refuses spawning for
+   that resolution (``max_spawn=0``; reclaim and promotion still run), with
+   the reason in the warning. Nothing is cached and no backup is consulted;
+   the next tick reads the file again. The invoking profile's caps are never
+   a fallback.
+5. ``max_spawn``, ``max_in_progress`` and ``max_in_progress_per_profile`` share
+   one parser: a nonnegative integer, ``0`` kept as ``0`` (spawn nothing).
 
-1. the last good caps this process resolved from the file;
-2. the default profile's last-known-good backup (``backups/config/``, the copy
-   the normal config loader keeps of the last file that parsed);
-3. otherwise no known-good caps exist and spawning is refused
-   (:attr:`BoardCaps.spawn_refused`) until the file is fixed.
-
-The invoking profile's caps are never used as a fallback: that is the
-profile-dependent rule #124 removes.
-
-Only the six capacity keys below are board-scope. Everything else under
-``kanban:`` (intervals, failure limits, alerts, worker containment) is runtime
-config of the process running the dispatcher and keeps resolving from the
-invoking profile.
+Everything else under ``kanban:`` (intervals, failure limits, alerts, worker
+containment) is runtime config of the process running the dispatcher and keeps
+resolving from that process's profile.
 """
 from __future__ import annotations
 
-import threading
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Optional
 
 # The board-scope capacity keys (issue #124): whose cards may be spawned, and
 # how many workers may run at once.
@@ -43,42 +45,38 @@ BOARD_CAP_KEYS = (
     "assignee_groups",
     "max_spawn",
 )
+_INT_KEYS = ("max_spawn", "max_in_progress", "max_in_progress_per_profile")
+_NAMED_KEYS = ("max_in_progress_by_assignee", "assignee_groups")
 
 SOURCE_DEFAULT = "default profile config"
-SOURCE_LAST_GOOD = "last good default profile config (kept in-process)"
-SOURCE_BACKUP = "default profile config last-known-good backup"
-SOURCE_NONE = "no known-good board caps"
+SOURCE_MANAGED = "managed scope"
 SOURCE_CLI_MAX = "--max"
 SOURCE_CLI_ASSIGNEE = "--max-per-assignee"
 SOURCE_DERIVED = "memory-derived default"
 SOURCE_REFUSED = "spawning refused"
 
-# default config path -> the last good board-cap section resolved from it.
-_LAST_GOOD: Dict[str, Dict[str, Any]] = {}
-_LAST_GOOD_LOCK = threading.Lock()
+_ENV_REF = re.compile(r"\$\{[^}]+\}")
 
 
-class _DefaultConfigUnreadable(Exception):
-    """The default profile's config.yaml could not be turned into board caps."""
+class _Unreadable(Exception):
+    """The default profile's config.yaml cannot be turned into board caps."""
 
 
 @dataclass(frozen=True)
 class BoardCaps:
     """One resolution of the board-scope caps.
 
-    ``section`` holds the six :data:`BOARD_CAP_KEYS` as the effective config
-    carries them; ``origin`` names which known-good layer they came from
-    (one of the ``SOURCE_*`` labels) and ``source`` adds the path for humans.
-    ``warning`` is a single line or ``None``. ``spawn_refused`` is True only
-    when no known-good caps exist at all.
+    ``section`` holds the valid :data:`BOARD_CAP_KEYS` values (default file
+    with the managed overlay applied); ``managed`` names the values the
+    managed scope set (``key`` or ``key.name``). ``warning`` is one line or
+    ``None``. ``spawn_refused`` is True when the default config is unreadable.
     """
 
     section: Dict[str, Any]
-    origin: str
-    source: str
+    source: str = SOURCE_DEFAULT
     warning: Optional[str] = None
     spawn_refused: bool = False
-    path: str = ""
+    managed: FrozenSet[str] = frozenset()
 
 
 @dataclass
@@ -95,84 +93,120 @@ def default_profile_config_path() -> Path:
     return _get_default_hermes_home() / "config.yaml"
 
 
-def _cap_section(effective: Any) -> Dict[str, Any]:
-    """The six board-cap keys of an effective config; raises when ``kanban:``
-    is not a mapping (a malformed section is unreadable, not "no caps")."""
-    if not isinstance(effective, dict):
-        raise _DefaultConfigUnreadable("top-level config is not a mapping")
-    kanban = effective.get("kanban")
+def _cap_keys(doc: Any, what: str) -> Dict[str, Any]:
+    """The board-cap keys of a parsed YAML document's ``kanban:`` section."""
+    if doc is None:
+        return {}
+    if not isinstance(doc, dict):
+        raise _Unreadable(f"{what}: top-level YAML is not a mapping")
+    kanban = doc.get("kanban")
     if kanban is None:
         return {}
     if not isinstance(kanban, dict):
-        raise _DefaultConfigUnreadable("kanban: is not a mapping")
+        raise _Unreadable(f"{what}: kanban: is not a mapping")
     return {k: kanban[k] for k in BOARD_CAP_KEYS if k in kanban}
 
 
-def _read_effective_caps(path: Path) -> Optional[Dict[str, Any]]:
-    """ONE read of ``path`` -> its effective board-cap section.
-
-    ``None`` when the file does not exist. Raises on any other read, parse or
-    shape error, so the caller can never mistake a failed read for an empty
-    config.
-    """
+def _read_default_caps(path: Path) -> Optional[Dict[str, Any]]:
+    """ONE read of the default config's raw board-cap keys; ``None`` when the
+    file does not exist; raises :class:`_Unreadable` on any other failure."""
     from hermes_cli import config as cfgmod
 
-    with cfgmod._CONFIG_LOCK:  # libyaml is not thread-safe on one file
-        try:
+    try:
+        with cfgmod._CONFIG_LOCK:  # libyaml is not thread-safe on one file
             with open(path, encoding="utf-8") as f:
-                raw = cfgmod.fast_safe_load(f)
-        except FileNotFoundError:
-            return None
-        except Exception as exc:
-            raise _DefaultConfigUnreadable(type(exc).__name__) from exc
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise _DefaultConfigUnreadable("top-level YAML is not a mapping")
-    try:
-        effective = cfgmod.effective_config_from_raw(raw)
-    except Exception as exc:
-        raise _DefaultConfigUnreadable(type(exc).__name__) from exc
-    return _cap_section(effective)
-
-
-def _backup_caps(path: Path) -> Optional[Tuple[Dict[str, Any], str]]:
-    """``(caps, backups dir)`` from the default profile's newest good backup."""
-    try:
-        from hermes_cli import config as cfgmod
-        from hermes_cli.config_backups import backups_dir, load_newest_good_backup
-
-        raw = load_newest_good_backup(path)
-        if raw is None:
-            return None
-        return _cap_section(cfgmod.effective_config_from_raw(raw)), str(backups_dir(path))
-    except Exception:
+                doc = cfgmod.fast_safe_load(f)
+    except FileNotFoundError:
         return None
+    except Exception as exc:
+        raise _Unreadable(type(exc).__name__) from exc
+    return _cap_keys(doc, "config.yaml")
+
+
+def _managed_caps() -> Dict[str, Any]:
+    """The managed scope's raw board-cap keys (``{}`` when no scope is set;
+    the managed loader is fail-open and logs its own parse errors)."""
+    from hermes_cli import managed_scope
+
+    try:
+        return _cap_keys(managed_scope.load_managed_config(), "managed config")
+    except Exception:
+        return {}
+
+
+def read_board_caps() -> BoardCaps:
+    """Resolve the board-scope caps now (see the module docstring). Never raises."""
+    from hermes_cli.config import _deep_merge
+
+    path: Any = "default profile config.yaml"
+    try:
+        path = default_profile_config_path()
+        user = _read_default_caps(path)
+    except Exception as exc:  # rule 4: fail closed, never the invoker's caps
+        reason = str(exc) if isinstance(exc, _Unreadable) else type(exc).__name__
+        return BoardCaps(
+            {}, f"{SOURCE_REFUSED}; {path} unreadable",
+            warning=(
+                f"kanban: default profile config ({path}) unreadable ({reason}); "
+                f"refusing to spawn workers until it is fixed"
+            ),
+            spawn_refused=True,
+        )
+    source = f"{SOURCE_DEFAULT} ({path})"
+    if user is None:  # rule 3: no default config is an empty user layer
+        user, source = {}, f"{SOURCE_DEFAULT} ({path} missing: no user caps)"
+    managed = _managed_caps()
+    section = _deep_merge(user, managed)
+    managed_keys = set()
+    for key, value in managed.items():
+        if value is None:  # _deep_merge keeps the user value under a managed None
+            continue
+        managed_keys.add(key)
+        if key in _NAMED_KEYS and isinstance(value, dict):
+            managed_keys.update(f"{key}.{name}" for name in value)
+    # rule 2: a ${VAR} anywhere in a key's value (nested too) invalidates that key
+    ignored = sorted(k for k in section if _ENV_REF.search(repr(section[k])))
+    for key in ignored:
+        del section[key]
+    warnings = []
+    if ignored:
+        warnings.append(
+            "kanban: board caps take literal values only; ignoring "
+            + ", ".join(ignored)
+            + " (a ${VAR} reference is not expanded)"
+        )
+    mismatch = _mismatch_line(section, path)
+    if mismatch:
+        warnings.append(mismatch)
+    return BoardCaps(
+        section, source,
+        warning="; ".join(warnings) or None,
+        managed=frozenset(managed_keys),
+    )
 
 
 def parse_caps(section: Dict[str, Any]) -> Dict[str, Any]:
     """The six caps as configured: ``None`` / empty when unset or invalid.
 
-    Uses the ``kanban_db_dispatch`` parsers every dispatcher already used, so
-    a typo drops one entry instead of bricking dispatch. Never raises.
+    The integer caps go through ONE parser (``_strict_int(minimum=0)``): a
+    nonnegative integer, ``0`` kept as ``0``. The named maps use the
+    ``kanban_db_dispatch`` parsers every dispatcher already used, so a typo
+    drops one entry instead of bricking dispatch. Never raises.
     """
     from hermes_cli import kanban_db_dispatch as kbd
 
     section = section if isinstance(section, dict) else {}
     raw_default = section.get("default_assignee")
     default_assignee = raw_default.strip() if isinstance(raw_default, str) else ""
-    return {
-        "default_assignee": default_assignee or None,
-        "max_in_progress": kbd._positive_int(section.get("max_in_progress"), None),
-        "max_in_progress_per_profile": kbd._positive_int(
-            section.get("max_in_progress_per_profile"), None
-        ),
-        "max_in_progress_by_assignee": kbd.parse_assignee_caps(
-            section.get("max_in_progress_by_assignee")
-        ),
-        "assignee_groups": kbd.parse_assignee_groups(section.get("assignee_groups")),
-        "max_spawn": kbd._positive_int(section.get("max_spawn"), None),
+    parsed: Dict[str, Any] = {
+        key: kbd._strict_int(section.get(key), minimum=0) for key in _INT_KEYS
     }
+    parsed["default_assignee"] = default_assignee or None
+    parsed["max_in_progress_by_assignee"] = kbd.parse_assignee_caps(
+        section.get("max_in_progress_by_assignee")
+    )
+    parsed["assignee_groups"] = kbd.parse_assignee_groups(section.get("assignee_groups"))
+    return parsed
 
 
 def _same_path(a: Path, b: Path) -> bool:
@@ -184,13 +218,8 @@ def _same_path(a: Path, b: Path) -> bool:
 
 def _mismatch_line(section: Dict[str, Any], default_path: Path) -> Optional[str]:
     """One line naming every board cap whose PARSED value differs between the
-    default profile's effective config and the invoking profile's effective
-    config, or ``None`` when they agree or the invoker is the default profile.
-
-    Both sides go through the same defaults + expansion + managed overlay and
-    the same parsers, so equivalent spellings (``${VAR}`` vs its value,
-    ``"2"`` vs ``2``) never produce a false mismatch.
-    """
+    board caps and the invoking profile's own config, or ``None`` when they
+    agree or the invoker is the default profile. Informational only."""
     try:
         from hermes_cli.config import get_config_path, load_config_readonly
 
@@ -215,67 +244,6 @@ def _mismatch_line(section: Dict[str, Any], default_path: Path) -> Optional[str]
     )
 
 
-def read_board_caps() -> BoardCaps:
-    """Resolve the board-scope caps now (one read of the default config).
-
-    See the module docstring for the fail-safe order. Never raises.
-    """
-    try:
-        path = default_profile_config_path()
-    except Exception as exc:  # pragma: no cover - profile layer unavailable
-        return BoardCaps(
-            {}, SOURCE_NONE, f"{SOURCE_NONE} (default profile path unresolved)",
-            warning=(
-                f"kanban: default profile config path cannot be resolved "
-                f"({type(exc).__name__}); no known-good board caps, refusing to spawn workers"
-            ),
-            spawn_refused=True,
-        )
-    key = str(path)
-    try:
-        section = _read_effective_caps(path)
-        if section is None:
-            with _LAST_GOOD_LOCK:
-                had_good = key in _LAST_GOOD
-            if had_good:
-                raise _DefaultConfigUnreadable("file disappeared")
-            # A host whose default profile never had a config: no caps set.
-            section = {}
-    except _DefaultConfigUnreadable as exc:
-        return _recover(path, str(exc))
-    with _LAST_GOOD_LOCK:
-        _LAST_GOOD[key] = dict(section)
-    return BoardCaps(
-        section, SOURCE_DEFAULT, f"{SOURCE_DEFAULT} ({path})",
-        warning=_mismatch_line(section, path), path=key,
-    )
-
-
-def _recover(path: Path, reason: str) -> BoardCaps:
-    key = str(path)
-    head = f"kanban: default profile config ({path}) unreadable ({reason})"
-    with _LAST_GOOD_LOCK:
-        last_good = _LAST_GOOD.get(key)
-    if last_good is not None:
-        return BoardCaps(
-            dict(last_good), SOURCE_LAST_GOOD, f"{SOURCE_LAST_GOOD}; {path} unreadable",
-            warning=f"{head}; keeping the last good board caps", path=key,
-        )
-    backup = _backup_caps(path)
-    if backup is not None:
-        section, where = backup
-        return BoardCaps(
-            section, SOURCE_BACKUP, f"{SOURCE_BACKUP} ({where}); {path} unreadable",
-            warning=f"{head}; keeping the last good board caps from its last-known-good backup",
-            path=key,
-        )
-    return BoardCaps(
-        {}, SOURCE_NONE, f"{SOURCE_NONE}; {path} unreadable",
-        warning=f"{head}; no last good board caps, refusing to spawn workers until it is fixed",
-        spawn_refused=True, path=key,
-    )
-
-
 def dispatch_caps(
     caps: BoardCaps,
     *,
@@ -296,15 +264,17 @@ def dispatch_caps(
         from hermes_cli import kanban_db_dispatch as kbd
 
     parsed = parse_caps(caps.section)
-    origin = caps.origin
+
+    def origin(key: str) -> str:
+        return SOURCE_MANAGED if key in caps.managed else SOURCE_DEFAULT
+
     sources: Dict[str, str] = {}
     for key in ("default_assignee", "max_in_progress_per_profile", "max_spawn", "max_in_progress"):
         if parsed[key] is not None:
-            sources[key] = origin
-    for name in parsed["max_in_progress_by_assignee"]:
-        sources[f"max_in_progress_by_assignee.{name}"] = origin
-    for name in parsed["assignee_groups"]:
-        sources[f"assignee_groups.{name}"] = origin
+            sources[key] = origin(key)
+    for key in _NAMED_KEYS:
+        for name in parsed[key]:
+            sources[f"{key}.{name}"] = origin(f"{key}.{name}")
 
     max_in_progress = kbd.resolve_max_in_progress(parsed["max_in_progress"])
     if parsed["max_in_progress"] is None and max_in_progress is not None:
@@ -344,12 +314,10 @@ def cap_rows(resolved: DispatchCaps) -> list:
     for key in ("max_spawn", "max_in_progress", "max_in_progress_per_profile", "default_assignee"):
         if kw.get(key) is not None:
             rows.append((key, kw[key], src.get(key, SOURCE_DEFAULT)))
-    for name, cap in sorted(kw.get("max_in_progress_by_assignee", {}).items()):
-        k = f"max_in_progress_by_assignee.{name}"
-        rows.append((k, cap, src.get(k, SOURCE_DEFAULT)))
-    for name, spec in sorted(kw.get("assignee_groups", {}).items()):
-        k = f"assignee_groups.{name}"
-        rows.append((k, dict(spec), src.get(k, SOURCE_DEFAULT)))
+    for key in _NAMED_KEYS:
+        for name, value in sorted(kw.get(key, {}).items()):
+            k = f"{key}.{name}"
+            rows.append((k, dict(value) if isinstance(value, dict) else value, src.get(k, SOURCE_DEFAULT)))
     return rows
 
 
