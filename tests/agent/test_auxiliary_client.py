@@ -2604,7 +2604,16 @@ class TestAuxiliaryAuthRefreshRetry:
             assert _refresh_provider_credentials("anthropic") is True
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
+        # The rotated pair must be committed. ``target_path`` is passed by the
+        # refresh transaction so the commit lands on the exact file it locked
+        # and re-read (the account-scoped one under CLAUDE_CONFIG_DIR); assert
+        # the rotated values rather than freezing the call signature.
+        mock_write.assert_called_once()
+        assert mock_write.call_args.args == (
+            "fresh-token",
+            "refresh-token-2",
+            9999999999999,
+        )
         stale_client.close.assert_called_once()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
