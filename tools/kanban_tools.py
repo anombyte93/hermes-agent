@@ -512,6 +512,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "block_reason": task.block_reason,
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
@@ -560,6 +561,7 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "block_reason": t.block_reason,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
@@ -850,7 +852,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             if not ok:
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    f"could not complete {tid}: "
+                    + kb.explain_complete_refusal(
+                        conn, tid, _worker_run_id(tid),
+                    )
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
@@ -923,7 +928,7 @@ def _handle_block(args: dict, **kw) -> str:
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"running/ready/review)"
                 )
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
@@ -934,6 +939,7 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                block_reason=landed.block_reason if landed else reason,
             )
         finally:
             conn.close()
@@ -1398,6 +1404,34 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _implicit_board_refusal(board: Optional[str]) -> Optional[str]:
+    """Refuse a board-less create routed only by ``kanban/current``.
+
+    Mirrors ``hermes kanban create``: no ``board`` argument, no
+    ``HERMES_KANBAN_DB`` pin, and a non-default board selected only by the
+    shared current-board file. ``kanban.require_explicit_board: false``
+    keeps the legacy behaviour.
+    """
+    if board or os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return None
+    from hermes_cli import kanban_db as kb
+
+    current, source = kb.resolve_current_board_with_source()
+    if source != kb.BOARD_SOURCE_CURRENT_FILE or current == kb.DEFAULT_BOARD:
+        return None
+    from hermes_cli.kanban import _require_explicit_board
+
+    required, config_path = _require_explicit_board()
+    if not required:
+        return None
+    return (
+        f"kanban_create: refusing to use board {current!r} selected only by "
+        f"{kb.current_board_path()} (kanban/current, shared by every session). "
+        f"Pass board={current!r} in the call, or set "
+        f"kanban.require_explicit_board: false in {config_path} to proceed."
+    )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1455,6 +1489,7 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    block_reason = args.get("block_reason")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1478,6 +1513,9 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    refusal = _implicit_board_refusal(board)
+    if refusal:
+        return tool_error(refusal)
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1517,6 +1555,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                block_reason=block_reason,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1525,6 +1564,7 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                block_reason=new_task.block_reason if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
@@ -1918,11 +1958,14 @@ KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "Set ``kind`` to say which: 'dependency' (waiting on an unfinished "
+        "parent card — goes to todo and auto-resumes when that card "
+        "finishes), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "'dependency' only when this card has an unfinished parent card; with "
+        "none it lands in blocked for a human. A question for whoever filed "
+        "the card is kind='needs_input'. "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -1947,8 +1990,11 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "Why you're blocked. 'dependency' only when this card has "
+                    "an unfinished parent card (waits in todo and resumes "
+                    "automatically); with none it lands in blocked for a "
+                    "human. A question for whoever filed the card is "
+                    "kind='needs_input'. The others surface to a human. "
                     "Omit only if none apply."
                 ),
             },
@@ -2303,6 +2349,13 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "block_reason": {
+                "type": "string",
+                "description": (
+                    "Required non-blank human-readable explanation when "
+                    "initial_status is 'blocked'."
                 ),
             },
             "skills": {

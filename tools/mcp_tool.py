@@ -6183,29 +6183,33 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"waiting {float(tool_timeout):.0f}s"
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    # Build the child-watcher awaitable exactly ONCE and
+                    # race that same object (#23). The old code probed
+                    # awaitability with ``inspect.isawaitable(
+                    # _watch_children())`` — which invoked the watcher and
+                    # discarded the coroutine — then invoked it a second
+                    # time for ``ensure_future``. Every real tool call
+                    # leaked the first coroutine and logged
+                    # "RuntimeWarning: coroutine ... was never awaited".
                     _watch_children = getattr(server, "_watch_stdio_children", None)
-                    _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
-                        and asyncio.iscoroutine(_call_coro)
+                    _watch_coro = (
+                        _watch_children() if _watch_children is not None else None
                     )
-                    if not _watch_ok:
-                        # Stubbed sessions (MagicMock in tests) return a
-                        # non-awaitable, or there is no child-watcher to race
-                        # against: plain await is exactly the pre-#81995
-                        # semantics.
-                        result = (
-                            await _call_coro
-                            if asyncio.iscoroutine(_call_coro)
-                            else _call_coro
-                        )
-                    else:
+                    if _watch_coro is not None and not inspect.isawaitable(_watch_coro):
+                        # Not awaitable (stubbed MagicMock sessions):
+                        # nothing coroutine-ish to dispose of — fall
+                        # through to the plain-await path below.
+                        _watch_coro = None
+                    if (
+                        _watch_coro is not None
+                        and asyncio.iscoroutine(_call_coro)
+                    ):
                         # Fast-fail machinery (#81995): the RPC races a
                         # stdio-children watcher so a dead subprocess fails
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_coro)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
@@ -6235,6 +6239,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             await asyncio.gather(
                                 rpc_task, watch_task, return_exceptions=True
                             )
+                    else:
+                        # We may hold an awaitable we created but will not
+                        # race (e.g. a real watcher against a mocked
+                        # non-coroutine RPC): close it so it is never
+                        # leaked (#23). Futures lack ``close``; skip.
+                        if _watch_coro is not None:
+                            _watch_close = getattr(_watch_coro, "close", None)
+                            if callable(_watch_close):
+                                _watch_close()
+                        # Stubbed sessions (MagicMock in tests) return a
+                        # non-awaitable, or there is no child-watcher to race
+                        # against: plain await is exactly the pre-#81995
+                        # semantics.
+                        result = (
+                            await _call_coro
+                            if asyncio.iscoroutine(_call_coro)
+                            else _call_coro
+                        )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -8143,6 +8165,7 @@ def refresh_agent_mcp_tools(
     enabled_override=None,
     disabled_override=None,
     quiet_mode: bool = True,
+    content_aware: bool = False,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
 
@@ -8244,10 +8267,31 @@ def refresh_agent_mcp_tools(
             for t in (getattr(agent, "tools", None) or [])
         }
         if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
-            agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-            return set()
+            # Same NAME set. For MCP-reload callers that is "no change" —
+            # leave the live snapshot untouched (no churn). Content-aware
+            # callers (the compaction boundary) also diff the serialized
+            # bytes: dynamic schemas (image_generate capabilities,
+            # delegate_task limits, execute_code stubs) change CONTENT
+            # under stable names when config changes between compactions.
+            content_changed = False
+            if content_aware:
+                try:
+                    _stable = json.dumps(
+                        (getattr(agent, "tools", None) or []),
+                        sort_keys=True, separators=(",", ":"), default=str,
+                    )
+                    _new = json.dumps(
+                        new_defs, sort_keys=True, separators=(",", ":"),
+                        default=str,
+                    )
+                    content_changed = _stable != _new
+                except Exception:  # noqa: BLE001
+                    content_changed = False
+            if not content_changed:
+                # Record the generation so an in-flight older caller can't
+                # clobber.
+                agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+                return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
         # Publish context-engine routing names atomically with the snapshot.

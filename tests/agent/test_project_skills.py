@@ -30,6 +30,7 @@ def project_env(tmp_path, monkeypatch):
     )
 
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.chdir(repo)
     su._external_dirs_cache_clear()
     yield {"home": home, "repo": repo, "config": config}
@@ -66,6 +67,39 @@ class TestFindProjectRoot:
         sub.mkdir(parents=True)
         os.chdir(sub)
         assert su.find_project_root() == project_env["repo"].resolve()
+
+    def test_context_override_wins_over_env_and_cwd(
+        self, project_env, tmp_path, monkeypatch,
+    ):
+        other = tmp_path / "other"
+        (other / ".git").mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(project_env["repo"]))
+        token = su.set_project_cwd_override(other)
+        try:
+            assert su.find_project_root() == other.resolve()
+        finally:
+            su.reset_project_cwd_override(token)
+        # Reset restores the TERMINAL_CWD / process-cwd behaviour, and the
+        # override never touched the process environment.
+        assert su.find_project_root() == project_env["repo"].resolve()
+        assert os.environ["TERMINAL_CWD"] == str(project_env["repo"])
+
+    def test_context_override_is_not_visible_to_other_threads(
+        self, project_env, tmp_path,
+    ):
+        import threading
+
+        other = tmp_path / "other"
+        (other / ".git").mkdir(parents=True)
+        seen = []
+        token = su.set_project_cwd_override(other)
+        try:
+            t = threading.Thread(target=lambda: seen.append(su.find_project_root()))
+            t.start()
+            t.join()
+        finally:
+            su.reset_project_cwd_override(token)
+        assert seen == [project_env["repo"].resolve()]
 
 
 class TestTrustGate:
@@ -126,13 +160,12 @@ class TestPrecedence:
         p = project_env["repo"] / ".hermes" / "skills" / "repo-skill" / "SKILL.md"
         assert su.is_external_skill_path(p) is True
 
-    def test_get_all_skills_dirs_unchanged(self, project_env):
-        # Backward-compat contract: local first, no project tier here.
+    def test_get_all_skills_dirs_excludes_project_tier(self, project_env):
+        # Local stays first; trusted project roots remain scan-order-only.
         _trust(project_env["config"], project_env["repo"])
         dirs = su.get_all_skills_dirs()
         assert dirs[0] == su.get_skills_dir()
-        for d in dirs:
-            assert ".agents" not in str(d)
+        assert project_env["repo"] / ".agents" / "skills" not in dirs
 
 
 class TestNonInteractiveInheritance:

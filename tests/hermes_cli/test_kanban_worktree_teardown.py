@@ -44,6 +44,8 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Lifecycle tests must not inspect or terminate real worker sessions.
+    monkeypatch.setattr(kb, "_cleanup_worker_tmux", lambda *_args: None)
     kb.init_db()
     return home
 
@@ -218,3 +220,142 @@ def test_parent_worktree_deferred_until_children_done(
         assert kb.complete_task(conn, child, summary="child done")
     # last child terminal -> deferred parent worktree reaped
     assert not parent_wt.exists()
+
+
+def _caller_worktree_task(conn, repo, monkeypatch, *, canonical, auto_branch):
+    """Create the checkout BEFORE its card, without Hermes' creation helper."""
+    from hermes_cli.kanban import _parse_workspace_flag
+
+    tid = "t_caller129"
+    monkeypatch.setattr(kb, "_new_task_id", lambda: tid)
+    wt = repo / ".worktrees" / tid if canonical else repo.parent / "caller checkout"
+    branch = f"wt/{tid}" if auto_branch else "feature/caller-owned"
+    _git("-C", str(repo), "worktree", "add", "-b", branch, str(wt), "HEAD")
+    kind, path = _parse_workspace_flag(f"worktree:{wt}")
+    assert kb.create_task(
+        conn, title="caller-owned checkout", assignee="worker",
+        workspace_kind=kind, workspace_path=path, branch_name=branch,
+    ) == tid
+    if canonical:
+        # Reusing a pre-existing canonical checkout must not confer ownership.
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kb.resolve_workspace(task) == wt
+        kb.set_workspace_path(conn, tid, wt)
+    return tid, wt, branch
+
+
+@pytest.mark.parametrize("canonical", [False, True], ids=["external", "managed-path"])
+@pytest.mark.parametrize("auto_branch", [False, True], ids=["custom", "auto-branch"])
+@pytest.mark.parametrize("action", ["complete", "archive", "reclaim", "stale-reclaim", "gc"])
+def test_caller_created_worktree_survives_lifecycle(
+    kanban_home, repo, monkeypatch, canonical, auto_branch, action
+):
+    with kb.connect_closing() as conn:
+        tid, wt, branch = _caller_worktree_task(
+            conn, repo, monkeypatch, canonical=canonical, auto_branch=auto_branch,
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        if action == "complete":
+            assert kb.complete_task(conn, tid, summary="done")
+        elif action == "archive":
+            assert kb.archive_task(conn, tid)
+        elif action == "reclaim":
+            assert kb.reclaim_task(conn, tid, reason="retry")
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == "ready"
+        elif action == "stale-reclaim":
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET claim_expires=1 WHERE id=?", (tid,))
+            assert kb.release_stale_claims(conn) == 1
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == "ready"
+        else:
+            import argparse
+            from hermes_cli.kanban import _cmd_gc
+
+            # Exercise GC's backstop for cards archived before cleanup existed.
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
+            assert _cmd_gc(argparse.Namespace()) == 0
+        assert wt.is_dir()
+        assert (wt / "README.md").read_text(encoding="utf-8") == "hello\n"
+        assert kb._git_current_branch(wt) == branch
+        assert _branch_exists(repo, branch)
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["siblings", "parent-child"])
+def test_last_card_preserves_caller_worktree(kanban_home, repo, monkeypatch, linked):
+    with kb.connect_closing() as conn:
+        tid, wt, branch = _caller_worktree_task(
+            conn, repo, monkeypatch, canonical=True, auto_branch=True,
+        )
+        monkeypatch.setattr(kb, "_new_task_id", lambda: "t_other129")
+        other = kb.create_task(
+            conn, title="next card", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(wt), branch_name=branch,
+            parents=[tid] if linked else [],
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.complete_task(conn, tid, summary="first done")
+        assert wt.is_dir()
+        assert kb.claim_task(conn, other, claimer="worker") is not None
+        assert kb.complete_task(conn, other, summary="last done")
+    assert wt.is_dir()
+    assert kb._git_current_branch(wt) == branch
+    assert _branch_exists(repo, branch)
+
+
+def test_resolved_owned_worktree_reaped_after_reclaim(kanban_home, repo):
+    """Creation proof survives resolution/retries and still allows teardown."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="Hermes owns this checkout", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        wt = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, wt)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.reclaim_task(conn, tid, reason="retry")
+        assert wt.is_dir()
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kb.resolve_workspace(task) == wt
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.complete_task(conn, tid, summary="done")
+    assert not wt.exists()
+
+
+def test_kanban_imports_use_checkout():
+    import hermes_cli
+
+    root = Path(__file__).resolve().parents[2]
+    print(f"hermes_cli imported from {hermes_cli.__file__}")
+    print(f"kanban_db imported from {kb.__file__}")
+    assert Path(hermes_cli.__file__).resolve() == root / "hermes_cli" / "__init__.py"
+    assert Path(kb.__file__).resolve() == root / "hermes_cli" / "kanban_db.py"
+
+
+def test_wrong_creation_proof_preserves_worktree(repo):
+    wt = _make_worktree(repo, "t_proof129")
+    git_dir = kb._git_dir(wt)
+    assert git_dir is not None
+    proof = git_dir / kb._KANBAN_WORKTREE_OWNER_FILE
+    assert proof.is_file()
+    proof.write_text(str(repo / "different-checkout"), encoding="utf-8")
+    kb._cleanup_worktree_workspace("t_proof129", str(wt))
+    assert wt.is_dir()
+
+
+def test_caller_replacement_does_not_inherit_creation_proof(repo):
+    tid = "t_replace129"
+    wt = _make_worktree(repo, tid)
+    _git("-C", str(repo), "worktree", "remove", str(wt))
+    _git("-C", str(repo), "worktree", "add", str(wt), f"wt/{tid}")
+    # A retry must not stamp a caller's replacement with the old ownership.
+    kb._ensure_git_worktree(repo, wt, f"wt/{tid}")
+    kb._cleanup_worktree_workspace(tid, str(wt))
+    assert wt.is_dir()
+    assert _branch_exists(repo, f"wt/{tid}")

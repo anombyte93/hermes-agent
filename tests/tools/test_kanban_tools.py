@@ -416,6 +416,31 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_blocked_requires_and_returns_reason(worker_env):
+    from tools import kanban_tools as kt
+
+    missing = json.loads(kt._handle_create({
+        "title": "blocked child",
+        "assignee": "peer",
+        "initial_status": "blocked",
+    }))
+    assert "error" in missing
+    assert "block reason is required" in missing["error"]
+
+    created = json.loads(kt._handle_create({
+        "title": "blocked child",
+        "assignee": "peer",
+        "initial_status": "blocked",
+        "block_reason": "  Waiting for access  ",
+    }))
+    assert created["ok"] is True
+    assert created["status"] == "blocked"
+    assert created["block_reason"] == "Waiting for access"
+
+    shown = json.loads(kt._handle_show({"task_id": created["task_id"]}))
+    assert shown["task"]["block_reason"] == "Waiting for access"
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -469,7 +494,10 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     try:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
-        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_reason=? WHERE id=?",
+            ("waiting for parent", child),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1134,3 +1162,74 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_create: explicit board required when only kanban/current selects one
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def switched_tool_home(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    for var in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_TASK",
+                "HERMES_SESSION_ID"):
+        monkeypatch.delenv(var, raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    kb.create_board("other")
+    kb.set_current_board("other")
+    return home
+
+
+def _board_titles(board):
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing(board=board) as conn:
+        return [t.title for t in kb.list_tasks(conn)]
+
+
+def test_create_refused_when_only_current_file_selects_board(switched_tool_home):
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "x", "assignee": "peer"}))
+    assert "error" in d and d.get("ok") is not True
+    assert "'other'" in d["error"]
+    assert "kanban/current" in d["error"]
+    assert "board=" in d["error"]
+    assert str(switched_tool_home / "config.yaml") in d["error"]
+    assert _board_titles("other") == []
+    assert _board_titles("default") == []
+
+
+def test_create_allowed_with_board_argument(switched_tool_home):
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "x", "assignee": "peer", "board": "other"}))
+    assert d["ok"] is True
+    assert _board_titles("other") == ["x"]
+
+
+def test_create_allowed_when_flag_false(switched_tool_home):
+    (switched_tool_home / "config.yaml").write_text(
+        "kanban:\n  require_explicit_board: false\n", encoding="utf-8"
+    )
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "x", "assignee": "peer"}))
+    assert d["ok"] is True
+    assert _board_titles("other") == ["x"]
+
+
+@pytest.mark.parametrize("pin", ["board", "db"])
+def test_create_allowed_with_env_pin(switched_tool_home, monkeypatch, pin):
+    from hermes_cli import kanban_db as kb
+    if pin == "board":
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "other")
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="other")))
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "x", "assignee": "peer"}))
+    assert d["ok"] is True
+    assert _board_titles("other") == ["x"]

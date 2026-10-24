@@ -1110,3 +1110,87 @@ def test_auth_remove_env_seeded_dotenv_with_bom_no_shell_hint(tmp_path, monkeypa
     out = capsys.readouterr().out
     assert "Cleared DEEPSEEK_API_KEY from .env" in out
     assert "still set in your shell environment" not in out
+
+
+def test_format_exhausted_status_includes_last_failure_timestamp_in_cooldown():
+    """An exhausted credential still in cooldown shows 'last 402 at <time>'."""
+    from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
+    from hermes_cli.auth_commands import _format_exhausted_status
+
+    entry = PooledCredential(
+        provider="deepseek",
+        id="cred-1",
+        label="deepseek",
+        auth_type="api_key",
+        priority=0,
+        source="manual",
+        access_token="sk-ds-test",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=time.time() - 120,  # 2 min ago; 402 TTL is 1 hour
+        last_error_code=402,
+        last_error_reason="invalid_request_error",
+    )
+
+    status = _format_exhausted_status(entry)
+
+    assert "last 402 at" in status
+
+
+def test_format_exhausted_status_uses_timestamp_after_cooldown_elapsed():
+    """Once the cooldown has elapsed the label reads as a past event, not
+    'ready to retry'."""
+    from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
+    from hermes_cli.auth_commands import _format_exhausted_status
+
+    entry = PooledCredential(
+        provider="deepseek",
+        id="cred-1",
+        label="deepseek",
+        auth_type="api_key",
+        priority=0,
+        source="manual",
+        access_token="sk-ds-test",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=time.time() - 7200,  # 2 hours ago; 402 TTL is 1 hour
+        last_error_code=402,
+        last_error_reason="invalid_request_error",
+    )
+
+    status = _format_exhausted_status(entry)
+
+    assert "last 402 at" in status
+    assert "ready to retry" not in status
+
+
+def test_format_exhausted_status_blank_after_record_success():
+    """A credential that recorded a success renders as ok (no exhausted label)."""
+    from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
+    from hermes_cli.auth_commands import _format_exhausted_status
+
+    entry = PooledCredential(
+        provider="deepseek",
+        id="cred-1",
+        label="deepseek",
+        auth_type="api_key",
+        priority=0,
+        source="manual",
+        access_token="sk-ds-test",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=time.time() - 120,
+        last_error_code=402,
+        last_error_reason="invalid_request_error",
+    )
+    from dataclasses import replace
+
+    cleared = replace(
+        entry,
+        last_status=None,
+        last_status_at=None,
+        last_error_code=None,
+        last_error_reason=None,
+        last_error_message=None,
+        last_error_reset_at=None,
+    )
+
+    assert _format_exhausted_status(cleared) == ""
+

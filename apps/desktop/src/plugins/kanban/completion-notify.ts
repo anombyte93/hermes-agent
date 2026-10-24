@@ -1,5 +1,6 @@
 /**
- * Native kanban terminal-event notification (completion, blocker, failure).
+ * Native kanban terminal-event notification (completion, blocker, failure,
+ * and review handoffs).
  *
  * No maintained exact-fit OSS exists and the SDK
  * has no kanban event door, so this module rides the kanban plugin's EXISTING
@@ -9,7 +10,9 @@
  * (gateway/kanban_watchers.py): 'completed' (kanban_db.complete_task —
  * payload: summary + artifacts), 'blocked' (payload: reason), 'gave_up'
  * (payload: error), 'crashed', 'timed_out', and 'block_loop_detected'
- * (payload: reason — the routed-to-triage human handoff).
+ * (payload: reason — the routed-to-triage human handoff), plus the review
+ * handoffs 'review_requested' (payload: summary) and 'changes_requested'
+ * (payload: reason).
  *
  * Two delivery doors, complementary by design:
  *  - `host.notify` — the in-app toast, covers the foreground case;
@@ -18,16 +21,21 @@
  *    door that covers "walked away and the worker hit a blocker".
  *
  * Cursor contract: first observation of a board baselines
- * seen[board] = GET /board latest_event_id (MAX task_events.id for that
- * board). Events id <= seen are historical/replay — never notified, no
- * cursor change. id > seen advances cursor for EVERY kind; only terminal
- * kinds emit. Reconnect replays from 0; cursor filters. Board switch never
- * mixes cursors; returning reuses prior cursor (never reset to current MAX).
- * Fail-closed: while a board's baseline is unknown, no event can be
- * classified so none is notified. Empty slug ('') suppressed.
+ * seen[board] from a bounded /events/baseline read (baseline-now returns the
+ * current high-water event id, never a full /board poll). Events id <= seen
+ * are historical/replay — never notified, no cursor change. id > seen advances
+ * cursor for EVERY kind; only terminal kinds emit. Reconnect replays from 0;
+ * cursor filters. Board switch never mixes cursors; returning reuses prior
+ * cursor (never reset to current MAX). Fail-closed: while a board's baseline
+ * is unknown, no event can be classified so none is notified. Empty slug ('')
+ * suppressed.
+ *
+ * Exact-card navigation: a terminal toast's action carries board/card through
+ * the shared `$openCard` atom, consumed by KanbanBoardPage whether it is
+ * already mounted or mounting next — never invented router query support.
  */
 
-import { host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
+import { atom, host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
 
 import { en } from './i18n'
 
@@ -38,24 +46,60 @@ export interface CompletionEvent {
   task_id?: string
   kind?: string
   payload?: Record<string, unknown> | null
+  /** The run that produced this event (present on terminal kinds from the
+   *  /events socket). A re-block under a NEW run id is a new intervention,
+   *  even when the reason text is identical. */
+  run_id?: null | number
 }
 
-type ToastKind = 'error' | 'success' | 'warning'
+/** Exact card open request, carried by a terminal toast's action and consumed
+ *  by the mounted KanbanBoardPage. board + card are the real selected board
+ *  and the event's task id — no invented router query. */
+export const $openCard = atom<{ board: string; card: string } | null>(null)
+
+type ToastKind = 'error' | 'info' | 'success' | 'warning'
 
 /** Terminal kinds → toast severity + i18n title key. Mirrors the gateway
  *  watcher's ping set (gateway/kanban_watchers.py) minus the intentionally
- *  silent kinds (status/archived/unblocked, which only advance the cursor). */
+ *  silent kinds (status/archived/unblocked, which only advance the cursor),
+ *  plus the review handoffs. */
 const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>([
   ['blocked', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
   ['block_loop_detected', { titleKey: 'notify.blockLoopTitle', toast: 'warning' }],
   ['completed', { titleKey: 'notify.completedTitle', toast: 'success' }],
   ['crashed', { titleKey: 'notify.crashedTitle', toast: 'error' }],
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
-  ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
+  ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }],
+  ['review_requested', { titleKey: 'notify.reviewRequestedTitle', toast: 'info' }],
+  ['changes_requested', { titleKey: 'notify.changesRequestedTitle', toast: 'warning' }]
 ])
 
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
+
+// R5 — meaningful-intervention dedup. Kinds that ask Hayden for a decision
+// (blocked / block_loop_detected / changes_requested) are fingerprint-deduped
+// per (board, task): a repeated UNCHANGED intervention is quiet, a changed
+// reason/remedy or a new run notifies. Completion notifications are NEVER
+// fingerprint-deduped — they always fire. Recovery (unblock/reclaim) or a new
+// run (claim/spawn) clears the stored fingerprint so a later identical block
+// notifies again. The cursor (seenEventIdByBoard) remains board-isolated; this
+// map is keyed by board+task so board switches never mix fingerprints.
+const INTERVENTION_KINDS = new Set(['blocked', 'block_loop_detected', 'changes_requested'])
+
+const CLEAR_INTERVENTION_KINDS = new Set([
+  'unblocked',
+  'claimed',
+  'spawned',
+  'reclaimed',
+  'completed',
+  'crashed',
+  'gave_up',
+  'timed_out',
+  'review_requested'
+])
+
+const interventionByTask = new Map<string, string>()
 
 let rest: Rest | null = null
 let translate: PluginTranslate | null = null
@@ -91,6 +135,10 @@ export function bindCompletionNotify(r: Rest, pluginTranslate?: PluginTranslate,
   osDoor = os ?? null
 }
 
+/** Baseline from a bounded changes read, never a full /board poll. The first
+ *  /events/baseline call is "baseline-now": it returns the current high-water
+ *  event id (evidence.baseline_id) without replaying history, and is capped by
+ *  the server's own page bound. */
 async function ensureBaseline(slug: string): Promise<void> {
   if (seenEventIdByBoard.has(slug) || baselinePending.has(slug)) {
     return
@@ -99,11 +147,28 @@ async function ensureBaseline(slug: string): Promise<void> {
   baselinePending.add(slug)
 
   try {
-    const board = (await rest!<{ latest_event_id?: unknown }>(`/board?board=${encodeURIComponent(slug)}`)) as {
-      latest_event_id?: unknown
-    }
+    const changes = (await rest!<{ state?: unknown; board?: unknown; evidence?: { baseline_id?: unknown } }>(
+      `/events/baseline?board=${encodeURIComponent(slug)}`
+    )) as { state?: unknown; board?: unknown; evidence?: { baseline_id?: unknown } }
 
-    seenEventIdByBoard.set(slug, typeof board.latest_event_id === 'number' ? board.latest_event_id : 0)
+    const baselineId = changes?.evidence?.baseline_id
+
+    // Only a PASS, board-exact, nonnegative finite integer baseline is
+    // authoritative. A FAIL/UNKNOWN or malformed HTTP 200 response must NOT
+    // fall back to baseline 0 (that would notify historical events): leave the
+    // board unknown so notifications stay suppressed and a later frame can
+    // recover with a fresh read.
+    const authoritative =
+      changes?.state === 'PASS' &&
+      changes?.board === slug &&
+      typeof baselineId === 'number' &&
+      Number.isFinite(baselineId) &&
+      Number.isInteger(baselineId) &&
+      baselineId >= 0
+
+    if (authoritative) {
+      seenEventIdByBoard.set(slug, baselineId as number)
+    }
   } catch {
     // Fail-closed: unknown baseline → notifications stay suppressed.
   } finally {
@@ -120,11 +185,11 @@ function trimmed(value: unknown): string {
 function bodyFor(kind: string, ev: CompletionEvent): string {
   const payload = ev.payload
 
-  if (kind === 'completed') {
+  if (kind === 'completed' || kind === 'review_requested') {
     return trimmed(payload?.summary)
   }
 
-  if (kind === 'blocked' || kind === 'block_loop_detected') {
+  if (kind === 'blocked' || kind === 'block_loop_detected' || kind === 'changes_requested') {
     return trimmed(payload?.reason)
   }
 
@@ -135,7 +200,26 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
   return ''
 }
 
-function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
+/** R5 fingerprint for an intervention kind: the kind, its reason/remedy
+ *  payload, AND the run it came from. Two events with the same fingerprint are
+ *  the same intervention. Including the run id means a worker that re-blocks
+ *  with an identical reason under a NEW run id (with no claim/spawn frame
+ *  reaching the renderer in between — a socket gap) is a NEW intervention and
+ *  notifies, closing the quiet-window the kind+reason-only fingerprint had. */
+function interventionFingerprint(kind: string, ev: CompletionEvent): string {
+  const payload = ev.payload ?? {}
+  const remedy = typeof payload.remedy === 'string' ? payload.remedy.trim() : ''
+  const runId = typeof ev.run_id === 'number' && Number.isFinite(ev.run_id) ? String(ev.run_id) : ''
+
+  return `${kind}\u0000${bodyFor(kind, ev)}\u0000${remedy}\u0000${runId}`
+}
+
+/** Map key for one (board, task) intervention slot — board-isolated. */
+function interventionKey(slug: string, taskId: string): string {
+  return `${slug}\u0000${taskId}`
+}
+
+function notifyOne(slug: string, kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
   const taskId = (ev.task_id ?? '').trim()
   const body = bodyFor(kind, ev)
 
@@ -161,7 +245,16 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
     title,
     message,
     ...(detail ? { detail } : {}),
-    action: { label: t('notify.openKanban'), onClick: () => host.navigate('/kanban') }
+    // Exact card open: carry board + card through the shared atom, then land
+    // on the board page. The page consumes it on mount OR while already
+    // mounted — no invented router query.
+    action: {
+      label: t('notify.openKanban'),
+      onClick: () => {
+        $openCard.set(taskId ? { board: slug, card: taskId } : null)
+        host.navigate('/kanban')
+      }
+    }
   })
 
   // Native OS notification — the desktop shell fires it only while the user
@@ -199,11 +292,32 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
 
     cursor = ev.id
     seenEventIdByBoard.set(slug, cursor)
-    const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
+    const kind = ev.kind ?? ''
+    const taskId = (ev.task_id ?? '').trim()
+    const slot = taskId ? interventionKey(slug, taskId) : null
+
+    // Recovery / new run clears the stored intervention fingerprint so a later
+    // identical block notifies again (never fingerprints a dead intervention).
+    if (slot && CLEAR_INTERVENTION_KINDS.has(kind)) {
+      interventionByTask.delete(slot)
+    }
+
+    const spec = TERMINAL_NOTIFY.get(kind)
 
     if (spec) {
+      // R5: unchanged intervention is quiet; changed reason or a new run fires.
+      if (slot && INTERVENTION_KINDS.has(kind)) {
+        const fingerprint = interventionFingerprint(kind, ev)
+
+        if (interventionByTask.get(slot) === fingerprint) {
+          continue
+        }
+
+        interventionByTask.set(slot, fingerprint)
+      }
+
       try {
-        notifyOne(ev.kind!, spec, ev)
+        notifyOne(slug, kind, spec, ev)
         fired = true
       } catch {
         /* swallowed */

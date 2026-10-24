@@ -35,6 +35,16 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _give_review_skill(home: Path, name: str) -> None:
+    """Create profile ``name`` with the mandatory ``sdlc-review`` skill."""
+    skill = home / "profiles" / name / "skills" / "development" / "sdlc-review"
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: sdlc-review\ndescription: Review a change.\n---\nReview.\n",
+        encoding="utf-8",
+    )
+
+
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
@@ -219,6 +229,7 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
 def test_review_lane_gets_reserved_slot_under_ready_backlog(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
+    _give_review_skill(kanban_home, "reviewer")
     import hermes_cli.config as cfgmod
     monkeypatch.setattr(
         cfgmod, "load_config",
@@ -294,6 +305,7 @@ def test_review_budget_still_bounded_by_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """The reservation caps the ready lane; it grants review no extra slots."""
+    _give_review_skill(kanban_home, "reviewer")
     import hermes_cli.config as cfgmod
     monkeypatch.setattr(
         cfgmod, "load_config",

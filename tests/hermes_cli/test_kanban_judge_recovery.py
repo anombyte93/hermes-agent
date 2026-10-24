@@ -95,6 +95,7 @@ def test_judge_permission_error_preserves_submission_and_parks(
     try:
         task = kb.get_task(conn, tid)
         # Retryable blocked state — NOT triage, NOT done, NOT running.
+        assert task is not None
         assert task.status == "blocked"
         # Submission preserved on the closing run.
         run = kb.latest_run(conn, tid)
@@ -106,6 +107,7 @@ def test_judge_permission_error_preserves_submission_and_parks(
         assert preserved["summary"] == SUBMISSION["summary"]
         assert preserved["metadata"] == SUBMISSION["metadata"]
         assert "PermissionDeniedError" in (preserved.get("error") or "")
+        assert task.block_reason == preserved["reason"]
     finally:
         conn.close()
 
@@ -159,6 +161,10 @@ def test_operator_retry_completes_and_releases_child(monkeypatch, goal_env):
 
     # Operator context: not the worker process.
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda task: (None, None),
+    )
 
     args = argparse.Namespace(
         task_ids=[tid], result=None, summary=None, metadata=None,
@@ -169,10 +175,14 @@ def test_operator_retry_completes_and_releases_child(monkeypatch, goal_env):
     conn = kb.connect()
     try:
         task = kb.get_task(conn, tid)
+        assert task is not None
         assert task.status == "done"
+        assert task.block_reason is None
         run = kb.latest_run(conn, tid)
+        assert run is not None
         assert run.outcome == "completed"
         assert run.summary == SUBMISSION["summary"]
+        assert run.metadata == SUBMISSION["metadata"]
         # Child released: parent done -> child promoted to ready.
         assert kb.get_task(conn, child).status == "ready"
     finally:
@@ -214,6 +224,51 @@ def test_operator_retry_with_judge_still_down_completes(monkeypatch, goal_env):
     try:
         assert kb.get_task(conn, tid).status == "done"
         assert kb.get_task(conn, child).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_operator_retry_stale_worker_run_is_refused_with_reason(
+    monkeypatch, goal_env, capsys
+):
+    """Recovery must retain main's stale-run guard and refusal diagnostics."""
+    import argparse
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban as kcli
+
+    tid, child = goal_env
+    conn = kb.connect()
+    try:
+        assert kb.park_completion_for_judge_failure(
+            conn, tid, **SUBMISSION, error="judge transport failure",
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "0")
+    monkeypatch.setattr(
+        kcli, "_goal_mode_handoff_rejection", lambda task, evidence: (None, None),
+    )
+    args = argparse.Namespace(
+        task_ids=[tid], result=None, summary=None, metadata=None,
+    )
+    assert kcli._cmd_complete(args) == 1
+    captured = capsys.readouterr()
+    assert f"cannot complete {tid}: run id mismatch (expected 0," in captured.err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        preserved = kb.get_preserved_completion_submission(conn, tid)
+        assert preserved is not None
+        assert preserved["summary"] == SUBMISSION["summary"]
+        assert preserved["metadata"] == SUBMISSION["metadata"]
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None
+        assert child_task.status == "todo"
     finally:
         conn.close()
 
