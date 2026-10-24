@@ -1160,9 +1160,11 @@ def _possible_duplicates(kb, conn, title: str, self_tid: Optional[str],
             # event in the window — the event, not created_at, is when it left.
             fresh = task.created_at >= cutoff
             if not fresh and task.status == "archived":
-                ev = next((e for e in kb.list_events(conn, task.id)
-                           if e.kind == "archived"), None)
-                fresh = ev is not None and ev.created_at >= cutoff
+                # Newest archived event: list_events is oldest-first, and a card
+                # restored then archived again left at its latest archive.
+                last = max((e.created_at for e in kb.list_events(conn, task.id)
+                            if e.kind == "archived"), default=None)
+                fresh = last is not None and last >= cutoff
             if not fresh:
                 continue
             if _title_overlap(title, task.title or "") > DUPLICATE_TITLE_OVERLAP:

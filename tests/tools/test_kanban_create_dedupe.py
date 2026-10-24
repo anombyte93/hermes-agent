@@ -343,3 +343,35 @@ def test_rule_6_describes_possible_duplicates_as_post_create_advice():
 
 def test_rule_6_keeps_lane_default():
     assert "own profile" in _rule_6()
+
+
+def test_create_flags_card_rearchived_an_hour_ago(worker_env):
+    """(c, r3) Freshness uses the NEWEST archived event: a card archived two days
+    ago, restored, then archived again an hour ago is flagged (list_events is
+    oldest-first, so reading its first archived event misses this card)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    gone = _create_card("Fix gitleaks gate in test_notify_needs")
+    conn = kbc.connect()
+    try:
+        kb.archive_task(conn, gone)
+    finally:
+        conn.close()
+    _age_task_and_archive_event(gone, created_ago=3 * 24 * 3600,
+                                archived_ago=2 * 24 * 3600)
+    conn = kbc.connect()
+    try:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'archived', ?)",
+            (gone, int(time.time()) - 3600))
+        conn.commit()
+    finally:
+        conn.close()
+
+    d = json.loads(kt._handle_create({
+        "title": "Fix gitleaks gate in test_notify_needs",
+        "assignee": "peer",
+    }))
+    assert d["ok"] is True
+    assert [c["task_id"] for c in d["possible_duplicates"]] == [gone]
