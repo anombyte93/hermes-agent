@@ -35,8 +35,24 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for name in ("worker", "reviewer"):
+        _review_profile(home, name)
     kb.init_db()
     return home
+
+
+def _review_profile(home: Path, name: str, *, with_skill: bool = True) -> Path:
+    profile = home / "profiles" / name
+    profile.mkdir(parents=True, exist_ok=True)
+    if with_skill:
+        skill = profile / "skills" / "development" / "sdlc-review" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            "---\nname: sdlc-review\ndescription: Review a change.\n---\n"
+            "Verify the change against its acceptance criteria.\n",
+            encoding="utf-8",
+        )
+    return profile
 
 
 def _row(conn, tid):
@@ -447,7 +463,14 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         )
         # Ready-lane task with the same fresh PR comment.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        assert kb.claim_task(conn, ready_id) is not None
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
+        with kb.write_txn(conn):
+            kb._end_run(conn, ready_id, outcome="crashed")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (ready_id,),
+            )
 
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kb.check_respawn_guard(conn, review_id, lane="review") is None
@@ -473,6 +496,352 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kb.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+@pytest.mark.parametrize(
+    "event_kind", ["status", "promoted", "promoted_manual", "unblocked", "reclaimed"]
+)
+def test_active_pr_guard_honours_newer_requeue(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, event_kind: str,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="resume builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Draft: https://github.com/example/repo/pull/123",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        clock[0] += 10
+        with kb.write_txn(conn):
+            payload = {"manual": True} if event_kind == "reclaimed" else None
+            kb._append_event(conn, tid, event_kind, payload)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # A later own PR comment must re-arm the guard. Neither an older
+        # requeue nor a newer non-PR comment may hide the newest PR signal.
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Updated https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        kb.add_comment(conn, tid, author="worker", body="Still working.")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_ignores_other_comment_authors(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(
+            conn, tid, author="parent",
+            body="Context: https://github.com/example/repo/pull/123",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_allows_ready_verifier_with_parent_pr_link(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Verify builder PR", assignee="reviewer", created_by="parent",
+        )
+        kb.add_comment(
+            conn, tid, author="parent",
+            body="Review https://github.com/example/repo/pull/123",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, tid) is None
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in result.spawned]
+        assert tid not in dict(result.respawn_guarded)
+
+
+@pytest.mark.parametrize("author", ["worker", "parent", "reviewer"])
+def test_active_pr_guard_allows_zero_run_child_with_other_cards_pr_link(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, author: str,
+) -> None:
+    """A sibling/parent worker's profile name is not this child's run."""
+    import hermes_cli.profiles as profmod
+
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        builder_id = kb.create_task(conn, title="builder", assignee="worker")
+        assert kb.claim_task(conn, builder_id) is not None
+        child_id = kb.create_task(
+            conn, title="Verify builder PR", assignee="worker", parents=[builder_id],
+        )
+        assert kb.complete_task(conn, builder_id, summary="builder complete")
+        # The link arrives AFTER dependency promotion, so no newer requeue
+        # can hide the authorship defect in the old guard.
+        clock[0] += 10
+        kb.add_comment(
+            conn, child_id, author=author,
+            body="Dependency: https://github.com/example/repo/pull/123",
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "ready"
+        assert conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ?", (builder_id,),
+        ).fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ?", (child_id,),
+        ).fetchone() is None
+        assert kb.check_respawn_guard(conn, child_id) is None
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert child_id in [s[0] for s in result.spawned]
+        assert child_id not in dict(result.respawn_guarded)
+
+
+def test_active_pr_guard_does_not_attribute_preclaim_comment_to_later_run(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="builder", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Dependency: https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        assert kb.claim_task(conn, tid) is not None
+        # A run must not retroactively turn its profile's context link into
+        # evidence that this card opened a PR.
+        assert kb.check_respawn_guard(conn, tid) is None
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Own PR: https://github.com/example/repo/pull/456",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_requires_matching_run_not_current_assignee(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reassigned builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        clock[0] += 10
+        assert kb.reclaim_task(conn, tid)
+        kb.assign_task(conn, tid, "reviewer")
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="reviewer",
+            body="Context: https://github.com/example/repo/pull/123",
+        )
+        # This card has a run, but not by this author. The assignee alone
+        # cannot supply the missing run attribution.
+        assert kb.check_respawn_guard(conn, tid) is None
+        clock[0] += 10
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.check_respawn_guard(conn, tid) is None
+        kb.add_comment(
+            conn, tid, author="reviewer",
+            body="Own PR: https://github.com/example/repo/pull/456",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("comment_time", [0, 5, 20])
+def test_active_pr_guard_keeps_prior_workers_link_at_or_after_own_claim(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, comment_time: int,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crashed builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        # Run: [base, base+10]. Comments at claim, during work and after
+        # the recorded crash all preserve the duplicate-PR protection.
+        started_at = clock[0]
+        if comment_time <= 10:
+            clock[0] = started_at + comment_time
+            kb.add_comment(
+                conn, tid, author="worker",
+                body="Opened https://github.com/example/repo/pull/123",
+            )
+        clock[0] = started_at + 10
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (tid,),
+            )
+        kb.assign_task(conn, tid, "reviewer")
+        if comment_time > 10:
+            clock[0] = started_at + comment_time
+            kb.add_comment(
+                conn, tid, author="worker",
+                body="Opened https://github.com/example/repo/pull/123",
+            )
+        clock[0] += 30
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_still_holds_builder_crashed_after_own_pr(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crashed builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        # Model crash recovery, not an intentional reclaim: no requeue event.
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (tid,),
+            )
+            kb._append_event(conn, tid, "crashed")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Reassignment must not erase the prior worker's PR evidence.
+        kb.assign_task(conn, tid, "reviewer")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_still_holds_after_automatic_claim_expiry(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="expired builder", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 12345)
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        clock[0] += 10
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (clock[0] - 1, tid),
+            )
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        reclaimed = [e for e in kb.list_events(conn, tid) if e.kind == "reclaimed"]
+        assert len(reclaimed) == 1
+        assert reclaimed[0].created_at == clock[0]
+        assert reclaimed[0].payload["worker_pid"] == 12345
+        assert reclaimed[0].payload.get("manual") is not True
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("payload", [None, {"manual": False}, {"manual": "true"}, {"manual": 1}])
+def test_active_pr_guard_ignores_nonmanual_reclaims(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, payload: dict | None,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="nonmanual reclaim", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "reclaimed", payload)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (None, "recent_success"),
+        ({"manual": False}, "recent_success"),
+        ({"manual": "true"}, "recent_success"),
+        ({"manual": 1}, "recent_success"),
+        ({"manual": True}, None),
+    ],
+)
+def test_recent_success_guard_only_honours_manual_reclaims(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+    payload: dict | None, expected: str | None,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="completed builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="implementation complete")
+        assert kb.check_respawn_guard(conn, tid) == "recent_success"
+        clock[0] += 10
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "reclaimed", payload)
+        assert kb.check_respawn_guard(conn, tid) == expected
+
+
+def test_active_pr_guard_real_reclaim_lifts_own_pr_guard(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reclaim builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        assert kb.reclaim_task(conn, tid, reason="parent supplied input")
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_real_manual_promotion_lifts_guard_after_success(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="promote builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="initial implementation")
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Opened https://github.com/example/repo/pull/123",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        clock[0] += 10
+        assert kb.promote_task(conn, tid, actor="parent") == (True, None)
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
@@ -525,6 +894,356 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
     assert task_id in [task[0] for task in result.spawned]
     assert captured == [["domain-specific-review", "sdlc-review"]]
+
+
+def test_review_dispatch_loads_skill_from_assignee_profile(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile = _review_profile(kanban_home, "review-specialist")
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    captured = []
+
+    def spawn(task, workspace):
+        token = set_hermes_home_override(profile)
+        try:
+            prompt, loaded, missing = build_preloaded_skills_prompt(task.skills)
+        finally:
+            reset_hermes_home_override(token)
+        assert prompt
+        assert loaded == ["sdlc-review"]
+        assert missing == []
+        captured.append(list(task.skills))
+        return None
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="available reviewer", assignee="review-specialist",
+            skills=["sdlc-review"],
+        )
+        assert kb.request_review(conn, tid, summary="ready")
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert [item[0] for item in result.spawned] == [tid]
+        assert captured == [["sdlc-review"]]
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id is not None
+        assert not _events(conn, tid, "review_unavailable")
+
+
+@pytest.mark.parametrize("unavailable", ["absent", "disabled"])
+@pytest.mark.parametrize("recovery", ["profile", "assignee"])
+def test_review_dispatch_missing_skill_stays_in_review_without_a_run(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unavailable: str,
+    recovery: str,
+) -> None:
+    import os
+
+    from hermes_constants import get_hermes_home
+
+    profile_name = "reviewer-without-skill"
+    profile = _review_profile(
+        kanban_home, profile_name, with_skill=unavailable == "disabled",
+    )
+    if unavailable == "disabled":
+        (profile / "config.yaml").write_text(
+            "skills:\n  disabled:\n    - sdlc-review\n", encoding="utf-8",
+        )
+    # A skill loadable by the dispatcher must not leak into the assignee.
+    skill = kanban_home / "skills" / "sdlc-review" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: sdlc-review\n---\nReview.\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    captured = []
+
+    def spawn(task, workspace):
+        captured.append((task.assignee, list(task.skills or [])))
+        return None
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review safely", assignee=profile_name)
+        assert kb.request_review(conn, tid, summary="implementation ready")
+        before_runs = kb.list_runs(conn, tid)
+        before_events = _events(conn, tid)
+
+        preview = kb.dispatch_once(conn, dry_run=True, spawn_fn=spawn)
+        assert not preview.spawned
+        assert _events(conn, tid) == before_events
+
+        for _ in range(3):
+            result = kb.dispatch_once(conn, spawn_fn=spawn)
+            assert not result.spawned
+            assert not result.crashed
+            assert not result.auto_blocked
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "review"
+            assert task.assignee == profile_name
+            assert task.current_run_id is None
+            assert task.claim_lock is None
+            assert task.worker_pid is None
+            assert kb.list_runs(conn, tid) == before_runs
+            assert get_hermes_home() == kanban_home
+            assert os.environ["HERMES_HOME"] == str(kanban_home)
+
+        assert captured == []
+        events = _events(conn, tid, "review_unavailable")
+        assert len(events) == 1
+        assert events[0][1] is not None
+        reason = events[0][1]["reason"]
+        assert "sdlc-review" in reason
+        assert profile_name in reason
+        assert not _events(conn, tid, "crashed")
+        assert not _events(conn, tid, "claimed")
+
+        if recovery == "profile":
+            _review_profile(kanban_home, profile_name)
+            (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+        else:
+            assert kb.assign_task(conn, tid, "reviewer")
+
+        resumed = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert [item[0] for item in resumed.spawned] == [tid]
+        expected_profile = profile_name if recovery == "profile" else "reviewer"
+        assert captured == [(expected_profile, ["sdlc-review"])]
+        assert kb.get_task(conn, tid).status == "running"
+        assert len(kb.list_runs(conn, tid)) == len(before_runs) + 1
+
+
+def test_parked_review_does_not_reserve_a_dispatch_slot(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review parked for a missing skill must not starve ready work."""
+    _review_profile(kanban_home, "no-review-skill", with_skill=False)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kb.connect() as conn:
+        parked = kb.create_task(conn, title="parked", assignee="no-review-skill")
+        assert kb.request_review(conn, parked, summary="ready for review")
+        ready = kb.create_task(conn, title="ready", assignee="worker")
+        result = kb.dispatch_once(conn, spawn_fn=spawn, max_in_progress=1)
+        assert [item[0] for item in result.spawned] == [ready]
+        assert spawned == [ready]
+        parked_task = kb.get_task(conn, parked)
+        assert parked_task is not None and parked_task.status == "review"
+        assert parked_task.current_run_id is None
+
+
+def test_capable_review_still_reserves_its_slot(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reservation itself is unchanged for a review that can run."""
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kb.connect() as conn:
+        for title in ("ready-1", "ready-2"):
+            kb.create_task(conn, title=title, assignee="worker")
+        review = kb.create_task(conn, title="review", assignee="reviewer")
+        assert kb.request_review(conn, review, summary="ready for review")
+        result = kb.dispatch_once(conn, spawn_fn=spawn, max_in_progress=2)
+        assert review in [item[0] for item in result.spawned]
+        assert len(result.spawned) == 2
+
+
+def test_review_skill_resolved_once_per_assignee_per_tick(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _review_profile(kanban_home, "no-review-skill", with_skill=False)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    real = kb._missing_worker_skills
+    review_calls = []
+
+    def counting(skills, assignee, *args, **kwargs):
+        if list(skills or []) == ["sdlc-review"]:
+            review_calls.append(assignee)
+        return real(skills, assignee, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "_missing_worker_skills", counting)
+
+    with kb.connect() as conn:
+        for i in range(3):
+            tid = kb.create_task(
+                conn, title=f"parked-{i}", assignee="no-review-skill",
+            )
+            assert kb.request_review(conn, tid, summary="s")
+        for i in range(2):
+            tid = kb.create_task(conn, title=f"ok-{i}", assignee="reviewer")
+            assert kb.request_review(conn, tid, summary="s")
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+
+    assert sorted(review_calls) == ["no-review-skill", "reviewer"]
+
+
+def _project_with_review_skill(tmp_path: Path) -> Path:
+    ws = tmp_path / "repo"
+    (ws / ".git").mkdir(parents=True)
+    skill = ws / ".hermes" / "skills" / "sdlc-review" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: sdlc-review\ndescription: Project review.\n---\nReview.\n",
+        encoding="utf-8",
+    )
+    return ws
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_review_uses_trusted_project_skills_of_task_workspace(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trusted: bool,
+) -> None:
+    import os
+
+    profile = _review_profile(kanban_home, "project-reviewer", with_skill=False)
+    ws = _project_with_review_skill(tmp_path)
+    if trusted:
+        (profile / "config.yaml").write_text(
+            f"skills:\n  trusted_project_dirs:\n    - {ws}\n", encoding="utf-8",
+        )
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="project review", assignee="project-reviewer",
+            workspace_kind="dir", workspace_path=str(ws),
+        )
+        assert kb.request_review(conn, tid, summary="s")
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        if trusted:
+            assert [item[0] for item in result.spawned] == [tid]
+            assert task.status == "running"
+            assert not _events(conn, tid, "review_unavailable")
+        else:
+            assert not result.spawned
+            assert task.status == "review"
+            assert len(_events(conn, tid, "review_unavailable")) == 1
+    assert "TERMINAL_CWD" not in os.environ
+
+
+@pytest.mark.parametrize("preset", [None, "/preset/workdir"])
+def test_missing_worker_skills_never_writes_process_env(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preset: str | None,
+) -> None:
+    """The workspace scope is a context-local override, not os.environ."""
+    import os
+
+    profile = _review_profile(kanban_home, "env-reviewer", with_skill=False)
+    ws = _project_with_review_skill(tmp_path)
+    (profile / "config.yaml").write_text(
+        f"skills:\n  trusted_project_dirs:\n    - {ws}\n", encoding="utf-8",
+    )
+    if preset is None:
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    else:
+        monkeypatch.setenv("TERMINAL_CWD", preset)
+
+    class GuardedEnviron(type(os.environ)):
+        def __setitem__(self, key, value):
+            raise AssertionError(f"os.environ write: {key}")
+
+        def __delitem__(self, key):
+            raise AssertionError(f"os.environ delete: {key}")
+
+        def pop(self, *args, **kwargs):
+            raise AssertionError("os.environ pop")
+
+        def setdefault(self, *args, **kwargs):
+            raise AssertionError("os.environ setdefault")
+
+        def update(self, *args, **kwargs):
+            raise AssertionError("os.environ update")
+
+    before = dict(os.environ)
+    guarded = GuardedEnviron.__new__(GuardedEnviron)
+    guarded.__dict__.update(os.environ.__dict__)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "environ", guarded)
+        # The workspace's own skill resolves, so the override was applied...
+        assert kb._missing_worker_skills(["sdlc-review"], "env-reviewer", str(ws)) == []
+        # ...and without it the same profile cannot load the skill.
+        assert kb._missing_worker_skills(["sdlc-review"], "env-reviewer") == [
+            "sdlc-review"
+        ]
+    assert dict(os.environ) == before
+    assert os.environ.get("TERMINAL_CWD") == preset
+
+
+def test_parked_review_is_parked_even_when_other_card_skills_resolve(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _review_profile(kanban_home, "partial", with_skill=False)
+    other = profile / "skills" / "domain-review" / "SKILL.md"
+    other.parent.mkdir(parents=True)
+    other.write_text(
+        "---\nname: domain-review\ndescription: d\n---\nbody\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="partial", assignee="partial", skills=["domain-review"],
+        )
+        assert kb.request_review(conn, tid, summary="s")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        assert not result.spawned
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_diagnostics_reports_parked_review_card(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import kanban_diagnostics as kd
+
+    _review_profile(kanban_home, "no-review-skill", with_skill=False)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="parked", assignee="no-review-skill")
+        assert kb.request_review(conn, tid, summary="s")
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        diags = kd.compute_task_diagnostics(task, events, [])
+        found = [d for d in diags if d.kind == "review_unavailable"]
+        assert len(found) == 1
+        assert found[0].data == {
+            "assignee": "no-review-skill", "missing_skills": ["sdlc-review"],
+        }
+        assert "sdlc-review" in found[0].detail
+        assert "no-review-skill" in found[0].detail
+
+        # Once the profile can load the skill and the card is claimed, the
+        # diagnostic clears.
+        _review_profile(kanban_home, "no-review-skill")
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        diags = kd.compute_task_diagnostics(task, events, [])
+        assert not [d for d in diags if d.kind == "review_unavailable"]
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(

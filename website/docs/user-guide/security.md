@@ -697,6 +697,7 @@ security:
   tirith_path: "tirith"      # Path to tirith binary (default: PATH lookup)
   tirith_timeout: 5          # Subprocess timeout in seconds
   tirith_fail_open: true     # Allow execution when tirith is unavailable (default: true)
+  tirith_trusted_hosts: []   # No trusted upload destinations by default
 ```
 
 When `tirith_fail_open` is `true` (default), commands proceed if tirith is not installed or times out. Set to `false` in high-security environments to block commands when tirith is unavailable.
@@ -704,6 +705,37 @@ When `tirith_fail_open` is `true` (default), commands proceed if tirith is not i
 Tirith ships prebuilt binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / arm64). On platforms with no prebuilt binary (Windows, etc.), tirith is silently skipped — pattern-matching guards still run, and the CLI does not surface an "unavailable" banner. To use tirith on Windows, run Hermes under WSL.
 
 Tirith's verdict integrates with the approval flow: safe commands pass through, while both suspicious and blocked commands trigger user approval with the full tirith findings (severity, title, description, safer alternatives). Users can approve or deny — the default choice is deny to keep unattended scenarios secure.
+
+#### Trusted upload hosts
+
+An operator can explicitly trust upload destinations with
+`security.tirith_trusted_hosts` in the active profile's `config.yaml`:
+
+```yaml
+security:
+  tirith_trusted_hosts: [build-host.example, my-build-alias]
+```
+
+The default is an empty list. Entries are literal ASCII hostnames, IP addresses
+(IPv4), or SSH aliases, without usernames, ports, paths or wildcards. Matching is
+case-insensitive and exact: trusting `build-host.example` does not trust its
+subdomains. SSH configuration and DNS are not resolved to discover other names;
+only add an alias if you trust its operator-controlled SSH configuration too.
+
+This exempts only Tirith's `data_exfiltration` finding for a direct
+`scp file user@host:dir/` or `rsync -av file host:dir/` upload. The scan still
+runs. Unlisted hosts keep the scanner's existing verdict; other findings,
+dangerous-command checks and explicit deny rules still apply. In single-query
+(`-q`) deny mode, an unexempted warning or block is refused, and the message
+includes the rule ID and this config key. A clean scanner verdict is unchanged.
+
+The exception deliberately recognises only simple commands with routing-neutral
+flags (including scp `-P`/`-l` with numeric values). Compound commands, wrappers,
+shell expansion/globs, remote sources, IPv6/URL/rsync-daemon destinations and
+unknown or routing-changing flags (such as scp `-o`, `-F`, `-S`, `-J` or rsync
+`-e`/`--rsh`) keep Tirith's verdict. Split compound transfers into direct calls
+with literal filenames if you need this exception. Invalid list entries grant
+no exception. This is not a command allowlist or a general approval bypass.
 
 ### Context File Injection Protection
 

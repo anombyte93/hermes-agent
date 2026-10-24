@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -715,14 +716,39 @@ PROJECT_SKILLS_SUBDIRS = (
 _PROJECT_ROOT_MAX_DEPTH = 64
 
 
+_PROJECT_CWD_UNSET = object()
+_PROJECT_CWD_OVERRIDE: ContextVar[str | object] = ContextVar(
+    "_PROJECT_CWD_OVERRIDE", default=_PROJECT_CWD_UNSET
+)
+
+
+def set_project_cwd_override(path: "str | Path | None") -> Token:
+    """Set a context-local start directory for project-root discovery.
+
+    Lets an in-process caller (e.g. the kanban dispatcher checking whether a
+    worker would find a skill in its task workspace) resolve project skills
+    as a worker started in ``path`` would. It deliberately does not mutate
+    ``os.environ``, which is shared by every thread in the process. Workers
+    never set it, so their behaviour is unchanged.
+    """
+    value: "str | object" = _PROJECT_CWD_UNSET if path is None else str(path)
+    return _PROJECT_CWD_OVERRIDE.set(value)
+
+
+def reset_project_cwd_override(token: Token) -> None:
+    """Restore the previous context-local project start directory."""
+    _PROJECT_CWD_OVERRIDE.reset(token)
+
+
 def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     """Locate the enclosing project root: nearest ancestor containing ``.git``.
 
     Returns None when cwd is not inside a git checkout. ``.git`` may be a dir
     (normal clone) or a file (worktree/submodule) — both count.
 
-    When *start* is not given, the surface's working directory wins over the
-    process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
+    When *start* is not given, a context-local override (see
+    :func:`set_project_cwd_override`) wins first; otherwise the surface's
+    working directory wins over the process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
     tool and cron jobs use (a cron job sets it from its per-job ``workdir``
     without chdir'ing the scheduler process). This is what lets
     non-interactive surfaces inherit a prior interactive trust decision by
@@ -731,8 +757,12 @@ def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     """
     try:
         if start is None:
+            override = _PROJECT_CWD_OVERRIDE.get()
             env_cwd = os.environ.get("TERMINAL_CWD")
-            start = Path(env_cwd) if env_cwd else Path.cwd()
+            if override is not _PROJECT_CWD_UNSET and override:
+                start = Path(str(override))
+            else:
+                start = Path(env_cwd) if env_cwd else Path.cwd()
         cur = Path(start).resolve()
     except OSError:
         return None

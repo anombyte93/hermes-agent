@@ -229,3 +229,43 @@ def test_missing_login_does_not_settle_when_no_claude_dir(tmp_path, monkeypatch)
     monkeypatch.setattr(anthropic_credentials, "_settle_pause", pauses.append, raising=False)
     assert anthropic_credentials._read_claude_code_credentials_from_file() is None
     assert pauses == []
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("initial_state", ["truncated", "dangling"])
+def test_settle_reresolves_borrower_owner(tmp_path, monkeypatch, scoped, initial_state):
+    """A settled read follows a repointed borrower, not its stale owner path."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        anthropic_credentials.Path, "home", classmethod(lambda cls: home)
+    )
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    selected_dir = home / ".claude"
+    if scoped:
+        selected_dir = tmp_path / "selected-account"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(selected_dir))
+        _write_creds(home / ".claude" / ".credentials.json", OLD_TOKEN)
+    selected_dir.mkdir(parents=True, exist_ok=True)
+    old_owner = tmp_path / "old-owner.json"
+    if initial_state == "truncated":
+        old_owner.write_text("{", encoding="utf-8")
+    new_owner = tmp_path / "new-owner.json"
+    _write_creds(new_owner, NEW_TOKEN)
+    borrower = selected_dir / ".credentials.json"
+    borrower.symlink_to(old_owner)
+    assert anthropic_credentials.claude_code_credentials_path() == old_owner
+    pauses = []
+
+    def finish_swap(seconds):
+        pauses.append(seconds)
+        borrower.unlink()
+        borrower.symlink_to(new_owner)
+
+    monkeypatch.setattr(anthropic_credentials, "_settle_pause", finish_swap)
+    creds = anthropic_credentials._read_claude_code_credentials_from_file()
+
+    assert creds is not None
+    assert creds["accessToken"] == NEW_TOKEN
+    assert pauses == [anthropic_credentials._CREDENTIALS_SETTLE_DELAYS[0]]
+    assert borrower.is_symlink()
+    assert anthropic_credentials.claude_code_credentials_path() == new_owner

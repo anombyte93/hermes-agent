@@ -21381,6 +21381,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _exit_on_kanban_infra_lock(result) -> None:
+    """Keep a storage stop out of the goal judge and worker failure budgets.
+
+    The exit code covers normal reaping. A run-scoped log marker also survives
+    a dispatcher restart, when its in-memory exit registry has been lost.
+    Never infer infrastructure failure from model-authored response text.
+    """
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and isinstance(result, dict)
+        and result.get("failure_reason") == "session_persistence_failed:locked"
+    ):
+        from hermes_cli.kanban_db import KANBAN_INFRA_LOCK_EXIT_CODE
+
+        try:
+            run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+        except ValueError:
+            run_id = None
+        print(f"kanban_exit: infra_lock run_id={run_id}", file=sys.stderr, flush=True)
+        sys.exit(KANBAN_INFRA_LOCK_EXIT_CODE)
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -21443,6 +21465,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        _exit_on_kanban_infra_lock(result)
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -22043,6 +22066,10 @@ def main(
                             print(f"Error: {result['error']}", file=sys.stderr)
                         elif response:
                             print(response)
+
+                        # SessionDB already retried this write in place. Do not
+                        # re-run tools or ask the goal judge to grade an infra stop.
+                        _exit_on_kanban_infra_lock(result)
 
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an
