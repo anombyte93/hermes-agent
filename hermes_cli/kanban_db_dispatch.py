@@ -3282,7 +3282,7 @@ def run_daemon(
             warn_caps(caps.warning)
             resolved = _kbcaps.dispatch_caps(
                 caps, cli_max=max_spawn, cli_assignee_caps=cli_assignee_caps,
-                kbd=sys.modules[__name__],
+                kbd=_THIS_MODULE,
             )
             # The long-wait alert is runtime config of this process: live too.
             capped_alert = configured_capped_alert()
@@ -3302,6 +3302,13 @@ def run_daemon(
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)
+
+
+# This module object, bound once at import. ``run_daemon`` hands it to
+# ``dispatch_caps``; a call-time ``sys.modules[__name__]`` lookup resolves to a
+# different, fresh copy whenever something has purged and re-imported
+# ``hermes_cli`` since (PR #142 recheck), dropping caps derived here.
+_THIS_MODULE = sys.modules[__name__]
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

@@ -16,7 +16,9 @@ Three gaps found in review of the original memory-guard PR:
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,22 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_connect as kbc
+
+
+@pytest.fixture(autouse=True)
+def _stub_memory_on_held_module(monkeypatch):
+    """Pin the memory sample on the ``kbd`` module object THIS file holds.
+
+    The root conftest stubs ``_system_memory_sample`` on whatever
+    ``hermes_cli.kanban_db_dispatch`` is in ``sys.modules`` at fixture time.
+    A sibling test file that purges ``hermes_cli*`` from ``sys.modules``
+    (``test_kanban_cli_dispatch_passthrough.py``) leaves that pointing at a
+    fresh copy, so the conftest stub lands there while every call below goes
+    through the copy imported at collection: live host memory would then
+    decide how many workers ``dispatch_once`` may spawn (Archie under 15%
+    free reads "elevated" and caps the tick at one).
+    """
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
 
 
 @pytest.fixture
@@ -83,6 +101,62 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 3
+
+
+def test_run_daemon_caps_resolve_against_its_own_module(
+    kanban_home, monkeypatch,
+):
+    """``run_daemon`` must resolve caps with the module it is defined in.
+
+    Regression guard (PR #142 recheck): ``run_daemon`` passed
+    ``kbd=sys.modules[__name__]`` to ``dispatch_caps``. Once another test
+    purged ``hermes_cli*`` from ``sys.modules`` that name resolved to a fresh,
+    unpatched copy, so the cap this module derives was silently dropped.
+    The stand-in below is that fresh copy: it derives no cap at all.
+    """
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
+
+    fresh_copy = types.ModuleType(kbd.__name__)
+    fresh_copy.__dict__.update(vars(kbd))
+    fresh_copy.resolve_max_in_progress = lambda configured: configured
+    monkeypatch.setitem(sys.modules, kbd.__name__, fresh_copy)
+
+    def on_tick(res):
+        stop.set()
+
+    # Safety net: a tick that raises never calls on_tick; never hang the run.
+    guard = threading.Timer(30, stop.set)
+    guard.start()
+    try:
+        kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+    finally:
+        guard.cancel()
+
+    assert captured.get("max_in_progress") == 3
+
+
+def test_memory_sample_pinned_on_held_module(monkeypatch):
+    """Live host memory must not reach the module this file exercises.
+
+    Forces the real sampler to report critical pressure; the held ``kbd``
+    must still read ``unknown`` (no restriction), whatever ``sys.modules``
+    holds after a sibling file's module purge.
+    """
+    from gateway import lifecycle_ledger
+
+    monkeypatch.setattr(
+        lifecycle_ledger, "sample_memory",
+        lambda: {"mem_total_kib": 64 * 1024 * 1024, "mem_available_kib": 1024},
+    )
+    assert kbd._memory_pressure_level() == "unknown"
 
 
 def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
