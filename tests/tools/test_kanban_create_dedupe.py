@@ -2,9 +2,10 @@
 
 Workers filed three duplicate cards for one already-fixed blocker. kanban_create
 now returns an advisory ``possible_duplicates`` list (same board, title token
-overlap over 0.6, created or archived in the last 24 h, excluding the worker's
-own card) and defaults an omitted/blank assignee to a dispatcher worker's own
-profile. These tests pin those contracts against a temp board.
+overlap over 0.6, created, archived or restored in the last 24 h whatever the
+card's current status, excluding the worker's own card) and defaults an
+omitted/blank assignee to a dispatcher worker's own profile. These tests pin
+those contracts against a temp board.
 """
 from __future__ import annotations
 
@@ -375,3 +376,125 @@ def test_create_flags_card_rearchived_an_hour_ago(worker_env):
     }))
     assert d["ok"] is True
     assert [c["task_id"] for c in d["possible_duplicates"]] == [gone]
+
+
+def _restore_to_ready(task_id, event_kind=None, event_ago=None):
+    """Move an archived card back to ``ready``.
+
+    With no ``event_kind`` this writes what the dashboard's restore (drag out of
+    the archive, ``plugin_api._set_status_direct``) writes: the status and a
+    generic ``status`` event stamped now. (Calling that function here spends
+    ~90 s in ``write_txn``'s commit retry on a temp board, so its rows are copied.)
+    With ``event_kind`` the status is written and that restore event is recorded
+    ``event_ago`` seconds into the past."""
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        if event_kind is None:
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'status', ?, ?)",
+                (task_id, json.dumps({"status": "ready", "requested_status": "ready"}),
+                 int(time.time())))
+        else:
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)",
+                (task_id, event_kind, int(time.time()) - event_ago))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _archived_card(created_ago, archived_ago):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    gone = _create_card("Fix gitleaks gate in test_notify_needs")
+    conn = kbc.connect()
+    try:
+        kb.archive_task(conn, gone)
+    finally:
+        conn.close()
+    _age_task_and_archive_event(gone, created_ago=created_ago, archived_ago=archived_ago)
+    return gone
+
+
+def _duplicates_for_same_subject():
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({
+        "title": "Fix gitleaks gate in test_notify_needs",
+        "assignee": "peer",
+    }))
+    assert d["ok"] is True
+    return d["possible_duplicates"]
+
+
+def test_create_flags_card_archived_an_hour_ago_then_restored(worker_env):
+    """(c, r4 P2) The reviewer's case: created three days ago, archived an hour
+    ago, then restored to ``ready``. Freshness is the newest of ``created_at`` and
+    the card's archive/restore events whatever its CURRENT status, so the restored
+    card is flagged (HEAD 93bf70b read the archive only while still archived)."""
+    gone = _archived_card(created_ago=3 * 24 * 3600, archived_ago=3600)
+    _restore_to_ready(gone)
+    dups = _duplicates_for_same_subject()
+    assert [c["task_id"] for c in dups] == [gone]
+    assert dups[0]["status"] == "ready" and dups[0]["archived"] is False
+
+
+@pytest.mark.parametrize("kind", ["unarchived", "restored"])
+def test_create_flags_card_restored_an_hour_ago(worker_env, kind):
+    """(c, r4 P2) An ``unarchived``/``restored`` event inside the window is
+    freshness too: archived two days ago, restored an hour ago, flagged."""
+    gone = _archived_card(created_ago=3 * 24 * 3600, archived_ago=2 * 24 * 3600)
+    _restore_to_ready(gone, event_kind=kind, event_ago=3600)
+    assert [c["task_id"] for c in _duplicates_for_same_subject()] == [gone]
+
+
+def test_create_ignores_card_restored_long_ago(worker_env):
+    """(c, r4 control) Every timestamp outside the window: created three days
+    ago, archived and restored two days ago. Not flagged — the fix widens the
+    events read, not the window."""
+    gone = _archived_card(created_ago=3 * 24 * 3600, archived_ago=2 * 24 * 3600)
+    _restore_to_ready(gone, event_kind="unarchived", event_ago=2 * 24 * 3600)
+    assert _duplicates_for_same_subject() == []
+
+
+def test_create_ignores_unrelated_recent_event_on_old_card(worker_env):
+    """(c, r4 control, fail closed) Only archive/restore events count: an old
+    open card with a fresh ``commented`` event is outside the window."""
+    from hermes_cli import kanban_db_connect as kbc
+    old = _create_card("Fix gitleaks gate in test_notify_needs")
+    _age_task_and_archive_event(old, created_ago=3 * 24 * 3600)
+    conn = kbc.connect()
+    try:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'commented', ?)",
+            (old, int(time.time()) - 60))
+        conn.commit()
+    finally:
+        conn.close()
+    assert _duplicates_for_same_subject() == []
+
+
+def test_create_ranks_by_freshness_not_creation(worker_env):
+    """(c, r4) Candidates are ordered freshest first, and a restored card's
+    freshness is its archive: archived 1 h ago (created three days ago) ranks
+    above a card created 5 h ago."""
+    newer = _create_card("Fix gitleaks gate in test_notify_needs")
+    _age_task_and_archive_event(newer, created_ago=5 * 3600)
+    gone = _archived_card(created_ago=3 * 24 * 3600, archived_ago=3600)
+    _restore_to_ready(gone)
+    assert [c["task_id"] for c in _duplicates_for_same_subject()] == [gone, newer]
+
+
+def test_residual_dashboard_restore_of_long_archived_card_not_flagged(worker_env):
+    """Recorded residual (#142 r5): the dashboard restore writes a generic
+    ``status`` event that does not name the status it left, so restoring a card
+    archived two days ago is not freshness. Fail closed: no status-payload
+    grammar is parsed; only ``archived``/``unarchived``/``restored`` events and
+    ``created_at`` count. If a restore verb starts emitting ``unarchived``, the
+    parametrized test above already covers it."""
+    gone = _archived_card(created_ago=3 * 24 * 3600, archived_ago=2 * 24 * 3600)
+    _restore_to_ready(gone)
+    assert _get_task(gone).status == "ready"
+    assert _duplicates_for_same_subject() == []

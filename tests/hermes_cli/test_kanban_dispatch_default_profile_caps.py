@@ -1068,7 +1068,9 @@ def _click_nudge(js_path: Path, tmp_path: Path) -> list:
     out = []
     for req in json.loads(proc.stdout)["requests"]:
         parts = urlsplit(req["url"])
-        out.append((req["method"], parts.path, parse_qs(parts.query)))
+        # keep_blank_values: a blank ``max=`` (or bare ``max``) is still a parameter
+        # the endpoint parses (and FastAPI rejects), so it must not vanish here.
+        out.append((req["method"], parts.path, parse_qs(parts.query, keep_blank_values=True)))
     return out
 
 
@@ -1078,6 +1080,10 @@ def _assert_nudge_sends_no_max(requests: list) -> None:
     _method, path, query = posts[0]
     assert path == "/api/plugins/kanban/dispatch", requests
     assert "max" not in query, f"nudge pinned a max override: {requests}"
+    # Fail closed: the nudge sends the board and nothing else, so any other
+    # parameter (``dry_run``, a misspelt cap, ...) fails without being enumerated.
+    extra = sorted(set(query) - {"board"})
+    assert not extra, f"unexpected parameter {extra}: {requests}"
     assert query.get("board") == [_NUDGE_BOARD], f"selected board lost: {requests}"
 
 
@@ -1097,8 +1103,18 @@ def test_dashboard_nudge_button_sends_no_max_override(tmp_path):
         ("withBoard(`${API}/dispatch?max=8`, board)", "max override"),
         # The selected board must survive the click too.
         ("`${API}/dispatch`", "selected board lost"),
+        # Review r4 (round 4 on #142): a blank ``max=`` that ``parse_qs`` drops by
+        # default; FastAPI rejects the empty integer, so the click is broken.
+        ('withBoard(`${API}/dispatch` + "?max=", board)', "max override"),
+        # A bare ``max`` with no ``=`` is the same blank parameter.
+        ('withBoard(`${API}/dispatch` + "?max", board)', "max override"),
+        # Fail closed: any parameter but ``board`` is refused, not enumerated.
+        ('withBoard(`${API}/dispatch` + "?dry_run=1", board)', "unexpected parameter"),
+        # A blank selected board is not the selected board.
+        ('withBoard(`${API}/dispatch`, "") + "?board="', "selected board lost"),
     ],
-    ids=["reviewer-append-mutation", "old-max-8-implementation", "board-dropped"],
+    ids=["reviewer-append-mutation", "old-max-8-implementation", "board-dropped",
+         "r4-blank-max", "r4-bare-max", "r4-unexpected-param", "r4-blank-board"],
 )
 def test_nudge_check_catches_a_wrong_request(tmp_path, new, why):
     """Known-red controls for the test above: the same click on a bundle whose

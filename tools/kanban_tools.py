@@ -561,6 +561,10 @@ _CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
 # --- Follow-up dedupe (#126): advisory possible_duplicates on kanban_create ---
 DUPLICATE_TITLE_OVERLAP = 0.6
 _DUPLICATE_WINDOW_SECONDS = 24 * 3600
+# Events that move a card off or back onto the board. With ``created_at`` they
+# are a card's freshness, whatever its current status (#142 review r4). Other
+# events (comments, edits, claims) never count: the window is not widened.
+_DUPLICATE_FRESHNESS_EVENTS = ("archived", "unarchived", "restored")
 
 
 def _title_overlap(a: str, b: str) -> float:
@@ -1147,29 +1151,33 @@ def _handle_create(args: dict, **kw) -> str:
 def _possible_duplicates(kb, conn, title: str, self_tid: Optional[str],
                          new_tid: str) -> list[dict[str, Any]]:
     """Advisory same-subject cards for a just-created follow-up (#126): same board,
-    title token overlap over ``DUPLICATE_TITLE_OVERLAP``, created or archived within the
-    last ``_DUPLICATE_WINDOW_SECONDS``, excluding the creator's own card. Never raises —
-    a dedupe hint must not fail the create it decorates."""
+    title token overlap over ``DUPLICATE_TITLE_OVERLAP``, fresh within the last
+    ``_DUPLICATE_WINDOW_SECONDS``, excluding the creator's own card. A card's
+    freshness is the newest of its ``created_at`` and its
+    ``_DUPLICATE_FRESHNESS_EVENTS``, whatever its current status: a card archived an
+    hour ago and since restored is fresh. Never raises — a dedupe hint must not fail
+    the create it decorates."""
     try:
         cutoff = int(time.time()) - _DUPLICATE_WINDOW_SECONDS
+        # One grouped read, bounded to the window: the newest archive/restore event
+        # per card (MAX, so the oldest-first event order cannot hide a later one).
+        marks = ",".join("?" * len(_DUPLICATE_FRESHNESS_EVENTS))
+        last_moved = {
+            row[0]: row[1] for row in conn.execute(
+                "SELECT task_id, MAX(created_at) FROM task_events "
+                f"WHERE kind IN ({marks}) AND created_at >= ? GROUP BY task_id",
+                (*_DUPLICATE_FRESHNESS_EVENTS, cutoff))}
         candidates: list[tuple[Any, int]] = []
         for task in kb.list_tasks(conn, include_archived=True):
             if task.id == self_tid or task.id == new_tid or task.id is None:
                 continue
-            # Freshness: created in the window, or (archived) with its archived
-            # event in the window — the event, not created_at, is when it left.
-            fresh = task.created_at >= cutoff
-            if not fresh and task.status == "archived":
-                # Newest archived event: list_events is oldest-first, and a card
-                # restored then archived again left at its latest archive.
-                last = max((e.created_at for e in kb.list_events(conn, task.id)
-                            if e.kind == "archived"), default=None)
-                fresh = last is not None and last >= cutoff
-            if not fresh:
+            moved = last_moved.get(task.id)
+            freshness = task.created_at if moved is None else max(task.created_at, moved)
+            if freshness < cutoff:
                 continue
             if _title_overlap(title, task.title or "") > DUPLICATE_TITLE_OVERLAP:
-                candidates.append((task, task.created_at))
-        # Newest first: the card a duplicated worker most likely meant.
+                candidates.append((task, freshness))
+        # Freshest first: the card a duplicated worker most likely meant.
         candidates.sort(key=lambda pair: pair[1], reverse=True)
         return [{"task_id": task.id, "title": task.title, "status": task.status,
                  "assignee": task.assignee, "archived": task.status == "archived"}
