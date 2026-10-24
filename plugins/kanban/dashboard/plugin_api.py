@@ -1217,14 +1217,28 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 
 @router.post("/dispatch")
-def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+def dispatch(dry_run: bool = Query(False), max_n: Optional[int] = Query(None, alias="max"), board: Optional[str] = Query(None)):
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    Applies the same board-scope caps as every other dispatcher (#124): the
+    default profile's ``kanban`` capacity keys. An omitted ``max`` is no
+    override: the configured ``max_spawn`` (``0`` included) applies; an
+    explicit ``max`` is the operator's spawn cap. An unreadable default config
+    spawns nothing (``board_caps_warning`` says why; key names only)."""
+    from hermes_cli import kanban_board_caps as kbcaps
+
+    caps = kbcaps.read_board_caps()
+    resolved = kbcaps.dispatch_caps(caps, cli_max=max_n)
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(conn, dry_run=dry_run, board=board, **resolved.kwargs)
         try:
-            return asdict(result)  # DispatchResult is a dataclass
+            body = asdict(result)  # DispatchResult is a dataclass
         except TypeError:
-            return {"result": str(result)}
+            body = {"result": str(result)}
+    body["board_caps_source"] = caps.source
+    if caps.warning:
+        body["board_caps_warning"] = caps.warning
+    return body
 
 
 @router.get("/model-options")

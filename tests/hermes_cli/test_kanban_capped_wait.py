@@ -185,12 +185,15 @@ def test_parse_assignee_groups_normalises_and_drops_invalid():
         "boolmax": {"members": ["evo"], "max": True},
         "nomembers": {"members": [], "max": 2},
         "badmembers": {"members": [1, None, ""], "max": 2},
+        "negative": {"members": ["evo"], "max": -1},
         "": {"members": ["evo"], "max": 1},
         "notamap": ["evo"],
     }
+    # #124 review r4 P1: ``max: 0`` is a cap of zero (no member spawns), kept.
     assert kbd.parse_assignee_groups(raw) == {
         "gpu0": {"members": ["evo", "coder"], "max": 3},
         "csv": {"members": ["evo", "claude"], "max": 2},
+        "zero": {"members": ["evo"], "max": 0},
     }
 
 

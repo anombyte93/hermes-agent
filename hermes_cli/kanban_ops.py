@@ -58,52 +58,38 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    # Honour kanban.default_assignee, kanban.max_in_progress,
-    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
-    try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        max_in_progress_per_profile = kbd._positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile"), None
-        )
-        by_assignee = kbd.parse_assignee_caps(_kanban_cfg.get("max_in_progress_by_assignee"))
-        assignee_groups = kbd.parse_assignee_groups(_kanban_cfg.get("assignee_groups"))
-        # Memory-derived default when unset — same fallback the gateway applies.
-        max_in_progress = kbd.resolve_max_in_progress(
-            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
-        )
-        # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
-        cli_max = getattr(args, "max", None)
-        max_spawn = (
-            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
-        )
-    except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = None
-        by_assignee = {}
-        assignee_groups = {}
-        max_spawn = getattr(args, "max", None)
-    # Explicit --max-per-assignee pairs win per name over config (#83).
-    by_assignee.update(kbd.parse_assignee_caps(getattr(args, "max_per_assignee", None)))
+    # Honour the six board-scope caps (kanban.default_assignee, max_in_progress,
+    # max_in_progress_per_profile, max_in_progress_by_assignee, assignee_groups,
+    # max_spawn) with the same semantics as every other dispatcher. They are
+    # BOARD-SCOPE (#124): resolved from the default profile's config + managed overlay
+    # so they hold whichever profile runs dispatch. Explicit --max and
+    # --max-per-assignee still win; an unreadable default config refuses to
+    # spawn, never falling back to this profile's caps.
+    from hermes_cli import kanban_board_caps as kbcaps
+
+    caps = kbcaps.read_board_caps()
+    if caps.warning:
+        print(f"warning: {caps.warning}", file=sys.stderr)
+    resolved = kbcaps.dispatch_caps(
+        caps,
+        cli_max=getattr(args, "max", None),
+        cli_assignee_caps=getattr(args, "max_per_assignee", None),
+    )
+    default_assignee = resolved.kwargs["default_assignee"]
     with kbc.connect_closing() as conn:
         try:
             res = kbd.dispatch_once(
                 conn,
                 dry_run=args.dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
                 failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                max_in_progress_by_assignee=by_assignee,
-                assignee_groups=assignee_groups,
                 on_locked="raise",
+                **resolved.kwargs,
             )
         except kbd.BoardDispatchLockedError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    # Refused spawning (unreadable default config) exits non-zero so scripts notice.
+    rc = 1 if caps.spawn_refused else 0
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
@@ -128,8 +114,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "capped_details": res.capped_details,
             "auto_assigned_default": res.auto_assigned_default,
+            "caps_source": caps.source,
+            "caps_spawn_refused": caps.spawn_refused,
+            "caps": {
+                key: {"value": value, "source": source}
+                for key, value, source in kbcaps.cap_rows(resolved)
+            },
         }, ascii=True)
-        return 0
+        return rc
     print(f"Reclaimed:    {res.reclaimed}")
     for label, items in (
         ("Crashed:     ", res.crashed),
@@ -141,6 +133,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    if args.dry_run or caps.spawn_refused:
+        print(f"Caps source: {caps.source}")
+        for line in kbcaps.describe_caps(resolved):
+            print(line)
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
@@ -172,7 +168,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"{res.board_allowlist_unreadable}; cards stay in their lanes): "
             f"{', '.join(tid for tid, _ in res.skipped_board_unreadable)}"
         )
-    return 0
+    return rc
 
 
 _DAEMON_DEPRECATED = (
@@ -326,6 +322,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             on_tick=_on_tick,
+            # Only EXPLICIT --max-per-assignee pairs are passed as overrides; the
+            # board-scope config caps are re-read from the default profile every
+            # tick inside run_daemon (#124) so config edits apply without a restart.
             max_in_progress_by_assignee=kbd.parse_assignee_caps(
                 getattr(args, "max_per_assignee", None)
             ),
