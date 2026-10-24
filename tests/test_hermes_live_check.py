@@ -263,3 +263,51 @@ def test_git_missing_is_unknown(tmp_path: Path, repo: Path) -> None:
     )
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert proc.stdout.startswith("UNKNOWN:")
+
+
+# --- Review r1 finding 3: the checker never writes; there is no --fetch.
+
+
+def _git_dir_state(repo: Path) -> dict[str, tuple[int, int]]:
+    """Every file under .git with its size and mtime: any write shows up."""
+    git_dir = repo / ".git"
+    return {
+        str(path.relative_to(git_dir)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in git_dir.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_fetch_option_is_refused_and_writes_nothing(tmp_path: Path, repo: Path) -> None:
+    """--fetch would write objects, refs and FETCH_HEAD: it must not exist."""
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(repo), str(clone))
+    release = _git(clone, "rev-parse", "HEAD")
+    tracking_before = _git(clone, "rev-parse", "refs/remotes/origin/main")
+    upstream_new = _commit(repo, "upstream moves on")  # something a fetch would pull
+    launcher = _launcher(tmp_path, release)
+    before = _git_dir_state(clone)
+    proc = run_check(release, "--launcher", str(launcher), "--repo", str(clone), "--fetch")
+    assert not (clone / ".git" / "FETCH_HEAD").exists()
+    assert _git(clone, "rev-parse", "refs/remotes/origin/main") == tracking_before
+    assert _git_dir_state(clone) == before
+    probe = subprocess.run(
+        ["git", "-C", str(clone), "cat-file", "-e", f"{upstream_new}^{{commit}}"],
+        capture_output=True,
+    )
+    assert probe.returncode != 0, "the upstream commit must not have been fetched"
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("UNKNOWN:")
+
+
+def test_ordinary_check_writes_nothing(tmp_path: Path, repo: Path) -> None:
+    """A normal LIVE/NOT-LIVE answer leaves the repo's .git untouched."""
+    release = _commit(repo, "release R")
+    _git(repo, "checkout", "-q", "-b", "side")
+    side = _commit(repo, "side S")
+    launcher = _launcher(tmp_path, release)
+    before = _git_dir_state(repo)
+    for sha, code in ((release, 0), (side, 1)):
+        proc = run_check(sha, "--launcher", str(launcher), "--repo", str(repo))
+        assert proc.returncode == code, proc.stdout + proc.stderr
+    assert _git_dir_state(repo) == before

@@ -19,14 +19,18 @@ Answers one line on stdout:
                                            NOT-LIVE)
 
 Usage:
-  scripts/hermes-live-check <sha> [--launcher PATH] [--repo PATH] [--fetch]
+  scripts/hermes-live-check <sha> [--launcher PATH] [--repo PATH]
 
   <sha>         short or full commit sha (resolves via git rev-parse).
   --launcher    the wrapper to read; default $HERMES_BIN else
                 ~/.local/bin/hermes.
   --repo        git repo the shas are resolved in; default: the repo this
-                script lives in. Never contacted remotely unless --fetch is
-                given (then `git fetch --quiet` runs first).
+                script lives in.
+
+Read-only: it runs only `git rev-parse` and `git merge-base --is-ancestor`,
+never fetches and never writes to the repo. Refresh the repo separately
+(e.g. `git fetch`) before asking about a sha it does not have yet; an
+unknown sha answers UNKNOWN. A bad argument is UNKNOWN/2 as well.
 """
 
 from __future__ import annotations
@@ -58,8 +62,16 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         raise  # unreachable: die_unknown exits
 
 
+class _Parser(argparse.ArgumentParser):
+    """A usage error is UNKNOWN/2 on stdout, like every other non-answer."""
+
+    def error(self, message: str) -> "None":  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        die_unknown(f"bad arguments: {message}")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="hermes-live-check",
         description="Answer whether a sha is in the live Hermes release.",
     )
@@ -73,11 +85,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--repo",
         default=None,
         help="git repo to resolve shas in (default: the repo this script lives in)",
-    )
-    parser.add_argument(
-        "--fetch",
-        action="store_true",
-        help="run `git fetch --quiet` in the repo before resolving (off by default)",
     )
     return parser.parse_args(argv)
 
@@ -133,10 +140,6 @@ def main(argv: list[str]) -> None:
     release_sha, release_dir = live_release(launcher_path(args.launcher))
     if not release_dir.is_dir():
         die_unknown(f"release dir {release_dir} named by the launcher is missing")
-    if args.fetch:
-        proc = _git(repo, "fetch", "--quiet")
-        if proc.returncode != 0:
-            die_unknown(f"git fetch failed in {repo}: {proc.stderr.strip()}")
 
     query = resolve_commit(repo, args.sha)
     release = resolve_commit(repo, release_sha)
