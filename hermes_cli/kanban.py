@@ -2974,6 +2974,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_workspace_busy": [
+                {"task_id": tid, "holder": holder, "workspace": ws}
+                for (tid, holder, ws) in res.skipped_workspace_busy
+            ],
             "rejected_skills": [
                 {"task_id": tid, "missing_skills": missing}
                 for (tid, missing) in res.rejected_skills
@@ -3023,6 +3027,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_workspace_busy:
+        for tid, holder, ws in res.skipped_workspace_busy:
+            print(
+                f"Deferred (workspace busy, held by {holder}): {tid} @ {ws}"
             )
     if res.skipped_nonspawnable:
         # Do NOT assert "OK" here: this bucket cannot tell a legitimate
