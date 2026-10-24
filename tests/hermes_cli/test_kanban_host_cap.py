@@ -143,19 +143,22 @@ def test_run_daemon_caps_resolve_against_its_own_module(
     assert captured.get("max_in_progress") == 3
 
 
+@pytest.mark.real_memory_guard
 def test_memory_sample_pinned_on_held_module(monkeypatch):
     """Live host memory must not reach the module this file exercises.
 
-    Forces the real sampler to report critical pressure; the held ``kbd``
-    must still read ``unknown`` (no restriction), whatever ``sys.modules``
-    holds after a sibling file's module purge.
+    ``real_memory_guard`` switches off the root conftest stub, so only this
+    file's ``_stub_memory_on_held_module`` stands between the held ``kbd`` and
+    the real sampler. The real sampler is forced to report critical pressure:
+    removing the local fixture must turn this test red.
     """
     from gateway import lifecycle_ledger
 
-    monkeypatch.setattr(
-        lifecycle_ledger, "sample_memory",
-        lambda: {"mem_total_kib": 64 * 1024 * 1024, "mem_available_kib": 1024},
-    )
+    critical = {"mem_total_kib": 64 * 1024 * 1024, "mem_available_kib": 1024}
+    monkeypatch.setattr(lifecycle_ledger, "sample_memory", lambda: dict(critical))
+    # Control: the injected sample really is critical when it is read.
+    assert kbd._memory_pressure_level(lifecycle_ledger.sample_memory()) == "critical"
+    # The held module never reads it: the local stub pins "no data".
     assert kbd._memory_pressure_level() == "unknown"
 
 
