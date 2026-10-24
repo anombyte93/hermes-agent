@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""hermes-live-check <sha> — is a sha running as the live Hermes release?
+
+"Merged is not live." The launcher wrapper (~/.local/bin/hermes) execs
+  ~/.hermes/releases/hermes-agent-<40-hex sha>/hermes
+so the LAST line of that wrapper names the live release (the same rule
+hermes-release.sh status uses; do not invent a second definition of live).
+
+Answers one line on stdout:
+  LIVE <sha7> in release <rel7>      exit 0  (sha is the release commit or an
+                                           ancestor of it)
+  NOT-LIVE <sha7> not in release <rel7>
+                                    exit 1  (sha is known to the repo but is
+                                           not in the release's history)
+  UNKNOWN: <reason>                  exit 2  (launcher unreadable, no release
+                                           sha in it, release dir missing, the
+                                           sha is unknown to the repo, or any
+                                           git error: fail closed, never
+                                           NOT-LIVE)
+
+Usage:
+  scripts/hermes-live-check <sha> [--launcher PATH] [--repo PATH]
+
+  <sha>         short or full commit sha (resolves via git rev-parse).
+  --launcher    the wrapper to read; default $HERMES_BIN else
+                ~/.local/bin/hermes.
+  --repo        git repo the shas are resolved in; default: the repo this
+                script lives in.
+
+Read-only: it runs only `git rev-parse` and `git merge-base --is-ancestor`,
+never fetches and never writes to the repo. Refresh the repo separately
+(e.g. `git fetch`) before asking about a sha it does not have yet; an
+unknown sha answers UNKNOWN. A bad argument is UNKNOWN/2 as well.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+# Same shape as hermes-release.sh RELEASE_RE: an absolute .../releases/hermes-agent-<hex>
+RELEASE_RE = re.compile(r"(/[A-Za-z0-9._@+-]+)+/releases/hermes-agent-([0-9a-f]{7,40})")
+
+
+def die_unknown(reason: str) -> "None":
+    print(f"UNKNOWN: {reason}")
+    sys.exit(2)
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a read-only git command; git that cannot even start is UNKNOWN."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True
+        )
+    except OSError as exc:
+        die_unknown(f"cannot run git in {repo}: {exc}")
+        raise  # unreachable: die_unknown exits
+
+
+class _Parser(argparse.ArgumentParser):
+    """A usage error is UNKNOWN/2 on stdout, like every other non-answer."""
+
+    def error(self, message: str) -> "None":  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        die_unknown(f"bad arguments: {message}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = _Parser(
+        prog="hermes-live-check",
+        description="Answer whether a sha is in the live Hermes release.",
+    )
+    parser.add_argument("sha", help="commit sha to check (short or full)")
+    parser.add_argument(
+        "--launcher",
+        default=None,
+        help="launcher wrapper path (default: $HERMES_BIN else ~/.local/bin/hermes)",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="git repo to resolve shas in (default: the repo this script lives in)",
+    )
+    return parser.parse_args(argv)
+
+
+def launcher_path(raw: str | None) -> Path:
+    if raw:
+        return Path(raw).expanduser()
+    if os.environ.get("HERMES_BIN"):
+        return Path(os.environ["HERMES_BIN"]).expanduser()
+    return Path.home() / ".local" / "bin" / "hermes"
+
+
+def live_release(launcher: Path) -> tuple[str, Path]:
+    """Return (release sha, release dir) named by the launcher's last line.
+
+    Mirrors hermes-release.sh live_release(): only the LAST line is read, and
+    it must name exactly one release path.
+    """
+    # Any stat or read failure (missing, not a file, permission denied, I/O
+    # error) is UNKNOWN/2, like hermes-release.sh, never a traceback.
+    try:
+        if not stat.S_ISREG(launcher.stat().st_mode):
+            die_unknown(f"launcher {launcher} is not a regular file")
+        text = launcher.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        die_unknown(f"cannot read launcher {launcher}: {exc.strerror or exc}")
+    # Exactly `tail -n1`: drop at most ONE terminal newline, then take what
+    # follows the last remaining "\n". A trailing blank line therefore IS the
+    # last line (and names no release), and a bare "\r" is not a line break.
+    last_line = text.removesuffix("\n").rsplit("\n", 1)[-1]
+    # Whole matches, like grep -oE: group(1) of (/[..]+)+ would hold only the
+    # last path segment, not the full release path.
+    hits = sorted({m.group(0) for m in RELEASE_RE.finditer(last_line)})
+    if len(hits) != 1:
+        die_unknown(
+            f"cannot read one release path from the last line of {launcher}"
+        )
+    release_dir = Path(hits[0])
+    sha = release_dir.name.removeprefix("hermes-agent-")
+    return sha, release_dir
+
+
+def resolve_commit(repo: Path, ref: str) -> str:
+    proc = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    if proc.returncode != 0 or not proc.stdout.strip():
+        die_unknown(f"{ref} is not a commit known to {repo}")
+    return proc.stdout.strip()
+
+
+def main(argv: list[str]) -> None:
+    args = parse_args(argv)
+
+    # Default repo: the checkout this script lives in (parent of scripts/).
+    # If that is not a git repo, the git calls below fail and we answer UNKNOWN.
+    script_repo = Path(__file__).resolve().parent.parent
+    repo = Path(args.repo).expanduser() if args.repo else script_repo
+
+    release_sha, release_dir = live_release(launcher_path(args.launcher))
+    try:
+        release_is_dir = stat.S_ISDIR(release_dir.stat().st_mode)
+    except OSError:
+        release_is_dir = False
+    if not release_is_dir:
+        die_unknown(f"release dir {release_dir} named by the launcher is missing")
+
+    query = resolve_commit(repo, args.sha)
+    release = resolve_commit(repo, release_sha)
+    proc = _git(repo, "merge-base", "--is-ancestor", query, release)
+    # --is-ancestor answers 0 (ancestor) or 1 (not an ancestor). Anything else
+    # (128 for an unreadable object, a corrupt repo, a signal) is a git error:
+    # fail closed to UNKNOWN, never NOT-LIVE.
+    if proc.returncode == 0:
+        print(f"LIVE {query[:7]} in release {release[:7]}")
+        sys.exit(0)
+    if proc.returncode == 1:
+        print(f"NOT-LIVE {query[:7]} not in release {release[:7]}")
+        sys.exit(1)
+    detail = proc.stderr.strip().splitlines()
+    die_unknown(
+        f"git merge-base --is-ancestor failed (exit {proc.returncode}) in {repo}"
+        + (f": {detail[-1]}" if detail else "")
+    )
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
