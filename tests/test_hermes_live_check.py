@@ -16,6 +16,7 @@ sha the repo has no commit for.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -311,3 +312,42 @@ def test_ordinary_check_writes_nothing(tmp_path: Path, repo: Path) -> None:
         proc = run_check(sha, "--launcher", str(launcher), "--repo", str(repo))
         assert proc.returncode == code, proc.stdout + proc.stderr
     assert _git_dir_state(repo) == before
+
+
+# --- Review r1 finding 4: an unreadable launcher is UNKNOWN/2, not a traceback.
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_unreadable_launcher_is_unknown(tmp_path: Path, repo: Path) -> None:
+    release = _commit(repo, "only")
+    launcher = _launcher(tmp_path, release)
+    launcher.chmod(0)
+    try:
+        # The control: the file exists and really cannot be read.
+        assert launcher.is_file()
+        with pytest.raises(PermissionError):
+            launcher.read_bytes()
+        proc = run_check(release, "--launcher", str(launcher), "--repo", str(repo))
+    finally:
+        launcher.chmod(0o644)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("UNKNOWN:")
+    assert "Traceback" not in proc.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 dir")
+def test_launcher_in_untraversable_dir_is_unknown(tmp_path: Path, repo: Path) -> None:
+    release = _commit(repo, "only")
+    launcher = _launcher(tmp_path, release)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    hidden = locked / "hermes"
+    hidden.write_bytes(launcher.read_bytes())
+    locked.chmod(0)
+    try:
+        proc = run_check(release, "--launcher", str(hidden), "--repo", str(repo))
+    finally:
+        locked.chmod(0o755)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("UNKNOWN:")
+    assert "Traceback" not in proc.stderr

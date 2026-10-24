@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -103,9 +104,14 @@ def live_release(launcher: Path) -> tuple[str, Path]:
     Mirrors hermes-release.sh live_release(): only the LAST line is read, and
     it must name exactly one release path.
     """
-    if not launcher.is_file():
-        die_unknown(f"no launcher at {launcher}")
-    text = launcher.read_bytes().decode("utf-8", errors="replace")
+    # Any stat or read failure (missing, not a file, permission denied, I/O
+    # error) is UNKNOWN/2, like hermes-release.sh, never a traceback.
+    try:
+        if not stat.S_ISREG(launcher.stat().st_mode):
+            die_unknown(f"launcher {launcher} is not a regular file")
+        text = launcher.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        die_unknown(f"cannot read launcher {launcher}: {exc.strerror or exc}")
     # Exactly `tail -n1`: drop at most ONE terminal newline, then take what
     # follows the last remaining "\n". A trailing blank line therefore IS the
     # last line (and names no release), and a bare "\r" is not a line break.
@@ -138,7 +144,11 @@ def main(argv: list[str]) -> None:
     repo = Path(args.repo).expanduser() if args.repo else script_repo
 
     release_sha, release_dir = live_release(launcher_path(args.launcher))
-    if not release_dir.is_dir():
+    try:
+        release_is_dir = stat.S_ISDIR(release_dir.stat().st_mode)
+    except OSError:
+        release_is_dir = False
+    if not release_is_dir:
         die_unknown(f"release dir {release_dir} named by the launcher is missing")
 
     query = resolve_commit(repo, args.sha)
