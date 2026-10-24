@@ -38,8 +38,14 @@ def kanban_list(tenant: str) -> list[dict]:
             ["hermes", "kanban", "list", "--tenant", tenant, "--json"],
             capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
         )
-        if out.returncode == 0 and out.stdout.strip().startswith("["):
-            return json.loads(out.stdout)
+        if out.returncode == 0 and out.stdout.strip().startswith(("[", "{")):
+            payload = json.loads(out.stdout)
+            # Plain `list --json` is a bare array; `--with-caps` wraps it as
+            # {"tasks": [...], "caps": {...}}. Accept both shapes.
+            if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
+                return payload["tasks"]
+            if isinstance(payload, list):
+                return payload
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     # Fallback: textual parse of `hermes kanban list`

@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli.web_read_coalescing import coalesced_read
+from hermes_cli import kanban_board_caps as kbcaps
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
@@ -320,9 +321,13 @@ def get_board(
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
+        # Resolved board caps (#124 display): the same object `kanban list`
+        # prints — ONE resolver call, never re-implemented here.
+        caps = kbcaps.caps_display(kbcaps.read_board_caps())
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
-            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time()),
+            "caps": caps}
 
 
 _read_board = coalesced_read(get_board)
