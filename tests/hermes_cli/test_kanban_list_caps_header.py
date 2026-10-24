@@ -402,3 +402,206 @@ def test_caps_header_lines_warning_only_payload():
         "warnings": ["kanban: ignoring invalid board caps: max_spawn"],
     }) == ["caps: none", "warnings: kanban: ignoring invalid board caps: max_spawn"]
 
+
+# ---------------------------------------------------------------------------
+# #147 review r1 P2 (finding 3): no cap number or provider name, in any form
+# ---------------------------------------------------------------------------
+#
+# Rule 6: warnings name KEYS only. The old assertions excluded the quoted text
+# ``"4"`` and an unseeded ``zai``, so a warning reading ``max_spawn=4`` passed.
+# These controls seed distinctive synthetic private values (cap numbers that
+# never occur elsewhere, provider ids in the same configs) into a
+# warning-only configuration, so the whole caps surface must be digit-free,
+# and check it with ONE checker that a planted leaking resolver must fail.
+
+import re
+
+_PRIVATE_NUMBERS = ("58213", "40917", "39012", "61027", "70455", "92741", "83306")
+_SEEDED_PROVIDERS = ("zai", "glm", "openrouter", "anthropic")
+
+# Default profile: every board cap invalid (dropped and named by key), each
+# carrying a distinctive number or a provider-named ${...} reference, beside
+# provider ids elsewhere in the same file.
+_DEFAULT_PRIVATE_CFG = """\
+model:
+  provider: zai
+  default: glm-coder
+fallback_providers:
+  - openrouter
+kanban:
+  max_spawn: "58213"
+  max_in_progress: "${ZAI_MAX_IN_PROGRESS}"
+  max_in_progress_per_profile: 61027.5
+  default_assignee: 70455
+  max_in_progress_by_assignee:
+    evo: "40917"
+  assignee_groups:
+    gpu:
+      max: "39012"
+      members: [evo]
+"""
+
+# The invoking (non-default) profile: valid caps that differ from the board's,
+# so the resolver emits its mismatch warning — which must name keys only.
+_INVOKING_PRIVATE_CFG = """\
+model:
+  provider: anthropic
+kanban:
+  max_spawn: 92741
+  max_in_progress: 83306
+"""
+
+
+def _provider_ids() -> list:
+    """Every provider id and alias Hermes knows (registry, bespoke, aliases)."""
+    from hermes_cli import auth
+    ids = (set(auth.PROVIDER_REGISTRY) | set(auth._REGISTRY_PLUGIN_SKIP)
+           | set(auth._PROVIDER_ALIASES) | set(auth._PROVIDER_ALIASES.values()))
+    assert set(_SEEDED_PROVIDERS) - {"glm"} <= ids and "glm" in auth._PROVIDER_ALIASES
+    return sorted(ids)
+
+
+def _token_hits(text: str, tokens) -> list:
+    """Tokens found in ``text`` as whole tokens in any case (``_``, ``.``,
+    ``$``, ``{`` and spaces all separate: ``${ZAI_X}`` hits ``zai``)."""
+    return [tok for tok in tokens
+            if re.search(r"(?<![a-z0-9])" + re.escape(tok) + r"(?![a-z0-9])", text, re.IGNORECASE)]
+
+
+def _assert_caps_surface_private(surface: str, default_cfg: Path) -> None:
+    """THE privacy checker: the caps surface (header lines or caps JSON) of a
+    warning-only configuration carries no digit at all (so no cap number in
+    any form: quoted, ``key=N``, ``key N``) and no provider id. The default
+    config path the mismatch warning names is the only scrubbed text."""
+    scrubbed = surface.replace(str(default_cfg), "<default-config>")
+    digits = re.findall(r"\d+", scrubbed)
+    assert not digits, f"cap number(s) {digits} leaked into the caps surface: {scrubbed!r}"
+    hits = _token_hits(scrubbed, _provider_ids())
+    assert not hits, f"provider id(s) {hits} leaked into the caps surface: {scrubbed!r}"
+
+
+def _assert_no_seeded_private_value(text: str) -> None:
+    """Whole-output check (task rows included): no seeded number or provider."""
+    numbers = [n for n in _PRIVATE_NUMBERS if re.search(r"(?<![0-9a-f])" + n + r"(?![0-9a-f])", text)]
+    assert not numbers, f"seeded private cap number(s) {numbers} leaked: {text!r}"
+    hits = _token_hits(text, _SEEDED_PROVIDERS)
+    assert not hits, f"seeded provider id(s) {hits} leaked: {text!r}"
+
+
+def _seed_private_configs(root: Path) -> Path:
+    _write_cfg(root / "config.yaml", _DEFAULT_PRIVATE_CFG)
+    _write_cfg(root / "profiles" / "evo" / "config.yaml", _INVOKING_PRIVATE_CFG)
+    from hermes_cli import kanban_board_caps as kbcaps
+    default_cfg = kbcaps.default_profile_config_path()
+    assert default_cfg == root / "config.yaml"
+    with kbc.connect_closing() as conn:
+        _seed_ready(conn)
+    return default_cfg
+
+
+def _human_caps_surface(text: str) -> str:
+    return "\n".join(line for line in text.splitlines()
+                     if line.startswith(("caps:", "warnings:")))
+
+
+def _private_outputs(root: Path) -> dict:
+    default_cfg = _seed_private_configs(root)
+    human = kc.run_slash("list")
+    payload = json.loads(kc.run_slash("list --json --with-caps"))
+    return {"default_cfg": default_cfg, "human": human, "payload": payload,
+            "plain": kc.run_slash("list --json")}
+
+
+def _assert_private(out: dict) -> None:
+    surface = _human_caps_surface(out["human"])
+    _assert_caps_surface_private(surface, out["default_cfg"])
+    _assert_no_seeded_private_value(out["human"].replace(str(out["default_cfg"]), "<default-config>"))
+    caps_json = json.dumps(out["payload"]["caps"])
+    _assert_caps_surface_private(caps_json, out["default_cfg"])
+    _assert_no_seeded_private_value(json.dumps(out["payload"]).replace(str(out["default_cfg"]), ""))
+    _assert_no_seeded_private_value(out["plain"])
+
+
+def test_caps_privacy_no_number_or_provider_in_any_form(sticky_profile_home):
+    out = _private_outputs(sticky_profile_home)
+    # Not vacuous: both resolver warnings (invalid keys, profile mismatch)
+    # reach the human header and the JSON, naming the keys.
+    surface = _human_caps_surface(out["human"])
+    assert surface.splitlines()[0] == "caps: none", surface
+    assert surface.count("warnings: ") == 2, surface
+    for key in ("max_spawn", "max_in_progress_per_profile", "default_assignee",
+                "max_in_progress_by_assignee.evo", "assignee_groups.gpu"):
+        assert key in surface, (key, surface)
+    assert "invoking profile caps differ" in surface, surface
+    assert len(out["payload"]["caps"]["warnings"]) == 2, out["payload"]["caps"]
+    assert all(w.startswith("kanban: ") for w in out["payload"]["caps"]["warnings"])
+    _assert_private(out)
+
+
+def test_caps_privacy_dashboard_payload(sticky_profile_home):
+    default_cfg = _seed_private_configs(sticky_profile_home)
+    mod = _plugin_api()
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    r = TestClient(app).get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    caps = r.json()["caps"]
+    assert caps["values"] == {} and len(caps["warnings"]) == 2, caps
+    _assert_caps_surface_private(json.dumps(caps), default_cfg)
+
+
+def test_caps_display_keeps_each_resolver_warning_whole():
+    """Surfaced by the privacy control: the resolver joins its lines with
+    "; " and its invalid-keys line itself contains "; ", so splitting on
+    every ";" cut one warning into fragments (two warnings showed as four)."""
+    from hermes_cli import kanban_board_caps as kbcaps
+    joined = ("kanban: ignoring invalid board caps (literal integers and names only; "
+              "a ${...} reference is never expanded): max_spawn; "
+              "kanban: invoking profile caps differ from default profile caps (max_spawn); "
+              "board caps taken from the default profile config (<path>)")
+    assert kbcaps.caps_display(kbcaps.BoardCaps({}, warning=joined))["warnings"] == [
+        "kanban: ignoring invalid board caps (literal integers and names only; "
+        "a ${...} reference is never expanded): max_spawn",
+        "kanban: invoking profile caps differ from default profile caps (max_spawn); "
+        "board caps taken from the default profile config (<path>)",
+    ]
+
+
+_LEAKS = {
+    "key=number": "kanban: dropped max_spawn=58213",
+    "key number": "kanban: dropped max_spawn 58213",
+    "number only": "kanban: invoking profile has 92741",
+    "provider": "kanban: board caps came from the zai profile",
+    "provider caps": "kanban: OpenRouter caps differ",
+    "reference": "kanban: max_in_progress is ${ZAI_MAX_IN_PROGRESS}",
+}
+
+
+@pytest.mark.parametrize("leak", list(_LEAKS.values()), ids=list(_LEAKS))
+def test_caps_privacy_checker_rejects_planted_leaking_resolver(sticky_profile_home, monkeypatch, leak):
+    """Known-red control: a resolver that leaks a private value WITHOUT quotes
+    must fail the same checker the real resolver passes. The old assertion
+    (``'"4"' not in text``) accepted every one of these leaks."""
+    import dataclasses
+    from hermes_cli import kanban_board_caps as kbcaps
+
+    real = kbcaps.read_board_caps
+
+    def leaky_read_board_caps():
+        caps = real()
+        return dataclasses.replace(caps, warning="; ".join(w for w in (caps.warning, leak) if w))
+
+    monkeypatch.setattr(kbcaps, "read_board_caps", leaky_read_board_caps)
+    out = _private_outputs(sticky_profile_home)
+    assert leak in out["human"], out["human"]  # the plant took effect
+    for number in _PRIVATE_NUMBERS:  # the old, quote-only exclusion is blind to it
+        assert f'"{number}"' not in out["human"]
+    with pytest.raises(AssertionError):
+        _assert_caps_surface_private(_human_caps_surface(out["human"]), out["default_cfg"])
+    with pytest.raises(AssertionError):
+        _assert_caps_surface_private(json.dumps(out["payload"]["caps"]), out["default_cfg"])
+    with pytest.raises(AssertionError):
+        _assert_private(out)
+

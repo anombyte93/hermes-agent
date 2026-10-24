@@ -42,6 +42,7 @@ resolving from that process's profile.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, Optional
@@ -427,7 +428,7 @@ def caps_display(caps: BoardCaps) -> Dict[str, Any]:
     """The resolved board caps as one JSON-safe object for surfaces that SHOW
     them (``kanban list`` header, dashboard): ``values`` (each cap in effect),
     ``scope`` (``managed``/``user`` per value; a group's members ride its key)
-    and ``warnings`` (the resolver's key-only warning lines, split on ``;``).
+    and ``warnings`` (the resolver's key-only warning lines, one entry per line).
 
     ONE resolution, ONE shape: every display surface renders this object and
     never re-implements resolution. Derived-from-memory values
@@ -440,7 +441,10 @@ def caps_display(caps: BoardCaps) -> Dict[str, Any]:
     for key, value, source in cap_rows(resolved):
         values[key] = value
         scope[key] = "managed" if source == SOURCE_MANAGED else "user"
-    warnings = [w.strip() for w in (caps.warning or "").split(";") if w.strip()]
+    # The resolver joins its lines with "; " and a line may itself contain
+    # "; " ("names only; a ${...} reference ..."), so split only where the
+    # next line starts: every resolver line begins with "kanban: ".
+    warnings = [w.strip() for w in re.split(r";\s*(?=kanban: )", caps.warning or "") if w.strip()]
     return {"values": values, "scope": scope, "warnings": warnings}
 
 
