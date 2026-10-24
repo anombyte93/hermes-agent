@@ -9855,6 +9855,30 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _has_deliberate_requeue_after(
+    conn: sqlite3.Connection, task_id: str, after: int, *, inclusive: bool = False,
+) -> bool:
+    """Automatic claim expiry is recovery, not permission to duplicate work."""
+    comparison = ">=" if inclusive else ">"
+    for event in conn.execute(
+        "SELECT kind, payload FROM task_events "
+        f"WHERE task_id = ? AND created_at {comparison} ? "
+        "AND kind IN ('status', 'promoted', 'promoted_manual', 'unblocked', 'reclaimed')",
+        (task_id, after),
+    ):
+        if event["kind"] != "reclaimed":
+            return True
+        # Both reclaim_task and release_stale_claims emit reclaimed. Only the
+        # former records manual=true; missing/invalid payloads prove no intent.
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else None
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("manual") is True:
+            return True
+    return False
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9900,13 +9924,18 @@ def check_respawn_guard(
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
         seconds. Useful work already succeeded for this task; wait for an
         explicit re-queue rather than immediately re-spawning. Bypassed when an
-        explicit re-queue event (status change, promote, unblock, reclaim)
+        explicit re-queue event (status change, promote, unblock, manual reclaim)
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A GitHub PR URL appears in a recent comment at or after a claimed run
+        on this task, authored by that run's profile (within
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds). Re-spawning risks a duplicate PR
+        unless an explicit re-queue is newer than the newest such comment.
+        Zero-run cards, pre-claim context and authors who have not run this task
+        never qualify, even if their profile matches the current assignee.
+        Post-run handoffs and prior workers' links remain duplicate-work signals.
+        Automatic claim-expiry reclaims do not lift either duplicate-work guard.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9972,7 +10001,7 @@ def check_respawn_guard(
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
-    #    reclaim) is a deliberate "run it again" — honor it instead of
+    #    manual reclaim) is a deliberate "run it again" — honor it instead of
     #    deferring. Without this, a manual done→ready just sits there,
     #    silently held by the guard, until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
@@ -9984,24 +10013,34 @@ def check_respawn_guard(
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
-        ).fetchone()
+        requeued_after = _has_deliberate_requeue_after(
+            conn, task_id, completed_at, inclusive=True,
+        )
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. Only own-worker PR links are duplicate-work signals. Comments store
+    # profile names (kanban_comment's HERMES_PROFILE), so bind each author to
+    # a claimed run on THIS task, no later than the comment. Assignee equality
+    # alone mistakes sibling handoffs for own work and traps zero-run children.
+    # No end bound: a worker may report its PR after the run has been closed.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT c.body, c.created_at FROM task_comments c "
+        "WHERE c.task_id = ? AND c.created_at >= ? "
+        "AND EXISTS (SELECT 1 FROM task_runs r "
+        "WHERE r.task_id = c.task_id AND r.profile = c.author "
+        "AND r.started_at <= c.created_at) "
+        "ORDER BY c.created_at DESC, c.id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            requeued_after = _has_deliberate_requeue_after(
+                conn, task_id, c["created_at"],
+            )
+            # Newest own PR comment is authoritative: don't let an old link
+            # veto a deliberate resume, or an old requeue clear a newer PR.
+            return None if requeued_after else "active_pr"
 
     return None
 
