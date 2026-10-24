@@ -153,3 +153,68 @@ def test_release_sha_unknown_to_repo_is_unknown(tmp_path: Path, repo: Path) -> N
     proc = run_check(head, "--launcher", str(launcher), "--repo", str(repo))
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert proc.stdout.startswith("UNKNOWN:")
+
+
+# --- Review r1 finding 1: the launcher's last line, read exactly as
+# hermes-release.sh live_release() reads it (`tail -n1 | grep -oE`).
+
+RELEASE_RE_SH = r"(/[A-Za-z0-9._@+-]+)+/releases/hermes-agent-[0-9a-f]{7,40}"
+
+
+def _status_release_paths(launcher: Path) -> list[str]:
+    """What hermes-release.sh status sees: tail -n1 | grep -oE | sort -u."""
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"tail -n1 \"$1\" | grep -oE '{RELEASE_RE_SH}' | sort -u || true",
+            "_",
+            str(launcher),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line for line in proc.stdout.split("\n") if line]
+
+
+def test_trailing_blank_line_launcher_is_unknown(tmp_path: Path, repo: Path) -> None:
+    """tail -n1 of 'exec R\\n\\n' is the empty line: status says UNKNOWN, so must we."""
+    release = _commit(repo, "only")
+    launcher = _launcher(tmp_path, release)
+    launcher.write_text(launcher.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert _status_release_paths(launcher) == []  # the control: status is UNKNOWN
+    proc = run_check(release, "--launcher", str(launcher), "--repo", str(repo))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("UNKNOWN:")
+
+
+@pytest.mark.parametrize(
+    ("tail_text", "status_live"),
+    [
+        ("\n", True),  # exactly one terminal newline (the normal wrapper)
+        ("", True),  # no terminal newline: tail -n1 returns the partial line
+        ("\n\n", False),  # one trailing blank line
+        ("\n\n\n", False),  # several trailing blank lines
+        ("\n   \n", False),  # a trailing whitespace-only line
+        ("\r\n", True),  # CRLF: the CR stays on the line, the path matches
+        ("\rjunk\n", True),  # a bare CR is not a line break for tail
+    ],
+)
+def test_last_line_matches_release_status(
+    tmp_path: Path, repo: Path, tail_text: str, status_live: bool
+) -> None:
+    """LIVE exactly when hermes-release.sh status reads one release path."""
+    release = _commit(repo, "only")
+    launcher = _launcher(tmp_path, release)
+    body = launcher.read_text(encoding="utf-8").removesuffix("\n")
+    launcher.write_bytes((body + tail_text).encode("utf-8"))
+    # The control: the real tail -n1 | grep -oE pipeline gives the expected view.
+    assert (len(_status_release_paths(launcher)) == 1) is status_live
+    proc = run_check(release, "--launcher", str(launcher), "--repo", str(repo))
+    if status_live:
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.stdout.strip() == f"LIVE {release[:7]} in release {release[:7]}"
+    else:
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert proc.stdout.startswith("UNKNOWN:")
