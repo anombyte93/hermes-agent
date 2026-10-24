@@ -1591,3 +1591,242 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Workflow bridge (K2/K3/K4/K5/K6/K7/K8) ------------------------- */
+
+.hermes-kanban-workflow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.hermes-kanban-workflow-btn {
+  align-self: flex-start;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 4%, transparent);
+  color: var(--color-foreground);
+  cursor: pointer;
+}
+.hermes-kanban-workflow-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hermes-kanban-workflow-attention-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-left: 2px solid var(--color-destructive, #d14a4a);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+  cursor: pointer;
+  font-size: 0.72rem;
+}
+.hermes-kanban-workflow-attention-card:hover {
+  border-left-color: var(--color-ring);
+}
+.hermes-kanban-workflow-attention-id {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-attention-title {
+  color: var(--color-foreground);
+  font-weight: 600;
+}
+.hermes-kanban-workflow-attention-status {
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-attention-reasons,
+.hermes-kanban-workflow-attention-action {
+  color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-workflow-change-event {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.7rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-change-task {
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-changes-fresh {
+  margin-top: 0.1rem;
+}
+
+.hermes-kanban-workflow-interval {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+  border-left: 2px solid var(--color-border);
+  padding-left: 0.5rem;
+}
+.hermes-kanban-workflow-interval-kind {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-foreground);
+  min-width: 6rem;
+}
+.hermes-kanban-workflow-interval-dur {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-totals {
+  margin-top: 0.1rem;
+}
+.hermes-kanban-workflow-gaps {
+  margin-top: 0.1rem;
+}
+
+.hermes-kanban-workflow-check {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  border-left: 2px solid var(--color-border);
+  padding-left: 0.5rem;
+}
+.hermes-kanban-workflow-check-name {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-foreground);
+  min-width: 8rem;
+}
+.hermes-kanban-workflow-check-state {
+  font-weight: 600;
+}
+.hermes-kanban-workflow-check-reason {
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-verdict {
+  font-weight: 600;
+  margin-top: 0.15rem;
+}
+
+.hermes-kanban-workflow-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 0.75rem;
+  padding: 0.3rem 0.45rem;
+  margin-top: 0.3rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: transparent;
+  color: var(--color-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.hermes-kanban-workflow-input::placeholder {
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-comm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hermes-kanban-workflow-draft {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.hermes-kanban-workflow-draft-original {
+  margin-top: 0.15rem;
+}
+.hermes-kanban-workflow-fingerprint {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-excerpt {
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  border-left: 2px solid var(--color-border);
+  padding-left: 0.4rem;
+  margin-top: 0.1rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.hermes-kanban-workflow-remaining {
+  font-size: 0.72rem;
+  display: flex;
+  flex-direction: column;
+}
+.hermes-kanban-workflow-remaining-check {
+  color: var(--color-foreground);
+}
+.hermes-kanban-workflow-remaining-acceptance {
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+}
+.hermes-kanban-workflow-result {
+  margin-top: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+/* K7 in-page notification region (extended existing /events stream). */
+.hermes-kanban-workflow-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-left: 2px solid var(--color-ring);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+  font-size: 0.72rem;
+}
+.hermes-kanban-workflow-notice-open {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+.hermes-kanban-workflow-notice-kind {
+  font-weight: 600;
+  color: var(--color-foreground);
+  white-space: nowrap;
+}
+.hermes-kanban-workflow-notice-task {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-workflow-notice-dismiss {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 0;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0 0.15rem;
+}
+.hermes-kanban-workflow-notice-dismiss:hover {
+  color: var(--color-foreground);
+}
+.hermes-kanban-workflow-notice-paused {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  margin-top: 0.15rem;
+}

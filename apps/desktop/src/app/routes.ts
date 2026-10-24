@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
+import type { Contribution } from '@/contrib/types'
 
 type NavigateLike = (to: string, options?: { replace?: boolean }) => void
 
@@ -87,9 +88,31 @@ export interface RouteContribution {
   path: string
 }
 
-export function contributedRoutes(): Array<{ key: string; path: string; title?: string; render: () => ReactNode }> {
-  return registry
-    .getArea(ROUTES_AREA)
+export function contributedRoutes(): ContributedRoute[] {
+  return routesFromContributions(registry.getArea(ROUTES_AREA))
+}
+
+/** A renderable contributed page route, derived from a resolved ROUTES_AREA
+ *  snapshot. */
+export interface ContributedRoute {
+  key: string
+  path: string
+  title?: string
+  render: () => ReactNode
+}
+
+/** Derive renderable routes from a resolved `routes` contribution snapshot.
+ *
+ *  Pure over its input so React callers can pass the live `useContributions`
+ *  snapshot and give the compiler a real dependency. Reading the registry
+ *  directly (the no-arg `contributedRoutes` above) is invisible to the React
+ *  compiler, which memoizes it as a constant — a route registered after mount
+ *  then never renders until a reload (#issue55). Non-React callers (path
+ *  classification, navigation, pane-mirror titles) keep the imperative read,
+ *  which runs fresh on every call and needs no subscription.
+ */
+export function routesFromContributions(contributions: readonly Contribution[]): ContributedRoute[] {
+  return contributions
     .map(c => ({
       key: `${c.source ?? 'core'}:${c.id}`,
       path: (c.data as RouteContribution | undefined)?.path ?? '',

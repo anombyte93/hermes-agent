@@ -1061,6 +1061,7 @@ def find_windows_gateway_services(
         if profile_processes is None:
             profile_processes = find_profile_gateway_processes(strict=True)
         service_names_by_pid: dict[int, set[str]] = {}
+        indeterminate_services_by_pid: dict[int, list[tuple[str, object]]] = {}
         for service in psutil_module.win_service_iter():
             try:
                 if all(
@@ -1086,9 +1087,11 @@ def find_windows_gateway_services(
             if service_status == "stopped":
                 continue
             if service_status != "running":
-                raise RuntimeError(
-                    f"SCM service {service_name} has indeterminate status: {service_status}"
-                )
+                if service_pid > 0:
+                    indeterminate_services_by_pid.setdefault(service_pid, []).append(
+                        (service_name, service_status)
+                    )
+                continue
             if service_pid <= 0:
                 raise RuntimeError(
                     f"Running SCM service {service_name} has no valid process ID"
@@ -1107,6 +1110,14 @@ def find_windows_gateway_services(
             ) > 0.001:
                 raise RuntimeError("Gateway process identity changed during SCM discovery")
             ancestor_pids = [int(parent.pid) for parent in gateway_process.parents()]
+            for pid in ancestor_pids:
+                indeterminate_services = indeterminate_services_by_pid.get(pid, [])
+                if indeterminate_services:
+                    service_name, service_status = indeterminate_services[0]
+                    raise RuntimeError(
+                        f"SCM service {service_name} has indeterminate status: "
+                        f"{service_status}"
+                    )
             shared_service_pids = [
                 pid
                 for pid in ancestor_pids
@@ -1936,6 +1947,210 @@ def _probe_launchd_service_running() -> bool:
     if result.returncode != 0:
         return False
     return _parse_launchd_pid_from_list_output(result.stdout) is not None
+
+
+def collect_gateway_ownership(system: bool = False):
+    """Build a :class:`gateway.reconcile.GatewayOwnership` for this profile.
+
+    Issue #9: ``gateway status`` could print "service failed", "definition
+    outdated", "manual process running" and "port occupied" as four unrelated
+    lines and still leave the operator without an answer to "who owns this
+    gateway". This collapses the same facts into one verdict — and it is the
+    only place the CLI decides it, so status and reconcile can never disagree.
+
+    Read-only: probes systemd/launchd state and PID files, starts nothing.
+    """
+    from gateway.reconcile import ListenerState, ServiceState, classify_gateway_ownership
+
+    snapshot = get_gateway_runtime_snapshot(system=system)
+    live_pids = [pid for pid in snapshot.gateway_pids if pid and pid > 0]
+
+    service_main_pid = None
+    failed = False
+    enabled = True
+    unit_current = True
+    if supports_systemd_services():
+        selected_system = _select_systemd_scope(system)
+        try:
+            props = _read_systemd_unit_properties(system=selected_system)
+        except Exception:
+            props = {}
+        service_main_pid = _systemd_main_pid_from_props(props)
+        failed = props.get("ActiveState", "") == "failed"
+        enabled = props.get("UnitFileState", "enabled") not in ("disabled", "masked")
+        if snapshot.service_installed:
+            try:
+                unit_current = systemd_unit_is_current(system=selected_system)
+            except Exception:
+                unit_current = True
+    elif is_macos() and snapshot.service_installed:
+        try:
+            unit_current = launchd_plist_is_current()
+        except Exception:
+            unit_current = True
+
+    service = ServiceState(
+        installed=snapshot.service_installed,
+        active=snapshot.service_running,
+        failed=failed,
+        enabled=enabled,
+        unit_current=unit_current,
+        main_pid=service_main_pid,
+    )
+
+    listener = None
+    if live_pids:
+        # Prefer the service's own MainPID when it is genuinely among the live
+        # gateway PIDs — otherwise the first live PID owns the profile.
+        pid = service_main_pid if service_main_pid in live_pids else live_pids[0]
+        listener = ListenerState(
+            pid=pid,
+            profile=_profile_suffix() or "default",
+            managed=bool(service_main_pid) and pid == service_main_pid
+            and snapshot.service_running,
+        )
+
+    return classify_gateway_ownership(service, listener)
+
+
+def _gateway_ownership_status_lines(system: bool = False) -> list[str]:
+    """Ownership + dispatcher-liveness lines for ``hermes gateway status``."""
+    lines: list[str] = []
+    try:
+        ownership = collect_gateway_ownership(system=system)
+    except Exception:
+        ownership = None
+    if ownership is not None:
+        lines.append(ownership.describe())
+        if ownership.state != "healthy":
+            lines.append(
+                "  Inspect the safe plan with: hermes gateway reconcile"
+                "  (dry run — it prints the plan and changes nothing)"
+            )
+
+    try:
+        from gateway.dispatcher_heartbeat import describe_dispatcher_heartbeat
+
+        lines.append(describe_dispatcher_heartbeat())
+    except Exception:
+        pass
+
+    # Name the owner of the gateway's API port rather than only saying it is
+    # occupied (issue #9). Value-safe: PID, profile and process name only.
+    try:
+        from gateway.reconcile import describe_port_owner
+
+        port = _configured_api_server_port()
+        if port:
+            owner = describe_port_owner(port)
+            if owner is not None and not owner.is_hermes_gateway:
+                lines.append(f"⚠ {owner.describe()}")
+            elif owner is not None:
+                lines.append(f"  {owner.describe()}")
+    except Exception:
+        pass
+    return lines
+
+
+def _configured_api_server_port() -> int | None:
+    """This profile's api_server port, or None when it cannot be resolved."""
+    try:
+        raw = get_env_value("API_SERVER_PORT")
+        if raw:
+            return int(str(raw).strip())
+    except Exception:
+        pass
+    try:
+        cfg = read_raw_config() or {}
+        extra = (
+            cfg.get("platforms", {}).get("api_server", {}).get("extra", {})
+            if isinstance(cfg, dict)
+            else {}
+        )
+        port = extra.get("port") if isinstance(extra, dict) else None
+        if port:
+            return int(port)
+    except Exception:
+        pass
+    return 8642
+
+
+def gateway_reconcile(system: bool = False, apply: bool = False,
+                      takeover: bool = False) -> int:
+    """Print (and optionally apply) the idempotent reconciliation plan.
+
+    Dry run by default. The plan never starts a listener while a same-profile
+    one is alive; transferring ownership away from an unmanaged process
+    requires an explicit ``--takeover``, which stops the incumbent first. That
+    ordering, plus a re-probe immediately before the start, is what makes a
+    second listener impossible (issue #9).
+    """
+    from gateway.reconcile import apply_reconciliation, plan_reconciliation
+
+    ownership = collect_gateway_ownership(system=system)
+    print(ownership.describe())
+    plan = plan_reconciliation(ownership, allow_takeover=takeover)
+    print()
+    print(plan.describe())
+
+    for line in _gateway_ownership_status_lines(system=system)[1:]:
+        print(line)
+
+    if not apply:
+        if plan.actions:
+            print()
+            print("Dry run — nothing was changed. Re-run with --apply to execute.")
+        return 0
+
+    selected_system = _select_systemd_scope(system) if supports_systemd_services() else system
+
+    class _Ops:
+        def listener_is_live(self) -> bool:
+            return bool([p for p in find_gateway_pids() if p and p > 0])
+
+        def refresh_unit(self) -> None:
+            if supports_systemd_services():
+                refresh_systemd_unit_if_needed(system=selected_system)
+            elif is_macos():
+                refresh_launchd_plist_if_needed()
+
+        def install_service(self) -> None:
+            if supports_systemd_services():
+                systemd_install(system=selected_system, non_interactive=True)
+            elif is_macos():
+                launchd_install()
+
+        def reset_failed(self) -> None:
+            if supports_systemd_services():
+                _run_systemctl(
+                    ["reset-failed", get_service_name()],
+                    system=selected_system, timeout=10,
+                )
+
+        def stop_listener(self, pid: int) -> None:
+            stop_profile_gateway()
+
+        def start_service(self) -> None:
+            if supports_systemd_services():
+                systemd_start(system=selected_system)
+            elif is_macos():
+                launchd_start()
+
+    result = apply_reconciliation(plan, _Ops())
+    print()
+    if result.ok:
+        print(f"✓ Reconciled: {', '.join(result.performed) or 'no changes needed'}")
+        return 0
+    print(
+        f"✗ Reconciliation stopped after {', '.join(result.performed) or 'no actions'}: "
+        f"{result.refused_reason}"
+    )
+    if result.refused_reason == "listener_already_live":
+        print(
+            "  A same-profile gateway is already listening. Refusing to start a "
+            "second one — stop it first, or re-run with --takeover."
+        )
+    return 1
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -4704,6 +4919,13 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
         for line in runtime_lines:
             print(f"  {line}")
 
+    ownership_lines = _gateway_ownership_status_lines(system=system)
+    if ownership_lines:
+        print()
+        print("Ownership and dispatch:")
+        for line in ownership_lines:
+            print(f"  {line}")
+
     unit_props = _read_systemd_unit_properties(system=system)
     active_state = unit_props.get("ActiveState", "")
     sub_state = unit_props.get("SubState", "")
@@ -5988,6 +6210,13 @@ def launchd_status(deep: bool = False):
         print("  Run: hermes gateway start")
         if fallback_pid:
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
+
+    ownership_lines = _gateway_ownership_status_lines()
+    if ownership_lines:
+        print()
+        print("Ownership and dispatch:")
+        for line in ownership_lines:
+            print(f"  {line}")
 
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
@@ -8228,6 +8457,19 @@ def _gateway_command_inner(args):
 
     if subcmd == "setup":
         gateway_setup()
+        return
+
+    if subcmd == "reconcile":
+        # Dry run by default: it prints the plan and changes nothing. --apply
+        # executes it, and even then a start is refused while a same-profile
+        # listener is alive (issue #9 — never two listeners).
+        code = gateway_reconcile(
+            system=getattr(args, "system", False),
+            apply=getattr(args, "apply", False),
+            takeover=getattr(args, "takeover", False),
+        )
+        if code:
+            sys.exit(code)
         return
 
     # Service management commands

@@ -142,9 +142,12 @@ class TestReconcileOrphanedRunning:
     def test_non_running_statuses_ignored(self, conn):
         for status in ("todo", "ready", "blocked", "done"):
             tid = kb.create_task(conn, title=f"s-{status}", assignee="w")
+            # ``blocked`` requires a current reason (kernel-level trigger); the
+            # other non-running statuses carry none.
+            block_reason = "test-only block reason" if status == "blocked" else None
             conn.execute(
-                "UPDATE tasks SET status=?, claim_lock=NULL, "
-                "claim_expires=NULL WHERE id=?", (status, tid),
+                "UPDATE tasks SET status=?, block_reason=?, claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (status, block_reason, tid),
             )
         conn.commit()
         assert kb.reconcile_orphaned_running(conn) == []
@@ -152,6 +155,21 @@ class TestReconcileOrphanedRunning:
 
 class TestDispatchOnceReconciles:
     def test_dispatch_once_reconciles_orphans(self, conn):
+        """Non-dry-run tick: orphans are durably requeued to ready."""
+        tid = kb.create_task(conn, title="zombie", assignee="w")
+        _orphan_running(conn, tid)
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""))
+
+        assert tid in result.reconciled_orphans
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["status"] == "ready"
+
+    def test_dispatch_once_dry_run_previews_orphan_reconcile_without_writes(self, conn):
+        """dry_run: the reconciliation is REPORTED (preview) but the source
+        row and the durable event log are left untouched — the same no-write
+        preview contract as every other dispatch_once side effect."""
         tid = kb.create_task(conn, title="zombie", assignee="w")
         _orphan_running(conn, tid)
 
@@ -159,9 +177,13 @@ class TestDispatchOnceReconciles:
                                   dry_run=True)
 
         assert tid in result.reconciled_orphans
+        # Source row untouched: still running, not requeued.
         assert conn.execute(
             "SELECT status FROM tasks WHERE id=?", (tid,)
-        ).fetchone()["status"] == "ready"
+        ).fetchone()["status"] == "running"
+        # No durable `reconciled` event was logged for a preview.
+        assert [e for e in kb.list_events(conn, tid)
+                if e.kind == "reconciled"] == []
 
     def test_dispatch_once_reconcile_can_be_disabled(self, conn):
         """kanban.reconcile_orphans=false plumbs through as

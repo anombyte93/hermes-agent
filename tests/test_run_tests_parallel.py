@@ -460,3 +460,163 @@ def test_drive_letter_colon_is_not_a_path_separator(tmp_path: Path) -> None:
         f"drive letter split off as a phantom root:\n{proc.stdout}"
     )
     assert "Discovered 1 test files" in proc.stdout, proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Missing explicitly-named paths are rejected up front.
+#
+# The bug: _discover_files silently skipped a nonexistent root, so
+# ``runner a.py missing.py`` exited 0 having run only a.py. The fix rejects
+# the whole selection before any test child spawns. A synthetic marker file
+# proves the valid file never executed: had its test run, the marker would
+# exist.
+
+
+def _marker_probe_dir(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    """A synthetic dir with one passing test that writes a marker when run.
+
+    Returns (probe_dir, marker). The marker's absence after a run proves the
+    test inside never executed.
+    """
+    probe_dir = tmp_path / name
+    probe_dir.mkdir()
+    marker = probe_dir / "ran"
+    (probe_dir / "test_valid.py").write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+            def test_writes_marker():
+                Path({str(marker)!r}).write_text("executed")
+                assert True
+            """
+        ).strip() + "\n",
+        encoding="utf-8",
+    )
+    return probe_dir, marker
+
+
+def test_missing_positional_path_rejected_before_any_test_runs(tmp_path: Path) -> None:
+    """A missing positional path fails the run and the valid file never runs."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir, marker = _marker_probe_dir(tmp_path, "probe_pos")
+    valid = probe_dir / "test_valid.py"
+    missing = tmp_path / "does_not_exist" / "test_missing.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), str(valid), str(missing),
+         "-j", "1", "--file-timeout", "30", "-q"],
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60,
+    )
+
+    assert proc.returncode != 0, proc.stdout
+    assert "test_missing.py" in proc.stdout, proc.stdout
+    assert not marker.exists(), (
+        f"valid file executed despite the rejected selection; "
+        f"runner output:\n{proc.stdout}"
+    )
+
+
+def test_missing_paths_entry_rejected_before_any_test_runs(tmp_path: Path) -> None:
+    """A missing ``--paths`` entry fails the run and the valid dir never runs."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir, marker = _marker_probe_dir(tmp_path, "probe_paths")
+    missing_dir = tmp_path / "does_not_exist"
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--paths",
+         f"{probe_dir}:{missing_dir}",
+         "-j", "1", "--file-timeout", "30", "-q"],
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60,
+    )
+
+    assert proc.returncode != 0, proc.stdout
+    assert str(missing_dir) in proc.stdout, proc.stdout
+    assert not marker.exists(), (
+        f"valid dir executed despite the rejected selection; "
+        f"runner output:\n{proc.stdout}"
+    )
+
+
+def test_missing_files_entry_rejected_before_any_test_runs(tmp_path: Path) -> None:
+    """A missing ``--files`` entry fails the run and the valid file never runs."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir, marker = _marker_probe_dir(tmp_path, "probe_files")
+    valid = probe_dir / "test_valid.py"
+    missing = tmp_path / "does_not_exist" / "test_missing.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--files", f"{valid}:{missing}",
+         "-j", "1", "--file-timeout", "30", "-q"],
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60,
+    )
+
+    assert proc.returncode != 0, proc.stdout
+    assert "test_missing.py" in proc.stdout, proc.stdout
+    assert not marker.exists(), (
+        f"valid file executed despite the rejected selection; "
+        f"runner output:\n{proc.stdout}"
+    )
+
+
+def test_all_missing_paths_are_named(tmp_path: Path) -> None:
+    """Every invalid explicit path is named, not just the first one hit."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    missing_a = tmp_path / "nope_a" / "test_a.py"
+    missing_b = tmp_path / "nope_b" / "test_b.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), str(missing_a), str(missing_b),
+         "-j", "1", "--file-timeout", "30", "-q"],
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60,
+    )
+
+    assert proc.returncode != 0, proc.stdout
+    assert "test_a.py" in proc.stdout, proc.stdout
+    assert "test_b.py" in proc.stdout, proc.stdout
+
+
+def test_explicit_skipped_dir_optin_still_runs(tmp_path: Path) -> None:
+    """A valid dir inside a skip-part is NOT treated as missing and still runs.
+
+    ``_SKIP_PARTS`` excludes integration/e2e/docker from default discovery,
+    but an explicitly named directory in that set opts back in. The missing
+    path rejection must not fire on it (the dir exists), and the test inside
+    must actually execute.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    marker = docker_dir / "ran"
+    (docker_dir / "test_in_docker.py").write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+            def test_writes_marker():
+                Path({str(marker)!r}).write_text("executed")
+                assert True
+            """
+        ).strip() + "\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), str(docker_dir),
+         "-j", "1", "--file-timeout", "30", "-q"],
+        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert marker.exists(), (
+        f"test inside the opted-in dir did not run; "
+        f"runner output:\n{proc.stdout}"
+    )

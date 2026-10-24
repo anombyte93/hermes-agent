@@ -696,7 +696,13 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     )
     assert tripped is True
     assert _failures(conn, task_id) == 2
-    assert kb.get_task(conn, task_id).status == "blocked"
+    tripped_task = kb.get_task(conn, task_id)
+    assert tripped_task is not None
+    assert tripped_task.status == "blocked"
+    assert tripped_task.block_reason is not None
+    assert tripped_task.block_reason.startswith(
+        "Circuit breaker tripped after 2 consecutive crashed failure(s):"
+    )
 
     # Sanity: complete_task's success path still clears the counter.
     ok_id = kb.create_task(conn, title="healthy", assignee="builder")

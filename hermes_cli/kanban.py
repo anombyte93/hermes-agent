@@ -56,6 +56,46 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _board_search_context(args: argparse.Namespace) -> str:
+    """Describe the existing resolver's result, without choosing a board here."""
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        # kanban_db_path() honours the pinned database before any board
+        # selection, so a board slug here would be misleading.
+        return (
+            f"database {kb.kanban_db_path()} "
+            "(pinned by HERMES_KANBAN_DB; board selection ignored)"
+        )
+    board, source = kb.resolve_current_board_with_source()
+    if getattr(args, "board", None):
+        label = "--board"
+    elif source == kb.BOARD_SOURCE_CURRENT_FILE:
+        label = str(kb.current_board_path())
+    elif source == kb.BOARD_SOURCE_DEFAULT:
+        label = "built-in default"
+    else:
+        label = source
+    return f"board {board!r} (resolved from {label})"
+
+
+def _refusal_reason(
+    conn,
+    args: argparse.Namespace,
+    task_id: str,
+    verb: str,
+    **kwargs: Any,
+) -> str:
+    """Why ``verb`` was refused for ``task_id``, with the searched board."""
+    return kb.explain_refusal(
+        conn, task_id, verb,
+        unknown_context=_board_search_context(args),
+        **kwargs,
+    )
+
+
+def _task_not_found(args: argparse.Namespace, task_id: str) -> str:
+    return f"no such task: {task_id} on {_board_search_context(args)}"
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -63,6 +103,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "block_reason": t.block_reason,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -213,6 +254,26 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+def _add_subcommand_board_arguments(
+    parser: argparse.ArgumentParser, board_help: str,
+) -> None:
+    """Accept the shared selector at every level, preserving local board args."""
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        # Aliases reference the same parser; register the flag only once.
+        for child in dict.fromkeys(action.choices.values()):
+            if not any(
+                arg.dest == "board" or "--board" in arg.option_strings
+                for arg in child._actions
+            ):
+                child.add_argument(
+                    "--board", default=argparse.SUPPRESS, metavar="<slug>",
+                    help=board_help,
+                )
+            _add_subcommand_board_arguments(child, board_help)
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -234,7 +295,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # writes to that board's DB. When omitted, resolves via the
     # HERMES_KANBAN_BOARD env var, then the persisted current-board
     # file, then "default". See kanban_db.get_current_board().
-    kanban_parser.add_argument(
+    board_argument = kanban_parser.add_argument(
         "--board",
         default=None,
         metavar="<slug>",
@@ -242,7 +303,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Board slug to operate on. Defaults to the current board "
             "(set via `hermes kanban boards switch <slug>` or the "
             "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards list` "
-            "to see all boards."
+            "to see all boards. May be given before or after subcommands; "
+            "the last explicit value wins."
         ),
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
@@ -326,6 +388,44 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_export = boards_sub.add_parser(
+        "export",
+        help="Export a board to a portable .tar.gz archive",
+        description=(
+            "Package a board's tasks, comments, links, history, and file "
+            "attachments into one archive that can be imported on another "
+            "machine. Claims, worker PIDs, chat subscriptions, and paths "
+            "belonging to this machine are stripped. Workspaces are never "
+            "included — they are rebuilt on demand."
+        ),
+    )
+    b_export.add_argument("slug", nargs="?", default=None,
+                          help="Board to export (default: the current board)")
+    b_export.add_argument("-o", "--output", default=None,
+                          help="Archive path (default: ./<slug>.tar.gz)")
+    b_export.add_argument("--no-attachments", action="store_true",
+                          help="Skip attachment files, keeping the archive small")
+    b_export.add_argument("--include-logs", action="store_true",
+                          help="Include per-task worker logs")
+    b_export.add_argument("--json", action="store_true")
+
+    b_import = boards_sub.add_parser(
+        "import",
+        help="Import a board archive as a new board",
+        description=(
+            "Import a .tar.gz produced by `hermes kanban boards export`. "
+            "The board always lands as a NEW board — the slug gains a "
+            "numeric suffix if it is already taken — so an import can "
+            "never overwrite or merge into a board you already have."
+        ),
+    )
+    b_import.add_argument("archive", help="Path to the .tar.gz archive")
+    b_import.add_argument("--as", dest="as_slug", default=None,
+                          help="Slug for the imported board (default: from the archive)")
+    b_import.add_argument("--switch", action="store_true",
+                          help="Switch to the imported board afterwards")
+    b_import.add_argument("--json", action="store_true")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -399,6 +499,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--block-reason", default=None,
+                          help="Required human-readable reason when "
+                               "--initial-status=blocked.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -630,9 +733,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument(
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
-            "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
+            "Typed block reason. 'dependency' only when this card has an "
+            "unfinished parent card (it waits in todo and is auto-promoted "
+            "when the parents finish); with none it lands in blocked for a "
+            "human. A question for whoever filed the card is "
+            "kind='needs_input'. 'needs_input'/'capability' go to blocked "
+            "for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
         ),
@@ -1014,6 +1120,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # Suppressed child defaults leave an earlier --board intact when omitted.
+    _add_subcommand_board_arguments(kanban_parser, board_argument.help)
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1159,7 +1267,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            message = f"kanban: {exc}"
+            if str(exc).startswith("unknown task"):
+                message += f" on {_board_search_context(args)}"
+            print(message, file=sys.stderr)
             return 1
 
 
@@ -1268,6 +1379,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "export":
+        return _cmd_boards_export(args)
+    if sub == "import":
+        return _cmd_boards_import(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1443,6 +1558,64 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_export(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_transfer
+    from hermes_cli.sizefmt import format_bytes
+
+    slug = args.slug or kb.get_current_board()
+    output = args.output or f"{slug}.tar.gz"
+    try:
+        res = kanban_transfer.export_board(
+            slug,
+            output,
+            include_attachments=not args.no_attachments,
+            include_logs=args.include_logs,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"kanban boards export: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    counts = res["counts"]
+    print(f"Exported board {res['board']!r} → {res['archive']}")
+    print(f"  Size:        {format_bytes(res['size'])}")
+    print(f"  Tasks:       {counts['tasks']}")
+    print(f"  Comments:    {counts['task_comments']}")
+    print(f"  Attachments: {counts['attachment_files']}")
+    print("Import it with `hermes kanban boards import <archive>`.")
+    return 0
+
+
+def _cmd_boards_import(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_transfer
+
+    try:
+        res = kanban_transfer.import_board(
+            args.archive, args.as_slug, activate=args.switch
+        )
+    except (OSError, ValueError) as exc:
+        print(f"kanban boards import: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Imported board {res['board']!r} ({res['name']}).")
+    if res["renamed"]:
+        print(f"  Renamed from {res['requested_board']!r} — that slug was taken.")
+    print(f"  Path:  {res['path']}")
+    print(f"  Tasks: {res['counts']['tasks']}")
+    for warning in res["warnings"]:
+        print(f"  Note:  {warning}")
+    if res["activated"]:
+        print(f"  Active board is now {res['board']!r}.")
+    else:
+        print(f"  Switch to it with `hermes kanban boards switch {res['board']}`.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1539,7 +1712,76 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _implicit_board(args: argparse.Namespace) -> Optional[str]:
+    """Board slug when this call's board came only from ``<root>/kanban/current``.
+
+    That file is global: any session's ``boards switch`` (or a dashboard
+    switch) rewrites it for every later caller with no ``--board`` and no
+    ``HERMES_KANBAN_BOARD`` pin, so a card can silently land on a board no
+    dispatcher serves. Returns None when the board was named explicitly,
+    pinned by env (board or DB path), or resolved to ``default``.
+    """
+    if getattr(args, "board", None):
+        return None
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return None
+    board, source = kb.resolve_current_board_with_source()
+    if source != kb.BOARD_SOURCE_CURRENT_FILE or board == kb.DEFAULT_BOARD:
+        return None
+    return board
+
+
+def _implicit_board_warning(args: argparse.Namespace) -> Optional[str]:
+    board = _implicit_board(args)
+    if board is None:
+        return None
+    return (
+        f"kanban: no --board given; this card went to board {board!r} because "
+        f"{kb.current_board_path()} (kanban/current, shared by every session) "
+        f"names it. Pass --board {board} to confirm, or --board default if "
+        f"that is not what you meant."
+    )
+
+
+def _require_explicit_board() -> "tuple[bool, str]":
+    """Return (flag value, config path consulted) for ``require_explicit_board``.
+
+    Fails closed: an unreadable config counts as ``True``. The path is the
+    one ``load_config`` reads (``hermes_cli.config.get_config_path``).
+    """
+    from hermes_cli.config import get_config_path
+
+    path = str(get_config_path())
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        value = cfg.get("kanban", {}).get("require_explicit_board", True)
+    except Exception:
+        value = True
+    return value is not False, path
+
+
+def _implicit_board_refusal(args: argparse.Namespace) -> Optional[str]:
+    """Fail closed unless config explicitly permits shared-current routing."""
+    board = _implicit_board(args)
+    if board is None:
+        return None
+    required, config_path = _require_explicit_board()
+    if not required:
+        return None
+    return (
+        f"kanban: refusing to use board {board!r} selected only by "
+        f"{kb.current_board_path()} (kanban/current, shared by every session). "
+        f"Pass --board {board}, export HERMES_KANBAN_BOARD={board}, or set "
+        f"kanban.require_explicit_board: false in {config_path} to proceed."
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1559,6 +1801,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(
             f"kanban: --max-retries must be >= 1 (got {max_retries}); "
             "use 1 to trip on the first failure.",
+            file=sys.stderr,
+        )
+        return 2
+    initial_status = getattr(args, "initial_status", "running")
+    block_reason = getattr(args, "block_reason", None)
+    if initial_status == "blocked" and not (block_reason or "").strip():
+        print(
+            "kanban create: --block-reason is required when "
+            "--initial-status=blocked",
             file=sys.stderr,
         )
         return 2
@@ -1585,9 +1836,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
+            block_reason=block_reason,
         )
         task = kb.get_task(conn, task_id)
+    implicit = _implicit_board_warning(args)
+    if implicit:
+        # stderr in both modes: --json stdout must stay machine-parseable.
+        print(f"⚠  {implicit}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1608,6 +1864,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
@@ -1628,6 +1888,9 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
+    implicit = _implicit_board_warning(args)
+    if implicit:
+        print(f"\u26a0  {implicit}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
     else:
@@ -1695,7 +1958,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
@@ -1750,6 +2013,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if task.status == "blocked" and task.block_reason:
+        print(f"  blocked:   {task.block_reason}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -1863,7 +2128,7 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
+        print(_task_not_found(args, args.task_id), file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
     return 0
@@ -1881,7 +2146,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
     if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
+        print(_task_not_found(args, args.task_id), file=sys.stderr)
         return 1
     if model:
         label = f"{provider}:{model}" if provider else model
@@ -1899,11 +2164,10 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
             conn, args.task_id,
             reason=getattr(args, "reason", None),
         )
+        if not ok:
+            reason = _refusal_reason(conn, args, args.task_id, "reclaim")
     if not ok:
-        print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
-            file=sys.stderr,
-        )
+        print(f"cannot reclaim {args.task_id}: {reason}", file=sys.stderr)
         return 1
     print(f"Reclaimed {args.task_id}")
     return 0
@@ -1917,12 +2181,13 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
         )
+        if not ok:
+            reason = _refusal_reason(
+                conn, args, args.task_id, "reassign",
+                reclaim_requested=bool(getattr(args, "reclaim", False)),
+            )
     if not ok:
-        print(
-            f"cannot reassign {args.task_id} "
-            f"(unknown id, or still running — pass --reclaim to release first)",
-            file=sys.stderr,
-        )
+        print(f"cannot reassign {args.task_id}: {reason}", file=sys.stderr)
         return 1
     print(
         f"Reassigned {args.task_id} to "
@@ -1946,7 +2211,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
             if task is None:
-                print(f"no such task: {args.task}", file=sys.stderr)
+                print(_task_not_found(args, args.task), file=sys.stderr)
                 return 1
             diags_by_task = {
                 args.task: kd.compute_task_diagnostics(
@@ -2090,7 +2355,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             # Report why
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
-                print(f"no such task: {args.task_id}", file=sys.stderr)
+                print(_task_not_found(args, args.task_id), file=sys.stderr)
                 return 1
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
@@ -2160,7 +2425,7 @@ def _cmd_attachments(args: argparse.Namespace) -> int:
     """List a task's attachments."""
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         atts = kb.list_attachments(conn, args.task_id)
     if getattr(args, "json", False):
@@ -2292,15 +2557,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            expected_run_id = _worker_run_id_for(tid)
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                reason = kb.explain_complete_refusal(
+                    conn, tid, expected_run_id,
+                    unknown_context=_board_search_context(args),
+                )
+                print(f"cannot complete {tid}: {reason}", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2326,7 +2596,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             metadata=metadata,
         ):
             print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
+                f"cannot edit {args.task_id}: "
+                f"{_refusal_reason(conn, args, args.task_id, 'edit')}",
                 file=sys.stderr,
             )
             return 1
@@ -2342,17 +2613,28 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            if kb.get_task(conn, tid) is None:
+                # No card to comment on or block: say which board was searched
+                # instead of failing inside add_comment.
+                failed.append(tid)
+                detail = _refusal_reason(conn, args, tid, "block")
+                print(f"cannot block {tid}: {detail}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            expected_run_id = _worker_run_id_for(tid)
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                detail = _refusal_reason(
+                    conn, args, tid, "block", expected_run_id=expected_run_id,
+                )
+                print(f"cannot block {tid}: {detail}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
@@ -2592,7 +2874,8 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         for tid in ids:
             if not kb.archive_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot archive {tid}", file=sys.stderr)
+                detail = _refusal_reason(conn, args, tid, "archive")
+                print(f"cannot archive {tid}: {detail}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
@@ -2617,6 +2900,10 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    refusal = _implicit_board_refusal(args)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
@@ -2670,6 +2957,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         print(json.dumps({
+            "dry_run": bool(args.dry_run),
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -2686,24 +2974,41 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "rejected_skills": [
+                {"task_id": tid, "missing_skills": missing}
+                for (tid, missing) in res.rejected_skills
+            ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
-    print(f"Reclaimed:    {res.reclaimed}")
-    print(f"Crashed:      {len(res.crashed)}")
+    if args.dry_run:
+        print(f"Would reclaim: {res.reclaimed}")
+        print(f"Would mark crashed: {len(res.crashed)}")
+        print(f"Would time out: {len(res.timed_out)}")
+        print(f"Would mark stale: {len(res.stale)}")
+        print(f"Would auto-block: {len(res.auto_blocked)}")
+        print(f"Would promote: {res.promoted}")
+        print(f"Would spawn:   {len(res.spawned)}")
+    else:
+        print(f"Reclaimed:    {res.reclaimed}")
+        print(f"Crashed:      {len(res.crashed)}")
+        print(f"Timed out:    {len(res.timed_out)}")
+        print(f"Stale:        {len(res.stale)}")
+        print(f"Auto-blocked: {len(res.auto_blocked)}")
+        print(f"Promoted:     {res.promoted}")
+        print(f"Spawned:      {len(res.spawned)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
-    print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
-    print(f"Stale:        {len(res.stale)}")
     if res.stale:
         print(f"  {', '.join(res.stale)}")
-    print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
-    print(f"Promoted:     {res.promoted}")
-    print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
@@ -2720,10 +3025,21 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
     if res.skipped_nonspawnable:
+        # Do NOT assert "OK" here: this bucket cannot tell a legitimate
+        # control-plane lane from a typo'd or deleted profile, and calling
+        # both of them fine is how a stranded card reads as healthy.
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (assignee is not a live Hermes profile — a terminal "
+            f"lane pulled via claim_task, or a typo/deleted profile): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, missing in res.rejected_skills:
+        print(
+            f"Rejected (forced skills unavailable): {tid}: "
+            f"{', '.join(missing)}"
+        )
+    for tid, reason in res.respawn_guarded:
+        print(f"Deferred (respawn guard: {reason}): {tid}")
     return 0
 
 
@@ -2875,7 +3191,15 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         if args.kinds else None
     )
     cursor = 0
-    print("Watching kanban events. Ctrl-C to stop.", flush=True)
+    _db = kb.kanban_db_path(None)
+    _board_name = (
+        "default" if _db.parent.name == "kanban" or _db.parent.name == "boards"
+        else _db.parent.name
+    )
+    print(
+        f"Watching kanban events on board '{_board_name}'. Ctrl-C to stop.",
+        flush=True,
+    )
     # Seed cursor at the latest id so we don't replay history.
     with kb.connect_closing() as conn:
         row = conn.execute(
@@ -2940,7 +3264,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+            print(_task_not_found(args, args.task_id), file=sys.stderr)
             return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,
@@ -3031,7 +3355,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"(no runs yet for {args.task_id})")
         return 0
     print(f"{'#':3s}  {'OUTCOME':12s}  {'PROFILE':16s}  {'ELAPSED':>8s}  STARTED")
-    for i, r in enumerate(runs, 1):
+    for r in runs:
         end = r.ended_at or int(time.time())
         # Clamp to 0 so NTP backward-jumps don't print negative durations.
         elapsed = max(0, end - r.started_at)
@@ -3042,7 +3366,12 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         else:
             el = f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
-        print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        # Print the task_runs ROW ID, not a per-task ordinal: `kanban show`
+        # and its event stream already reference runs by row id ([run N],
+        # Runs #N), so a per-task ordinal here made one run look like several
+        # (troubleshooting#83, 2026-08-31: run 1 printed as "run 5" read as
+        # worker churn that never happened).
+        print(f"{r.id:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
         if r.summary:
             # Indent and truncate long summaries to keep the table readable.
             summary = r.summary.splitlines()[0][:100]

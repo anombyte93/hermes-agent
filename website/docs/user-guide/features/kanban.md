@@ -10,6 +10,19 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+### Worker execution host
+
+Set `kanban.execution_host` to the physical hostname that should run workers.
+The dispatcher refuses to spawn on a different host, regardless of the selected
+model or provider. Start the dispatcher on the required host with a locally
+provisioned board, profile and workspace. This setting does not transfer boards,
+files or running workers. There is no automatic local fallback. Leave it unset
+to preserve the default same-host execution behaviour.
+
+A `dispatch --max 0` maintenance tick can still inspect and retire existing
+local runs without starting new workers. Treat model selection and execution
+placement as separate facts in status reports.
+
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
@@ -225,11 +238,25 @@ up on the next tick (60s by default).
 # config.yaml
 kanban:
   dispatch_in_gateway: true        # default
+  require_explicit_board: true     # default: also covers swarm and the kanban_create tool
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
 ```
+
+By default, `hermes kanban create`, `hermes kanban dispatch`, `hermes kanban swarm` and the `kanban_create` tool refuse with
+exit code 2 when the shared `kanban/current` file is the only source selecting
+a non-default board. No task is created or dispatched. Pass `--board <slug>`
+(before the subcommand), export `HERMES_KANBAN_BOARD`, or set
+`kanban.require_explicit_board: false` in `config.yaml` to allow it. Setting
+the flag to `false` restores legacy routing, including the existing stderr
+warning on `create` and `swarm`. An explicit `HERMES_KANBAN_DB` pin, the `default` board,
+and all other subcommands are unaffected.
+
+When `kanban/current` names a non-default board, every board-less create, dispatch and swarm (including a chat `/kanban create`) is refused until it gets an explicit board or the flag is set to `false`. The refusal names the config file it read the flag from.
+
+If the assignee profile cannot load `sdlc-review`, the card stays in `review` without a worker run, even when the card's own other skills resolve fine; a deduplicated `review_unavailable` event names the profile and missing skill, and dispatch resumes once the profile can load it or the card is reassigned to one that can. The check resolves skills the way the worker would, including the trusted project skills (`.hermes/skills`, `.agents/skills`) of the card's workspace when that workspace is listed in `skills.trusted_project_dirs`. A parked review does not reserve a dispatch slot, so it never starves ready cards under `max_in_progress`. `hermes kanban diagnostics` reports a parked review card with the profile and the missing skill.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -299,7 +326,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (only with an unfinished parent card: waits in `todo`, auto-resumes; with none it lands in `blocked` for a human), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -787,18 +814,26 @@ All commands are also available as a slash command in the interactive CLI and in
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
+`hermes kanban dispatch --dry-run` runs the normal dependency-promotion,
+recovery, timeout, and candidate-selection logic against an in-memory SQLite
+snapshot. It reports what would be promoted or spawned but does not update task
+rows, append events, claim work, signal workers, call the spawn function, or
+checkpoint the source database. JSON output includes `"dry_run": true`.
+
 ### Concurrency, scheduling, and child promotion config
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.default_max_runtime` | `7200` (2 hours) | Finite backstop for tasks created without `--max-runtime`. The effective value is written to both the task and its run when claimed, so timeout evidence is explicit. A task's own `--max-runtime` always wins. Set `0` to disable default inheritance. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
   max_in_progress: 2
+  default_max_runtime: 7200
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
@@ -960,7 +995,7 @@ abandons its own. Instead, create a reconciliation card assigned to a **third,
 neutral profile** with **both** conflicted cards linked as parents: the parent
 links carry both sides' completion summaries into the reconciler's context, so
 it receives both diffs *and* both intents. The bundled
-[`merge-reconciler` skill](https://github.com/NousResearch/hermes-agent/blob/main/skills/autonomous-ai-agents/merge-reconciler/SKILL.md)
+[`agent-merge-conflict-arbiter` optional skill](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/autonomous-ai-agents/agent-merge-conflict-arbiter/SKILL.md)
 gives that worker the full procedure: classify each conflicted hunk, resolve
 impartially, verify, and hand back a summary naming every decision.
 
@@ -984,8 +1019,27 @@ path** should create a dedicated refactor/decomposition card for that file
 **before** queuing more work that touches it — splitting the magnet file is
 cheaper than reconciling every future collision it would cause. For conflicts
 that have *already* happened, use the reconciliation-card pattern above with
-the `merge-reconciler` skill; hotspot flagging is the upstream fix that keeps
+the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
+
+### Stale premises: check HEAD before working an old card
+
+A card written days ago describes the repo as it was *then*. Before writing —
+or picking up — a card more than a few days old, check whether HEAD already
+carries the requested feature, possibly in a newer form under a different
+name. If it does, the deliverable becomes the missing test/contract coverage
+that pins the shipped behavior, and the card body should say so explicitly:
+restate the deliverable as the coverage gap rather than leaving the original
+feature ask standing.
+
+Measured evidence (2026-09-22): two of four cards written 2026-08-31 had
+stale premises — the requested popup search had already shipped in its
+issue-#38 form and the manifest was already at 0.4.0 — so the correct
+deliverable each time was the missing contract test suite, not the feature.
+
+The check is cheap: `git log -p -S "<symbol>"` or a read of the current code
+path before planning the work. A worker that skips it either rebuilds what
+HEAD already carries or "fixes" a premise that never held.
 
 ## Multi-tenant usage
 
@@ -1129,8 +1183,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
-| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
-| `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
+| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, `dependency` when the task had no unfinished parent to wait on, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
+| `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so, while a parent is unfinished, it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. A `dependency` block with no unfinished parent lands in `blocked` instead and emits `blocked`. A genuine wait never counts toward the block-loop limit. |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
@@ -1156,6 +1210,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `review_unavailable` | `{assignee, missing_skills, reason}` | A card in `review` was not dispatched because its assignee profile cannot load the mandatory `sdlc-review` skill. No run is created and the card stays in `review`. Recorded once per unchanged streak (same assignee and missing skills); `hermes kanban diagnostics` surfaces it until the card is claimed, assigned, edited or reclaimed. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |

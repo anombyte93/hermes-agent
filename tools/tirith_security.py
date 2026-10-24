@@ -6,7 +6,8 @@ threats (homograph URLs, pipe-to-interpreter, terminal injection, etc.).
 Exit code is the verdict source of truth:
   0 = allow, 1 = block, 2 = warn
 
-JSON stdout enriches findings/summary but never overrides the verdict.
+JSON stdout enriches findings/summary. Narrow exceptions apply to .app-only
+warnings and operator-trusted direct scp/rsync upload-only findings.
 Operational failures (spawn error, timeout, unknown exit code) respect
 the fail_open config setting. Programming errors propagate.
 
@@ -25,6 +26,8 @@ import json
 import logging
 import os
 import platform
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -84,6 +87,7 @@ def _load_security_config() -> dict:
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
         "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "tirith_trusted_hosts": cfg.get("tirith_trusted_hosts", []),
     }
 
 
@@ -728,11 +732,78 @@ _MAX_FINDINGS = 50
 _MAX_SUMMARY_LEN = 500
 
 
+def _is_trusted_upload(command: str, trusted_hosts: object) -> bool:
+    """Recognise only a direct local-to-remote scp/rsync with a literal host.
+
+    This is an exception recogniser, not a shell parser. Anything ambiguous
+    keeps Tirith's verdict: compounds, expansion, remote sources, wrappers,
+    daemon/URL syntax, and options that can redirect the transport or host.
+    Never resolve SSH config or DNS, or treat trust as a substring/glob.
+    """
+    host_pattern = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+    if not isinstance(trusted_hosts, list) or not trusted_hosts:
+        return False
+    if any(not isinstance(h, str) or not re.fullmatch(host_pattern, h)
+           for h in trusted_hosts):
+        return False
+    if any(ord(c) < 32 and c != "\t" for c in command):
+        return False
+    if re.search(r"[$`;&|<>(){}*?\[\]#]", command):
+        return False
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not argv or argv[0] not in {"scp", "rsync"}:
+        return False
+
+    # Only known routing-neutral flags. In particular never accept scp -o,
+    # -F, -S, -J or rsync --rsh/-e, --files-from, --rsync-path. An unknown
+    # option must not be mistaken for an operand (or have its value skipped).
+    short_flags = "346BCOpqRrsTv" if argv[0] == "scp" else "avzrlptgoDHnqchPs"
+    long_flags = {
+        "--archive", "--verbose", "--recursive", "--compress", "--progress",
+        "--partial", "--numeric-ids", "--checksum", "--dry-run", "--human-readable",
+    } if argv[0] == "rsync" else set()
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        option = argv[i]
+        i += 1
+        if option == "--":
+            break
+        if argv[0] == "scp" and option[:2] in {"-P", "-l"}:
+            value = option[2:]
+            if not value:
+                if i == len(argv):
+                    return False
+                value = argv[i]
+                i += 1
+            if not value.isascii() or not value.isdecimal():
+                return False
+        elif option not in long_flags and not (
+            option.startswith("-") and not option.startswith("--")
+            and len(option) > 1 and all(c in short_flags for c in option[1:])
+        ):
+            return False
+
+    operands = argv[i:]
+    if len(operands) < 2 or any(p.startswith("-") for p in operands):
+        return False
+    if any(":" in source for source in operands[:-1]):
+        return False  # Downloads and remote-to-remote copies are not uploads.
+    destination = re.fullmatch(
+        rf"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?({host_pattern}):(?!:)(.*)",
+        operands[-1],
+    )
+    return bool(destination and destination[1].lower() in {h.lower() for h in trusted_hosts})
+
+
 def check_command_security(command: str) -> dict:
     """Run tirith security scan on a command.
 
-    Exit code determines action (0=allow, 1=block, 2=warn). JSON enriches
-    findings/summary. Spawn failures and timeouts respect fail_open config.
+    Exit code determines action (0=allow, 1=block, 2=warn), except narrowly
+    scoped, operator-configured trusted uploads and .app-only warnings.
+    Spawn failures and timeouts respect fail_open config.
     Programming errors propagate.
 
     Returns:
@@ -824,9 +895,10 @@ def check_command_security(command: str) -> dict:
             return {"action": "allow", "findings": [], "summary": f"tirith exit code {exit_code} (fail-open)"}
         return {"action": "block", "findings": [], "summary": f"tirith exit code {exit_code} (fail-closed)"}
 
-    # Parse JSON for enrichment (never overrides the exit code verdict)
+    # Parse JSON for enrichment and the narrow finding-specific exceptions below.
     findings = []
     summary = ""
+    raw_findings = []
     try:
         data = json.loads(result.stdout) if result.stdout.strip() else {}
         raw_findings = data.get("findings", [])
@@ -839,6 +911,17 @@ def check_command_security(command: str) -> dict:
             summary = "security issue detected (details unavailable)"
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
+
+    # Do not skip the scan. Exempt only a complete result consisting entirely
+    # of the upload rule, never mixed findings, missing JSON, operational
+    # failures, or other transports. Inspect the UNCAPPED findings so a later
+    # non-upload rule cannot be hidden by the display limit.
+    if (action in {"block", "warn"}
+            and isinstance(raw_findings, list) and raw_findings
+            and all(isinstance(f, dict) and f.get("rule_id") == "data_exfiltration"
+                    for f in raw_findings)
+            and _is_trusted_upload(command, cfg.get("tirith_trusted_hosts", []))):
+        return {"action": "allow", "findings": [], "summary": ""}
 
     # Suppress warn verdicts that consist solely of a lookalike_tld finding for
     # the .app TLD.  .app is a legitimate gTLD used by many production services

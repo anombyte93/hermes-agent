@@ -51,6 +51,7 @@ def fresh_home(tmp_path, monkeypatch):
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_HOME",
         "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_TASK",
     ):
         monkeypatch.delenv(var, raising=False)
     # Also reset hermes_constants cache so get_default_hermes_root() re-reads.
@@ -341,6 +342,166 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
+
+
+@pytest.fixture
+def switched_home(fresh_home):
+    kb.create_board("other")
+    kb.set_current_board("other")
+    return fresh_home
+
+
+class TestExplicitBoardRequired:
+    @pytest.mark.parametrize("json_mode", [False, True])
+    @pytest.mark.parametrize("command", [["create", "refused"], ["dispatch"]])
+    def test_current_file_refuses_without_side_effects(self, switched_home, command, json_mode):
+        flags = ["--json"] if json_mode else []
+        r = _cli(command + flags)
+        assert r.returncode == 2, (r.stdout, r.stderr)
+        assert r.stdout == ""
+        assert "board 'other'" in r.stderr
+        assert str(switched_home / "kanban" / "current") in r.stderr
+        assert "--board other" in r.stderr
+        assert "HERMES_KANBAN_BOARD" in r.stderr
+        assert "kanban.require_explicit_board: false" in r.stderr
+        for board in ("default", "other"):
+            with kb.connect_closing(board=board) as conn:
+                assert kb.list_tasks(conn) == []
+                assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+    @pytest.mark.parametrize("command", [["create", "explicit"], ["dispatch"]])
+    @pytest.mark.parametrize("pin", ["flag", "env", "db"])
+    def test_explicit_pin_proceeds(self, switched_home, monkeypatch, command, pin):
+        flags = []
+        if pin == "flag":
+            flags = ["--board", "other"]
+        elif pin == "env":
+            monkeypatch.setenv("HERMES_KANBAN_BOARD", "other")
+        else:
+            monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="other")))
+        r = _cli(flags + command + ["--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        assert "kanban/current" not in r.stderr
+        if command[0] == "create":
+            with kb.connect_closing(board="other") as conn:
+                assert [t.title for t in kb.list_tasks(conn)] == ["explicit"]
+
+    @pytest.mark.parametrize("command", [["create", "default"], ["dispatch"]])
+    def test_default_current_file_proceeds(self, switched_home, command):
+        kb.set_current_board("default")
+        r = _cli(command + ["--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        assert "kanban/current" not in r.stderr
+
+    def test_dispatch_opt_out_proceeds_without_new_warning(self, switched_home):
+        (switched_home / "config.yaml").write_text(
+            "kanban:\n  require_explicit_board: false\n", encoding="utf-8"
+        )
+        r = _cli(["dispatch", "--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        assert "kanban/current" not in r.stderr
+
+    def test_refusal_names_config_file_consulted(self, switched_home):
+        r = _cli(["create", "refused"])
+        assert r.returncode == 2
+        assert f"in {switched_home / 'config.yaml'} to proceed" in r.stderr
+
+    SWARM = ["swarm", "goal", "--worker", "dev:part", "--verifier", "dev", "--synthesizer", "dev"]
+
+    def test_swarm_refused_without_cards(self, switched_home):
+        r = _cli(self.SWARM + ["--json"])
+        assert r.returncode == 2, (r.stdout, r.stderr)
+        assert r.stdout == ""
+        assert "board 'other'" in r.stderr
+        assert str(switched_home / "config.yaml") in r.stderr
+        for board in ("default", "other"):
+            with kb.connect_closing(board=board) as conn:
+                assert kb.list_tasks(conn) == []
+
+    def test_swarm_with_board_flag_proceeds(self, switched_home):
+        r = _cli(["--board", "other"] + self.SWARM + ["--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        with kb.connect_closing(board="other") as conn:
+            assert len(kb.list_tasks(conn)) == 4
+        with kb.connect_closing(board="default") as conn:
+            assert kb.list_tasks(conn) == []
+
+    def test_swarm_opt_out_warns_and_proceeds(self, switched_home):
+        (switched_home / "config.yaml").write_text(
+            "kanban:\n  require_explicit_board: false\n", encoding="utf-8"
+        )
+        r = _cli(self.SWARM + ["--json"])
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)
+        assert "board 'other'" in r.stderr
+        assert "kanban/current" in r.stderr
+
+    @pytest.mark.parametrize("env_board", ["missing-board", "invalid/board"])
+    def test_invalid_env_pin_does_not_bypass_refusal(self, switched_home, monkeypatch, env_board):
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", env_board)
+        r = _cli(["create", "refused", "--json"])
+        assert r.returncode == 2, (r.stdout, r.stderr)
+        assert "board 'other'" in r.stderr
+
+
+@pytest.mark.usefixtures("fresh_home")
+class TestImplicitBoardWarning:
+    """`create` with no --board / env pin that lands on a non-default board
+    via the global ``<root>/kanban/current`` file must say so on stderr —
+    including in --json mode, whose stdout must stay machine-parseable."""
+
+    def _switched_home(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_KANBAN_BOARD": "",
+               "HERMES_KANBAN_DB": ""}
+        assert _cli(["boards", "create", "other"], env_extra=env).returncode == 0
+        assert _cli(["boards", "switch", "other"], env_extra=env).returncode == 0
+        return env
+
+    def test_json_create_from_current_file_warns_on_stderr(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        (tmp_path / "config.yaml").write_text(
+            "kanban:\n  require_explicit_board: false\n", encoding="utf-8"
+        )
+        r = _cli(["create", "Implicit", "--assignee", "dev", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        json.loads(r.stdout)  # stdout stays pure JSON
+        assert "board 'other'" in r.stderr
+        assert "kanban/current" in r.stderr
+        assert "--board" in r.stderr
+
+    def test_plain_create_from_current_file_warns(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        (tmp_path / "config.yaml").write_text(
+            "kanban:\n  require_explicit_board: false\n", encoding="utf-8"
+        )
+        r = _cli(["create", "Implicit", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "board 'other'" in r.stderr
+
+    def test_explicit_board_flag_is_silent(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        r = _cli(["--board", "other", "create", "Explicit", "--assignee", "dev", "--json"],
+                 env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "kanban/current" not in r.stderr
+
+    def test_env_pin_is_silent(self, tmp_path):
+        env = self._switched_home(tmp_path)
+        env["HERMES_KANBAN_BOARD"] = "other"
+        r = _cli(["create", "Pinned", "--assignee", "dev", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "kanban/current" not in r.stderr
+
+    def test_default_board_is_silent(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_KANBAN_BOARD": "",
+               "HERMES_KANBAN_DB": ""}
+        r = _cli(["create", "Default", "--assignee", "dev", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "kanban/current" not in r.stderr
 
 
 
