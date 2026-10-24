@@ -6,12 +6,17 @@ Known-red controls, one per behaviour the card demands:
     in the repo (a check that only tests "sha exists" would pass it);
 (b) a launcher whose exec line names no hermes-agent-<sha> release path is
     UNKNOWN, never LIVE;
-(c) the same side-branch commit, after being merged into the release line,
-    is LIVE.
+(c) a side-branch commit merged --no-ff into a main that moved on is LIVE:
+    a STRICT ancestor (side != release), so an equality-only rule fails it.
 
 Plus the UNKNOWN edges: a query sha the repo does not know, an unreadable
 launcher, a launcher naming a release dir that is missing, and a release
 sha the repo has no commit for.
+
+Review r1 controls: the launcher's last line is read exactly as
+hermes-release.sh status reads it (tail -n1, trailing blank lines
+included); a git error is UNKNOWN, never NOT-LIVE; there is no --fetch and
+nothing under .git is written; an unreadable launcher is UNKNOWN.
 """
 
 from __future__ import annotations
@@ -98,13 +103,25 @@ def test_launcher_without_release_sha_is_unknown(tmp_path: Path, repo: Path) -> 
 
 
 def test_merged_commit_is_live(tmp_path: Path, repo: Path) -> None:
-    """(c) once S is merged into the release line, it is LIVE."""
+    """(c) once S is merged into the release line, it is LIVE.
+
+    S must be a STRICT ancestor of the release (side != release), on a real
+    branch that diverged from main, so an equality-only rule cannot pass.
+    """
     _commit(repo, "base2")
     _git(repo, "checkout", "-q", "-b", "feature")
     side = _commit(repo, "side S")
     _git(repo, "checkout", "-q", "main")
-    _git(repo, "merge", "--no-edit", "feature")
+    main_moved = _commit(repo, "main moves on")  # feature is now a real branch
+    # Before the merge, S is not in main's history: NOT-LIVE.
+    pre_launcher = _launcher(tmp_path / "pre", main_moved)
+    pre = run_check(side, "--launcher", str(pre_launcher), "--repo", str(repo))
+    assert pre.returncode == 1, pre.stdout + pre.stderr
+    _git(repo, "merge", "--no-ff", "--no-edit", "feature")
     release = _git(repo, "rev-parse", "HEAD")
+    assert side != release
+    assert release not in (side, main_moved)
+    assert _git(repo, "rev-parse", "HEAD^2") == side  # a true merge commit
     launcher = _launcher(tmp_path, release)
     proc = run_check(side, "--launcher", str(launcher), "--repo", str(repo))
     assert proc.returncode == 0, proc.stdout + proc.stderr
