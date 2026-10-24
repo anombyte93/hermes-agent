@@ -68,6 +68,39 @@ class TestFindProjectRoot:
         os.chdir(sub)
         assert su.find_project_root() == project_env["repo"].resolve()
 
+    def test_context_override_wins_over_env_and_cwd(
+        self, project_env, tmp_path, monkeypatch,
+    ):
+        other = tmp_path / "other"
+        (other / ".git").mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(project_env["repo"]))
+        token = su.set_project_cwd_override(other)
+        try:
+            assert su.find_project_root() == other.resolve()
+        finally:
+            su.reset_project_cwd_override(token)
+        # Reset restores the TERMINAL_CWD / process-cwd behaviour, and the
+        # override never touched the process environment.
+        assert su.find_project_root() == project_env["repo"].resolve()
+        assert os.environ["TERMINAL_CWD"] == str(project_env["repo"])
+
+    def test_context_override_is_not_visible_to_other_threads(
+        self, project_env, tmp_path,
+    ):
+        import threading
+
+        other = tmp_path / "other"
+        (other / ".git").mkdir(parents=True)
+        seen = []
+        token = su.set_project_cwd_override(other)
+        try:
+            t = threading.Thread(target=lambda: seen.append(su.find_project_root()))
+            t.start()
+            t.join()
+        finally:
+            su.reset_project_cwd_override(token)
+        assert seen == [project_env["repo"].resolve()]
+
 
 class TestTrustGate:
     def test_untrusted_loads_nothing(self, project_env):

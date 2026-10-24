@@ -99,19 +99,53 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+STATUS_ORDER = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived")
+VALID_STATUSES = set(STATUS_ORDER)
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# Statuses ``complete_task`` accepts, and the terminal states a card cannot
+# leave by completing. Shared by the SQL guards, the parent gate and the
+# refusal explanation so they cannot drift apart.
+COMPLETE_ACCEPTED_STATUSES = ("running", "ready", "blocked", "review")
+TERMINAL_STATUSES = ("done", "archived")
+# The same single-source rule for the other verbs that can refuse a card. Each
+# tuple feeds both the SQL guard in kanban_db and the CLI refusal reason.
+RECLAIM_ACCEPTED_STATUSES = ("running", "ready", "blocked")
+BLOCK_ACCEPTED_STATUSES = ("running", "ready", "review")
+EDIT_ACCEPTED_STATUSES = ("done",)
+REASSIGN_REFUSED_STATUSES = ("running",)  # while a worker holds the claim
+ARCHIVE_REFUSED_STATUSES = ("archived",)
+REASSIGN_ACCEPTED_STATUSES = tuple(
+    s for s in STATUS_ORDER if s not in REASSIGN_REFUSED_STATUSES
+)
+ARCHIVE_ACCEPTED_STATUSES = tuple(
+    s for s in STATUS_ORDER if s not in ARCHIVE_REFUSED_STATUSES
+)
+
+
+def _sql_in_list(values) -> str:
+    """Render a tuple of trusted status constants as an SQL ``IN`` list body."""
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+_COMPLETE_ACCEPTED_SQL = _sql_in_list(COMPLETE_ACCEPTED_STATUSES)
+_RECLAIM_ACCEPTED_SQL = _sql_in_list(RECLAIM_ACCEPTED_STATUSES)
+_BLOCK_ACCEPTED_SQL = _sql_in_list(BLOCK_ACCEPTED_STATUSES)
+_ARCHIVE_REFUSED_SQL = _sql_in_list(ARCHIVE_REFUSED_STATUSES)
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
 # unblocks → worker re-blocks → cron unblocks … forever.
 #
-#   * ``dependency``   — can't proceed until another task finishes. Routed to
-#                        ``todo`` (NOT ``blocked``) so the existing
-#                        parent-gating / ``recompute_ready`` machinery promotes
-#                        it automatically once parents are done. No human, no
-#                        cron, no retry storm.
+#   * ``dependency``   — can't proceed until another task finishes. While the
+#                        task has an unfinished parent it is routed to ``todo``
+#                        (NOT ``blocked``) so the existing parent-gating /
+#                        ``recompute_ready`` machinery promotes it automatically
+#                        once parents are done, and it never counts toward the
+#                        block-loop limit. With no unfinished parent there is
+#                        nothing to wait on: it lands in ``blocked`` for a
+#                        human and counts like any other kind.
 #   * ``needs_input``  — needs a human decision/answer it cannot derive.
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
@@ -628,12 +662,31 @@ def get_current_board() -> str:
     with a best-effort warning — the dispatcher must never crash because a
     user hand-edited a file or removed a board directory.
     """
+    return resolve_current_board_with_source()[0]
+
+
+# Source labels returned by :func:`resolve_current_board_with_source`.
+BOARD_SOURCE_OVERRIDE = "board-override"
+BOARD_SOURCE_ENV = "HERMES_KANBAN_BOARD"
+BOARD_SOURCE_CURRENT_FILE = "current-file"
+BOARD_SOURCE_DEFAULT = "default"
+
+
+def resolve_current_board_with_source() -> tuple[str, str]:
+    """Return ``(slug, source)`` for the active board.
+
+    The one implementation of the resolution chain documented on
+    :func:`get_current_board`. ``source`` is one of ``BOARD_SOURCE_OVERRIDE``
+    (a scoped override such as ``--board``), ``BOARD_SOURCE_ENV``,
+    ``BOARD_SOURCE_CURRENT_FILE`` or ``BOARD_SOURCE_DEFAULT``. Callers that
+    only need the slug use :func:`get_current_board`.
+    """
     scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
     if scoped:
         try:
             normed = _normalize_board_slug(scoped)
             if normed and board_exists(normed):
-                return normed
+                return normed, BOARD_SOURCE_OVERRIDE
         except ValueError:
             pass
 
@@ -642,7 +695,7 @@ def get_current_board() -> str:
         try:
             normed = _normalize_board_slug(env)
             if normed and board_exists(normed):
-                return normed
+                return normed, BOARD_SOURCE_ENV
         except ValueError:
             pass
     try:
@@ -653,12 +706,12 @@ def get_current_board() -> str:
                 try:
                     normed = _normalize_board_slug(val)
                     if normed and board_exists(normed):
-                        return normed
+                        return normed, BOARD_SOURCE_CURRENT_FILE
                 except ValueError:
                     pass
     except OSError:
         pass
-    return DEFAULT_BOARD
+    return DEFAULT_BOARD, BOARD_SOURCE_DEFAULT
 
 
 def set_current_board(slug: str) -> Path:
@@ -3821,7 +3874,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
+        if (
+            row["claim_lock"] is not None
+            and row["status"] in REASSIGN_REFUSED_STATUSES
+        ):
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
@@ -4718,7 +4774,7 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"AND p.status NOT IN ({_sql_in_list(TERMINAL_STATUSES)}) LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -5260,7 +5316,7 @@ def reclaim_task(
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            f"WHERE id = ? AND status IN ({_RECLAIM_ACCEPTED_SQL}) "
             "AND claim_lock IS ?",
             (retry_status, task_id, prev_lock),
         )
@@ -5462,6 +5518,126 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def explain_complete_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int] = None,
+    *,
+    unknown_context: Optional[str] = None,
+) -> str:
+    """Say why :func:`complete_task` returned False for ``task_id``.
+
+    Read-only. The order is: unknown id, already terminal, unsatisfied
+    parents, unsupported status, stale run id, then a catch-all for a race.
+    A terminal card is reported as terminal even when a parent has since
+    reopened, because completing that parent would not make it completable.
+    ``unknown_context`` is appended to the unknown-id reason (for example the
+    board that was searched).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return _unknown_task_reason(unknown_context)
+    if task.status in TERMINAL_STATUSES:
+        return f"already terminal (status is {task.status})"
+    unsatisfied = []
+    for pid in parent_ids(conn, task_id):
+        parent = get_task(conn, pid)
+        if parent is not None and parent.status not in TERMINAL_STATUSES:
+            unsatisfied.append(parent.id)
+    if unsatisfied:
+        return f"unsatisfied parents: {', '.join(unsatisfied)}"
+    if task.status not in COMPLETE_ACCEPTED_STATUSES:
+        accepted = "/".join(COMPLETE_ACCEPTED_STATUSES)
+        hint = "Use `kanban archive` to drop a card."
+        if task.status == "triage":
+            hint = (
+                "Use `kanban specify` to turn it into a spec, "
+                "or `kanban archive` to drop it."
+            )
+        return f"status is {task.status}; complete accepts {accepted}. {hint}"
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        return (
+            f"run id mismatch (expected {expected_run_id}, "
+            f"current {task.current_run_id})"
+        )
+    return "task changed while completing; inspect its current state and retry"
+
+
+def _unknown_task_reason(unknown_context: Optional[str]) -> str:
+    reason = "unknown task id"
+    return f"{reason} on {unknown_context}" if unknown_context else reason
+
+
+# Statuses each verb accepts, for the generic refusal reason below. ``complete``
+# keeps its own richer explanation in :func:`explain_complete_refusal`.
+_VERB_ACCEPTED_STATUSES = {
+    "reclaim": RECLAIM_ACCEPTED_STATUSES,
+    "block": BLOCK_ACCEPTED_STATUSES,
+    "edit": EDIT_ACCEPTED_STATUSES,
+    "reassign": REASSIGN_ACCEPTED_STATUSES,
+    "archive": ARCHIVE_ACCEPTED_STATUSES,
+}
+# Verbs whose accepted set is "everything except a short refusal list"; naming
+# the full set would be noise, so only the status is reported.
+_VERBS_WITHOUT_ACCEPTED_LIST = {"archive"}
+
+
+def explain_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    verb: str,
+    expected_run_id: Optional[int] = None,
+    *,
+    unknown_context: Optional[str] = None,
+    reclaim_requested: bool = False,
+) -> str:
+    """Say why ``reclaim``/``reassign``/``edit``/``block``/``archive`` returned
+    False for ``task_id``. Read-only.
+
+    The order is: unknown id, already terminal, a status the verb does not
+    accept, then the verb's own remaining refusal (no active claim, stale run
+    id) and finally a catch-all for a race. Every status list comes from the
+    ``*_STATUSES`` constants that also build the verb's SQL guard.
+    """
+    accepted = _VERB_ACCEPTED_STATUSES[verb]
+    task = get_task(conn, task_id)
+    if task is None:
+        return _unknown_task_reason(unknown_context)
+    status = task.status
+    names_accepted = verb not in _VERBS_WITHOUT_ACCEPTED_LIST
+    suffix = f"; {verb} accepts {'/'.join(accepted)}" if names_accepted else ""
+    if verb == "reassign":
+        # Reassign is refused only while a worker holds the claim.
+        if status in REASSIGN_REFUSED_STATUSES and task.claim_lock is not None:
+            if reclaim_requested:
+                return (
+                    f"status is {status} and the claim could not be released; "
+                    "inspect its current state and retry"
+                )
+            return (
+                f"status is {status} (claimed by a worker); reassign accepts "
+                f"every status except {'/'.join(REASSIGN_REFUSED_STATUSES)}. "
+                "Pass --reclaim to release the claim first."
+            )
+        return "task changed during reassign; inspect its current state and retry"
+    if status in TERMINAL_STATUSES and status not in accepted:
+        return f"already terminal (status is {status}){suffix}"
+    if status not in accepted:
+        return f"status is {status}{suffix}"
+    if verb == "reclaim" and status != "running" and task.claim_lock is None:
+        return f"status is {status} but it has no active claim to reclaim"
+    if (
+        verb == "block"
+        and expected_run_id is not None
+        and task.current_run_id != expected_run_id
+    ):
+        return (
+            f"run id mismatch (expected {expected_run_id}, "
+            f"current {task.current_run_id})"
+        )
+    return f"task changed during {verb}; inspect its current state and retry"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5554,7 +5730,7 @@ def complete_task(
         prior_status = prior["status"] if prior else None
         if expected_run_id is None:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5565,13 +5741,13 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ({_COMPLETE_ACCEPTED_SQL})
                 """,
                 (result, now, task_id),
             )
         else:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5582,7 +5758,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ({_COMPLETE_ACCEPTED_SQL})
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -5993,9 +6169,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
-    when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
+    ``scratch`` workspaces are removed; Hermes-created ``worktree`` workspaces
+    are removed only when provably free of work (clean tree, every commit
+    reachable from a remote-tracking ref). Caller-owned worktrees and ``dir``
+    workspaces are intentionally preserved.
     """
     try:
         row = conn.execute(
@@ -6066,12 +6243,18 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+_KANBAN_WORKTREE_OWNER_FILE = "hermes-kanban-owner"
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
 
-    Mirrors the safety judgment of the CLI startup pruner
+    Requires creation proof in the linked checkout's private Git directory;
+    a canonical path or a task-like branch alone does not establish ownership.
+    Legacy worktrees without proof are preserved. Mirrors the safety judgment
+    of the CLI startup pruner
     (``cli._prune_stale_worktrees``): removal requires a clean working tree
     AND every commit reachable from a remote-tracking ref. Any doubt — dirty
     files, unpushed commits, unresolvable repo, failing git — preserves the
@@ -6112,6 +6295,12 @@ def _cleanup_worktree_workspace(
                 task_id, expected_branch, actual_branch or "<detached>", wp,
             )
             return
+        git_dir = _git_dir(wp)
+        if git_dir is None or git_dir == common:
+            return
+        owner = git_dir / _KANBAN_WORKTREE_OWNER_FILE
+        if owner.is_symlink() or owner.read_text(encoding="utf-8") != os.path.abspath(wp):
+            return  # missing/unreadable proof is also preserved by the outer guard
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -6248,8 +6437,10 @@ _SCRATCH_TIP_SENTINEL_NAME = ".scratch_tip_shown"
 
 _SCRATCH_TIP_MESSAGE = (
     "scratch workspaces are ephemeral — they're deleted when the task "
-    "completes. Use --workspace worktree: (git worktree) or "
-    "--workspace dir:/abs/path (existing dir) to preserve worker output."
+    "completes. With --workspace worktree:<path>, Hermes-created managed "
+    "worktrees are removed when clean and fully pushed; caller-created "
+    "worktrees are preserved. Use --workspace dir:/abs/path to reuse an "
+    "existing checkout as-is and keep worker output."
 )
 
 
@@ -6290,8 +6481,8 @@ def _maybe_emit_scratch_tip(
     """Emit the first-use scratch-workspace tip exactly once per install.
 
     Called from the dispatcher right after a scratch workspace is
-    materialized. No-op for ``worktree`` / ``dir`` workspaces (they're
-    preserved by design) and no-op after the sentinel exists.
+    materialized. No-op for ``worktree`` / ``dir`` workspaces and after the
+    sentinel exists; their distinct lifecycles are explained in the tip.
     """
     if (workspace_kind or "scratch") != "scratch":
         return
@@ -6325,7 +6516,7 @@ def edit_completed_task_result(
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if not row or row["status"] != "done":
+        if not row or row["status"] not in EDIT_ACCEPTED_STATUSES:
             return False
         conn.execute(
             "UPDATE tasks SET result = ? WHERE id = ?",
@@ -6384,17 +6575,28 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``running``/``ready``/``review`` → ``blocked`` (or route elsewhere).
+
+    A task parked in ``review`` (``request_review`` moved it there and closed
+    the implementer run with ``outcome=review_requested``) may be *held* with
+    the same call: it transitions to ``blocked`` with ``source_status=review``
+    recorded on the block event, so a later explicit ``unblock_task`` restores
+    ``review`` rather than ``ready``. A review hold never stops a live process
+    and never synthesizes or rewrites a run; the implementer's ended
+    ``review_requested`` run and all prior events/result/PR metadata are
+    preserved untouched, and an ``expected_run_id`` (stale for an unclaimed
+    review card) is refused exactly like the running/ready CAS guard.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+    * ``dependency`` — while a parent is unfinished, the task goes to ``todo``
+      so ``recompute_ready`` promotes it automatically once its parents finish.
+      With no unfinished parents it lands in ``blocked`` for a human instead
+      of immediately re-entering the work pool. A genuine wait never counts
+      toward the recurrence limit (it holds in ``todo`` and cannot spin); only
+      the parentless path counts recurrences and escalates to ``triage``.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -6426,11 +6628,18 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        source_status = (
-            _retry_status_for_run(conn, task_id)
-            if cur_row["status"] == "running"
-            else "ready"
-        )
+        if cur_row["status"] == "review":
+            # A card parked in the review lane is being *held*, not blocked
+            # mid-execution. It has no live run (``request_review`` already
+            # closed the implementer run and cleared ``current_run_id``), so
+            # the durable provenance is ``review`` and nothing here must
+            # synthesize or rewrite a run.
+            source_status = "review"
+        elif cur_row["status"] == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        else:
+            source_status = "ready"
+        is_review_hold = cur_row["status"] == "review"
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -6439,24 +6648,26 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        # Only wait in todo when there is actually an unfinished parent.
+        # Otherwise recompute_ready would immediately re-promote the task.
+        # A genuine wait holds in todo until a parent finishes, so it cannot
+        # spin and is neither counted nor limited: the counter is carried
+        # over unchanged.
+        if kind == "dependency" and not _parents_satisfied(conn, task_id):
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status        = 'todo',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ({_BLOCK_ACCEPTED_SQL})
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, prev_recurrences, task_id) if expected_run_id is None
+                else (kind, prev_recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6465,7 +6676,7 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=reason,
             )
-            if run_id is None and reason:
+            if run_id is None and reason and not is_review_hold:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
@@ -6489,12 +6700,8 @@ def block_task(
             )
             return True
 
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
+        # Parentless paths (and every other kind) count recurrences. Preserve
+        # the existing same-kind definition of a recurring cause.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
@@ -6502,7 +6709,7 @@ def block_task(
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status        = 'triage',
                        claim_lock    = NULL,
@@ -6511,7 +6718,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ({_BLOCK_ACCEPTED_SQL})
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6523,7 +6730,7 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=reason,
             )
-            if run_id is None and reason:
+            if run_id is None and reason and not is_review_hold:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
@@ -6541,7 +6748,7 @@ def block_task(
         else:
             if expected_run_id is None:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE tasks
                        SET status        = 'blocked',
                            claim_lock    = NULL,
@@ -6551,13 +6758,13 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ({_BLOCK_ACCEPTED_SQL})
                     """,
                     (reason, kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE tasks
                        SET status        = 'blocked',
                            claim_lock    = NULL,
@@ -6567,7 +6774,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ({_BLOCK_ACCEPTED_SQL})
                        AND current_run_id = ?
                     """,
                     (reason, kind, recurrences, task_id, int(expected_run_id)),
@@ -6580,8 +6787,11 @@ def block_task(
                 summary=reason,
             )
             # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
+            # reason is preserved in attempt history. A review hold is the
+            # exception: the implementer's already-ended run is the durable
+            # attestation and must not be shadowed by a synthetic "blocked"
+            # run (or rewritten), so no run is created for review holds.
+            if run_id is None and reason and not is_review_hold:
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
@@ -7653,7 +7863,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            f"WHERE id = ? AND status NOT IN ({_ARCHIVE_REFUSED_SQL})",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -7936,6 +8146,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
     try:
         _require_worktree_branch(target, branch_name)
+        # Only a successful creation confers cleanup ownership. Reusing an
+        # existing checkout returns above without stamping it, even at the
+        # canonical path. Keep proof out of the working tree (and its status)
+        # and bind it to this path so moved/replaced checkouts fail closed.
+        git_dir = _git_dir(target)
+        if git_dir is None or git_dir == repo_common:
+            raise RuntimeError(f"cannot record worktree ownership for {target}")
+        with (git_dir / _KANBAN_WORKTREE_OWNER_FILE).open("x", encoding="utf-8") as owner:
+            owner.write(os.path.abspath(target))
     except Exception as validation_error:
         remove_result = subprocess.run(
             [
@@ -10184,26 +10403,37 @@ def _append_skill_rejected_event(
     task_id: str,
     assignee: str,
     missing_skills: list[str],
+    *,
+    lane: str = "ready",
 ) -> None:
     """Record a forced-skill refusal as a durable ``skill_rejected`` event,
     rate-limited to one event per unchanged refusal streak (#20).
+
+    The review lane uses ``review_unavailable`` with a named reason instead.
 
     A dispatch tick that rejects the same task for the same assignee and the
     same missing skill set appends nothing — the first event already says
     everything, and the default 60s dispatcher loop would otherwise spam an
     unbounded stream of identical rows. A changed assignee or skill set, or a
     fresh refusal after an intervening claim/spawn, IS a new refusal and is
-    recorded again. The payload is deliberately minimal — assignee and missing
-    skill names only; the task id is the event row's own identity.
+    recorded again. The payload contains the assignee and missing skill names,
+    plus a reason for review refusals; the task id is the event row's identity.
     """
+    event_kind = "review_unavailable" if lane == "review" else "skill_rejected"
+    payload = {"assignee": assignee, "missing_skills": sorted(missing_skills)}
+    if lane == "review":
+        payload["reason"] = (
+            f"Profile '{assignee}' cannot load required review skill(s): "
+            + ", ".join(sorted(missing_skills))
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND kind IN ('skill_rejected', 'claimed', 'spawned') "
+            "WHERE task_id = ? AND kind IN (?, 'claimed', 'spawned') "
             "ORDER BY id DESC LIMIT 1",
-            (task_id,),
+            (task_id, event_kind),
         ).fetchone()
-        if row is not None and row["kind"] == "skill_rejected":
+        if row is not None and row["kind"] == event_kind:
             try:
                 prev = json.loads(row["payload"] or "{}")
             except Exception:
@@ -10217,15 +10447,151 @@ def _append_skill_rejected_event(
         _append_event(
             conn,
             task_id,
-            "skill_rejected",
-            {"assignee": assignee, "missing_skills": sorted(missing_skills)},
+            event_kind,
+            payload,
         )
 
 
+# How long a ``dispatch_skipped`` (non-spawnable assignee) notice stays
+# authoritative before the dispatcher re-states it. The card is skipped on
+# EVERY tick — at a 30s interval that is 120 notices an hour — so the notice
+# is rate-limited rather than emitted per tick. It is deliberately re-stated
+# (rather than emitted exactly once) so a card cannot go quiet while it is
+# still stranded: a re-notice every hour is what makes "ready forever with a
+# bad assignee" self-announcing instead of silent.
+NONSPAWNABLE_RENOTIFY_SECONDS = 3600
+
+
+def _append_nonspawnable_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+) -> bool:
+    """Record a non-spawnable-assignee skip as a durable ``dispatch_skipped``
+    event, rate-limited to one notice per ``NONSPAWNABLE_RENOTIFY_SECONDS``.
+
+    Mirrors :func:`_append_skill_rejected_event` — same shape, same
+    fail-closed contract (the card is never spawned, edited or auto-blocked
+    here). The difference is the rate limit: a skill refusal is a one-shot
+    condition an operator fixes, while a non-resolving assignee can sit for
+    days, so an unchanged streak is re-stated hourly instead of suppressed
+    forever.
+
+    Returns True when an event was actually appended, so the caller can
+    emit exactly one matching log line per notice.
+
+    The rate-limit read runs OUTSIDE ``write_txn`` on purpose. This branch is
+    hit on every tick for as long as the card is stranded, and ``write_txn``
+    is a ``BEGIN IMMEDIATE``: taking the board's write lock only to discover
+    there is nothing to write would add lock churn to every tick of every
+    board carrying a parked card. The dispatch tick already runs under the
+    board's single-writer dispatch lock, so no other dispatcher can append a
+    competing notice between the read and the write.
+    """
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN ('dispatch_skipped', 'claimed', 'spawned') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["kind"] == "dispatch_skipped":
+        try:
+            prev = json.loads(row["payload"] or "{}")
+        except Exception:
+            prev = {}
+        age = now - int(row["created_at"] or 0)
+        if (
+            isinstance(prev, dict)
+            and prev.get("assignee") == assignee
+            and prev.get("reason") == "assignee_not_a_profile"
+            and age < NONSPAWNABLE_RENOTIFY_SECONDS
+        ):
+            return False
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_skipped",
+            {"reason": "assignee_not_a_profile", "assignee": assignee},
+        )
+    return True
+
+
+def _note_nonspawnable(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    *,
+    dry_run: bool,
+    lane: str,
+) -> None:
+    """Make a non-spawnable skip visible: durable event + one log line.
+
+    Before this, the ready/review loops appended the id to
+    ``skipped_nonspawnable`` and moved on with no event and no log, so a card
+    whose assignee was a typo or a deleted profile was indistinguishable from
+    an empty queue on every unattended surface (the gateway logs only when
+    something spawned; the ``--verbose`` daemon's ``did_work`` tuple does not
+    include this bucket). The card then sat ``ready`` until a human happened
+    to run ``hermes kanban diagnostics``.
+    """
+    if dry_run:
+        return
+    try:
+        if _append_nonspawnable_event(conn, task_id, assignee):
+            _log.warning(
+                "kanban dispatch: %s task %s is assigned to %r, which is not a "
+                "live Hermes profile — not spawning. If this is a control-plane "
+                "lane pulled by a terminal, it is expected; otherwise the "
+                "assignee is a typo or a deleted profile and the card will stay "
+                "ready until it is reassigned.",
+                lane, task_id, assignee,
+            )
+    except Exception:
+        # Visibility must never break dispatch. A failed notice degrades to
+        # the previous (silent) behaviour rather than dropping the tick.
+        _log.debug(
+            "kanban dispatch: failed to record non-spawnable notice for %s",
+            task_id, exc_info=True,
+        )
+
+
+def _worker_skill_scope(workspace_path: Optional[str]) -> Optional[str]:
+    """Directory a worker for this workspace would resolve project skills from.
+
+    The worker is spawned with ``TERMINAL_CWD=<workspace>``, so trusted
+    ``.hermes/skills`` / ``.agents/skills`` of the enclosing project checkout
+    are visible to it. Returns that project root (or the workspace itself
+    when it is not inside a checkout), or ``None`` when the workspace is not
+    an existing absolute directory (the worker would not pin it either).
+    """
+    if not workspace_path or not os.path.isabs(workspace_path):
+        return None
+    if not os.path.isdir(workspace_path):
+        return None
+    try:
+        from agent.skill_utils import find_project_root
+
+        root = find_project_root(Path(workspace_path))
+    except Exception:
+        root = None
+    return str(root) if root is not None else workspace_path
+
+
 def _missing_worker_skills(
-    skill_identifiers: Optional[list[str]], assignee: str
+    skill_identifiers: Optional[list[str]],
+    assignee: str,
+    workspace_cwd: Optional[str] = None,
 ) -> list[str]:
-    """Resolve forced skills in the assignee profile without mutating process env."""
+    """Resolve forced skills in the assignee profile as the worker would,
+    without mutating process env.
+
+    The profile home and, when ``workspace_cwd`` is given, the project start
+    directory are overridden through context-local overrides (never
+    ``os.environ``, which every thread shares), so trusted project-local
+    skills of the task workspace resolve as they do in the spawned worker.
+    """
     if not skill_identifiers:
         return []
 
@@ -10238,6 +10604,12 @@ def _missing_worker_skills(
         return list(dict.fromkeys(skill_identifiers))
 
     token = set_hermes_home_override(profile_home)
+    from agent.skill_utils import (
+        reset_project_cwd_override,
+        set_project_cwd_override,
+    )
+
+    cwd_token = set_project_cwd_override(workspace_cwd or None)
     try:
         import json
 
@@ -10259,6 +10631,7 @@ def _missing_worker_skills(
                 missing.append(name)
         return missing
     finally:
+        reset_project_cwd_override(cwd_token)
         reset_hermes_home_override(token)
 
 
@@ -10313,6 +10686,14 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # Reject wrong-host dispatch before claiming cards or changing run state.
+    # A max=0 maintenance tick may still retire already-existing local runs.
+    if spawn_fn is None and max_spawn != 0 and not preview:
+        from hermes_cli.config import load_config
+        from hermes_cli.kanban_host import require_execution_host
+
+        require_execution_host(load_config())
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale. Preview runs against an
     # in-memory snapshot and must not mutate process-lifecycle state.
@@ -10429,7 +10810,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, workspace_path FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10444,18 +10825,47 @@ def _dispatch_once_locked(
     # full budget. "Spawnable" mirrors the review loop's own gate
     # (assigned + real profile) so a review column full of human-pulled
     # control-plane lanes doesn't permanently tax ready throughput.
+    #
+    # A review whose assignee cannot load the mandatory ``sdlc-review`` skill
+    # is parked (the review loop skips it), so it must not hold the slot
+    # either: otherwise at ``max_in_progress=1`` one parked card would starve
+    # every ready card forever. The skill check is resolved ONCE per
+    # (assignee, project scope) per tick, here, and the review loop reuses
+    # the result: skill resolution reads the profile's skills tree and runs
+    # under the dispatch lock, so it must not scale with the card count.
+    try:
+        from hermes_cli.profiles import profile_exists as _rpe
+    except Exception:
+        _rpe = None  # type: ignore[assignment]
+
+    def _review_scope(row) -> tuple[str, Optional[str]]:
+        cwd = _worker_skill_scope(row["workspace_path"])
+        return (row["assignee"], cwd), cwd
+
+    review_missing: dict[tuple[str, Optional[str]], list[str]] = {}
+    for row in review_rows:
+        if not row["assignee"]:
+            continue
+        if _rpe is not None and not _rpe(row["assignee"]):
+            continue
+        key, cwd = _review_scope(row)
+        if key not in review_missing:
+            review_missing[key] = _missing_worker_skills(
+                ["sdlc-review"], row["assignee"], cwd
+            )
+
     def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+        # "Spawnable" = assigned, a real profile (or no profiles module —
+        # test stubs, exotic envs — matching the review loop's own
+        # fallback), and able to load the review skill.
+        for row in review_rows:
+            if not row["assignee"]:
+                continue
+            if _rpe is not None and not _rpe(row["assignee"]):
+                continue
+            if not review_missing.get(_review_scope(row)[0]):
+                return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
@@ -10565,7 +10975,15 @@ def _dispatch_once_locked(
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
+            #
+            # That suppression is exactly why the skip must announce itself
+            # here: has_spawnable_ready() excludes these assignees, so such a
+            # card can never raise the dispatcher's "stuck" alarm, and with no
+            # event and no log it was invisible on every unattended surface.
             result.skipped_nonspawnable.append(row["id"])
+            _note_nonspawnable(
+                conn, row["id"], row_assignee, dry_run=dry_run, lane="ready"
+            )
             continue
         candidate = get_task(conn, row["id"])
         missing_skills = _missing_worker_skills(
@@ -10731,6 +11149,20 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            _note_nonspawnable(
+                conn, row["id"], row["assignee"], dry_run=dry_run, lane="review"
+            )
+            continue
+        # Check the mandatory review skill in the worker's profile BEFORE
+        # claiming: an unavailable skill must not create a run or boot a
+        # worker that will fail (or silently review without its guidance).
+        missing_skills = review_missing.get(_review_scope(row)[0], [])
+        if missing_skills:
+            result.rejected_skills.append((row["id"], missing_skills))
+            if not dry_run:
+                _append_skill_rejected_event(
+                    conn, row["id"], row["assignee"], missing_skills, lane="review"
+                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -11127,6 +11559,12 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
+    # A remote model endpoint does not move this process or its tools off-box.
+    # Validate placement before opening logs or starting any worker process.
+    from hermes_cli.config import load_config
+    from hermes_cli.kanban_host import require_execution_host
+
+    require_execution_host(load_config())
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")

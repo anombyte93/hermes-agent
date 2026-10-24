@@ -1297,3 +1297,54 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_task_detail_can_omit_paged_history_before_reading(client, monkeypatch):
+    task = client.post('/api/plugins/kanban/tasks', json={'title': 'paged history'}).json()['task']
+    path = f"/api/plugins/kanban/tasks/{task['id']}"
+    positive = client.get(path).json()
+    assert positive['events']  # actual SQLite creation event, not an empty oracle
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('paged detail must not materialise legacy histories')
+
+    for name in ('list_events', 'list_runs', 'list_attachments'):
+        monkeypatch.setattr(kb, name, forbidden)
+    module = sys.modules['hermes_dashboard_plugin_kanban_test']
+    monkeypatch.setattr(module, '_compute_task_diagnostics', forbidden)
+    response = client.get(path, params={'include_history': 'false'})
+    assert response.status_code == 200
+    data = response.json()
+    assert data['task']['id'] == task['id']
+    assert data['events'] == data['runs'] == data['attachments'] == []
+    assert data['history_included'] is False
+    assert data['diagnostics_state'] == 'UNKNOWN'
+    assert client.get('/api/plugins/kanban/tasks/t_ffffffff', params={'include_history': 'false'}).status_code == 404
+
+
+def test_attachment_json_transport_returns_real_bytes_and_preserves_bounds(client, monkeypatch):
+    import base64
+    import sys
+    mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "attachment transport"}).json()["task"]
+    content = b"report bytes\x00\xff\n"
+    upload = client.post(f"/api/plugins/kanban/tasks/{task['id']}/attachments", files={"file": ("report.bin", content, "application/octet-stream")})
+    assert upload.status_code == 200
+    att = upload.json()["attachment"]
+    url = f"/api/plugins/kanban/attachments/{att['id']}"
+    binary = client.get(url)
+    assert binary.content == content
+    response = client.get(url, params={"format": "json"})
+    assert response.headers["content-type"].startswith("application/json")
+    body = response.json()
+    assert base64.b64decode(body["content_base64"], validate=True) == content
+    assert body["filename"] == "report.bin"
+    assert body["size"] == len(content)
+    assert "stored_path" not in body
+    assert client.get(url, params={"format": "unsupported"}).status_code == 422
+    assert client.get("/api/plugins/kanban/attachments/999999?format=json").status_code == 404
+    monkeypatch.setattr(mod, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
+    assert client.get(url, params={"format": "json"}).status_code == 413
+    monkeypatch.setattr(mod, "KANBAN_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024)
+    Path(att["stored_path"]).unlink()
+    assert client.get(url, params={"format": "json"}).status_code == 404

@@ -1003,6 +1003,35 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     return request_client.chat.completions.create(**api_kwargs)
 
 
+def _record_credential_success(agent) -> None:
+    """Clear any exhausted cooldown on the credential that just succeeded.
+
+    Best-effort counterpart to the failure path
+    (``recover_with_credential_pool``): a successful response proves the
+    credential that dispatched the request is healthy again, so its exhausted
+    state is cleared and ``hermes auth list`` renders it as ok (#104).  This
+    is the only mechanism that clears borrowed (env-seeded) credentials, which
+    are resolved straight from the environment and never pass through the
+    pool's ``select``/``clear_expired`` recovery path.
+
+    Must never disturb the request path: a missing pool or a cleared-but-stale
+    entry id degrades to a no-op.
+    """
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None:
+        return
+    record = getattr(pool, "record_success", None)
+    if not callable(record):
+        return
+    try:
+        record(
+            api_key_hint=getattr(agent, "api_key", None),
+            credential_id=getattr(agent, "_credential_pool_entry_id", None),
+        )
+    except Exception:
+        logger.debug("credential pool record_success skipped", exc_info=True)
+
+
 def should_use_direct_api_call(agent) -> bool:
     """Whether an OpenAI-wire request should skip the interrupt worker.
 
@@ -1315,6 +1344,7 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_state["done"] = True
         _reset_stale_streak(agent)
+        _record_credential_success(agent)
         succeeded = True
         return response
     finally:
@@ -1822,6 +1852,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _record_credential_success(agent)
     return result["response"]
 
 
@@ -5464,6 +5495,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _record_credential_success(agent)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

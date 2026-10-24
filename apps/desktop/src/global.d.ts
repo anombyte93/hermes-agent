@@ -571,6 +571,18 @@ export interface DesktopVersionInfo {
   bundleOutOfSync?: boolean
   /** Commits under apps/desktop/ the running bundle is missing (null unknown). */
   bundleCommitsBehind?: null | number
+  /** R1 — the loaded renderer bundle's own build commit, from the packaged
+   *  install-stamp.json read once at process startup. This is the renderer
+   *  build identity; it is DISTINCT from `appVersion` (the backend tree's
+   *  version) and never derivable from `bundleCommitsBehind`. Null when no
+   *  stamp exists (dev run / non-git build) → the UI shows UNKNOWN. */
+  rendererCommit?: null | string
+  /** The stamp's source tag ('ci' | 'local' | 'fallback'), null when absent. */
+  rendererStampSource?: null | string
+  /** ISO-8601 build timestamp from the stamp, null when absent. */
+  rendererBuiltAt?: null | string
+  /** Whether the packaged build was dirty at stamp time, null when absent. */
+  rendererDirty?: null | boolean
 }
 
 export type DesktopUninstallMode = 'full' | 'gui' | 'lite'

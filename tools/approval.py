@@ -4275,8 +4275,17 @@ def _format_tirith_description(tirith_result: dict) -> str:
     parts = []
     for f in findings:
         severity = f.get("severity", "")
-        title = f.get("title", "")
+        rule_id = f.get("rule_id", "")
+        title = f.get("title") or rule_id
+        if rule_id and title != rule_id:
+            title = f"{rule_id}: {title}"
         desc = f.get("description", "")
+        if rule_id == "data_exfiltration":
+            desc = (desc + ". " if desc else "") + (
+                "For direct scp/rsync uploads to an operator-trusted host, "
+                "configure security.tirith_trusted_hosts in config.yaml "
+                "(default: []; other findings still apply)"
+            )
         if title and desc:
             parts.append(f"[{severity}] {title}: {desc}" if severity else f"{title}: {desc}")
         elif title:

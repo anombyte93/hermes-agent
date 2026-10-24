@@ -101,6 +101,7 @@ from agent.anthropic_credentials import (  # noqa: F401
     _write_claude_code_credentials,
     _write_hermes_oauth_credentials,
     claude_code_credentials_path,
+    claude_config_dir,
     is_claude_code_token_valid,
     is_rotation_consumed_uncommitted,
     mark_rotation_consumed_uncommitted,

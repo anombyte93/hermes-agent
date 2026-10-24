@@ -206,6 +206,8 @@ type KanbanMessages = {
     gaveUpTitle: string
     crashedTitle: string
     timedOutTitle: string
+    reviewRequestedTitle: string
+    changesRequestedTitle: string
     openKanban: string
     artifacts: (n: number) => string
   }
@@ -418,6 +420,8 @@ export const en: KanbanMessages = {
     gaveUpTitle: 'Task gave up',
     crashedTitle: 'Worker crashed — will retry',
     timedOutTitle: 'Task timed out — will retry',
+    reviewRequestedTitle: 'Task handed off for review',
+    changesRequestedTitle: 'Review changes requested',
     openKanban: 'Open Kanban',
     artifacts: (n: number) => `${n} artifacts`
   }
@@ -629,6 +633,8 @@ const ja: KanbanMessages = {
     gaveUpTitle: 'タスクを断念しました',
     crashedTitle: 'ワーカーがクラッシュ — 再試行します',
     timedOutTitle: 'タスクがタイムアウト — 再試行します',
+    reviewRequestedTitle: 'タスクをレビューに提出しました',
+    changesRequestedTitle: 'レビュー変更が要求されました',
     openKanban: 'かんばんを開く',
     artifacts: (n: number) => `成果物 ${n} 件`
   }
@@ -837,6 +843,8 @@ const zh: KanbanMessages = {
     gaveUpTitle: '任务已放弃',
     crashedTitle: '工作单元崩溃 — 将重试',
     timedOutTitle: '任务超时 — 将重试',
+    reviewRequestedTitle: '任务已提交审查',
+    changesRequestedTitle: '审查要求修改',
     openKanban: '打开看板',
     artifacts: (n: number) => `${n} 个产物`
   }
@@ -1045,6 +1053,8 @@ const zhHant: KanbanMessages = {
     gaveUpTitle: '任務已放棄',
     crashedTitle: '工作單元當機 — 將重試',
     timedOutTitle: '任務逾時 — 將重試',
+    reviewRequestedTitle: '任務已提交審查',
+    changesRequestedTitle: '審查要求修改',
     openKanban: '開啟看板',
     artifacts: (n: number) => `${n} 個產物`
   }
