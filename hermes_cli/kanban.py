@@ -32,6 +32,7 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
+from hermes_cli.kanban_parser import reason_extra_ids, reason_usage_error
 
 
 # --- Flag parsing helpers ---
@@ -246,6 +247,29 @@ def _joined_words(words) -> Optional[str]:
     return " ".join(words).strip() if words else None
 
 
+def _require_reason(args: argparse.Namespace) -> tuple[Optional[str], int]:
+    """Resolve the reason from ``--reason`` or the trailing positional words (#125).
+
+    This is where both forms at once is refused (``reason_usage_error``),
+    before any change; parse failures keep the parser's one fixed refusal.
+    The non-id word after ``--ids`` the parser already refuses is checked
+    again here for callers that build the Namespace directly. With
+    ``--reason`` (even empty) on a bulk verb, id-shaped trailing words are
+    extra task ids (``_bulk_ids`` folds them in), not reason text. Verbs whose
+    reason is required (``block``, ``request-changes``) handle "neither given"
+    (None).
+    """
+    raw_flag = getattr(args, "_reason_opt", None)
+    words = list(getattr(args, "reason", None) or [])
+    verb = getattr(args, "kanban_action", None) or "kanban"
+    usage = reason_usage_error(verb, words, raw_flag, getattr(args, "ids", None))
+    if usage:
+        return None, _err(f"kanban {verb}: {usage}", 2)
+    if raw_flag is None:
+        return _joined_words(words), 0
+    return _stripped_or_none(raw_flag), 0
+
+
 def _stripped_or_none(value: Optional[str]) -> Optional[str]:
     """``None`` stays ``None``; otherwise strip, and treat the empty string as ``None``."""
     return None if value is None else (value.strip() or None)
@@ -260,8 +284,16 @@ def _ok_or_err(ok, fail: str, done: str) -> int:
 
 
 def _bulk_ids(args: argparse.Namespace) -> list[str]:
-    """Positional ``task_id`` plus ``--ids`` extras (bulk verbs)."""
-    return [args.task_id] + list(getattr(args, "ids", None) or [])
+    """Positional ``task_id`` plus ``--ids`` extras (bulk verbs).
+
+    With ``--reason``, id-shaped trailing words are extra task ids too
+    (``block T U --reason "..."``, #125); handlers call ``_require_reason``
+    first, which refuses any non-id trailing word alongside ``--reason``.
+    """
+    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    return ids + reason_extra_ids(getattr(args, "kanban_action", None) or "",
+                                  getattr(args, "reason", None),
+                                  getattr(args, "_reason_opt", None))
 
 
 def _require_ids(args: argparse.Namespace) -> tuple[list[str], int]:
@@ -975,7 +1007,9 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, rc = _require_reason(args)
+    if rc:
+        return rc
     kind = getattr(args, "kind", None)
     if reason is None:
         return _err("kanban block: a reason is required — explain what input you need", 2)
@@ -999,7 +1033,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, rc = _require_reason(args)
+    if rc:
+        return rc
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -1050,7 +1086,14 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
-    reason = " ".join(args.reason).strip()
+    # Single-task verb: no bulk ids, so any positional word alongside --reason
+    # is a conflict to surface, not an id to fold in (#125).
+    reason, rc = _require_reason(args)
+    if rc:
+        return rc
+    if reason is None:
+        return _err("kanban request-changes: a reason is required — the implementer "
+                    "needs concrete changes to act on", 2)
     with kbc.connect_closing() as conn:
         ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
         if not ok:
@@ -1081,7 +1124,9 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, rc = _require_reason(args)
+    if rc:
+        return rc
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))

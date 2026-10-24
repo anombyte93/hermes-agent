@@ -9,10 +9,22 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import re
+import secrets
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli.kanban_refusal import (  # noqa: F401  (re-exported)
+    PROTECTED_VERBS as _PROTECTED_VERBS,
+    _ProtectedVerbRefusal,
+    _KanbanVerbRefusal,
+    _refusing_parser_class,
+    hermes_parser_classes,
+    invalid_arguments_refusal,
+    is_protected_verb_call,
+)
 
 
 def _arg(*flags: str, **kw):
@@ -22,6 +34,171 @@ def _arg(*flags: str, **kw):
 def _cmd(name: str, args=(), *, children=None, **parser_kw):
     """``children`` = ``(dest, [specs])`` for a nested subparser group."""
     return (name, parser_kw, tuple(args), children)
+
+
+# Verbs whose trailing positional reason (``nargs="*"``) must keep working when
+# it lands AFTER an option string. argparse's greedy first positional chunk
+# consumes the chunk empty and rejects the leftovers ("unrecognized arguments"),
+# which is exactly the #125 symptom. ``parse_known_intermixed_args`` on the
+# leaf parser splits positional/optional parsing into two passes so the words
+# after ``--ids``/``--kind``/``--reason`` land in ``reason`` — it is only
+# reachable by overriding how the subparsers action dispatches into the leaf
+# parser.
+_REASON_INTERMIXED_VERBS = frozenset({"block", "schedule", "promote", "request-changes"})
+# The same four names are ``_PROTECTED_VERBS`` (from ``kanban_refusal``): their
+# calls never echo a caller word on a parse failure (reviews r4 and r5).
+# Bulk verbs: with ``--reason``, id-shaped trailing words are extra task ids
+# (``block T1 T2 --reason "..."``, the #125 failing call 1).
+_BULK_REASON_VERBS = frozenset({"block", "schedule", "promote"})
+# ``t_`` + id chars, the shape minted by kanban_db.new_task_id; deliberately
+# loose so other ``t_...`` shapes (e.g. imported boards) still count as ids.
+# Always applied with ``fullmatch``: ``match`` with ``$`` accepts a final
+# newline, so ``"t_b\n"`` passed every check (review r2 of #133).
+_TASK_ID_RE = re.compile(r"t_[a-z0-9_:\-\.]+", re.IGNORECASE)
+
+
+def _is_task_id(word) -> bool:
+    return isinstance(word, str) and _TASK_ID_RE.fullmatch(word) is not None
+
+
+def reason_extra_ids(verb: str, words, flag: Optional[str]) -> list[str]:
+    """Trailing words that are extra task ids rather than reason text.
+
+    Only when ``--reason`` was given (even empty) and the verb is a bulk verb;
+    otherwise trailing words are the (legacy) positional reason.
+    """
+    if flag is None or verb not in _BULK_REASON_VERBS:
+        return []
+    return [w for w in (words or ()) if _is_task_id(w)]
+
+
+def reason_conflict(verb: str, words, flag: Optional[str]) -> Optional[str]:
+    """Usage-error text when a positional reason AND ``--reason`` are both given.
+
+    The two forms are alternatives; both at once is refused, never a silent
+    pick. An explicitly given empty ``--reason ""`` counts as given, so it never
+    silently yields to the positional words. Returns None when there is no
+    conflict. The text names the two forms by label only and never echoes a
+    reason value: a reason can carry a secret, and the ``/kanban`` reply goes
+    back to a chat surface (review r1 of the #133 Codex fix).
+    """
+    if flag is None:
+        return None
+    ids = reason_extra_ids(verb, words, flag)
+    text = [w for w in (words or ()) if w not in ids]
+    if not text:
+        return None
+    hint = ("; with --reason the only trailing words allowed are task ids (t_...)"
+            if verb in _BULK_REASON_VERBS else "")
+    return (f"pass the reason either as trailing words or as --reason, not both "
+            f"({len(text)} trailing reason word(s) and --reason were both given; "
+            f"reason text is not shown){hint}")
+
+
+def ids_not_task_ids(verb: str, ids) -> Optional[str]:
+    """Usage-error text when a word after ``--ids`` is not a task id.
+
+    ``--ids`` (``nargs="+"``) reads every word up to the next option as a task
+    id, so a reason placed after it lands there. Refusing it before any change
+    beats the alternative: a partial change on the real ids that drops the
+    reason (review r1 of #133). Returns None when every word is id-shaped.
+    """
+    if verb not in _BULK_REASON_VERBS:
+        return None
+    bad = [w for w in (ids or ()) if not _is_task_id(w)]
+    if not bad:
+        return None
+    return f"{len(bad)} word(s) after --ids are not task ids; {_IDS_ONLY_HINT}"
+
+
+# Shared tail of every ``--ids`` refusal. Never echoes the offending word: it is
+# usually a misplaced reason, and a reason can carry a secret.
+_IDS_ONLY_HINT = ("--ids takes task ids only (t_...), and the offending text is not "
+                  "shown; nothing was changed. A reason is never read after --ids: "
+                  "pass it with --reason, or put the words before --ids")
+
+
+def task_id_word(value: str) -> str:
+    """argparse ``type`` for ``--ids``: refuse a non-id word per occurrence.
+
+    argparse keeps only the LAST ``--ids`` occurrence, so a check on the parsed
+    namespace misses a reason hidden in an earlier one
+    (``schedule T --ids U "later" --ids V``). Validating every word as it is
+    read closes that before any replacement (review r1 of the #133 Codex fix).
+    The failure surfaces as the fixed protected-verb refusal
+    (``_ProtectedVerbRefusal``), never with the word.
+    """
+    if not _is_task_id(value):
+        raise argparse.ArgumentTypeError("not a task id")
+    return value
+
+
+def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
+    """Every reason/ids usage error for the #125 verbs, checked before any change."""
+    return ids_not_task_ids(verb, ids) or reason_conflict(verb, words, flag)
+
+
+class _KanbanSubParsersAction(argparse._SubParsersAction):
+    """Dispatches the #125 verbs through ``parse_known_intermixed_args``.
+
+    Every other verb parses exactly as before (``parse_known_args``), so no
+    other verb's accepted syntax changes. Mirrors the stdlib ``__call__``:
+    parse into a fresh subnamespace, copy it onto the caller's namespace and
+    hand leftovers up exactly as the stdlib does; the kanban-level
+    ``_ProtectedVerbRefusal`` refuses them with the one fixed message. Leftovers
+    are NOT re-parsed without intermixing: that would report the trailing
+    reason words as unrecognized next to the genuinely bad option, i.e. the
+    #125 symptom.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if not values or values[0] not in _REASON_INTERMIXED_VERBS:
+            return super().__call__(parser, namespace, values, option_string)
+        parser_name, arg_strings = values[0], values[1:]
+        if self.dest is not argparse.SUPPRESS:
+            setattr(namespace, self.dest, parser_name)
+        leaf = self._name_parser_map[parser_name]
+        # parse_known_intermixed_args raises TypeError for parsers holding
+        # subparsers or REMAINDER/PARSER positionals; these four verbs have none.
+        arg_strings, unshield = _shield_after_separator(arg_strings)
+        subnamespace, extras = leaf.parse_known_intermixed_args(arg_strings, None)
+        for key, value in vars(subnamespace).items():
+            setattr(namespace, key, unshield(value))
+        if extras:
+            vars(namespace).setdefault(argparse._UNRECOGNIZED_ARGS_ATTR, [])
+            getattr(namespace, argparse._UNRECOGNIZED_ARGS_ATTR).extend(unshield(extras))
+
+
+def _shield_after_separator(arg_strings):
+    """Keep every token after the first ``--`` positional under intermixed parsing.
+
+    On Python 3.11 ``parse_known_intermixed_args`` loses a leading ``--``: its
+    first pass (positionals suppressed) consumes the separator, so
+    ``schedule -- T --ids U --reason X`` parsed ``--ids``/``--reason`` as
+    options and scheduled U too (review r1 of the #133 Codex fix). It also
+    drops a later literal ``--``. Each token after the separator is swapped for
+    an opaque placeholder that can never look like an option, the separator
+    itself stays (so an option right before it still cannot take a value from
+    past it), and ``unshield`` maps a parsed value (a string or a list of
+    them) back to the original words. Returns ``(arg_strings, unshield)``; with
+    no separator both are no-ops.
+    """
+    if "--" not in arg_strings:
+        return arg_strings, lambda value: value
+    cut = arg_strings.index("--")
+    tail = arg_strings[cut + 1:]
+    nonce = secrets.token_hex(8)
+    originals = {f"\x00kanban-arg-{nonce}-{i}\x00": word for i, word in enumerate(tail)}
+    shielded = arg_strings[:cut + 1] + list(originals)
+
+    def unshield(value):
+        if isinstance(value, str):
+            return originals.get(value, value)
+        if isinstance(value, list):
+            return [originals.get(v, v) if isinstance(v, str) else v for v in value]
+        return value
+
+    return shielded, unshield
 
 
 def _add_commands(sub: argparse._SubParsersAction, specs) -> None:
@@ -40,6 +217,15 @@ def _json_flag(**kw):
 
 def _reason(help: str):
     return _arg("--reason", help=help)
+
+
+def _reason_opt(help: str):
+    """``--reason`` for verbs that ALSO take trailing positional reason words.
+
+    Stored on a distinct dest so handlers can reject "both forms at once"
+    instead of silently picking one (#125).
+    """
+    return _arg("--reason", dest="_reason_opt", metavar="REASON", help=help)
 
 
 def _run_state_args(type_help: str):
@@ -63,7 +249,10 @@ def _triage_sweep_args(verb: str, Verb: str, noun: str):
 
 
 def _bulk_ids(verb: str):
-    return _arg("--ids", nargs="+", help=f"Additional task ids to {verb} with the same reason (bulk mode)")
+    return _arg("--ids", nargs="+", type=task_id_word,
+                help=f"Additional task ids to {verb} with the same reason (bulk mode). "
+                     "Every word up to the next option is read as a task id; a word "
+                     "that is not a task id (t_...) is refused before any change.")
 
 
 _TASK_ID = _arg("task_id")
@@ -295,7 +484,12 @@ _SPECS = [
     ], help="Edit recovery fields on an already-completed task"),
     _cmd("block", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
+        _arg("reason", nargs="*",
+             help="Reason (also appended as a comment). May sit after the task id "
+                  "or after --kind, but not after --ids: --ids reads those words as "
+                  "task ids and the call is refused before any change. Prefer "
+                  "--reason; words here are only a reason when no --reason flag "
+                  "was given."),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
@@ -303,11 +497,20 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _reason_opt("Reason (also appended as a comment). Quote multi-word reasons. "
+                    "May sit anywhere; with this form extra task ids may also be "
+                    "given positionally (block T1 T2 --reason \"...\"). An empty "
+                    "--reason beside positional reason words is refused."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        _arg("reason", nargs="*",
+             help="Reason/timing note (also appended as a comment). May sit after "
+                  "the task id, but not after --ids: --ids reads those words as task "
+                  "ids and the call is refused before any change. Prefer --reason."),
         _bulk_ids("schedule"),
+        _reason_opt("Reason/timing note (also appended as a comment). Quote multi-word "
+                    "reasons."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
@@ -322,7 +525,14 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="*",
+             help="Concrete changes required before re-review. Required; also "
+                  "acceptable via --reason. May sit after options."),
+        _reason_opt("Concrete changes required before re-review (alternative to the "
+                    "positional words). Quote multi-word reasons."),
+    ],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
@@ -330,8 +540,14 @@ _SPECS = [
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
     _cmd("promote", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+        _arg("reason", nargs="*",
+             help="Audit-trail reason (recorded on the task_events row). May sit "
+                  "after the task id or after --dry-run/--json, but not after --ids: "
+                  "--ids reads those words as task ids and the call is refused before "
+                  "any change. Prefer --reason."),
         _bulk_ids("promote"),
+        _reason_opt("Audit-trail reason (recorded on the task_events row). Quote "
+                    "multi-word reasons."),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
@@ -436,9 +652,8 @@ _SPECS = [
 ]
 
 
-def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
-    """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
-    kanban_parser = parent_subparsers.add_parser(
+def _add_kanban_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    return parent_subparsers.add_parser(
         "kanban",
         help="Multi-profile collaboration board (tasks, links, comments)",
         description="Durable SQLite-backed task board shared across Hermes profiles. "
@@ -447,6 +662,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                     "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban "
                     "or docs/hermes-kanban-v1-spec.pdf for the full design.",
     )
+
+
+def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
+    # The kanban parser (and so every parser below it: add_subparsers defaults
+    # to the parent's class) arms the protected-verb refusal itself.
+    parent_class = parent_subparsers._parser_class
+    parent_subparsers._parser_class = _refusing_parser_class(parent_class)
+    try:
+        kanban_parser = _add_kanban_parser(parent_subparsers)
+    finally:
+        parent_subparsers._parser_class = parent_class
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
     # file, then "default" (kanban_db.get_current_board()).
@@ -455,6 +682,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                     "via `hermes kanban boards switch <slug>` or the "
                                     "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
                                     "list` to see all boards.")
-    _add_commands(kanban_parser.add_subparsers(dest="kanban_action"), _SPECS)
+    # ``action=`` (not a ``parsers_class`` kwarg) swaps the subparsers action
+    # class on every argparse generation; see _KanbanSubParsersAction.
+    _add_commands(
+        kanban_parser.add_subparsers(dest="kanban_action", action=_KanbanSubParsersAction),
+        _SPECS,
+    )
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
