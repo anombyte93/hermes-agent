@@ -1285,6 +1285,9 @@
           boardData,
           onOpen: setSelectedTaskId,
         }),
+        h(BoardCapsStrip, {
+          caps: (boardData && boardData.caps) || null,
+        }),
         h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
@@ -2407,6 +2410,48 @@
           }, submitting ? tx(t, "saving", "Saving…") : tx(t, "save", "Save")),
         ),
       ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Board caps strip — resolved board-scope caps + warnings (#124 display)
+  // -------------------------------------------------------------------------
+
+  function BoardCapsStrip(props) {
+    const caps = props.caps;
+    // Hide entirely when the backend predates the caps payload or nothing
+    // is configured — an empty strip would be noise, not information.
+    if (!caps || !caps.values || Object.keys(caps.values).length === 0) {
+      if (!caps || !caps.warnings || caps.warnings.length === 0) return null;
+    }
+    const entries = Object.keys(caps.values || {}).map(function (key) {
+      const value = caps.values[key];
+      const scope = (caps.scope || {})[key] || "user";
+      const shown = value && typeof value === "object"
+        ? "max " + value.max + " [" + (value.members || []).join(",") + "]"
+        : String(value);
+      const isCapZero = Number(value) === 0;
+      return h("span", {
+        key: key,
+        className: "text-xs px-1.5 py-0.5 rounded-md bg-muted" + (isCapZero ? " text-destructive" : " text-muted-foreground"),
+        title: "Board cap " + key + " = " + shown + " (" + scope + " scope). A cap of 0 means the board deliberately runs/spawns nothing here — it is never \"uncapped\".",
+      }, key + "=" + shown + " (" + scope + ")");
+    });
+    const warnings = (caps.warnings || []).map(function (w, i) {
+      return h("div", {
+        key: "w" + i,
+        className: "text-xs text-amber-600 dark:text-amber-400",
+        title: "Board-cap resolution warning from the default profile config (key names only).",
+      }, "⚠ " + w);
+    });
+    if (entries.length === 0 && warnings.length === 0) return null;
+    return h("div", { className: "flex flex-col gap-1 px-2 py-1" },
+      entries.length
+        ? h("div", { className: "flex flex-wrap items-center gap-1.5" },
+            h("span", { className: "text-xs font-medium text-muted-foreground" }, "caps:" ),
+            entries)
+        : null,
+      warnings.length ? h("div", { className: "flex flex-col gap-0.5" }, warnings) : null,
     );
   }
 

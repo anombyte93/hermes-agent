@@ -52,10 +52,11 @@ def test_kanban_list_json_includes_session_id(kanban_home):
         )
     raw = kc.run_slash("list --json")
     payload = json.loads(raw)
+    rows = payload["tasks"] if isinstance(payload, dict) else payload
     assert any(
         row.get("title") == "acp task"
         and row.get("session_id") == "acp-x"
-        for row in payload
+        for row in rows
     )
 
 

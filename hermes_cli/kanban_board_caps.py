@@ -423,6 +423,27 @@ def cap_rows(resolved: DispatchCaps) -> list:
     return rows
 
 
+def caps_display(caps: BoardCaps) -> Dict[str, Any]:
+    """The resolved board caps as one JSON-safe object for surfaces that SHOW
+    them (``kanban list`` header, dashboard): ``values`` (each cap in effect),
+    ``scope`` (``managed``/``user`` per value; a group's members ride its key)
+    and ``warnings`` (the resolver's key-only warning lines, split on ``;``).
+
+    ONE resolution, ONE shape: every display surface renders this object and
+    never re-implements resolution. Derived-from-memory values
+    (``SOURCE_DERIVED``) report the scope they were derived from as ``user``;
+    a display shows what a cap IS, not how the memory heuristic picked it.
+    """
+    resolved = dispatch_caps(caps)
+    values: Dict[str, Any] = {}
+    scope: Dict[str, str] = {}
+    for key, value, source in cap_rows(resolved):
+        values[key] = value
+        scope[key] = "managed" if source == SOURCE_MANAGED else "user"
+    warnings = [w.strip() for w in (caps.warning or "").split(";") if w.strip()]
+    return {"values": values, "scope": scope, "warnings": warnings}
+
+
 def describe_caps(resolved: DispatchCaps) -> list:
     """Human lines (``  key: value (source)``) for every cap in effect."""
     lines = []

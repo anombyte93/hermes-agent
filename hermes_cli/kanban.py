@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli import kanban_board_caps as kbcaps
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -462,10 +463,38 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _caps_header_lines(caps: dict) -> list[str]:
+    """One-line human header for a :func:`caps_display` payload (#124 display).
+
+    ``0`` renders ``0`` (a cap, never "uncapped"); no caps renders
+    ``caps: none``; dict caps (groups, per-assignee maps) flatten to
+    ``key.name=value`` entries. A warning line follows when the resolver
+    dropped or refused anything (keys only — the resolver guarantees that).
+    """
+    if not caps["values"]:
+        return ["caps: none"]
+
+    def _fmt(value) -> str:
+        if isinstance(value, dict):  # a group: max + members, compact
+            return f"max {value.get('max')} [{','.join(value.get('members', []))}]"
+        return str(value)
+
+    bits = [
+        f"{key}={_fmt(caps['values'][key])} ({caps['scope'].get(key, 'user')})"
+        for key in caps["values"]
+    ]
+    lines = ["caps: " + " ".join(bits)]
+    for warning in caps.get("warnings") or []:
+        lines.append(f"warnings: {warning}")
+    return lines
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    # One caps resolution feeds both surfaces of this command (#124 display).
+    caps = kbcaps.caps_display(kbcaps.read_board_caps())
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
         kb.recompute_ready(conn)
@@ -477,7 +506,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
         # Model truth (#7): the latest run's answering route, one aggregate
         # query; feeds the [model] marker on each line below.
         truth = kb.latest_model_truth(conn, [t.id for t in tasks])
-    if _json_out(args, [_task_to_dict(t) for t in tasks]):
+    if getattr(args, "json", False):
+        _print_json({"tasks": [_task_to_dict(t) for t in tasks], "caps": caps}, ascii=True)
         return 0
     # Passive discoverability: only multi-board users see which board this is.
     try:
@@ -488,6 +518,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         other_count = len(all_boards) - 1
         print(f"Board: {kb.get_current_board()} ({other_count} other board{'s' if other_count != 1 else ''} — "
               f"`hermes kanban boards list`)\n")
+    # The resolved board caps explain why a ready card is not dispatching.
+    for line in _caps_header_lines(caps):
+        print(line)
     if not tasks:
         print("(no matching tasks)")
         return 0
