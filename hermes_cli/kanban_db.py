@@ -111,6 +111,7 @@ TERMINAL_STATUSES = ("done", "archived")
 # The same single-source rule for the other verbs that can refuse a card. Each
 # tuple feeds both the SQL guard in kanban_db and the CLI refusal reason.
 RECLAIM_ACCEPTED_STATUSES = ("running", "ready", "blocked")
+UNBLOCK_ACCEPTED_STATUSES = ("blocked", "scheduled")
 BLOCK_ACCEPTED_STATUSES = ("running", "ready", "review")
 EDIT_ACCEPTED_STATUSES = ("done",)
 REASSIGN_REFUSED_STATUSES = ("running",)  # while a worker holds the claim
@@ -130,6 +131,7 @@ def _sql_in_list(values) -> str:
 
 _COMPLETE_ACCEPTED_SQL = _sql_in_list(COMPLETE_ACCEPTED_STATUSES)
 _RECLAIM_ACCEPTED_SQL = _sql_in_list(RECLAIM_ACCEPTED_STATUSES)
+_UNBLOCK_ACCEPTED_SQL = _sql_in_list(UNBLOCK_ACCEPTED_STATUSES)
 _BLOCK_ACCEPTED_SQL = _sql_in_list(BLOCK_ACCEPTED_STATUSES)
 _ARCHIVE_REFUSED_SQL = _sql_in_list(ARCHIVE_REFUSED_STATUSES)
 
@@ -5560,6 +5562,7 @@ def _unknown_task_reason(unknown_context: Optional[str]) -> str:
 # keeps its own richer explanation in :func:`explain_complete_refusal`.
 _VERB_ACCEPTED_STATUSES = {
     "reclaim": RECLAIM_ACCEPTED_STATUSES,
+    "unblock": UNBLOCK_ACCEPTED_STATUSES,
     "block": BLOCK_ACCEPTED_STATUSES,
     "edit": EDIT_ACCEPTED_STATUSES,
     "reassign": REASSIGN_ACCEPTED_STATUSES,
@@ -5579,19 +5582,29 @@ def explain_refusal(
     unknown_context: Optional[str] = None,
     reclaim_requested: bool = False,
 ) -> str:
-    """Say why ``reclaim``/``reassign``/``edit``/``block``/``archive`` returned
-    False for ``task_id``. Read-only.
+    """Say why ``reclaim``/``unblock``/``reassign``/``edit``/``block``/``archive``
+    returned False for ``task_id``. Read-only.
 
-    The order is: unknown id, already terminal, a status the verb does not
-    accept, then the verb's own remaining refusal (no active claim, stale run
-    id) and finally a catch-all for a race. Every status list comes from the
-    ``*_STATUSES`` constants that also build the verb's SQL guard.
+    The order is: unknown id, recovery-verb hints, already terminal, a status
+    the verb does not accept, then the verb's own remaining refusal (no active
+    claim, stale run id) and finally a catch-all for a race. Every status list
+    comes from the ``*_STATUSES`` constants that also build the verb's SQL guard.
     """
     accepted = _VERB_ACCEPTED_STATUSES[verb]
     task = get_task(conn, task_id)
     if task is None:
+        if verb in {"reclaim", "unblock"}:
+            reason = f"no such task: {task_id}"
+            return f"{reason} on {unknown_context}" if unknown_context else reason
         return _unknown_task_reason(unknown_context)
     status = task.status
+    if verb == "reclaim" and status in UNBLOCK_ACCEPTED_STATUSES:
+        return f"status is {status}; use unblock to release it"
+    if verb == "unblock":
+        if status == "running":
+            return "status is running; use reclaim to stop it and requeue"
+        if status in {"ready", "todo"}:
+            return f"status is {status}; no unblock is needed"
     names_accepted = verb not in _VERBS_WITHOUT_ACCEPTED_LIST
     suffix = f"; {verb} accepts {'/'.join(accepted)}" if names_accepted else ""
     if verb == "reassign":
@@ -7245,7 +7258,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             else "ready"
         )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn, task_id, statuses=UNBLOCK_ACCEPTED_STATUSES, now=now,
             note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
@@ -7268,7 +7281,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            f"WHERE id = ? AND status IN ({_UNBLOCK_ACCEPTED_SQL})",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
