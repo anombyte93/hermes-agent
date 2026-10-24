@@ -469,21 +469,23 @@ def _caps_header_lines(caps: dict) -> list[str]:
     ``0`` renders ``0`` (a cap, never "uncapped"); no caps renders
     ``caps: none``; dict caps (groups, per-assignee maps) flatten to
     ``key.name=value`` entries. A warning line follows when the resolver
-    dropped or refused anything (keys only — the resolver guarantees that).
+    dropped or refused anything (keys only — the resolver guarantees that),
+    whether or not any cap value resolved: a warning-only configuration
+    (every cap invalid, no memory sample) prints ``caps: none`` AND its
+    warnings (#147 review r1 P2).
     """
-    if not caps["values"]:
-        return ["caps: none"]
-
     def _fmt(value) -> str:
         if isinstance(value, dict):  # a group: max + members, compact
             return f"max {value.get('max')} [{','.join(value.get('members', []))}]"
         return str(value)
 
-    bits = [
-        f"{key}={_fmt(caps['values'][key])} ({caps['scope'].get(key, 'user')})"
-        for key in caps["values"]
-    ]
-    lines = ["caps: " + " ".join(bits)]
+    values = caps.get("values") or {}
+    scope = caps.get("scope") or {}
+    if values:
+        bits = [f"{key}={_fmt(values[key])} ({scope.get(key, 'user')})" for key in values]
+        lines = ["caps: " + " ".join(bits)]
+    else:
+        lines = ["caps: none"]
     for warning in caps.get("warnings") or []:
         lines.append(f"warnings: {warning}")
     return lines

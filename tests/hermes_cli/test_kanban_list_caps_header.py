@@ -374,3 +374,31 @@ def test_monitor_kanban_list_parses_real_cli_json(tmp_path, monkeypatch, extra):
     rows = monitor.kanban_list("vid")
     assert sorted(r["title"] for r in rows) == ["Shot 1", "Shot 2"], rows
     assert all(r["id"].startswith("t_") and r["tenant"] == "vid" for r in rows), rows
+
+
+# ---------------------------------------------------------------------------
+# #147 review r1 P2 (finding 2): warnings print even when no cap value resolves
+# ---------------------------------------------------------------------------
+
+
+def test_list_header_warning_only_config_prints_warnings(sticky_profile_home):
+    """The reviewer's case: the ONLY cap is invalid and memory sampling is
+    unavailable (conftest stubs it to ``{}``), so ``values`` is empty and the
+    resolver's warning is the only information. The header must print
+    ``caps: none`` AND that warning, never swallow it."""
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_spawn: \"4\"\n")
+    with kbc.connect_closing() as conn:
+        _seed_ready(conn)
+    lines = kc.run_slash("list").splitlines()
+    assert "caps: none" in lines, lines
+    warning_lines = [line for line in lines if line.startswith("warnings: ")]
+    assert warning_lines, lines
+    assert any("max_spawn" in line for line in warning_lines), warning_lines
+
+
+def test_caps_header_lines_warning_only_payload():
+    assert _board_lines({
+        "values": {}, "scope": {},
+        "warnings": ["kanban: ignoring invalid board caps: max_spawn"],
+    }) == ["caps: none", "warnings: kanban: ignoring invalid board caps: max_spawn"]
+
