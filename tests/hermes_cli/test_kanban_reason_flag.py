@@ -936,3 +936,124 @@ def test_protected_verb_help_still_prints(kanban_home: Path, capsys) -> None:
     assert _cli(["kanban", "request-changes", "--help"]) == 0
     captured = capsys.readouterr()
     assert "--reason REASON" in captured.out and "invalid arguments" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Review r5 (hermes-agent-133-r4, round 6): the TOP-LEVEL ``hermes`` parser.
+# The kanban-tree choke point did not cover failures above ``kanban``: a
+# leftover or an ``ArgumentError`` at the ``hermes`` level (or in a sibling
+# subparser such as ``chat``) reached stock argparse, which quotes the caller's
+# word. On a protected-verb call (argv holds ``kanban`` and one of the four
+# protected verbs) the same mixin now arms at the top level, so every level
+# prints the one fixed refusal, exit code 2. Every other call is unchanged.
+# ---------------------------------------------------------------------------
+
+_R5_CONTROLS = {
+    # The two reviewer repros, verbatim.
+    "r5 top-level leftover": "--{secret} kanban request-changes t_a --reason clean",
+    "r5 top-level surplus help value": "--help={secret} kanban request-changes t_a --reason clean",
+    # The same failure inside a sibling subparser of the armed top level.
+    "r5 chat surplus help value": "chat --help={secret} kanban request-changes t_a --reason clean",
+    # Two more top-level failures that quote the caller's word on stock argparse.
+    "r5 top-level invalid choice": "{secret} kanban request-changes t_a --reason clean",
+    "r5 top-level surplus version value": "--version={secret} kanban request-changes t_a --reason clean",
+}
+
+
+@pytest.mark.parametrize("control", sorted(_R5_CONTROLS))
+@pytest.mark.parametrize("secret", [_R2_CONTROL_SECRET, _SYNTHETIC_SECRET])
+def test_top_level_protected_verb_refusal_is_fixed_and_token_free(
+    kanban_home: Path, capsys, control: str, secret: str
+) -> None:
+    import shlex
+
+    code = _cli(shlex.split(_R5_CONTROLS[control].format(secret=secret)))
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err, captured.err
+    assert code == 2, code
+    assert captured.err.strip() == _REFUSAL, captured.err
+    assert captured.out == "", captured.out
+
+
+@pytest.mark.parametrize("control", sorted(_R5_CONTROLS))
+def test_top_level_protected_verb_refusal_on_the_real_cli_streams(
+    kanban_home: Path, tmp_path: Path, control: str
+) -> None:
+    """``python -m hermes_cli.main <argv>`` exactly as the reviewer ran it:
+    the real entry point, its fast paths included, and the process streams."""
+    import os
+    import shlex
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[2]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+    env.update(HERMES_HOME=str(kanban_home), HOME=str(tmp_path),
+               PYTHONPATH=str(repo), PYTHONDONTWRITEBYTECODE="1")
+    argv = shlex.split(_R5_CONTROLS[control].format(secret=_R2_CONTROL_SECRET))
+    proc = subprocess.run([sys.executable, "-m", "hermes_cli.main", *argv],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+    assert _R2_CONTROL_SECRET not in proc.stdout + proc.stderr, proc.stderr
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert proc.stderr.strip() == _REFUSAL, proc.stderr
+    assert proc.stdout == "", proc.stdout
+
+
+def test_light_chat_parser_refuses_a_protected_verb_call(kanban_home: Path, capsys) -> None:
+    """The fast-path parser (top level + chat only) carries the same refusal."""
+    from hermes_cli import main as hermes_main
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_main._light_chat_parser().parse_args(
+            ["chat", f"--help={_R2_CONTROL_SECRET}", "kanban", "request-changes", "t_a"])
+    captured = capsys.readouterr()
+    assert _R2_CONTROL_SECRET not in captured.out + captured.err, captured.err
+    assert exc.value.code == 2
+    assert captured.err.strip() == _REFUSAL, captured.err
+
+
+def test_fast_chat_launch_leaves_a_protected_verb_call_to_the_full_parser(
+    kanban_home: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fast chat path declines a protected-verb call before parsing, so the
+    full parser prints the refusal once and nothing else reaches the streams."""
+    import sys
+
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.delenv("HERMES_DISABLE_FAST_CHAT_LAUNCH", raising=False)
+    monkeypatch.setattr(sys, "argv", [
+        "hermes", "chat", f"--help={_R2_CONTROL_SECRET}", "kanban", "request-changes", "t_a"])
+    assert hermes_main._try_fast_chat_launch() is False
+    captured = capsys.readouterr()
+    assert captured.out + captured.err == "", captured.err
+
+
+@pytest.mark.parametrize("argv, stock", [
+    # No protected verb: the top level keeps stock argparse messages.
+    (["--{secret}", "kanban", "list"], "unrecognized arguments: --{secret}"),
+    (["--help={secret}", "kanban", "list"], "ignored explicit argument '{secret}'"),
+    # A protected word but no ``kanban``: not a protected-verb call.
+    (["--{secret}", "cron", "list", "block"], "unrecognized arguments"),
+])
+def test_top_level_non_protected_calls_are_unchanged(
+    kanban_home: Path, capsys, argv: list[str], stock: str
+) -> None:
+    secret = "NOT_A_PROTECTED_CALL"
+    assert _cli([a.format(secret=secret) for a in argv]) == 2
+    captured = capsys.readouterr()
+    assert stock.format(secret=secret) in captured.err, captured.err
+    assert "invalid arguments; see --help" not in captured.err, captured.err
+
+
+def test_top_level_protected_call_still_parses_and_helps(kanban_home: Path, capsys) -> None:
+    """Arming only changes failures: a valid call parses, and ``--help`` prints."""
+    parser, subparsers = _cli_parser()
+    from hermes_cli import main as hermes_main
+
+    args = hermes_main._parse_cli_args(
+        parser, subparsers, ["kanban", "request-changes", "t_a", "--reason", "clean"])
+    assert (args.command, args.kanban_action, args.task_id) == ("kanban", "request-changes", "t_a")
+    assert _cli(["--help", "kanban", "request-changes"]) == 0
+    captured = capsys.readouterr()
+    assert "usage: hermes" in captured.out and "invalid arguments" not in captured.out

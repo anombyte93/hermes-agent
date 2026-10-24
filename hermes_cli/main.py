@@ -2924,10 +2924,16 @@ def _run_oneshot_from_args(args) -> None:
 
 
 def _light_chat_parser():
-    """Top-level + chat parser only (no subcommand tree); chat dispatches to cmd_chat."""
-    from hermes_cli._parser import build_top_level_parser
+    """Top-level + chat parser only (no subcommand tree); chat dispatches to cmd_chat.
 
-    parser, _subparsers, chat_parser = build_top_level_parser()
+    Built with the protected-verb refusal classes, like the full parser: a
+    ``kanban <protected verb>`` call that reaches a fast path never gets a stock
+    argparse message quoting a caller word (review r5 of #133).
+    """
+    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.kanban_refusal import hermes_parser_classes
+
+    parser, _subparsers, chat_parser = build_top_level_parser(*hermes_parser_classes())
     chat_parser.set_defaults(func=cmd_chat)
     return parser
 
@@ -2990,6 +2996,12 @@ def _try_fast_chat_launch() -> bool:
         return False
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
+        return False
+    # A protected kanban verb is never a chat launch; the full parser refuses
+    # its parse failures once (the light parser would print the refusal too).
+    from hermes_cli.kanban_refusal import is_protected_verb_call
+
+    if is_protected_verb_call(argv):
         return False
     # Container routing must win: NixOS container mode forwards EVERY invocation.
     try:
@@ -3192,8 +3204,11 @@ def _build_cli_parser():
     those modules never import main.
     """
     from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.kanban_refusal import hermes_parser_classes
 
-    parser, subparsers, chat_parser = build_top_level_parser()
+    # A ``hermes ... kanban <protected verb> ...`` call refuses every parse
+    # failure, at any level, with one token-free message (#125, review r5).
+    parser, subparsers, chat_parser = build_top_level_parser(*hermes_parser_classes())
     chat_parser.set_defaults(func=cmd_chat)
 
     build_model_parser(subparsers, cmd_model=cmd_model)

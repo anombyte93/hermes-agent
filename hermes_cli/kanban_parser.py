@@ -9,16 +9,22 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
-import contextvars
-import functools
 import re
 import secrets
-import sys
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli.kanban_refusal import (  # noqa: F401  (re-exported)
+    PROTECTED_VERBS as _PROTECTED_VERBS,
+    _ProtectedVerbRefusal,
+    _KanbanVerbRefusal,
+    _refusing_parser_class,
+    hermes_parser_classes,
+    invalid_arguments_refusal,
+    is_protected_verb_call,
+)
 
 
 def _arg(*flags: str, **kw):
@@ -39,8 +45,8 @@ def _cmd(name: str, args=(), *, children=None, **parser_kw):
 # reachable by overriding how the subparsers action dispatches into the leaf
 # parser.
 _REASON_INTERMIXED_VERBS = frozenset({"block", "schedule", "promote", "request-changes"})
-# Verbs whose calls never echo a caller word on a parse failure (review r4).
-_PROTECTED_VERBS = _REASON_INTERMIXED_VERBS
+# The same four names are ``_PROTECTED_VERBS`` (from ``kanban_refusal``): their
+# calls never echo a caller word on a parse failure (reviews r4 and r5).
 # Bulk verbs: with ``--reason``, id-shaped trailing words are extra task ids
 # (``block T1 T2 --reason "..."``, the #125 failing call 1).
 _BULK_REASON_VERBS = frozenset({"block", "schedule", "promote"})
@@ -130,81 +136,6 @@ def task_id_word(value: str) -> str:
 def reason_usage_error(verb: str, words, flag: Optional[str], ids) -> Optional[str]:
     """Every reason/ids usage error for the #125 verbs, checked before any change."""
     return ids_not_task_ids(verb, ids) or reason_conflict(verb, words, flag)
-
-
-# Set while a kanban parse whose argv names a protected verb runs; holds the
-# verb named in the refusal. One context-local value covers every parser of the
-# tree (kanban, the leaf, any nested group) for the duration of that parse.
-_REFUSING_AS: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "kanban_refusing_as", default=None)
-
-
-def invalid_arguments_refusal(verb: str) -> str:
-    """The ONE message for every argparse failure on a protected-verb call.
-
-    ``verb`` is a subcommand name from the parser's own table, never caller
-    text, so the message carries no word the caller supplied.
-    """
-    return f"kanban {verb}: invalid arguments; see --help"
-
-
-def _resolved_verb(parser: argparse.ArgumentParser, args: list) -> str:
-    """The subcommand the call names (first argv word in the verb table), else
-    the first protected verb in argv. Always a fixed name, never caller text."""
-    verbs = {name for action in parser._actions
-             if isinstance(action, argparse._SubParsersAction) for name in action.choices}
-    named = [word for word in args if isinstance(word, str) and word in verbs]
-    if named:
-        return named[0]
-    return next(word for word in args if isinstance(word, str) and word in _PROTECTED_VERBS)
-
-
-class _ProtectedVerbRefusal:
-    """Mixin for every parser in the kanban tree: the one refusal choke point.
-
-    When argv names one of the four protected verbs anywhere, ANY argparse
-    failure, at ANY level of the tree, becomes ``invalid_arguments_refusal``
-    with exit code 2 (an ``ArgumentError`` carrying it when ``exit_on_error``
-    is off, as in ``run_slash``): an ``ArgumentError`` such as a surplus
-    ``--help=VALUE`` or a bad ``--ids`` word, leftovers after the verb, and
-    leftovers at the ``kanban`` level before it. argparse's own messages quote
-    caller words, and a reason can carry a secret (review r4 of #133). Every
-    failure path ends in ``error()``, or in ``parse_known_args`` returning
-    leftovers or raising, so those two methods are the whole choke point.
-    """
-
-    def parse_known_args(self, args=None, namespace=None):
-        args = sys.argv[1:] if args is None else list(args)
-        if _REFUSING_AS.get() is not None or not any(
-                isinstance(word, str) and word in _PROTECTED_VERBS for word in args):
-            return super().parse_known_args(args, namespace)
-        token = _REFUSING_AS.set(_resolved_verb(self, args))
-        try:
-            try:
-                namespace, extras = super().parse_known_args(args, namespace)
-            except argparse.ArgumentError:
-                extras = True
-            if extras:
-                self.error("")
-            return namespace, extras
-        finally:
-            _REFUSING_AS.reset(token)
-
-    def error(self, message):
-        verb = _REFUSING_AS.get()
-        if verb is None:
-            return super().error(message)
-        refusal = invalid_arguments_refusal(verb)
-        if not self.exit_on_error:
-            raise argparse.ArgumentError(None, refusal)
-        self.exit(2, refusal + "\n")
-
-
-@functools.lru_cache(maxsize=None)
-def _refusing_parser_class(cls: type) -> type:
-    if issubclass(cls, _ProtectedVerbRefusal):
-        return cls
-    return type(f"Kanban{cls.__name__}", (_ProtectedVerbRefusal, cls), {})
 
 
 class _KanbanSubParsersAction(argparse._SubParsersAction):
@@ -736,7 +667,7 @@ def _add_kanban_parser(parent_subparsers: argparse._SubParsersAction) -> argpars
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
     # The kanban parser (and so every parser below it: add_subparsers defaults
-    # to the parent's class) carries the protected-verb refusal.
+    # to the parent's class) arms the protected-verb refusal itself.
     parent_class = parent_subparsers._parser_class
     parent_subparsers._parser_class = _refusing_parser_class(parent_class)
     try:

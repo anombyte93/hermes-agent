@@ -277,16 +277,20 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
     return chat_parser
 
 
-def build_top_level_parser():
+def build_top_level_parser(parser_class=argparse.ArgumentParser, subparser_class=None):
     """Build the top-level parser, the subparsers action, and the ``chat`` subparser.
 
     Returns ``(parser, subparsers, chat_parser)``; the caller wires
     ``chat_parser.set_defaults(func= cmd_chat)`` and registers further subparsers via
-    ``subparsers.add_parser(...)``.
+    ``subparsers.add_parser(...)``. ``parser_class`` builds the top-level parser and
+    ``subparser_class`` (default: ``parser_class``) every subparser added through
+    ``subparsers``; the full CLI passes the protected-verb refusal classes
+    (``kanban_parser.hermes_parser_classes``), the light chat parser the defaults.
     """
-    parser = argparse.ArgumentParser(
+    parser = parser_class(
         prog="hermes", description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_EPILOGUE)
     _add_top_level_flags(parser)
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    subparsers = parser.add_subparsers(dest="command", help="Command to run",
+                                       parser_class=subparser_class or parser_class)
     return parser, subparsers, _build_chat_parser(subparsers)
