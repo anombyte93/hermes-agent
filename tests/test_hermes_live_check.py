@@ -65,9 +65,11 @@ def _launcher(tmp_path: Path, release_sha: str, *, make_dir: bool = True) -> Pat
     return launcher
 
 
-def run_check(*args: str) -> subprocess.CompletedProcess[str]:
+def run_check(
+    *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(SCRIPT), *args], capture_output=True, text=True
+        [sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=env
     )
 
 
@@ -218,3 +220,46 @@ def test_last_line_matches_release_status(
     else:
         assert proc.returncode == 2, proc.stdout + proc.stderr
         assert proc.stdout.startswith("UNKNOWN:")
+
+
+# --- Review r1 finding 2: a git error is UNKNOWN/2, never NOT-LIVE/1.
+
+
+def test_ancestry_git_error_is_unknown(tmp_path: Path, repo: Path) -> None:
+    """merge-base exits 128 on an unreadable parent object: UNKNOWN, not NOT-LIVE."""
+    _git(repo, "checkout", "-q", "-b", "side")
+    side = _commit(repo, "side S")
+    _git(repo, "checkout", "-q", "main")
+    lost = _commit(repo, "parent X")
+    release = _commit(repo, "release R")
+    (repo / ".git" / "objects" / lost[:2] / lost[2:]).unlink()
+    # The control: both shas still resolve, but the ancestry walk errors (128).
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", side, release],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode not in (0, 1), probe
+    launcher = _launcher(tmp_path, release)
+    proc = run_check(side, "--launcher", str(launcher), "--repo", str(repo))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("UNKNOWN:")
+    assert "NOT-LIVE" not in proc.stdout
+
+
+def test_git_missing_is_unknown(tmp_path: Path, repo: Path) -> None:
+    """No git on PATH is UNKNOWN/2, not a traceback with exit 1 (= NOT-LIVE)."""
+    release = _commit(repo, "only")
+    launcher = _launcher(tmp_path, release)
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    proc = run_check(
+        release,
+        "--launcher",
+        str(launcher),
+        "--repo",
+        str(repo),
+        env={"PATH": str(empty_bin), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("UNKNOWN:")

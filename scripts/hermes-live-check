@@ -13,8 +13,10 @@ Answers one line on stdout:
                                     exit 1  (sha is known to the repo but is
                                            not in the release's history)
   UNKNOWN: <reason>                  exit 2  (launcher unreadable, no release
-                                           sha in it, release dir missing, or
-                                           the sha is unknown to the repo)
+                                           sha in it, release dir missing, the
+                                           sha is unknown to the repo, or any
+                                           git error: fail closed, never
+                                           NOT-LIVE)
 
 Usage:
   scripts/hermes-live-check <sha> [--launcher PATH] [--repo PATH] [--fetch]
@@ -46,9 +48,14 @@ def die_unknown(reason: str) -> "None":
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True
-    )
+    """Run a read-only git command; git that cannot even start is UNKNOWN."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True
+        )
+    except OSError as exc:
+        die_unknown(f"cannot run git in {repo}: {exc}")
+        raise  # unreachable: die_unknown exits
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -134,11 +141,20 @@ def main(argv: list[str]) -> None:
     query = resolve_commit(repo, args.sha)
     release = resolve_commit(repo, release_sha)
     proc = _git(repo, "merge-base", "--is-ancestor", query, release)
+    # --is-ancestor answers 0 (ancestor) or 1 (not an ancestor). Anything else
+    # (128 for an unreadable object, a corrupt repo, a signal) is a git error:
+    # fail closed to UNKNOWN, never NOT-LIVE.
     if proc.returncode == 0:
         print(f"LIVE {query[:7]} in release {release[:7]}")
         sys.exit(0)
-    print(f"NOT-LIVE {query[:7]} not in release {release[:7]}")
-    sys.exit(1)
+    if proc.returncode == 1:
+        print(f"NOT-LIVE {query[:7]} not in release {release[:7]}")
+        sys.exit(1)
+    detail = proc.stderr.strip().splitlines()
+    die_unknown(
+        f"git merge-base --is-ancestor failed (exit {proc.returncode}) in {repo}"
+        + (f": {detail[-1]}" if detail else "")
+    )
 
 
 if __name__ == "__main__":
