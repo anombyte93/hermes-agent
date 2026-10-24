@@ -605,3 +605,282 @@ def test_caps_privacy_checker_rejects_planted_leaking_resolver(sticky_profile_ho
     with pytest.raises(AssertionError):
         _assert_private(out)
 
+
+# ---------------------------------------------------------------------------
+# #147 review r1 P2 (finding 4): the shipped dashboard bundle renders the caps
+# ---------------------------------------------------------------------------
+#
+# The API tests above stop at the payload. These run the SHIPPED bundle
+# (plugins/kanban/dashboard/dist/index.js) in node with a stub SDK, let the
+# kanban page load a /board response carrying a caps object, find the
+# BoardCapsStrip element the page actually renders, render it, and assert on
+# the visible text. Known-red controls plant a strip that returns null, hides
+# warnings, shows zero as "uncapped" or drops the scope label; each must FAIL.
+
+import shutil
+import subprocess
+
+_BUNDLE = _WORKTREE / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+
+_STRIP_HARNESS = r"""
+"use strict";
+const fs = require("fs");
+const vm = require("vm");
+const [, , jsPath, capsPath] = process.argv;
+const capsSpec = JSON.parse(fs.readFileSync(capsPath, "utf8"));
+let slots = [], idx = 0, effects = [];
+function changed(prev, deps) {
+  return !prev || !deps || deps.length !== prev.length
+    || deps.some(function (d, k) { return !Object.is(d, prev[k]); });
+}
+const hooks = {
+  useState(init) {
+    const i = idx++;
+    if (!(i in slots)) slots[i] = typeof init === "function" ? init() : init;
+    return [slots[i], function (v) { slots[i] = typeof v === "function" ? v(slots[i]) : v; }];
+  },
+  useEffect(fn, deps) {
+    const i = idx++;
+    if (changed(slots[i], deps)) { slots[i] = deps; effects.push(fn); }
+  },
+  useMemo(fn, deps) {
+    const i = idx++;
+    if (!slots[i] || changed(slots[i].deps, deps)) slots[i] = { deps: deps, value: fn() };
+    return slots[i].value;
+  },
+  useCallback(fn, deps) { return hooks.useMemo(function () { return fn; }, deps); },
+  useRef(init) { const i = idx++; if (!(i in slots)) slots[i] = { current: init }; return slots[i]; },
+};
+function createElement(type, props) {
+  const children = Array.prototype.slice.call(arguments, 2);
+  return { type: type, props: Object.assign({}, props || {}, { children: children }) };
+}
+class Component { constructor(props) { this.props = props; this.state = {}; } setState() {} }
+const React = Object.assign({ createElement: createElement, Component: Component }, hooks);
+const components = {};
+["Card", "CardContent", "Badge", "Button", "Input", "Label", "Select", "SelectOption"]
+  .forEach(function (n) { components[n] = { [n]: function () { return null; } }[n]; });
+function respond(url) {
+  const path = url.split("?")[0];
+  if (path.endsWith("/config")) return { render_markdown: true };
+  if (path.endsWith("/boards")) return { boards: [{ slug: "default", name: "default" }], current: "default" };
+  if (path.endsWith("/board")) {
+    const board = { columns: [], tenants: [], assignees: [], latest_event_id: 0 };
+    if (capsSpec.mode === "present") board.caps = capsSpec.caps;
+    return board;
+  }
+  return {};
+}
+const SDK = {
+  React: React, hooks: hooks, components: components,
+  utils: { cn: function () { return ""; }, timeAgo: function () { return ""; } },
+  fetchJSON: function (url) { return Promise.resolve(respond(url)); },
+  buildWsUrl: function () { return new Promise(function () {}); },
+};
+let page = null;
+const store = { "hermes.kanban.selectedBoard": "default" };
+const noop = function () {};
+const window = {
+  __HERMES_PLUGIN_SDK__: SDK,
+  __HERMES_PLUGINS__: { register: function (name, comp) { if (name === "kanban") page = comp; } },
+  localStorage: {
+    getItem: function (k) { return k in store ? store[k] : null; },
+    setItem: function (k, v) { store[k] = String(v); },
+    removeItem: function (k) { delete store[k]; },
+  },
+  addEventListener: noop, removeEventListener: noop,
+};
+const ctx = {
+  window: window, console: console, setTimeout: setTimeout, clearTimeout: clearTimeout,
+  setInterval: setInterval, clearInterval: clearInterval, URLSearchParams: URLSearchParams,
+  WebSocket: function () {},
+};
+vm.runInNewContext(fs.readFileSync(jsPath, "utf8"), ctx, { filename: jsPath });
+if (!page) throw new Error("kanban page did not register");
+function find(node, pred) {
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const n of node) { const hit = find(n, pred); if (hit) return hit; }
+    return null;
+  }
+  if (pred(node)) return node;
+  return find(node.props && node.props.children, pred);
+}
+function text(node) {
+  if (node == null || node === false || node === true) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(text).join("");
+  return text(node.props && node.props.children);
+}
+function leaves(node, out) {
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) { node.forEach(function (n) { leaves(n, out); }); return out; }
+  const kids = [].concat(node.props && node.props.children || []).flat(Infinity);
+  if (kids.every(function (k) { return k == null || typeof k !== "object"; })) out.push(text(node));
+  else leaves(kids, out);
+  return out;
+}
+const named = function (name) {
+  return function (n) { return typeof n.type === "function" && n.type.name === name; };
+};
+const settle = function () { return new Promise(function (r) { setImmediate(r); }); };
+(async function () {
+  let strip = null, toolbar = null;
+  for (let pass = 0; pass < 25 && !(strip && toolbar); pass++) {
+    idx = 0; effects = [];
+    const tree = page();
+    effects.forEach(function (fn) { fn(); });
+    for (let k = 0; k < 5; k++) await settle();
+    strip = find(tree, named("BoardCapsStrip"));
+    toolbar = find(tree, named("BoardToolbar"));
+  }
+  if (!toolbar) throw new Error("the board never loaded (BoardToolbar not rendered)");
+  if (!strip) throw new Error("the page does not render BoardCapsStrip");
+  const out = strip.type(strip.props);
+  process.stdout.write(JSON.stringify({
+    props_caps: strip.props.caps === undefined ? "undefined" : strip.props.caps,
+    rendered: out != null && out !== false,
+    text: text(out),
+    leaves: leaves(out, []).filter(function (s) { return s !== ""; }),
+  }));
+  process.exit(0);
+})().catch(function (e) { process.stderr.write(String(e && e.stack || e)); process.exit(3); });
+"""
+
+
+def _render_strip(tmp_path: Path, caps, *, bundle: Path = _BUNDLE, mode: str = "present") -> dict:
+    """Run ``bundle`` with a /board response carrying ``caps`` (``mode``
+    ``absent`` omits the key, as a backend predating caps does) and return the
+    BoardCapsStrip the page renders."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to run the dashboard bundle")
+    harness = tmp_path / "caps_strip_harness.js"
+    harness.write_text(_STRIP_HARNESS, encoding="utf-8")
+    spec = tmp_path / f"caps_spec_{abs(hash((mode, json.dumps(caps, sort_keys=True))))}.json"
+    spec.write_text(json.dumps({"mode": mode, "caps": caps}), encoding="utf-8")
+    proc = subprocess.run([node, str(harness), str(bundle), str(spec)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _board_caps_via_api(root: Path, tmp_path: Path, monkeypatch, user_cfg: str, managed_cfg: str = "") -> dict:
+    """The REAL GET /board caps object for a config (one resolver call)."""
+    _write_cfg(root / "config.yaml", user_cfg)
+    if managed_cfg:
+        managed = tmp_path / "managed"
+        _write_cfg(managed / "config.yaml", managed_cfg)
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        from hermes_cli import managed_scope
+        managed_scope.invalidate_managed_cache()
+    with kbc.connect_closing() as conn:
+        _seed_ready(conn)
+    mod = _plugin_api()
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    r = TestClient(app).get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    return r.json()["caps"]
+
+
+_ZERO_USER_CFG = (
+    "kanban:\n  max_in_progress: 0\n  max_in_progress_by_assignee:\n    evo: 0\n"
+    "  assignee_groups:\n    gpu:\n      max: 0\n      members: [evo, kimi]\n"
+)
+_ZERO_MANAGED_CFG = "kanban:\n  max_spawn: 0\n"
+_WARNING_ONLY_CFG = "kanban:\n  max_spawn: \"4\"\n"
+
+
+def _assert_strip_shows_zero_caps(result: dict) -> None:
+    assert result["rendered"], f"BoardCapsStrip rendered nothing for configured caps: {result}"
+    text = result["text"]
+    for entry in ("max_spawn=0 (managed)", "max_in_progress=0 (user)",
+                  "max_in_progress_by_assignee.evo=0 (user)",
+                  "assignee_groups.gpu=max 0 [evo,kimi] (user)"):
+        assert entry in result["leaves"], f"{entry!r} not rendered: {result['leaves']}"
+    assert "caps:" in text, text
+    assert "uncapped" not in text.lower(), f"a zero cap was shown as uncapped: {text!r}"
+
+
+def _assert_strip_shows_warning_only(result: dict) -> None:
+    assert result["rendered"], f"BoardCapsStrip hid a warning-only payload: {result}"
+    warnings = [leaf for leaf in result["leaves"] if leaf.startswith("⚠ ")]
+    assert warnings, f"no warning rendered: {result['leaves']}"
+    assert any("max_spawn" in w and "ignoring invalid board caps" in w for w in warnings), warnings
+    assert "caps:" not in result["text"], result["text"]  # no values to label
+
+
+def test_dashboard_bundle_renders_zero_caps_with_scope(sticky_profile_home, tmp_path, monkeypatch):
+    caps = _board_caps_via_api(sticky_profile_home, tmp_path, monkeypatch, _ZERO_USER_CFG, _ZERO_MANAGED_CFG)
+    assert caps["values"]["max_spawn"] == 0 and caps["scope"]["max_spawn"] == "managed", caps
+    result = _render_strip(tmp_path, caps)
+    assert result["props_caps"] == caps  # the page hands the strip the /board caps
+    _assert_strip_shows_zero_caps(result)
+
+
+def test_dashboard_bundle_renders_warning_only_caps(sticky_profile_home, tmp_path, monkeypatch):
+    caps = _board_caps_via_api(sticky_profile_home, tmp_path, monkeypatch, _WARNING_ONLY_CFG)
+    assert caps["values"] == {} and caps["warnings"], caps
+    _assert_strip_shows_warning_only(_render_strip(tmp_path, caps))
+
+
+@pytest.mark.parametrize("mode,caps", [
+    ("absent", None),
+    ("present", None),
+    ("present", {"values": {}, "scope": {}, "warnings": []}),
+], ids=["backend-predates-caps", "null-caps", "nothing-configured"])
+def test_dashboard_bundle_hides_strip_without_caps(tmp_path, mode, caps):
+    result = _render_strip(tmp_path, caps, mode=mode)
+    assert result["rendered"] is False, result
+
+
+# Known-red controls: each plant edits ONLY BoardCapsStrip in a copy of the
+# shipped bundle; the anchor must exist exactly once so a plant never no-ops.
+_STRIP_PLANTS = {
+    "returns-null": ("function BoardCapsStrip(props) {", "function BoardCapsStrip(props) { return null;"),
+    "hides-warnings": ("const warnings = (caps.warnings || []).map(", "const warnings = [].map("),
+    "zero-uncapped": (
+        '        : String(value);\n      const isCapZero',
+        '        : (Number(value) === 0 ? "uncapped" : String(value));\n      const isCapZero',
+    ),
+    "zero-blank": (
+        '        : String(value);\n      const isCapZero',
+        '        : (value ? String(value) : "");\n      const isCapZero',
+    ),
+    "drops-scope": ('key + "=" + shown + " (" + scope + ")"', 'key + "=" + shown'),
+}
+
+
+def _planted_bundle(tmp_path: Path, plant: str) -> Path:
+    old, new = _STRIP_PLANTS[plant]
+    src = _BUNDLE.read_text(encoding="utf-8")
+    start = src.index("function BoardCapsStrip(props) {")
+    end = src.index("// Toolbar", start)
+    body = src[start:end]
+    assert body.count(old) == 1, f"plant {plant!r} anchor not found exactly once in BoardCapsStrip"
+    out = tmp_path / f"index.{plant}.js"
+    out.write_text(src[:start] + body.replace(old, new) + src[end:], encoding="utf-8")
+    return out
+
+
+@pytest.mark.parametrize("plant,case", [
+    ("returns-null", "zero"),
+    ("returns-null", "warning-only"),
+    ("hides-warnings", "warning-only"),
+    ("zero-uncapped", "zero"),
+    ("zero-blank", "zero"),
+    ("drops-scope", "zero"),
+])
+def test_dashboard_bundle_controls_fail_on_planted_strip(sticky_profile_home, tmp_path, monkeypatch, plant, case):
+    if case == "zero":
+        caps = _board_caps_via_api(sticky_profile_home, tmp_path, monkeypatch, _ZERO_USER_CFG, _ZERO_MANAGED_CFG)
+        check = _assert_strip_shows_zero_caps
+    else:
+        caps = _board_caps_via_api(sticky_profile_home, tmp_path, monkeypatch, _WARNING_ONLY_CFG)
+        check = _assert_strip_shows_warning_only
+    check(_render_strip(tmp_path, caps))  # the shipped strip passes ...
+    with pytest.raises(AssertionError):  # ... and the planted one fails the SAME check
+        check(_render_strip(tmp_path, caps, bundle=_planted_bundle(tmp_path, plant)))
