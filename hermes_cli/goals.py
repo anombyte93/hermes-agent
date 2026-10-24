@@ -829,37 +829,50 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
 
 def load_goal(session_id: str) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
+    return _load_goal_snapshot(session_id)[0]
+
+
+def _load_goal_snapshot(session_id: str) -> Tuple[Optional[GoalState], Optional[str]]:
+    """Read state and its exact persisted value together for conditional writes."""
     if not session_id:
-        return None
+        return None, None
     db = _get_session_db()
     if db is None:
-        return None
+        return None, None
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
         logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
+        return None, None
     if not raw:
-        return None
+        return None, None
     try:
-        return GoalState.from_json(raw)
+        return GoalState.from_json(raw), raw
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        return None, None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
-    """Persist a goal to SessionDB. No-op if DB unavailable."""
+def save_goal(
+    session_id: str, state: GoalState, *, expected_raw: Optional[str] = None
+) -> bool:
+    """Persist a goal, optionally only if the exact loaded snapshot still exists."""
     if not session_id:
-        return
+        return False
     db = _get_session_db()
     if db is None:
         _warn_dropped_write("GoalManager", "goal", session_id)
-        return
+        return False
     try:
+        if expected_raw is not None:
+            return db.compare_and_set_meta(
+                _meta_key(session_id), expected_raw, state.to_json()
+            )
         db.set_meta(_meta_key(session_id), state.to_json())
+        return True
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
+        return False
 
 
 def clear_goal(session_id: str) -> None:
@@ -1538,13 +1551,17 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         self._state = None
 
-    def mark_done(self, reason: str) -> None:
+    def mark_done(self, reason: str, *, expected_raw: Optional[str] = None) -> bool:
         if not self._state:
-            return
+            return False
+        previous = self._state.to_json()
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
-        save_goal(self.session_id, self._state)
+        if save_goal(self.session_id, self._state, expected_raw=expected_raw):
+            return True
+        self._state = GoalState.from_json(previous)
+        return False
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1657,7 +1674,7 @@ class GoalManager:
             lines.append(f"- {i}. $ {g.command}{status}")
         return "\n".join(lines)
 
-    def _check_gates(self) -> Optional[Dict[str, Any]]:
+    def _check_gates(self, *, expected_raw: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Run quality gates in order; return a decision dict on failure.
 
         Returns ``None`` when there are no gates or every gate passes —
@@ -1670,11 +1687,22 @@ class GoalManager:
         NOT re-run — the recorded failure is replayed and the attempt count
         advances, so a stalled agent can't spin re-running an identical red
         suite (mirrors Prime-Agent's unchanged-gate rule).
+
+        Rejudge supplies ``expected_raw`` to bind bookkeeping and any pause
+        to the verified generation. Concurrent edits are never overwritten.
         """
         state = self._state
         if state is None or not state.gates:
             return None
 
+        goal_changed = {
+            "outcome": "goal_changed",
+            "verdict": "goal_changed",
+            "reason": (
+                "goal changed while quality gates ran or their results could "
+                "not be persisted; re-run rejudge"
+            ),
+        }
         fingerprint = workspace_fingerprint()
         for gate in state.gates:
             unchanged = (
@@ -1702,7 +1730,9 @@ class GoalManager:
                 state.paused_reason = (
                     f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}"
                 )
-                save_goal(self.session_id, state)
+                saved = save_goal(self.session_id, state, expected_raw=expected_raw)
+                if not saved and expected_raw is not None:
+                    return goal_changed
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -1717,7 +1747,9 @@ class GoalManager:
                     ),
                 }
 
-            save_goal(self.session_id, state)
+            saved = save_goal(self.session_id, state, expected_raw=expected_raw)
+            if not saved and expected_raw is not None:
+                return goal_changed
             prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                 goal=state.goal,
                 command=gate.command,
@@ -1738,7 +1770,9 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        saved = save_goal(self.session_id, state, expected_raw=expected_raw)
+        if not saved and expected_raw is not None:
+            return goal_changed
         return None
 
     # --- /goal wait barrier -------------------------------------------
@@ -2229,7 +2263,9 @@ def rejudge_goal(
       was re-set, cleared, or completed by someone else during that
       window is never overwritten by this (now stale) snapshot — the
       transition is refused (``goal_changed``) or reported
-      (``already_done``).
+      (``already_done``). The generation (``created_at``), completion
+      contract, subgoals and gate configuration must still match. Gate
+      bookkeeping and completion use atomic snapshot-checked writes.
     - Idempotent: a goal already in ``done`` is reported as
       ``already_done`` without judging again.
     - ``dry_run=True`` judges the evidence and reports, but writes
@@ -2265,7 +2301,7 @@ def rejudge_goal(
             "exit_code": REJUDGE_EXIT_UNKNOWN_SESSION,
         }
 
-    state = load_goal(sid)
+    state, expected_raw = _load_goal_snapshot(sid)
     if state is None:
         # Distinguish "this session has no goal at all" (wrong id, or the
         # goal lives on a different session) from terminal states below.
@@ -2351,6 +2387,7 @@ def rejudge_goal(
 
     mgr = GoalManager(session_id=sid)
     mgr._state = state
+    assert expected_raw is not None
 
     # Quality gates run before the judge on a REAL run, exactly as in the
     # loop: a failing gate is deterministic evidence the goal is not done.
@@ -2361,21 +2398,26 @@ def rejudge_goal(
     # (gates_pending), never a certification.
     if not dry_run:
         status_before = state.status  # _check_gates mutates `state` in place
-        gate_decision = mgr._check_gates()
+        gate_decision = mgr._check_gates(expected_raw=expected_raw)
         if gate_decision is not None:
             reloaded = load_goal(sid)
             status_after = reloaded.status if reloaded is not None else state.status
             return {
-                "outcome": "incomplete",
+                "outcome": gate_decision.get("outcome", "incomplete"),
                 "reason": gate_decision.get("reason", "quality gate failed"),
                 # A persisted pause IS a state transition (active→paused);
                 # attempt bookkeeping on a still-active goal is not.
-                "changed": status_after != status_before,
+                "changed": (
+                    gate_decision.get("outcome") != "goal_changed"
+                    and status_after != status_before
+                ),
                 "status_after": status_after,
                 "verdict": gate_decision.get("verdict", "gate_failed"),
                 "evidence": evidence,
                 "exit_code": REJUDGE_EXIT_INCOMPLETE,
             }
+        if state.gates:
+            expected_raw = state.to_json()  # conditional gate bookkeeping saved
 
     verdict, reason, parse_failed, _wait_directive, transport_failed = judge_goal(
         state.goal,
@@ -2443,6 +2485,26 @@ def rejudge_goal(
                 "evidence": evidence,
                 "exit_code": REJUDGE_EXIT_UNKNOWN_SESSION,
             }
+        goal_changed = {
+            "outcome": "goal_changed",
+            "reason": (
+                "goal generation, criteria or state changed while rejudging, "
+                "or completion could not be persisted — re-run rejudge"
+            ),
+            "changed": False,
+            "status_after": current.status,
+            "verdict": "done",
+            "evidence": evidence,
+            "exit_code": REJUDGE_EXIT_INCOMPLETE,
+        }
+        if (
+            current.goal != state.goal
+            or current.created_at != state.created_at
+            or current.contract != state.contract
+            or current.subgoals != state.subgoals
+            or current.gates != state.gates
+        ):
+            return goal_changed
         if current.status == "done":
             return {
                 "outcome": "already_done",
@@ -2468,24 +2530,13 @@ def rejudge_goal(
                 "evidence": evidence,
                 "exit_code": REJUDGE_EXIT_INCOMPLETE,
             }
-        if (current.goal or "").strip() != (state.goal or "").strip():
-            return {
-                "outcome": "goal_changed",
-                "reason": (
-                    "the goal was changed while the judge ran "
-                    f"(now: {_truncate(current.goal, 120)}) — not "
-                    "transitioning; re-run rejudge on the new goal"
-                ),
-                "changed": False,
-                "status_after": current.status,
-                "verdict": "done",
-                "evidence": evidence,
-                "exit_code": REJUDGE_EXIT_INCOMPLETE,
-            }
-        # Same goal: adopt the fresh snapshot (preserving any concurrent
-        # subgoal/contract edits) and perform the genuine transition.
+        # Bind completion to the exact judged generation and verified gates.
+        # An edit after this reload is still protected by the atomic write.
         mgr._state = current
-        mgr.mark_done(reason)
+        if not mgr.mark_done(reason, expected_raw=expected_raw):
+            latest = load_goal(sid)
+            goal_changed["status_after"] = latest.status if latest is not None else None
+            return goal_changed
         return {
             "outcome": "done",
             "reason": reason,

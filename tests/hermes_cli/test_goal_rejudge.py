@@ -543,6 +543,160 @@ def test_goal_changed_during_judge_latency_is_not_overwritten(hermes_home):
     assert reloaded.status != "done", "stale mark_done must not have landed"
 
 
+@pytest.mark.parametrize(
+    "when", ["judge", "completion", "gate", "gate_failure", "gate_exhausted"]
+)
+@pytest.mark.parametrize(
+    "edit",
+    ["same_text_reset", "contract", "subgoal", "new_gate", "gate_command",
+     "gate_timeout", "gate_retries"],
+)
+def test_concurrent_goal_edits_are_not_certified(hermes_home, edit, when):
+    """Real persistence must preserve edits at every external/write boundary."""
+    from hermes_cli import goals
+
+    sid = _rand_sid("concurrent")
+    start = 1_700_000_000.0
+    _seed_transcript(sid, "Rollout verified.", evidence_timestamp=start + 90)
+    _seed_goal(sid, status="active", created_at=start)
+    goals.GoalManager(session_id=sid).add_gate("exit 0")
+    if when == "gate_exhausted":
+        state = goals.load_goal(sid)
+        assert state is not None
+        state.gates[0].attempts = state.gates[0].max_retries
+        goals.save_goal(sid, state)
+    edited_row = None
+
+    def edit_goal():
+        nonlocal edited_row
+        mgr = goals.GoalManager(session_id=sid)
+        if edit == "same_text_reset":
+            assert mgr.state is not None
+            mgr.set(mgr.state.goal)
+        elif edit == "contract":
+            mgr.set_contract(goals.GoalContract(verification="new smoke test"))
+        elif edit == "subgoal":
+            mgr.add_subgoal("Verify the rollback")
+        elif edit == "new_gate":
+            mgr.add_gate("exit 7")
+        else:
+            state = goals.load_goal(sid)
+            assert state is not None
+            if edit == "gate_command":
+                state.gates[0].command = "exit 7"
+            elif edit == "gate_timeout":
+                state.gates[0].timeout_seconds += 1
+            else:
+                state.gates[0].max_retries += 1
+            goals.save_goal(sid, state)
+        edited_row = _raw_goal_row(sid)
+
+    def judge_reply(*args, **kwargs):
+        if when == "judge":
+            edit_goal()
+        return MagicMock(choices=[MagicMock(message=MagicMock(content=DONE_REPLY))])
+
+    original_mark_done = goals.GoalManager.mark_done
+
+    def finish(mgr, reason, **kwargs):
+        if when == "completion":
+            edit_goal()
+        return original_mark_done(mgr, reason, **kwargs)
+
+    original_run_gate = goals.run_gate
+
+    def run_gate(gate):
+        result = original_run_gate(gate)
+        if when.startswith("gate"):
+            edit_goal()
+        if when in ("gate_failure", "gate_exhausted"):
+            return False, 7, "smoke test failed"
+        return result
+
+    with patch("agent.auxiliary_client.call_llm", side_effect=judge_reply), patch(
+        "hermes_cli.goals.GoalManager.mark_done", new=finish
+    ), patch("hermes_cli.goals.run_gate", side_effect=run_gate), patch(
+        "hermes_cli.goals.workspace_fingerprint", return_value=""
+    ):
+        result = goals.rejudge_goal(sid)
+
+    assert edited_row is not None
+    assert result["outcome"] == "goal_changed"
+    assert result["changed"] is False
+    assert result["exit_code"] == goals.REJUDGE_EXIT_INCOMPLETE
+    assert _raw_goal_row(sid) == edited_row
+    state = goals.load_goal(sid)
+    assert state is not None
+    assert state.status != "done"
+
+
+def test_legacy_raw_snapshot_can_be_completed(hermes_home):
+    """CAS uses original bytes, not a round-trip with newly defaulted fields."""
+    from hermes_state import SessionDB
+
+    from hermes_cli.goals import load_goal, rejudge_goal
+
+    sid = _rand_sid("legacyraw")
+    _seed_transcript(sid, "Rollout verified.")
+    db = SessionDB()
+    try:
+        db.set_meta(f"goal:{sid}", json.dumps({"goal": "Deploy and verify"}))
+    finally:
+        db.close()
+
+    with _judge_patch(DONE_REPLY):
+        result = rejudge_goal(sid)
+
+    assert result["outcome"] == "done"
+    assert result["changed"] is True
+    state = load_goal(sid)
+    assert state is not None
+    assert state.status == "done"
+
+
+def test_meta_compare_and_swap_preserves_other_connection_write(hermes_home):
+    from hermes_state import SessionDB
+
+    first = SessionDB()
+    second = SessionDB()
+    try:
+        key = "goal:cas-control"
+        first.set_meta(key, "original")
+        assert first.compare_and_set_meta(key, "original", "judged") is True
+        assert second.get_meta(key) == "judged"
+        second.set_meta(key, "replacement")
+        assert first.compare_and_set_meta(key, "judged", "done") is False
+        assert second.get_meta(key) == "replacement"
+        assert first.compare_and_set_meta("goal:missing", "original", "done") is False
+        assert first.get_meta("goal:missing") is None
+    finally:
+        first.close()
+        second.close()
+
+
+def test_new_gate_on_ungated_goal_during_judge_is_refused(hermes_home):
+    from hermes_cli.goals import GoalManager, load_goal, rejudge_goal
+
+    sid = _rand_sid("newgate")
+    _seed_transcript(sid, "Rollout verified.")
+    _seed_goal(sid, status="active")
+
+    def judge_reply(*args, **kwargs):
+        GoalManager(session_id=sid).add_gate("exit 7")
+        return MagicMock(choices=[MagicMock(message=MagicMock(content=DONE_REPLY))])
+
+    with patch("agent.auxiliary_client.call_llm", side_effect=judge_reply):
+        result = rejudge_goal(sid)
+
+    assert result["outcome"] == "goal_changed"
+    assert result["changed"] is False
+    state = load_goal(sid)
+    assert state is not None
+    assert state.status == "active"
+    assert state.gates[0].last_exit_code is None
+    assert state.gates[0].attempts == 0
+
+
 def test_goal_done_elsewhere_during_judge_latency_reports_already_done(hermes_home):
     """A concurrent completion during the judge window is reported, not
     overwritten."""

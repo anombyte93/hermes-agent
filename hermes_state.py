@@ -14351,6 +14351,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def compare_and_set_meta(self, key: str, expected: str, value: str) -> bool:
+        """Replace a meta value only if its exact snapshot still matches.
+
+        Comparison and write share one SQLite transaction, including against
+        writers using another SessionDB connection or process.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (value, key, expected),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.
 
