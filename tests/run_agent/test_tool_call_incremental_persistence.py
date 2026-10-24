@@ -286,6 +286,61 @@ def test_locked_flush_exception_surfaces_locked_cause_in_result_contract():
     assert "disk" not in result["error"].lower()
 
 
+@pytest.mark.parametrize("locked_role", ["assistant", "tool"])
+def test_kanban_lock_retry_resumes_same_turn_without_replaying_tools(tmp_path, monkeypatch, locked_role):
+    """A real transient writer must not cause an LLM/tool-turn replay."""
+    import sqlite3
+
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    db = _attach_real_session_db(agent, db_path, "lock-recovery")
+    db._conn.execute("PRAGMA busy_timeout=0")
+    holder = sqlite3.connect(str(db_path), isolation_level=None)
+    original_append = db.append_messages_batch
+    locked = []
+    sleeps = []
+    clock = [0.0]
+
+    def append(*args, **kwargs):
+        if not locked and any(row["role"] == locked_role for row in kwargs["messages"]):
+            holder.execute("BEGIN IMMEDIATE")
+            locked.append(True)
+        return original_append(*args, **kwargs)
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+        if len(sleeps) == 2:
+            holder.rollback()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_lock_recovery")
+    monkeypatch.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
+    monkeypatch.setattr(db, "append_messages_batch", append)
+    monkeypatch.setattr("hermes_state.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("hermes_state.time.sleep", sleep)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[_mock_tool_call()]),
+        _mock_response(content="done", finish_reason="stop"),
+    ]
+    try:
+        with (
+            patch("run_agent.handle_function_call", return_value="result") as dispatch,
+            patch("agent.tool_executor.maybe_persist_tool_result", side_effect=lambda **kw: kw["content"]),
+        ):
+            result = agent.run_conversation("inspect")
+        assert result["failed"] is False
+        assert result["final_response"] == "done"
+        assert dispatch.call_count == 1
+        assert agent.client.chat.completions.create.call_count == 2
+        assert locked == [True]
+        assert sleeps == [5.0, 10.0]
+    finally:
+        holder.rollback()
+        holder.close()
+        db.close()
+    assert _durable_roles(db_path, "lock-recovery") == ["user", "assistant", "tool", "assistant"]
+
+
 def test_persistence_cause_resets_between_turns():
     """A locked failure on turn 1 must not leak its cause into turn 2."""
     import sqlite3

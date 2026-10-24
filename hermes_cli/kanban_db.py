@@ -471,6 +471,12 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Separate from quota and generic failures: an exhausted state.db lock retry.
+KANBAN_INFRA_LOCK_EXIT_CODE = 76
+_INFRA_LOCK_REQUEUE_LIMIT = 10
+_INFRA_LOCK_WINDOW_SECONDS = 3600
+_INFRA_LOCK_COOLDOWN_SECONDS = 30
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -1544,7 +1550,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | infra_lock | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -8534,6 +8540,8 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    infra_lock: list[str] = field(default_factory=list)
+    """No-fault state.db lock exits, excluded from both failure budgets."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8599,6 +8607,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"infra_lock"`` — ``KANBAN_INFRA_LOCK_EXIT_CODE``: bounded state.db
+      contention retries were exhausted. No failure budget is consumed.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -8620,6 +8630,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_INFRA_LOCK_EXIT_CODE:
+                return ("infra_lock", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -9271,7 +9283,8 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``detect_crashed_workers`` just closed — and counts how many in a row were
     clean-exit protocol violations:
 
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
+    * ``rate_limited`` / ``infra_lock`` runs are neutral and skipped: an
+      infrastructure stop says nothing
       about the task, exactly as it is neutral for the unified
       ``consecutive_failures`` counter.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
@@ -9293,7 +9306,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in {"rate_limited", "infra_lock"}:
             continue
         if outcome == "crashed":
             is_violation = False
@@ -9314,7 +9327,19 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def _worker_log_reports_infra_lock(task_id: str, run_id: Optional[int], *, board=None) -> bool:
+    """Trust a structured marker for THIS run, never an old busy banner.
+
+    Logs append across respawns and the card itself may quote the explainer.
+    A broad substring search would hide unrelated later failures.
+    """
+    if run_id is None:
+        return False
+    log_tail = read_worker_log(task_id, tail_bytes=8192, board=board) or ""
+    return f"kanban_exit: infra_lock run_id={run_id}" in log_tail.splitlines()
+
+
+def detect_crashed_workers(conn: sqlite3.Connection, *, board: Optional[str] = None) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -9341,9 +9366,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    State DB lock stops similarly end as ``infra_lock``, with no failure or
+    protocol-violation count. Ten no-fault requeues per card per rolling hour
+    are allowed; exceeding that separate budget creates a transient block
+    naming lock contention, not a ``gave_up`` failure. Retry phase is retained.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    infra_lock: list[str] = []
+    infra_blocked: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9357,7 +9389,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -9380,8 +9412,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            # A signal is still a real crash. Otherwise a run-scoped marker
+            # recovers classification after a dispatcher restart lost waitpid.
+            infra_lock_exit = kind == "infra_lock" or (
+                kind in {"clean_exit", "nonzero_exit", "unknown"}
+                and _worker_log_reports_infra_lock(
+                    row["id"], row["current_run_id"], board=board,
+                )
+            )
             rate_limited_exit = False
-            if kind == "clean_exit":
+            if infra_lock_exit:
+                protocol_violation = False
+                error_text = (
+                    "state.db lock contention (session storage was busy); "
+                    "requeued without counting a failure. Work is preserved: "
+                    "verify it, commit if needed, and report via kanban_complete."
+                )
+                event_kind = "infra_lock"
+                event_payload = {
+                    "pid": pid, "claimer": row["claim_lock"],
+                    "exit_code": code, "exit_kind": "infra_lock",
+                    "observed_exit_kind": kind, "infra": "state_db_locked",
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -9455,7 +9508,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                _run_outcome = (
+                    "infra_lock" if infra_lock_exit
+                    else "rate_limited" if rate_limited_exit else "crashed"
+                )
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9472,12 +9528,45 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "assignee": row["assignee"],
                     "run_id": run_id,
                     "worker_pid": pid,
-                    "exit_kind": kind,
+                    "exit_kind": "infra_lock" if infra_lock_exit else kind,
                     "exit_code": code,
                     "outcome": _run_outcome,
                     "retry_status": retry_status,
                 })
-                if rate_limited_exit:
+                if infra_lock_exit:
+                    infra_lock.append(row["id"])
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text, row["id"]),
+                    )
+                    # Durable rolling per-card cap, independent of max_retries
+                    # and both failure budgets, including across daemon restarts.
+                    lock_exits = conn.execute(
+                        "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+                        "AND outcome = 'infra_lock' AND ended_at > ?",
+                        (row["id"], int(time.time()) - _INFRA_LOCK_WINDOW_SECONDS),
+                    ).fetchone()[0]
+                    if lock_exits > _INFRA_LOCK_REQUEUE_LIMIT:
+                        reason = (
+                            "state.db lock contention: exhausted "
+                            f"{_INFRA_LOCK_REQUEUE_LIMIT} no-fault requeues in an hour; "
+                            "inspect session storage before resuming."
+                        )
+                        conn.execute(
+                            "UPDATE tasks SET status = 'blocked', block_kind = 'transient', "
+                            "block_reason = ? WHERE id = ?",
+                            (reason, row["id"]),
+                        )
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {"reason": reason, "kind": "transient",
+                             "infra": "state_db_locked", "source_status": retry_status,
+                             "lock_exits": lock_exits,
+                             "requeue_limit": _INFRA_LOCK_REQUEUE_LIMIT},
+                            run_id=run_id,
+                        )
+                        infra_blocked.append(row["id"])
+                elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
                     # respawn until the window clears — WITHOUT touching
@@ -9522,7 +9611,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # A per-task ``max_retries`` overrides the violation bound with the same
     # top precedence it has for every other failure kind. Systemic same-error
     # crashes still trip immediately.
-    auto_blocked: list[str] = []
+    auto_blocked: list[str] = list(infra_blocked)
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
@@ -9597,6 +9686,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_infra_lock = infra_lock  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -9965,7 +10055,7 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
@@ -9986,6 +10076,10 @@ def check_respawn_guard(
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
         return None
+
+    if latest_run is not None and latest_run["outcome"] == "infra_lock":
+        if now - int(latest_run["ended_at"]) < _INFRA_LOCK_COOLDOWN_SECONDS:
+            return "infra_lock_cooldown"
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
@@ -10758,7 +10852,8 @@ def _dispatch_once_locked(
         stale_timeout_seconds=stale_timeout_seconds,
         signal_fn=signal_fn,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
+    result.infra_lock = getattr(detect_crashed_workers, "_last_infra_lock", [])
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
