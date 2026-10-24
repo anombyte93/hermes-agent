@@ -20,11 +20,11 @@ Two defects from the filed repro (observed 2026-09-06 on release a47f117e):
 import json
 import pytest
 
-from cron.jobs import get_job, mark_job_run
+from cron.jobs import claim_dispatch, get_job, mark_job_run
 from tools.cronjob_tools import cronjob, _repeat_display
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
 def tmp_cron_dir(tmp_path, monkeypatch):
     """Isolate the cron store (same pattern as tests/cron/test_jobs.py)."""
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
@@ -117,11 +117,20 @@ class TestScheduleTypeReadback:
 
     def test_update_readback_names_oneshot_type(self):
         created = json.loads(cronjob(action="create", prompt="p", schedule="every 1h"))
+        jid = created["job_id"]
+        assert mark_job_run(jid, success=True) is True
         updated = json.loads(
-            cronjob(action="update", job_id=created["job_id"], schedule="in 45m")
+            cronjob(action="update", job_id=jid, schedule="in 45m")
         )
         assert updated["success"] is True
         assert updated["job"]["schedule_type"] == "one-shot"
+        assert updated["job"]["repeat"] == "once"
+        assert claim_dispatch(jid) is True
+        stored = get_job(jid)
+        assert stored is not None
+        assert stored["state"] == "scheduled"
+        assert stored["enabled"] is True
+        assert stored["next_run_at"] is not None
 
 
 # =========================================================================

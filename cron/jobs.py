@@ -2639,14 +2639,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         prior_completed = prior_repeat.get("completed", 0)
                         if new_kind == "once":
                             if prior_repeat.get("times") is None:
+                                # Prior recurring runs must not consume the
+                                # newly adopted one-shot dispatch budget.
                                 updated["repeat"] = {
                                     "times": 1,
-                                    "completed": prior_completed,
+                                    "completed": 0,
                                 }
                         elif old_kind == "once" and new_kind in ("interval", "cron"):
                             # Clear only the one-shot auto-default (times=1);
                             # an explicit finite limit (>1) survives the
                             # transition — the caller asked for that budget.
+                            # Keep the historical count: an unlimited budget
+                            # cannot be exhausted by prior executions.
                             if prior_repeat.get("times") == 1:
                                 updated["repeat"] = {
                                     "times": None,
