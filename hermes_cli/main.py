@@ -474,6 +474,7 @@ from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.goals import build_goals_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
@@ -12363,7 +12364,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
-        "project", "proxy",
+        "project", "proxy", "goals",
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
@@ -14633,6 +14634,13 @@ def main():
     # logs command  (parser built in hermes_cli/subcommands/logs.py)
     # =========================================================================
     build_logs_parser(subparsers, cmd_logs=cmd_logs)
+
+    # =========================================================================
+    # goals command  (parser built in hermes_cli/subcommands/goals.py)
+    # =========================================================================
+    from hermes_cli.subcommands.goals import cmd_goals
+
+    build_goals_parser(subparsers, cmd_goals=cmd_goals)
 
     # =========================================================================
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)

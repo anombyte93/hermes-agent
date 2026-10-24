@@ -274,6 +274,54 @@ You: _
 
 Four turns, one `/goal` invocation, zero "keep going" prompts from you.
 
+## Re-judging a paused goal from the terminal: `hermes goals rejudge`
+
+The judge is a network call, and networks fail. When the judge API is unreachable for enough turns in a row (expired key, provider outage), the goal loop **auto-pauses** rather than burning the budget on a dead judge — the work itself may already have been complete when that happened.
+
+`hermes goals rejudge` is the recovery path that doesn't require re-running the agent:
+
+```bash
+hermes goals rejudge <session_id>           # judge the stored evidence
+hermes goals rejudge <session_id> --dry-run # judge only: gates deferred, nothing run or written
+```
+
+Running `hermes goals` with no subcommand prints a usage refusal to stderr (`Usage: hermes goals {rejudge}`) and exits 2 — the same usage-error family as a missing or invalid subcommand elsewhere in the CLI. Nothing is judged and nothing is written.
+
+It is scoped to exactly one session. The command:
+
+1. Loads the goal bound to that session and shows it (text, status, turns used).
+2. Shows the **evidence** — the session's last stored assistant response, read from the transcript (trailing tool output is never used as evidence). If that response predates the goal itself, the command refuses with `stale_evidence` — it belongs to an earlier goal on the session, and judging it could certify a false done.
+3. Runs the same judge the loop uses, with the same subgoals/completion-contract context, against that evidence. On a real run, quality gates run first, exactly as in the loop. Under `--dry-run` gates are **deferred entirely** — they are shell commands, and a read-only report must not execute them.
+4. Either performs a genuine done transition, or reports an explicit outcome.
+
+Outcomes and exit codes:
+
+| Outcome | Meaning | Exit |
+|---|---|---|
+| `done` | Judge said done and all gates passed; goal transitioned (or would, with `--dry-run` on a gateless goal) | 0 |
+| `gates_pending` | `--dry-run` on a gated goal: judge said done, but the gates were **not evaluated** (not run) — a preview, not a certification | 0 |
+| `already_done` | Goal was already done — nothing judged, nothing changed | 0 |
+| `incomplete` | Judged: the goal is genuinely not done (or a quality gate failed; an exhausted gate also pauses the goal, visibly) | 1 |
+| `stale_evidence` | The newest stored response predates the goal — refusing to judge an earlier goal's leftovers | 1 |
+| `goal_changed` | The goal was edited while the judge call was in flight; nothing written — re-run | 1 |
+| `no_session` / `no_goal` | No such session, or it has no goal — nothing judged | 2 |
+| `unreachable` | The judge API still can't be reached | 3 |
+| `unparseable` | The judge replied, but not with a usable verdict | 4 |
+
+Safety properties: no agent turns are run, the turn budget is never reset, tools are never replayed, and every state change goes through the same persistence path the goal loop uses. `--dry-run` runs nothing and writes nothing — gate commands are not executed, gate retry budgets are not consumed, and repeated dry-runs leave the stored goal byte-identical. Before a done transition is written, the goal is re-read: if it was re-set, cleared, or completed by someone else while the judge call was in flight, the transition is refused instead of overwriting it. A goal on a *different* session is never touched — if you name the wrong session you get `no_goal`, not a surprising transition. Re-running after a done transition is idempotent (`already_done`, no judge call).
+
+Typical recovery flow after fixing the judge key in `config.yaml`:
+
+```
+$ hermes goals rejudge 8f3a…
+Goal rejudge — session 8f3a…
+  Goal: Deploy v1.2.3 and verify health
+  Status: paused (4/20 turns)
+  Evidence (last assistant response): Deployed v1.2.3. /healthz returns 200 on all 3 replicas; rollout complete.
+  ✓ Goal achieved: deploy verified: /healthz green on all replicas
+  Goal transitioned to done.
+```
+
 ## When the judge gets it wrong
 
 No judge is perfect. Two failure modes to watch for:
