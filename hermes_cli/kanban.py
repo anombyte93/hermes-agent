@@ -493,8 +493,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    # One caps resolution feeds both surfaces of this command (#124 display).
-    caps = kbcaps.caps_display(kbcaps.read_board_caps())
+    json_out = getattr(args, "json", False)
+    with_caps = getattr(args, "with_caps", False)
+    # One caps resolution feeds both surfaces of this command (#124 display),
+    # resolved only when a surface shows it: plain ``--json`` never carries caps.
+    caps = kbcaps.caps_display(kbcaps.read_board_caps()) if (with_caps or not json_out) else None
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
         kb.recompute_ready(conn)
@@ -506,8 +509,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
         # Model truth (#7): the latest run's answering route, one aggregate
         # query; feeds the [model] marker on each line below.
         truth = kb.latest_model_truth(conn, [t.id for t in tasks])
-    if getattr(args, "json", False):
-        _print_json({"tasks": [_task_to_dict(t) for t in tasks], "caps": caps}, ascii=True)
+    rows = [_task_to_dict(t) for t in tasks]
+    if json_out and with_caps:
+        # Opt-in envelope: only a caller that asked for caps sees this shape.
+        _print_json({"tasks": rows, "caps": caps}, ascii=True)
+        return 0
+    # Plain ``--json`` stays the bare task array, byte for byte, so existing
+    # consumers (e.g. kanban-video-orchestrator's monitor.py) keep working.
+    if _json_out(args, rows):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
     try:

@@ -87,7 +87,7 @@ def test_list_json_zero_cap_value_is_zero_not_null(sticky_profile_home):
     )
     with kbc.connect_closing() as conn:
         _seed_ready(conn)
-    payload = json.loads(kc.run_slash("list --json"))
+    payload = json.loads(kc.run_slash("list --json --with-caps"))
     caps = payload["caps"]
     assert caps["values"]["max_in_progress"] == 0
     assert caps["values"]["max_in_progress"] is not None
@@ -123,7 +123,7 @@ def test_list_json_carries_warning(sticky_profile_home):
     )
     with kbc.connect_closing() as conn:
         _seed_ready(conn)
-    payload = json.loads(kc.run_slash("list --json"))
+    payload = json.loads(kc.run_slash("list --json --with-caps"))
     assert payload["caps"]["warnings"]
     assert any("max_spawn" in w for w in payload["caps"]["warnings"])
 
@@ -165,7 +165,7 @@ def test_list_json_scope_map_labels_both(sticky_profile_home, tmp_path, monkeypa
 
     with kbc.connect_closing() as conn:
         _seed_ready(conn)
-    payload = json.loads(kc.run_slash("list --json"))
+    payload = json.loads(kc.run_slash("list --json --with-caps"))
     assert payload["caps"]["scope"]["max_in_progress"] == "user"
     assert payload["caps"]["scope"]["max_spawn"] == "managed"
 
@@ -185,7 +185,7 @@ def test_list_header_no_caps_renders_none(sticky_profile_home):
 def test_list_json_no_caps_empty_values(sticky_profile_home):
     with kbc.connect_closing() as conn:
         _seed_ready(conn)
-    payload = json.loads(kc.run_slash("list --json"))
+    payload = json.loads(kc.run_slash("list --json --with-caps"))
     assert payload["caps"]["values"] == {}
     assert payload["caps"]["scope"] == {}
     assert payload["caps"]["warnings"] == []
@@ -239,7 +239,7 @@ def test_dashboard_board_returns_same_caps_object(sticky_profile_home, tmp_path,
     assert caps["values"]["max_in_progress_by_assignee.evo"] == 2
 
     # SAME object as the CLI JSON (one resolver, two surfaces).
-    cli_payload = json.loads(kc.run_slash("list --json"))
+    cli_payload = json.loads(kc.run_slash("list --json --with-caps"))
     assert cli_payload["caps"] == caps
 
 
@@ -287,3 +287,90 @@ def test_caps_header_lines_shapes():
     assert "assignee_groups.gpu=max 3 [evo,kimi] (managed)" in text
     assert "warnings: kanban: ignoring invalid board caps: max_spawn" in text
     assert _board_lines({"values": {}, "scope": {}, "warnings": []}) == ["caps: none"]
+
+
+# ---------------------------------------------------------------------------
+# #147 review r1 P1: plain ``list --json`` stays the bare task array
+# ---------------------------------------------------------------------------
+
+_WORKTREE = Path(__file__).resolve().parents[2]
+_MONITOR = (_WORKTREE / "optional-skills" / "creative" / "kanban-video-orchestrator"
+            / "scripts" / "monitor.py")
+
+
+def test_list_json_plain_is_bare_task_array_byte_compatible(sticky_profile_home):
+    """Plain ``--json`` is byte-identical to the pre-caps output: the bare task
+    array, non-ASCII kept as-is, and no caps anywhere in it."""
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_in_progress: 0\n")
+    with kbc.connect_closing() as conn:
+        _seed_ready(conn, title="café card")
+        tasks = kb.list_tasks(conn)
+    raw = kc.run_slash("list --json")
+    expected = json.dumps([kc._task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False) + "\n"
+    assert raw == expected.rstrip("\n")  # run_slash rstrips captured stdout
+    assert isinstance(json.loads(raw), list)
+    assert "caps" not in raw and "max_in_progress" not in raw
+
+
+def test_list_json_with_caps_is_the_opt_in_envelope(sticky_profile_home):
+    _write_cfg(sticky_profile_home / "config.yaml", "kanban:\n  max_in_progress: 0\n")
+    with kbc.connect_closing() as conn:
+        _seed_ready(conn)
+    payload = json.loads(kc.run_slash("list --json --with-caps"))
+    assert set(payload) == {"tasks", "caps"}
+    assert [t["title"] for t in payload["tasks"]] == ["ready card"]
+    assert payload["caps"]["values"]["max_in_progress"] == 0
+
+
+def _load_monitor():
+    import importlib.util
+    import sys
+    spec = importlib.util.spec_from_file_location("kanban_video_monitor_under_test", _MONITOR)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _real_cli_runner(home: Path, extra: tuple = ()):
+    """A ``subprocess.run`` stand-in that runs the REAL ``hermes`` CLI from this
+    worktree (``python -m hermes_cli.main``) against an isolated home."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env.update({"PYTHONPATH": str(_WORKTREE), "HERMES_HOME": str(home), "HOME": str(home.parent)})
+    for var in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_MANAGED_DIR"):
+        env.pop(var, None)
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        assert argv[0] == "hermes", argv
+        argv = [sys.executable, "-m", "hermes_cli.main", *argv[1:]]
+        if "--json" in argv:
+            argv = argv + list(extra)
+        kw.pop("check", None)
+        return real_run(argv, env=env, cwd=str(_WORKTREE), timeout=300, check=False, **kw)
+
+    return run
+
+
+@pytest.mark.parametrize("extra", [(), ("--with-caps",)], ids=["plain-json", "with-caps-envelope"])
+def test_monitor_kanban_list_parses_real_cli_json(tmp_path, monkeypatch, extra):
+    """r1 P1 regression control: monitor.py's ``kanban_list`` parser run against
+    the real CLI JSON returns the board's tasks (a dict envelope on plain
+    ``--json`` made it fall back to the text parser and report zero)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _write_cfg(home / "config.yaml", "kanban:\n  max_in_progress: 2\n")
+    monitor = _load_monitor()
+    run = _real_cli_runner(home, extra)
+    for title in ("Shot 1", "Shot 2"):
+        created = run(["hermes", "kanban", "create", title, "--assignee", "dev", "--tenant", "vid"],
+                      capture_output=True, text=True)
+        assert created.returncode == 0, created.stderr
+    monkeypatch.setattr(monitor.subprocess, "run", run)
+    rows = monitor.kanban_list("vid")
+    assert sorted(r["title"] for r in rows) == ["Shot 1", "Shot 2"], rows
+    assert all(r["id"].startswith("t_") and r["tenant"] == "vid" for r in rows), rows
