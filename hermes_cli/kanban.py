@@ -103,6 +103,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "review_mode": t.review_mode,
         "block_reason": t.block_reason,
         "priority": t.priority,
         "tenant": t.tenant,
@@ -431,6 +432,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument("--review", choices=("auto", "parent"), default="auto",
+                          help="Review ownership: auto dispatch (default), or await parent approval")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -1853,6 +1856,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             title=args.title,
             body=args.body,
             assignee=args.assignee,
+            review_mode=getattr(args, "review", "auto"),
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
@@ -2050,6 +2054,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.status == "blocked" and task.block_reason:
         print(f"  blocked:   {task.block_reason}")
     print(f"  assignee:  {task.assignee or '-'}")
+    print(f"  review:    {task.review_mode}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +

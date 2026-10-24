@@ -512,6 +512,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "review_mode": task.review_mode,
         "block_reason": task.block_reason,
         "priority": task.priority,
         "tenant": task.tenant,
@@ -561,6 +562,7 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "review_mode": t.review_mode,
                     "block_reason": t.block_reason,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
@@ -1534,6 +1536,7 @@ def _handle_create(args: dict, **kw) -> str:
                 title=str(title).strip(),
                 body=body,
                 assignee=str(assignee),
+                review_mode=args.get("review", "auto"),
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1564,6 +1567,7 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                review_mode=new_task.review_mode if new_task else None,
                 block_reason=new_task.block_reason if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
@@ -2014,7 +2018,12 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
         "NOT a blocker — it never counts toward unblock-loop detection, so a "
         "task can cycle through review across follow-ups without ever being "
         "falsely escalated to triage. Use this instead of blocking with a "
-        "free-form 'review-required:' reason."
+        "free-form 'review-required:' reason. On default auto-review cards, "
+        "name an independent reviewer profile. If you omit `reviewer` while "
+        "still assigned as the author, the card waits in `review` for an "
+        "independent reviewer or parent or human approval; no self-review "
+        "starts and no reviewer is auto-selected. Parent-owned review cards "
+        "wait for explicit parent or human review instead."
     ),
     "parameters": {
         "type": "object",
@@ -2034,8 +2043,12 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "reviewer": {
                 "type": "string",
                 "description": (
-                    "Optional reviewer profile. When provided, the task is "
-                    "reassigned to that profile before review dispatch."
+                    "An independent reviewer profile to assign before automatic "
+                    "review dispatch. Optional for parent or human review. If "
+                    "you omit `reviewer` while still assigned as the author on "
+                    "a default auto-review card, it waits in `review` for "
+                    "reassignment or parent or human approval; no self-review "
+                    "starts and no reviewer is auto-selected."
                 ),
             },
             "metadata": {
@@ -2369,6 +2382,15 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "review": {
+                "type": "string",
+                "enum": ["auto", "parent"],
+                "description": (
+                    "Review ownership. 'auto' (default) dispatches an independent "
+                    "assigned reviewer. 'parent' leaves the card in review for "
+                    "parent/human approval, without automatic review workers."
                 ),
             },
             "goal_mode": {
