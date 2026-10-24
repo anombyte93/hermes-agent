@@ -458,6 +458,29 @@ class TestJobCRUD:
 
 
 class TestUpdateJob:
+    @pytest.mark.parametrize("prior_runs", [1, 3])
+    def test_recurring_to_once_gets_fresh_dispatch_budget(self, tmp_cron_dir, prior_runs):
+        job = create_job(prompt="Check server status", schedule="every 30m")
+        jid = job["id"]
+        for _ in range(prior_runs):
+            assert mark_job_run(jid, success=True) is True
+        previous = get_job(jid)
+        assert previous is not None
+        assert previous["repeat"]["completed"] == prior_runs
+
+        updated = update_job(jid, {"schedule": "in 30m"})
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "once"
+        assert updated["repeat"]["times"] == 1
+        # Prior recurring executions must not exhaust the new one-shot budget.
+        assert claim_dispatch(jid) is True
+        stored = get_job(jid)
+        assert stored is not None
+        assert stored["state"] == "scheduled"
+        assert stored["enabled"] is True
+        assert stored["next_run_at"] is not None
+        assert stored["repeat"] == {"times": 1, "completed": 1}
+
     def test_update_name(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="every 1h", name="Old Name")
         assert job["name"] == "Old Name"
