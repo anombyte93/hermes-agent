@@ -246,8 +246,9 @@ def test_kanban_refusal_not_found_named_board(kanban_home, capsys, command):
     assert "resolved from --board" in captured.err
 
 
+@pytest.mark.parametrize("verb", ["show", "reclaim", "unblock"])
 @pytest.mark.parametrize("source", ["env", "current", "default", "stale-env", "db"])
-def test_kanban_refusal_not_found_board_source(kanban_home, monkeypatch, capsys, source):
+def test_kanban_refusal_not_found_board_source(kanban_home, monkeypatch, capsys, source, verb):
     board = "default"
     if source in {"env", "current", "stale-env"}:
         kb.create_board("example")
@@ -266,8 +267,9 @@ def test_kanban_refusal_not_found_board_source(kanban_home, monkeypatch, capsys,
     else:
         expected_source = "built-in default"
 
-    assert _run_kanban("show", "missing-task") == 1
+    assert _run_kanban(verb, "missing-task") == 1
     error = capsys.readouterr().err
+    assert "no such task: missing-task" in error
     if source == "db":
         assert str(kanban_home / "isolated.db") in error
         assert "pinned by HERMES_KANBAN_DB" in error
@@ -475,7 +477,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# Specific refusal reasons for reclaim / reassign / edit / block / archive
+# Specific refusal reasons for reclaim / unblock / reassign / edit / block / archive
 # ---------------------------------------------------------------------------
 
 
@@ -490,6 +492,7 @@ def _set_status(tid, status):
 
 _UNKNOWN_ID_COMMANDS = {
     "reclaim": ["reclaim", "missing-task"],
+    "unblock": ["unblock", "missing-task"],
     "reassign": ["reassign", "missing-task", "example-profile"],
     "edit": ["edit", "missing-task", "--result", "backfilled"],
     "block": ["block", "missing-task", "waiting"],
@@ -505,7 +508,10 @@ def test_kanban_refusal_unknown_id_names_board(kanban_home, capsys, verb):
     assert captured.out == ""
     assert f"cannot {verb}" in captured.err
     assert "missing-task" in captured.err
-    assert "unknown task id on board 'example'" in captured.err
+    if verb in {"reclaim", "unblock"}:
+        assert "no such task: missing-task on board 'example'" in captured.err
+    else:
+        assert "unknown task id on board 'example'" in captured.err
     assert "resolved from --board" in captured.err
     assert "unknown id or" not in captured.err
 
@@ -534,6 +540,110 @@ def test_kanban_refusal_reclaim_ready_without_claim(kanban_home, capsys):
         tid = kb.create_task(conn, title="idle task")
     assert _run_kanban("reclaim", tid) == 1
     assert "no active claim to reclaim" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("status", ["blocked", "scheduled"])
+def test_kanban_refusal_reclaim_names_unblock(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="waiting task")
+    _set_status(tid, status)
+    with kb.connect_closing() as conn:
+        before = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert _run_kanban("reclaim", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot reclaim {tid}: status is {status}" in captured.err
+    assert "use unblock" in captured.err
+    assert "unknown" not in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid) == before
+        assert kb.list_events(conn, tid) == events
+
+    # The suggested verb really releases this card.
+    assert _run_kanban("unblock", tid) == 0
+    assert capsys.readouterr().out == f"Unblocked {tid}\n"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_kanban_refusal_unblock_running_names_reclaim(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="busy task", assignee="example-profile")
+        assert kb.claim_task(conn, tid) is not None
+        before = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        runs = kb.list_runs(conn, tid)
+
+    assert _run_kanban("unblock", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot unblock {tid}: status is running" in captured.err
+    assert "use reclaim" in captured.err
+    assert "unknown" not in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid) == before
+        assert kb.list_events(conn, tid) == events
+        assert kb.list_runs(conn, tid) == runs
+
+    # Reclaim releases the real claim without spawning or signalling a worker.
+    assert _run_kanban("reclaim", tid) == 0
+    assert capsys.readouterr().out == f"Reclaimed {tid}\n"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+@pytest.mark.parametrize("status", ["ready", "todo"])
+def test_kanban_refusal_unblock_queued_needs_no_unblock(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="queued task")
+    _set_status(tid, status)
+
+    assert _run_kanban("unblock", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"cannot unblock {tid}: status is {status}" in captured.err
+    assert "no unblock is needed" in captured.err
+    assert "reclaim" not in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == status
+
+
+@pytest.mark.parametrize("status", ["triage", "review", "done", "archived"])
+def test_kanban_refusal_unblock_other_status(kanban_home, capsys, status):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="not blocked")
+    _set_status(tid, status)
+
+    assert _run_kanban("unblock", tid) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"status is {status}" in captured.err
+    assert "unblock accepts blocked/scheduled" in captured.err
+    assert "use reclaim" not in captured.err
+    assert "use unblock" not in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == status
+
+
+@pytest.mark.parametrize("refusal_first", [False, True])
+def test_kanban_unblock_batch_keeps_reason_after_refusal(kanban_home, capsys, refusal_first):
+    with kb.connect_closing() as conn:
+        refused = kb.create_task(conn, title="already queued")
+        blocked = kb.create_task(conn, title="waiting task")
+        assert kb.block_task(conn, blocked, reason="waiting")
+    ids = [refused, blocked] if refusal_first else [blocked, refused]
+
+    assert _run_kanban("unblock", *ids, "--reason", "parent answered") == 1
+    captured = capsys.readouterr()
+    assert captured.out == f"Unblocked {blocked}: parent answered\n"
+    assert f"cannot unblock {refused}: status is ready" in captured.err
+    assert "no unblock is needed" in captured.err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, refused).status == "ready"
+        assert kb.get_task(conn, blocked).status == "ready"
+        assert kb.list_comments(conn, blocked)[-1].body == "UNBLOCK: parent answered"
 
 
 def test_kanban_refusal_reassign_running_claimed(kanban_home, capsys):
@@ -611,6 +721,7 @@ def test_kanban_refusal_archive_already_archived(kanban_home, capsys):
 def test_refusal_status_sets_match_sql_guards(kanban_home):
     """The shared constants decide each verb's outcome, not a second copy."""
     outcomes = {
+        "unblock": (("blocked", "scheduled"), kb.unblock_task),
         "edit": (kb.EDIT_ACCEPTED_STATUSES,
                  lambda c, t: kb.edit_completed_task_result(c, t, result="r")),
         "archive": (kb.ARCHIVE_ACCEPTED_STATUSES, kb.archive_task),
