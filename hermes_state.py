@@ -5280,7 +5280,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
+        kanban_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+        if kanban_worker and getattr(self, "_kanban_lock_retry_exhausted", False):
+            # Turn finalisation and CLI shutdown also flush. Once this worker
+            # has stopped for contention, they cannot restart the retry clock.
+            raise sqlite3.OperationalError("database is locked (worker retry budget exhausted)")
         deadline = time.monotonic() + patience_s
+        # A dispatcher-owned worker must not wait indefinitely, or replay its
+        # conversation (and tool side effects), when transcript storage is busy.
+        # Retry this SAME atomic write at most three times, with 5s/10s backoff
+        # inside a 30s window. Every other writer/error keeps its existing policy.
+        kanban_transcript = (
+            kanban_worker
+            and patience_s == self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+        kanban_lock_deadline = time.monotonic() + 30.0
+        kanban_lock_attempts = 0
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
@@ -5339,13 +5354,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
-                    if self._sleep_before_write_retry(deadline, patience_s):
+                    if kanban_transcript:
+                        kanban_lock_attempts += 1
+                        remaining = kanban_lock_deadline - time.monotonic()
+                        if kanban_lock_attempts < 3 and remaining > 0:
+                            time.sleep(min(5.0 * kanban_lock_attempts, remaining))
+                            if time.monotonic() < kanban_lock_deadline:
+                                continue
+                        self._kanban_lock_retry_exhausted = True
+                    elif self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
+                    lock_wait = (
+                        "until the bounded worker retry budget was exhausted"
+                        if kanban_transcript else f"for over {patience_s:.0f}s"
+                    )
                     raise sqlite3.OperationalError(
                         f"database is locked (another Hermes process held the "
-                        f"state.db write lock for over {patience_s:.0f}s — "
+                        f"state.db write lock {lock_wait} — "
                         "likely a long maintenance operation such as VACUUM, "
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
