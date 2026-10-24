@@ -463,7 +463,14 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         )
         # Ready-lane task with the same fresh PR comment.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        assert kb.claim_task(conn, ready_id) is not None
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
+        with kb.write_txn(conn):
+            kb._end_run(conn, ready_id, outcome="crashed")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (ready_id,),
+            )
 
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kb.check_respawn_guard(conn, review_id, lane="review") is None
@@ -501,6 +508,7 @@ def test_active_pr_guard_honours_newer_requeue(
     monkeypatch.setattr(kb.time, "time", lambda: clock[0])
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="resume builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
         kb.add_comment(
             conn, tid, author="worker",
             body="Draft: https://github.com/example/repo/pull/123",
@@ -530,6 +538,7 @@ def test_active_pr_guard_ignores_other_comment_authors(
 ) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
         kb.add_comment(
             conn, tid, author="parent",
             body="Context: https://github.com/example/repo/pull/123",
@@ -557,6 +566,132 @@ def test_active_pr_guard_allows_ready_verifier_with_parent_pr_link(
         result = kb.dispatch_once(conn, dry_run=True)
         assert tid in [s[0] for s in result.spawned]
         assert tid not in dict(result.respawn_guarded)
+
+
+@pytest.mark.parametrize("author", ["worker", "parent", "reviewer"])
+def test_active_pr_guard_allows_zero_run_child_with_other_cards_pr_link(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, author: str,
+) -> None:
+    """A sibling/parent worker's profile name is not this child's run."""
+    import hermes_cli.profiles as profmod
+
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        builder_id = kb.create_task(conn, title="builder", assignee="worker")
+        assert kb.claim_task(conn, builder_id) is not None
+        child_id = kb.create_task(
+            conn, title="Verify builder PR", assignee="worker", parents=[builder_id],
+        )
+        assert kb.complete_task(conn, builder_id, summary="builder complete")
+        # The link arrives AFTER dependency promotion, so no newer requeue
+        # can hide the authorship defect in the old guard.
+        clock[0] += 10
+        kb.add_comment(
+            conn, child_id, author=author,
+            body="Dependency: https://github.com/example/repo/pull/123",
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "ready"
+        assert conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ?", (builder_id,),
+        ).fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ?", (child_id,),
+        ).fetchone() is None
+        assert kb.check_respawn_guard(conn, child_id) is None
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert child_id in [s[0] for s in result.spawned]
+        assert child_id not in dict(result.respawn_guarded)
+
+
+def test_active_pr_guard_does_not_attribute_preclaim_comment_to_later_run(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="builder", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Dependency: https://github.com/example/repo/pull/123",
+        )
+        clock[0] += 10
+        assert kb.claim_task(conn, tid) is not None
+        # A run must not retroactively turn its profile's context link into
+        # evidence that this card opened a PR.
+        assert kb.check_respawn_guard(conn, tid) is None
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Own PR: https://github.com/example/repo/pull/456",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_requires_matching_run_not_current_assignee(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reassigned builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        clock[0] += 10
+        assert kb.reclaim_task(conn, tid)
+        kb.assign_task(conn, tid, "reviewer")
+        clock[0] += 10
+        kb.add_comment(
+            conn, tid, author="reviewer",
+            body="Context: https://github.com/example/repo/pull/123",
+        )
+        # This card has a run, but not by this author. The assignee alone
+        # cannot supply the missing run attribution.
+        assert kb.check_respawn_guard(conn, tid) is None
+        clock[0] += 10
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.check_respawn_guard(conn, tid) is None
+        kb.add_comment(
+            conn, tid, author="reviewer",
+            body="Own PR: https://github.com/example/repo/pull/456",
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("comment_time", [0, 5, 20])
+def test_active_pr_guard_keeps_prior_workers_link_at_or_after_own_claim(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, comment_time: int,
+) -> None:
+    clock = [1_800_000_000]
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crashed builder", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        # Run: [base, base+10]. Comments at claim, during work and after
+        # the recorded crash all preserve the duplicate-PR protection.
+        started_at = clock[0]
+        if comment_time <= 10:
+            clock[0] = started_at + comment_time
+            kb.add_comment(
+                conn, tid, author="worker",
+                body="Opened https://github.com/example/repo/pull/123",
+            )
+        clock[0] = started_at + 10
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (tid,),
+            )
+        kb.assign_task(conn, tid, "reviewer")
+        if comment_time > 10:
+            clock[0] = started_at + comment_time
+            kb.add_comment(
+                conn, tid, author="worker",
+                body="Opened https://github.com/example/repo/pull/123",
+            )
+        clock[0] += 30
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
 
 
 def test_active_pr_guard_still_holds_builder_crashed_after_own_pr(
@@ -631,6 +766,7 @@ def test_active_pr_guard_ignores_nonmanual_reclaims(
     monkeypatch.setattr(kb.time, "time", lambda: clock[0])
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="nonmanual reclaim", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
         kb.add_comment(
             conn, tid, author="worker",
             body="Opened https://github.com/example/repo/pull/123",

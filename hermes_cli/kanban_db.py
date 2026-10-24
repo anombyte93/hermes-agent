@@ -9891,13 +9891,13 @@ def check_respawn_guard(
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent comment by this task's current
-        assignee or a prior run's profile (within ``_RESPAWN_GUARD_PR_WINDOW``
-        seconds). Re-spawning risks a duplicate PR unless an explicit re-queue
-        is newer than the newest such comment. Other authors' links are context,
-        not evidence that this task opened a PR (including ready-lane verifiers).
-        Authors identify profiles, not runs: same-profile cross-task comments
-        cannot be distinguished and conservatively retain the guard.
+        A GitHub PR URL appears in a recent comment at or after a claimed run
+        on this task, authored by that run's profile (within
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds). Re-spawning risks a duplicate PR
+        unless an explicit re-queue is newer than the newest such comment.
+        Zero-run cards, pre-claim context and authors who have not run this task
+        never qualify, even if their profile matches the current assignee.
+        Post-run handoffs and prior workers' links remain duplicate-work signals.
         Automatic claim-expiry reclaims do not lift either duplicate-work guard.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
@@ -9906,7 +9906,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
+        "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9983,16 +9983,19 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. Only own-worker PR links are duplicate-work signals. Comments store
-    # profile names (kanban_comment's HERMES_PROFILE), not task/run identities.
-    # Preserve evidence from prior assignees that actually ran this task, too.
+    # profile names (kanban_comment's HERMES_PROFILE), so bind each author to
+    # a claimed run on THIS task, no later than the comment. Assignee equality
+    # alone mistakes sibling handoffs for own work and traps zero-run children.
+    # No end bound: a worker may report its PR after the run has been closed.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? "
-        "AND (author = ? OR author IN ("
-        "SELECT profile FROM task_runs WHERE task_id = ?)) "
-        "ORDER BY created_at DESC, id DESC",
-        (task_id, pr_cutoff, row["assignee"], task_id),
+        "SELECT c.body, c.created_at FROM task_comments c "
+        "WHERE c.task_id = ? AND c.created_at >= ? "
+        "AND EXISTS (SELECT 1 FROM task_runs r "
+        "WHERE r.task_id = c.task_id AND r.profile = c.author "
+        "AND r.started_at <= c.created_at) "
+        "ORDER BY c.created_at DESC, c.id DESC",
+        (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             requeued_after = _has_deliberate_requeue_after(
