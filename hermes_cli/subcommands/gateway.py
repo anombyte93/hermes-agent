@@ -217,6 +217,39 @@ def build_gateway_parser(
         help="Target the Linux system-level gateway service",
     )
 
+    # gateway reconcile — one idempotent lifecycle-ownership pass (issue #9)
+    gateway_reconcile_p = gateway_subparsers.add_parser(
+        "reconcile",
+        help="Diagnose gateway ownership and print a safe reconciliation plan",
+        description=(
+            "Classify this profile's gateway as healthy, DEGRADED or stopped, "
+            "then print the smallest ordered plan that moves it toward a "
+            "managed-healthy state. Dry run by default. The plan never starts "
+            "a gateway while a same-profile listener is already alive; taking "
+            "ownership away from an unmanaged process requires --takeover, "
+            "which stops the incumbent first, so a second listener is never "
+            "created."
+        ),
+    )
+    gateway_reconcile_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the plan instead of only printing it",
+    )
+    gateway_reconcile_p.add_argument(
+        "--takeover",
+        action="store_true",
+        help=(
+            "Permit transferring ownership from a live unmanaged gateway: the "
+            "incumbent is stopped before the service is started"
+        ),
+    )
+    gateway_reconcile_p.add_argument(
+        "--system",
+        action="store_true",
+        help="Target the Linux system-level gateway service",
+    )
+
     # gateway list
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 

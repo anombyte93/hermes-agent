@@ -30,6 +30,7 @@ vi.mock('../shell/hooks/use-statusbar-items', () => ({
 vi.mock('../shell/statusbar-controls', () => ({ StatusbarControls: () => null }))
 vi.mock('../routes', () => ({
   contributedRoutes: () => [],
+  routesFromContributions: () => [],
   NEW_CHAT_ROUTE: '/new',
   ROUTES_AREA: 'routes',
   sessionRoute: (id: string) => `/${id}`

@@ -101,12 +101,15 @@ declare global {
           clientPlacement: boolean
           controlDrag: boolean
           nativeDrag: boolean
+          solid: boolean
           workspaceTransfer: boolean
         }
         open: (request?: { sessionId?: null | string; profile?: null | string }) => Promise<{ ok: boolean }>
         close: () => Promise<{ ok: boolean }>
         setIgnoreMouse: (ignore: boolean) => void
-        moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
+        beginMove: () => void
+        endMove: () => void
+        moveBy: (delta: { width: number; height: number }) => void
         setWorkspaceTransfer?: (transferring: boolean) => void
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
         resetLayout: () => Promise<{ ok: boolean }>
@@ -297,6 +300,18 @@ declare global {
       setDisableF12?: (blocked: boolean) => void
       setPreviewShortcutActive?: (active: boolean) => void
       openExternal: (url: string) => Promise<void>
+      /** One-shot loopback callback listener for MCP OAuth against remote
+       *  backends (electron/mcp-oauth-callback-ipc.ts): bind on THIS machine,
+       *  pass redirectUri as client_redirect_uri to mcp.servers.oauth.start,
+       *  await the provider redirect, relay code/state via oauth.callback. */
+      mcpOauth?: {
+        listen: () => Promise<{ id: string; redirectUri: string }>
+        wait: (
+          id: string,
+          timeoutMs?: number
+        ) => Promise<{ code: null | string; error: null | string; state: null | string }>
+        cancel: (id: string) => Promise<boolean>
+      }
       openPreviewInBrowser?: (url: string) => Promise<void>
       fetchLinkTitle: (url: string) => Promise<string>
       /** A site's icon as a data URL, or '' when it has none we can read.
@@ -556,6 +571,18 @@ export interface DesktopVersionInfo {
   bundleOutOfSync?: boolean
   /** Commits under apps/desktop/ the running bundle is missing (null unknown). */
   bundleCommitsBehind?: null | number
+  /** R1 — the loaded renderer bundle's own build commit, from the packaged
+   *  install-stamp.json read once at process startup. This is the renderer
+   *  build identity; it is DISTINCT from `appVersion` (the backend tree's
+   *  version) and never derivable from `bundleCommitsBehind`. Null when no
+   *  stamp exists (dev run / non-git build) → the UI shows UNKNOWN. */
+  rendererCommit?: null | string
+  /** The stamp's source tag ('ci' | 'local' | 'fallback'), null when absent. */
+  rendererStampSource?: null | string
+  /** ISO-8601 build timestamp from the stamp, null when absent. */
+  rendererBuiltAt?: null | string
+  /** Whether the packaged build was dirty at stamp time, null when absent. */
+  rendererDirty?: null | boolean
 }
 
 export type DesktopUninstallMode = 'full' | 'gui' | 'lite'

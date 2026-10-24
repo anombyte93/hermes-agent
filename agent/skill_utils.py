@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -147,6 +148,42 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
         if (skill_root / "SKILL.md").exists():
             return True
     return False
+
+
+def is_inside_skill_package(path, *, stop: Optional[Path] = None) -> bool:
+    """True if *path* sits inside another skill's package directory.
+
+    A markdown file nested anywhere under a directory that contains
+    ``SKILL.md`` is internal package content (subskills, mechanism notes,
+    agent briefs, ...), not a standalone legacy skill — regardless of
+    whether its containing directory is one of the canonical
+    :data:`SKILL_SUPPORT_DIRS`. Discovered live 2026-09-04: dispatch
+    rejected a card force-loading ``deep-research`` because
+    ``atlas-report/subskills/deep-research.md`` collided with the real
+    ``deep-research/SKILL.md`` package.
+
+    ``stop`` bounds the ancestor walk (exclusive): pass the skills
+    directory being scanned so an unrelated ``SKILL.md`` higher up the
+    filesystem cannot influence the verdict. The check starts from the
+    file's parent directory, so a skill package's own ``SKILL.md`` never
+    marks the package itself as nested.
+    """
+    path_obj = path if isinstance(path, Path) else Path(str(path))
+    try:
+        stop_resolved = stop.resolve() if stop is not None else None
+        current = path_obj.resolve().parent
+    except OSError:
+        stop_resolved = stop
+        current = path_obj.parent
+    while True:
+        if stop_resolved is not None and current == stop_resolved:
+            return False
+        if (current / "SKILL.md").exists():
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -613,8 +650,19 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
+def get_shared_skills_dirs() -> List[Path]:
+    """Return canonical cross-runtime skill registries that exist.
+
+    ``~/.agents/skills`` is the shared convention used by Codex and other
+    harnesses. It is user-owned, read-only from Hermes' perspective, and must
+    remain available when a named Hermes profile changes ``HERMES_HOME``.
+    """
+    shared = Path.home() / ".agents" / "skills"
+    return [shared.resolve()] if shared.is_dir() else []
+
+
 def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
+    """Return local, canonical shared, then configured external skill dirs.
 
     The local dir is always first (and always included even if it doesn't exist
     yet — callers handle that).  External dirs follow in config order.
@@ -625,9 +673,8 @@ def get_all_skills_dirs() -> List[Path]:
     those roots first. See ``get_scan_ordered_skills_dirs`` for the full
     precedence-ordered list.
     """
-    dirs = [get_skills_dir()]
-    dirs.extend(get_external_skills_dirs())
-    return dirs
+    dirs = [get_skills_dir(), *get_shared_skills_dirs(), *get_external_skills_dirs()]
+    return list(dict.fromkeys(dirs))
 
 
 # ── Project-local skills directories ──────────────────────────────────────
@@ -669,14 +716,39 @@ PROJECT_SKILLS_SUBDIRS = (
 _PROJECT_ROOT_MAX_DEPTH = 64
 
 
+_PROJECT_CWD_UNSET = object()
+_PROJECT_CWD_OVERRIDE: ContextVar[str | object] = ContextVar(
+    "_PROJECT_CWD_OVERRIDE", default=_PROJECT_CWD_UNSET
+)
+
+
+def set_project_cwd_override(path: "str | Path | None") -> Token:
+    """Set a context-local start directory for project-root discovery.
+
+    Lets an in-process caller (e.g. the kanban dispatcher checking whether a
+    worker would find a skill in its task workspace) resolve project skills
+    as a worker started in ``path`` would. It deliberately does not mutate
+    ``os.environ``, which is shared by every thread in the process. Workers
+    never set it, so their behaviour is unchanged.
+    """
+    value: "str | object" = _PROJECT_CWD_UNSET if path is None else str(path)
+    return _PROJECT_CWD_OVERRIDE.set(value)
+
+
+def reset_project_cwd_override(token: Token) -> None:
+    """Restore the previous context-local project start directory."""
+    _PROJECT_CWD_OVERRIDE.reset(token)
+
+
 def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     """Locate the enclosing project root: nearest ancestor containing ``.git``.
 
     Returns None when cwd is not inside a git checkout. ``.git`` may be a dir
     (normal clone) or a file (worktree/submodule) — both count.
 
-    When *start* is not given, the surface's working directory wins over the
-    process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
+    When *start* is not given, a context-local override (see
+    :func:`set_project_cwd_override`) wins first; otherwise the surface's
+    working directory wins over the process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
     tool and cron jobs use (a cron job sets it from its per-job ``workdir``
     without chdir'ing the scheduler process). This is what lets
     non-interactive surfaces inherit a prior interactive trust decision by
@@ -685,8 +757,12 @@ def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     """
     try:
         if start is None:
+            override = _PROJECT_CWD_OVERRIDE.get()
             env_cwd = os.environ.get("TERMINAL_CWD")
-            start = Path(env_cwd) if env_cwd else Path.cwd()
+            if override is not _PROJECT_CWD_UNSET and override:
+                start = Path(str(override))
+            else:
+                start = Path(env_cwd) if env_cwd else Path.cwd()
         cur = Path(start).resolve()
     except OSError:
         return None
@@ -803,16 +879,22 @@ def get_untrusted_project_skills_root() -> Optional[Tuple[Path, int]]:
     return root, count
 
 
-def get_scan_ordered_skills_dirs() -> List[Path]:
-    """All skill dirs in precedence order: project → local → external.
+def get_scan_ordered_skills_dirs(local_skills_dir: Optional[Path] = None) -> List[Path]:
+    """All skill dirs in precedence order: project → local → shared → external.
 
     First-wins name deduplication over this order gives project skills
     priority over profile-local and external ones.
     """
     dirs = list(get_project_skills_dirs())
-    dirs.append(get_skills_dir())
+    local_dir = local_skills_dir if local_skills_dir is not None else get_skills_dir()
+    dirs.append(local_dir)
+    # A patched/custom local root is an explicit isolated registry (used by
+    # embedders and tests); do not silently blend the user's global registry
+    # into it. Normal profile resolution passes its live get_skills_dir().
+    if local_skills_dir is None or local_dir == get_skills_dir():
+        dirs.extend(get_shared_skills_dirs())
     dirs.extend(get_external_skills_dirs())
-    return dirs
+    return list(dict.fromkeys(dirs))
 
 
 # ── Project skill quarantine (scan-time injection defense) ────────────────
@@ -1018,6 +1100,13 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
         "requires_toolsets": hermes.get("requires_toolsets", []),
         "fallback_for_tools": hermes.get("fallback_for_tools", []),
         "requires_tools": hermes.get("requires_tools", []),
+        # Gateway-channel gate (maintainer-directed, skills-index slim):
+        # list of session platforms (e.g. ["msteams"]) the skill is FOR.
+        # Unlike top-level ``platforms:`` (host OS), this hides the skill
+        # from the index on every other channel — the teams-meeting
+        # pipeline has no business in a desktop or telegram session's
+        # index. Empty/absent = visible everywhere (backward compat).
+        "session_platforms": hermes.get("session_platforms", []),
     }
 
 

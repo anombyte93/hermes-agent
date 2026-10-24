@@ -190,6 +190,19 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
     assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
 
 
+def test_dashboard_requires_and_renders_current_block_reason():
+    """The shipped Desktop bundle must collect and display the kernel field."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text(encoding="utf-8")
+
+    assert 'label: tx(i18n, "blockReason", "Block reason")' in js
+    assert "value: t.block_reason" in js
+    assert "block_reason: r.blockReason" in js
+    assert "A block reason is required before marking a task blocked." in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
@@ -594,6 +607,60 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Bulk actions
 # ---------------------------------------------------------------------------
+
+
+def test_status_blocked_requires_and_persists_reason(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "needs context"}
+    ).json()["task"]
+
+    missing = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked"},
+    )
+    assert missing.status_code == 400
+    assert "block reason is required" in missing.json()["detail"]
+
+    blocked = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "  Waiting for owner  "},
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["task"]["block_reason"] == "Waiting for owner"
+
+
+def test_bulk_status_blocked_requires_and_persists_reason(client):
+    tasks = [
+        client.post(
+            "/api/plugins/kanban/tasks", json={"title": title}
+        ).json()["task"]
+        for title in ("a", "b")
+    ]
+
+    missing = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task["id"] for task in tasks], "status": "blocked"},
+    )
+    assert missing.status_code == 200
+    assert all(not item["ok"] for item in missing.json()["results"])
+    assert all(
+        "block reason is required" in item["error"]
+        for item in missing.json()["results"]
+    )
+
+    blocked = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task["id"] for task in tasks],
+            "status": "blocked",
+            "block_reason": "  Shared dependency  ",
+        },
+    )
+    assert blocked.status_code == 200
+    assert all(item["ok"] for item in blocked.json()["results"])
+    for task in tasks:
+        detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+        assert detail["task"]["block_reason"] == "Shared dependency"
 
 
 def test_bulk_status_ready(client):
@@ -1230,3 +1297,54 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_task_detail_can_omit_paged_history_before_reading(client, monkeypatch):
+    task = client.post('/api/plugins/kanban/tasks', json={'title': 'paged history'}).json()['task']
+    path = f"/api/plugins/kanban/tasks/{task['id']}"
+    positive = client.get(path).json()
+    assert positive['events']  # actual SQLite creation event, not an empty oracle
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('paged detail must not materialise legacy histories')
+
+    for name in ('list_events', 'list_runs', 'list_attachments'):
+        monkeypatch.setattr(kb, name, forbidden)
+    module = sys.modules['hermes_dashboard_plugin_kanban_test']
+    monkeypatch.setattr(module, '_compute_task_diagnostics', forbidden)
+    response = client.get(path, params={'include_history': 'false'})
+    assert response.status_code == 200
+    data = response.json()
+    assert data['task']['id'] == task['id']
+    assert data['events'] == data['runs'] == data['attachments'] == []
+    assert data['history_included'] is False
+    assert data['diagnostics_state'] == 'UNKNOWN'
+    assert client.get('/api/plugins/kanban/tasks/t_ffffffff', params={'include_history': 'false'}).status_code == 404
+
+
+def test_attachment_json_transport_returns_real_bytes_and_preserves_bounds(client, monkeypatch):
+    import base64
+    import sys
+    mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "attachment transport"}).json()["task"]
+    content = b"report bytes\x00\xff\n"
+    upload = client.post(f"/api/plugins/kanban/tasks/{task['id']}/attachments", files={"file": ("report.bin", content, "application/octet-stream")})
+    assert upload.status_code == 200
+    att = upload.json()["attachment"]
+    url = f"/api/plugins/kanban/attachments/{att['id']}"
+    binary = client.get(url)
+    assert binary.content == content
+    response = client.get(url, params={"format": "json"})
+    assert response.headers["content-type"].startswith("application/json")
+    body = response.json()
+    assert base64.b64decode(body["content_base64"], validate=True) == content
+    assert body["filename"] == "report.bin"
+    assert body["size"] == len(content)
+    assert "stored_path" not in body
+    assert client.get(url, params={"format": "unsupported"}).status_code == 422
+    assert client.get("/api/plugins/kanban/attachments/999999?format=json").status_code == 404
+    monkeypatch.setattr(mod, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
+    assert client.get(url, params={"format": "json"}).status_code == 413
+    monkeypatch.setattr(mod, "KANBAN_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024)
+    Path(att["stored_path"]).unlink()
+    assert client.get(url, params={"format": "json"}).status_code == 404

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,13 @@ def kb(tmp_path, monkeypatch):
     """
     home = tmp_path / ".hermes"
     for prof in ("alpha", "beta", "default"):
-        (home / "profiles" / prof).mkdir(parents=True, exist_ok=True)
+        skill = home / "profiles" / prof / "skills" / "sdlc-review" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            "---\nname: sdlc-review\ndescription: Review a change.\n---\n"
+            "Verify the change against its acceptance criteria.\n",
+            encoding="utf-8",
+        )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -217,6 +224,76 @@ def test_scratch_tasks_without_paths_both_spawn(kb):
 
     assert sorted(s[0] for s in res.spawned) == sorted([id_a, id_b])
     assert res.skipped_workspace_busy == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_caller_owned_worktree_anchor_does_not_lease_the_callers_path(
+    kb, tmp_path, dry_run,
+):
+    """Main resolves an external checkout into a fresh per-task worktree.
+
+    A worker using the caller's checkout as ``dir`` must not block a task
+    that merely uses it as a ``worktree`` anchor, including in previews.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            [
+                "git", "-C", str(repo), "-c", "user.name=Test User",
+                "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false",
+                *args,
+            ],
+            check=True, capture_output=True, text=True,
+        )
+
+    git("init", "-b", "main")
+    git("commit", "--allow-empty", "-m", "init")
+    caller = tmp_path / "caller-worktree"
+    git("worktree", "add", "-b", "caller-work", str(caller))
+
+    with kb.connect_closing() as conn:
+        holder = _mk(kb, conn, "caller worker", workspace=caller)
+        task_id = kb.create_task(
+            conn, title="isolated worker", assignee="beta",
+            workspace_kind="worktree", workspace_path=str(caller),
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET priority = 10 WHERE id = ?", (holder,))
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=dry_run)
+        assert {row[0] for row in res.spawned} == {holder, task_id}
+        assert res.skipped_workspace_busy == []
+        if not dry_run:
+            task = kb.get_task(conn, task_id)
+            assert task.workspace_path == str((repo / ".worktrees" / task_id).resolve())
+            assert task.branch_name == f"wt/{task_id}"
+    branch = subprocess.run(
+        ["git", "-C", str(caller), "branch", "--show-current"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert branch == "caller-work"
+
+
+def test_missing_review_skill_is_still_rejected_before_the_lease(kb, tmp_path):
+    """Keep main's fail-closed review preflight, not just the lease guard."""
+    (tmp_path / ".hermes" / "profiles" / "unskilled").mkdir(parents=True)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    with kb.connect_closing() as conn:
+        ready_id = _mk(kb, conn, "ready worker", workspace=shared)
+        review_id = _mk(
+            kb, conn, "unavailable reviewer", assignee="unskilled",
+            workspace=shared, status="review",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert [row[0] for row in res.spawned] == [ready_id]
+        assert res.rejected_skills == [(review_id, ["sdlc-review"])]
+        assert res.skipped_workspace_busy == []
+        assert _status(conn, review_id) == "review"
+        assert conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (review_id,),
+        ).fetchone()["claim_lock"] is None
 
 
 # --------------------------------------------------------------------------
@@ -784,4 +861,3 @@ def test_lease_is_single_board_scoped_and_says_so(kb, tmp_path):
         "the per-board scope must be stated in the DispatchResult docstring, "
         "which is what a caller reads to learn what the guarantee covers"
     )
-
