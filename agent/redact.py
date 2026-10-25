@@ -379,7 +379,11 @@ _SECRET_HEADER_NAMES = r"(?:x-api-key|x-goog-api-key|api-key|apikey|x-api-token|
 _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
 
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars.
-_TELEGRAM_RE = re.compile(r"(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
+# Consume a digit run even when its token suffix is absent, leaving that match
+# unchanged below. Requiring the suffix retries from every digit on a nonmatch
+# (quadratic while holding the GIL). A digit boundary would lose adjacent matches
+# when a preceding token body ends partway through a Unicode digit run.
+_TELEGRAM_RE = re.compile(r"(bot)?(\d{8,})(?::([-A-Za-z0-9_]{30,}))?")
 
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 
@@ -704,7 +708,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
-        text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
+        text = _TELEGRAM_RE.sub(
+            lambda m: f"{m.group(1) or ''}{m.group(2)}:***" if m.group(3) else m.group(0), text)
 
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
