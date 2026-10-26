@@ -60,6 +60,23 @@ def merge_model_cooldowns(*maps: Any) -> dict[str, float]:
 
 
 class CredentialPoolModelCooldownMixin:
+    def _rotation_entries(self) -> list[PooledCredential]:
+        """Token-bearing non-DEAD rows, including those temporarily cooling down.
+
+        Keyless references/placeholders cannot be selected, even after auth reset
+        clears their status. They must not turn a sole key's brief throttle into
+        an hour-long bench or hide its limit state.
+        """
+        from agent.credential_pool import AUTH_TYPE_OAUTH, STATUS_DEAD
+
+        return [entry for entry in self._entries
+                if entry.last_status != STATUS_DEAD and (
+                    bool((entry.access_token or "").strip()) if entry.auth_type == AUTH_TYPE_OAUTH
+                    else bool(entry.runtime_api_key))]
+
+    def _is_sole_credential(self) -> bool:
+        return len(self._rotation_entries()) <= 1
+
     def token_is_blocked(self, token: str, *, model: Optional[str] = None) -> bool:
         """Whether a pool cooldown blocks *token* for *model*.
 
@@ -127,11 +144,11 @@ class CredentialPoolModelCooldownMixin:
         ends. Entitlement benches (a year: the plan lacks the model) aren't windows that reset, so
         they're left out. Read-only: never clears or persists a cooldown.
         """
-        from agent.credential_pool import STATUS_DEAD, _exhausted_until
+        from agent.credential_pool import _exhausted_until
 
         now = time.time()
         with self._lock:
-            live = [entry for entry in self._entries if entry.last_status != STATUS_DEAD]
+            live = self._rotation_entries()
             sole = len(live) <= 1
             benched = {entry.id: until for entry in live
                        if (until := _exhausted_until(entry, sole_credential=sole)) and until > now}
