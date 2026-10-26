@@ -6043,6 +6043,7 @@ class TestAnthropicCredentialRefresh:
         agent._anthropic_api_key = "sk-ant-oat01-stale-token"
         agent._anthropic_base_url = "https://api.anthropic.com"
         agent.provider = "anthropic"
+        agent._is_anthropic_oauth = True
 
         with (
             patch("agent.anthropic_credentials.resolve_anthropic_token", return_value="sk-ant-oat01-fresh-token"),
@@ -7006,10 +7007,10 @@ class TestNormalizeCodexDictArguments:
 
 
 class TestOAuthFlagAfterCredentialRefresh:
-    """_is_anthropic_oauth must update when token type changes during refresh."""
+    """Only active OAuth credentials refresh; their replacement updates the OAuth flag."""
 
-    def test_oauth_flag_updates_api_key_to_oauth(self, agent):
-        """Refreshing from API key to OAuth token must set flag to True."""
+    def test_api_key_is_not_replaced_by_oauth(self, agent):
+        """A Console API key must not adopt an unrelated OAuth resolver token."""
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
         agent._anthropic_api_key = "sk-ant-api-old"
@@ -7024,8 +7025,8 @@ class TestOAuthFlagAfterCredentialRefresh:
         ):
             result = agent._try_refresh_anthropic_client_credentials()
 
-        assert result is True
-        assert agent._is_anthropic_oauth is True
+        assert result is False
+        assert agent._is_anthropic_oauth is False
 
     def test_oauth_flag_updates_oauth_to_api_key(self, agent):
         """Refreshing from OAuth to API key must set flag to False."""
