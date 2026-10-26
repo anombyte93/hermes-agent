@@ -858,11 +858,11 @@ class ClientLifecycleMixin:
         return ok
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
-        # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
-        # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
+        # Only refresh an active native Anthropic OAuth credential. Console API keys, third-party
+        # providers and Azure must not be replaced by a token from the OAuth resolver.
         if (
             self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key")
-            or self.provider != "anthropic"
+            or self.provider != "anthropic" or not getattr(self, "_is_anthropic_oauth", False)
             or base_url_host_matches(getattr(self, "_anthropic_base_url", "") or "", "azure.com")
         ):
             return False
