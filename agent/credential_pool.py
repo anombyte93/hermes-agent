@@ -1038,15 +1038,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 until
                 for until in (
                     _exhausted_until(entry, sole_credential=sole_credential)
-                    for entry in self._entries
+                    for entry in self._rotation_entries()
                     if entry.last_status == STATUS_EXHAUSTED
                 )
                 if until is not None
             ]
             candidates.extend(
                 until
-                for entry in self._entries
-                if entry.last_status != STATUS_DEAD
+                for entry in self._rotation_entries()
                 for until in (model_cooldown_until(entry, model),)
                 if until is not None
             )
@@ -1055,10 +1054,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     def entries(self) -> list[PooledCredential]:
         with self._lock:
             return list(self._entries)
-
-    def _is_sole_credential(self) -> bool:
-        """DEAD entries never re-enter rotation, so <=1 non-DEAD entry means nothing to rotate to."""
-        return sum(1 for e in self._entries if e.last_status != STATUS_DEAD) <= 1
 
     def _find(self, predicate: Callable[[PooledCredential], bool]) -> Optional[PooledCredential]:
         return next((e for e in self._entries if predicate(e)), None)
