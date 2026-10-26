@@ -949,12 +949,13 @@ class CredentialPool(CredentialPoolAdminMixin):
             # Mirror _available_entries: a sole credential's transient throttle
             # cools down in seconds, and the fallback restore gate must not
             # wait an hour for a 60s cooldown.
-            sole_credential = self._is_sole_credential()
+            rotation_entries = self._rotation_entries()
+            sole_credential = len(rotation_entries) <= 1
             candidates = [
                 until
                 for until in (
                     _exhausted_until(entry, sole_credential=sole_credential)
-                    for entry in self._entries
+                    for entry in rotation_entries
                     if entry.last_status == STATUS_EXHAUSTED
                 )
                 if until is not None
@@ -965,9 +966,27 @@ class CredentialPool(CredentialPoolAdminMixin):
         with self._lock:
             return list(self._entries)
 
+    def _rotation_entries(self) -> List[PooledCredential]:
+        """Timing candidates, not all persisted rows or only currently available rows.
+
+        Mirror _available_entries' token guards, including selection's refresh
+        before the OAuth access-token guard. Singleton references are hydrated
+        by load_pool; a reference alone is not a key. Keep exhausted real keys
+        in the count, without refreshing, clearing status or dropping any rows.
+        """
+        return [
+            entry for entry in self._entries
+            if entry.last_status != STATUS_DEAD
+            and (entry.auth_type != AUTH_TYPE_API_KEY or entry.runtime_api_key)
+            and (
+                entry.auth_type != AUTH_TYPE_OAUTH
+                or (entry.access_token or "").strip()
+                or (entry.refresh_token and self._entry_needs_refresh(entry))
+            )
+        ]
+
     def _is_sole_credential(self) -> bool:
-        """DEAD entries never re-enter rotation, so <=1 non-DEAD entry means nothing to rotate to."""
-        return sum(1 for e in self._entries if e.last_status != STATUS_DEAD) <= 1
+        return len(self._rotation_entries()) <= 1
 
     def _find(self, predicate: Callable[[PooledCredential], bool]) -> Optional[PooledCredential]:
         return next((e for e in self._entries if predicate(e)), None)
