@@ -780,6 +780,10 @@ def _credential_child_env_names(
     and endpoint names; empty or unknown routes grant no credentials.
     """
     names = set(_LEGACY_PROVIDER_ENV_NAMES) if credential_routes is None else set()
+    if credential_routes is not None and {"openai-codex", "openai-api"}.intersection(credential_routes):
+        # OpenAI compatibility names missing from the registry; other routes
+        # must not inherit them or the legacy provider list wholesale.
+        names.update({"OPENAI_ORG_ID", "OPENAI_ORGANIZATION", "OPENAI_API_BASE", "CODEX_API_KEY"})
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
 
