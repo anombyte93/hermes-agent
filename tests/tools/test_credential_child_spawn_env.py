@@ -10,6 +10,9 @@ from tools import env_passthrough
 
 _SENTINEL = "synthetic-child-secret-not-for-diagnostics"
 _BAD_NAMES = ("ABUSEIPDB_API_KEY", "ABUSECH_AUTH_KEY", "abuseipdb_api_key")
+_OPENAI_COMPAT_NAMES = frozenset({
+    "OPENAI_ORG_ID", "OPENAI_ORGANIZATION", "OPENAI_API_BASE", "CODEX_API_KEY",
+})
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +31,7 @@ def synthetic_environment(monkeypatch, tmp_path):
         "GITHUB_TOKEN": _SENTINEL,
         "_HERMES_FORCE_SHODAN_API_KEY": _SENTINEL,
         **dict.fromkeys(_BAD_NAMES, _SENTINEL),
+        **dict.fromkeys(_OPENAI_COMPAT_NAMES, _SENTINEL),
     })
     monkeypatch.setattr(env_passthrough, "_config_passthrough", frozenset())
     token = env_passthrough._allowed_env_vars_var.set(set())
@@ -42,17 +46,25 @@ def _assert_safe(env, *, routes, explicit_force=False):
     from hermes_cli.auth import PROVIDER_REGISTRY
 
     allowed = set()
-    for route in routes:
-        provider = PROVIDER_REGISTRY[route]
+    providers = (
+        PROVIDER_REGISTRY.values() if routes is None else
+        (PROVIDER_REGISTRY[route] for route in routes)
+    )
+    for provider in providers:
         allowed.update(provider.api_key_env_vars)
         if provider.base_url_env_var:
             allowed.add(provider.base_url_env_var)
+    if routes is None:
+        # Route-agnostic children keep the existing legacy names, not CODEX_API_KEY.
+        allowed.update(_OPENAI_COMPAT_NAMES - {"CODEX_API_KEY"})
+    elif {"openai-codex", "openai-api"}.intersection(routes):
+        allowed.update(_OPENAI_COMPAT_NAMES)
     # Generic GitHub auth remains Tier-1 even for Copilot.
     allowed.difference_update({"GH_TOKEN", "GITHUB_TOKEN"})
     provider_names = {
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
         "COPILOT_GITHUB_TOKEN", "COPILOT_API_BASE_URL", "COPILOT_ACP_BASE_URL",
-    }
+    } | _OPENAI_COMPAT_NAMES
     blocked = set(_BAD_NAMES) | {
         "_HERMES_FORCE_SHODAN_API_KEY", "EXTRA_AUTH_KEY", "GH_TOKEN", "GITHUB_TOKEN",
     } | (provider_names - allowed)
@@ -62,6 +74,28 @@ def _assert_safe(env, *, routes, explicit_force=False):
         preserved = env.get(name) == os.environ[name]
         assert preserved, f"Provider name not preserved: {name}"
     assert ("SHODAN_API_KEY" in env) == explicit_force
+
+
+@pytest.mark.parametrize("routes", (
+    ("openai-codex",), ("openai-api",), ("copilot", "copilot-acp"), ("anthropic",), (),
+))
+@pytest.mark.parametrize("source", ("inherited", "extra"))
+def test_openai_compatibility_names_are_route_scoped(routes, source):
+    from tools.environments.local import _credential_child_env_names, hermes_subprocess_env
+
+    extra = None
+    if source == "extra":
+        extra = {name: os.environ.pop(name) for name in _OPENAI_COMPAT_NAMES}
+    result = hermes_subprocess_env(
+        inherit_credentials=True, credential_routes=routes, extra_env=extra,
+    )
+    _assert_safe(result, routes=routes)
+    if {"openai-codex", "openai-api"}.intersection(routes):
+        for name in _OPENAI_COMPAT_NAMES:
+            preserved = result.get(name) == _SENTINEL
+            assert preserved, f"OpenAI compatibility name not preserved: {name}"
+    elif not routes:
+        assert _credential_child_env_names(()) == frozenset()
 
 
 @pytest.mark.parametrize("explicit_force", (False, True))
@@ -111,10 +145,7 @@ def test_tui_supervisor_does_not_restore_parent_environment(monkeypatch, tmp_pat
     monkeypatch.setattr(hs, "_Thread", lambda **_kw: SimpleNamespace(start=lambda: None))
     monkeypatch.setattr(supervisor, "_persist_registry", lambda: None)
     supervisor._spawn_locked(reason="synthetic-test")
-    _assert_safe(
-        captured, routes=("openai-api", "anthropic", "copilot", "copilot-acp"),
-        explicit_force=explicit_force,
-    )
+    _assert_safe(captured, routes=None, explicit_force=explicit_force)
 
 
 def test_copilot_route_keeps_dedicated_provider_token():
