@@ -179,10 +179,110 @@ def test_internal_secrets_remain_blocked_under_passthrough_and_force(builder, mo
     _assert_absent(result, (name, f"{local._HERMES_PROVIDER_ENV_FORCE_PREFIX}{name}"))
 
 
-def test_nonterminal_explicit_inherit_keeps_unknown_credentials():
+@pytest.mark.parametrize("inherit_credentials", (False, True))
+def test_nonterminal_unknown_credentials_require_passthrough(inherit_credentials):
     with patch.object(os, "environ", {"CUSTOM_AUTH_KEY": _SENTINEL}):
-        result = local.hermes_subprocess_env(inherit_credentials=True)
+        result = local.hermes_subprocess_env(inherit_credentials=inherit_credentials)
+    _assert_absent(result, ("CUSTOM_AUTH_KEY",))
+
+
+@pytest.mark.parametrize("builder", _BUILDERS)
+def test_inherited_force_prefix_never_restores_a_credential(builder):
+    name = "SHODAN_API_KEY"
+    force = f"{local._HERMES_PROVIDER_ENV_FORCE_PREFIX}{name}"
+    result = _build(builder, {name: _SENTINEL, force: _SENTINEL})
+    _assert_absent(result, (name, force))
+
+
+@pytest.mark.parametrize("inherit_credentials", (False, True))
+@pytest.mark.parametrize("source", ("skill", "config"))
+def test_nonterminal_passthrough_uses_existing_opt_ins(inherit_credentials, source, monkeypatch):
+    if source == "skill":
+        env_passthrough.register_env_passthrough(["CUSTOM_AUTH_KEY"])
+    else:
+        monkeypatch.setattr(env_passthrough, "_config_passthrough", None)
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {
+            "terminal": {"env_passthrough": ["CUSTOM_AUTH_KEY"]},
+        })
+    os.environ["CUSTOM_AUTH_KEY"] = _SENTINEL
+    result = local.hermes_subprocess_env(inherit_credentials=inherit_credentials)
     _assert_preserved(result, {"CUSTOM_AUTH_KEY": _SENTINEL})
+
+
+@pytest.mark.parametrize("inherit_credentials", (False, True))
+def test_nonterminal_force_is_explicit_only(inherit_credentials):
+    name = "SHODAN_API_KEY"
+    force = f"{local._HERMES_PROVIDER_ENV_FORCE_PREFIX}{name}"
+    os.environ.update({name: "synthetic-inherited", force: "synthetic-inherited"})
+    result = local.hermes_subprocess_env(
+        inherit_credentials=inherit_credentials, extra_env={force: _SENTINEL},
+    )
+    _assert_absent(result, (force,))
+    _assert_preserved(result, {name: _SENTINEL})
+
+
+def test_credential_child_keeps_provider_names_not_tool_or_unknown_secrets(monkeypatch, caplog):
+    names = ("ABUSEIPDB_API_KEY", "ABUSECH_AUTH_KEY", "abuseipdb_api_key", "FIRECRAWL_API_KEY")
+    os.environ.update(dict.fromkeys(names, _SENTINEL))
+    os.environ.update({"OPENAI_API_KEY": _SENTINEL, "COPILOT_GITHUB_TOKEN": _SENTINEL})
+    monkeypatch.setattr(local, "_subprocess_env_strip_logged", False)
+    caplog.set_level(logging.DEBUG, logger=local.__name__)
+    result = local.hermes_subprocess_env(inherit_credentials=True)
+    _assert_absent(result, names)
+    _assert_preserved(result, {
+        "OPENAI_API_KEY": _SENTINEL, "COPILOT_GITHUB_TOKEN": _SENTINEL,
+    })
+    records = [record for record in caplog.records if record.name == local.__name__]
+    assert len(records) == 1
+    assert records[0].args == (len(names), ", ".join(sorted(names)))
+    values_absent = _SENTINEL not in caplog.text
+    assert values_absent, "A credential value appeared in the debug log"
+
+
+def test_credential_child_uses_provider_registry_names(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import auth
+
+    name = "SYNTHETIC_PROVIDER_API_KEY"
+    monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {
+        "synthetic": SimpleNamespace(
+            api_key_env_vars=(name,), base_url_env_var="SYNTHETIC_PROVIDER_URL",
+            auth_type="api_key",
+        ),
+    })
+    os.environ[name] = _SENTINEL
+    result = local.hermes_subprocess_env(inherit_credentials=True)
+    _assert_preserved(result, {name: _SENTINEL})
+    _assert_absent(local.hermes_subprocess_env(), (name,))
+
+
+@pytest.mark.parametrize("inherit_credentials", (False, True))
+def test_nonterminal_tier_one_and_internal_secrets_cannot_be_forced(inherit_credentials, monkeypatch):
+    names = ("GH_TOKEN", "AUXILIARY_SYNTHETIC_API_KEY", "GATEWAY_RELAY_SECRET")
+    monkeypatch.setattr(env_passthrough, "is_env_passthrough", lambda _name: True)
+    os.environ.update(dict.fromkeys(names, _SENTINEL))
+    result = local.hermes_subprocess_env(
+        inherit_credentials=inherit_credentials,
+        extra_env={f"{local._HERMES_PROVIDER_ENV_FORCE_PREFIX}{name}": _SENTINEL for name in names},
+    )
+    _assert_absent(result, names)
+
+
+def test_real_credential_child_emits_only_permitted_names():
+    names = ("ABUSEIPDB_API_KEY", "ABUSECH_AUTH_KEY", "abusech_auth_key")
+    os.environ.update(dict.fromkeys(names, _SENTINEL))
+    os.environ["OPENAI_API_KEY"] = _SENTINEL
+    os.environ["CUSTOM_AUTH_KEY"] = _SENTINEL
+    env_passthrough.register_env_passthrough(["CUSTOM_AUTH_KEY"])
+    env = local.hermes_subprocess_env(inherit_credentials=True)
+    child = subprocess.run(
+        [sys.executable, "-c", "import os; print(*sorted(os.environ), sep=chr(10))"],
+        env=env, capture_output=True, text=True, timeout=30, check=True,
+    )
+    child_names = set(child.stdout.splitlines())
+    _assert_absent(child_names, names)
+    expected = {"OPENAI_API_KEY", "CUSTOM_AUTH_KEY", "PATH", "HOME", "HERMES_HOME"}
+    assert expected <= child_names, f"Missing required names: {sorted(expected - child_names)}"
 
 
 @pytest.mark.parametrize("builder", _BUILDERS)
