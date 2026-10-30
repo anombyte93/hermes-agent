@@ -11972,7 +11972,11 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    from tools.environments.local import hermes_subprocess_env
+
+    # Workers make provider calls, but must not inherit unrelated credentials
+    # or parent-supplied _HERMES_FORCE_* escape hatches.
+    env = hermes_subprocess_env(inherit_credentials=True)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.

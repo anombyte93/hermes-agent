@@ -112,6 +112,7 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
         probe = subprocess.run(
             [command, "--help"],
             capture_output=True, text=True, timeout=5,
+            env=_build_subprocess_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None

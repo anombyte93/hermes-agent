@@ -87,9 +87,8 @@ class CodexAppServerClient:
         # centralized helper so Tier-1 + dynamic-internal secrets are always
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
-        if env:
-            spawn_env.update(env)
+        # Route explicit extras through the same credential policy as inheritance.
+        spawn_env = hermes_subprocess_env(inherit_credentials=True, extra_env=env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
