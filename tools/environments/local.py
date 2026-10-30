@@ -770,19 +770,24 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def _credential_child_env_names() -> frozenset[str]:
-    """Names consumed by provider routes, not the tool/messaging blocklist.
+def _credential_child_env_names(
+    credential_routes: tuple[str, ...] | None = None,
+) -> frozenset[str]:
+    """Names consumed by the selected provider routes.
 
-    Registry metadata covers the provider's API-key and endpoint names,
-    including Copilot's dedicated COPILOT_GITHUB_TOKEN. Keep the legacy
-    OpenAI-compatible route's names too; arbitrary custom-provider names
-    remain explicit passthrough opt-ins, not a wildcard credential grant.
+    ``None`` retains all registry and legacy names for children that resolve
+    their own provider. Fixed-route children receive only those routes' key
+    and endpoint names; empty or unknown routes grant no credentials.
     """
-    names = set(_LEGACY_PROVIDER_ENV_NAMES)
+    names = set(_LEGACY_PROVIDER_ENV_NAMES) if credential_routes is None else set()
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
 
-        for provider in PROVIDER_REGISTRY.values():
+        providers = (
+            PROVIDER_REGISTRY.values() if credential_routes is None else
+            (PROVIDER_REGISTRY[route] for route in credential_routes if route in PROVIDER_REGISTRY)
+        )
+        for provider in providers:
             names.update(provider.api_key_env_vars)
             if provider.base_url_env_var:
                 names.add(provider.base_url_env_var)
@@ -795,22 +800,36 @@ def _credential_child_env_names() -> frozenset[str]:
 
 def hermes_subprocess_env(
     *, inherit_credentials: bool = False, extra_env: dict | None = None,
+    credential_routes: tuple[str, ...] | None = None,
+    preserve_runtime_env: bool = False,
 ) -> dict[str, str]:
     """Build a credential-safe environment for a non-terminal child.
 
     ``inherit_credentials=True`` retains known provider-route names only.
+    ``credential_routes`` limits that grant to registry route IDs; ``None``
+    keeps all providers for children that resolve their own route.
     Unknown secret-shaped names still require ``terminal.env_passthrough``
     or skill registration, just like terminal children. Tier-1 and internal
     secrets remain blocked regardless of inheritance, passthrough or force.
     Callers must pass explicit overrides via ``extra_env``, never update
     the returned dict with inherited environment data. ``_HERMES_FORCE_*``
     is honoured only in those explicit extras, not in ``os.environ``.
+
+    ``preserve_runtime_env=True`` applies only credential filtering, with no
+    HOME, Python runtime, session-context or platform rewrites. Kanban workers
+    need their launcher's runtime unchanged and own their explicit profile,
+    board and session overrides at the spawn site.
     """
     env, stripped = _filter_subprocess_env(
         os.environ.copy(), extra_env,
-        credential_names=_credential_child_env_names() if inherit_credentials else frozenset(),
+        credential_names=(
+            _credential_child_env_names(credential_routes) if inherit_credentials else frozenset()
+        ),
         always_strip=_ALWAYS_STRIP_KEYS,
     )
+    if preserve_runtime_env:
+        _log_stripped_env_once(stripped.difference(env))
+        return env
 
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")
