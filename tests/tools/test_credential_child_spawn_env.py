@@ -18,7 +18,14 @@ def synthetic_environment(monkeypatch, tmp_path):
         "PATH": os.defpath, "HOME": str(tmp_path),
         "HERMES_HOME": str(tmp_path / "hermes"),
         "OPENAI_API_KEY": _SENTINEL,
+        "OPENAI_BASE_URL": "https://synthetic-openai.invalid/v1",
+        "ANTHROPIC_API_KEY": _SENTINEL,
+        "ANTHROPIC_BASE_URL": "https://synthetic-anthropic.invalid",
         "COPILOT_GITHUB_TOKEN": _SENTINEL,
+        "COPILOT_API_BASE_URL": "https://synthetic-copilot.invalid",
+        "COPILOT_ACP_BASE_URL": "acp://synthetic-copilot",
+        "GH_TOKEN": _SENTINEL,
+        "GITHUB_TOKEN": _SENTINEL,
         "_HERMES_FORCE_SHODAN_API_KEY": _SENTINEL,
         **dict.fromkeys(_BAD_NAMES, _SENTINEL),
     })
@@ -30,12 +37,29 @@ def synthetic_environment(monkeypatch, tmp_path):
         env_passthrough._allowed_env_vars_var.reset(token)
 
 
-def _assert_safe(env, *, explicit_force=False):
+def _assert_safe(env, *, routes, explicit_force=False):
     __tracebackhide__ = True
-    leaked = set(_BAD_NAMES + ("_HERMES_FORCE_SHODAN_API_KEY", "EXTRA_AUTH_KEY")) & set(env)
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    allowed = set()
+    for route in routes:
+        provider = PROVIDER_REGISTRY[route]
+        allowed.update(provider.api_key_env_vars)
+        if provider.base_url_env_var:
+            allowed.add(provider.base_url_env_var)
+    # Generic GitHub auth remains Tier-1 even for Copilot.
+    allowed.difference_update({"GH_TOKEN", "GITHUB_TOKEN"})
+    provider_names = {
+        "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+        "COPILOT_GITHUB_TOKEN", "COPILOT_API_BASE_URL", "COPILOT_ACP_BASE_URL",
+    }
+    blocked = set(_BAD_NAMES) | {
+        "_HERMES_FORCE_SHODAN_API_KEY", "EXTRA_AUTH_KEY", "GH_TOKEN", "GITHUB_TOKEN",
+    } | (provider_names - allowed)
+    leaked = blocked & set(env)
     assert not leaked, f"Credential-shaped names leaked: {sorted(leaked)}"
-    for name in ("OPENAI_API_KEY", "COPILOT_GITHUB_TOKEN"):
-        preserved = env.get(name) == _SENTINEL
+    for name in allowed & set(os.environ):
+        preserved = env.get(name) == os.environ[name]
         assert preserved, f"Provider name not preserved: {name}"
     assert ("SHODAN_API_KEY" in env) == explicit_force
 
@@ -57,7 +81,7 @@ def test_codex_app_server_filters_explicit_overlay(monkeypatch, explicit_force):
         extra["_HERMES_FORCE_SHODAN_API_KEY"] = _SENTINEL
     client = cas.CodexAppServerClient(env=extra)
     client._closed = True
-    _assert_safe(captured, explicit_force=explicit_force)
+    _assert_safe(captured, routes=("openai-codex", "openai-api"), explicit_force=explicit_force)
 
 
 @pytest.mark.parametrize("explicit_force", (False, True))
@@ -87,13 +111,16 @@ def test_tui_supervisor_does_not_restore_parent_environment(monkeypatch, tmp_pat
     monkeypatch.setattr(hs, "_Thread", lambda **_kw: SimpleNamespace(start=lambda: None))
     monkeypatch.setattr(supervisor, "_persist_registry", lambda: None)
     supervisor._spawn_locked(reason="synthetic-test")
-    _assert_safe(captured, explicit_force=explicit_force)
+    _assert_safe(
+        captured, routes=("openai-api", "anthropic", "copilot", "copilot-acp"),
+        explicit_force=explicit_force,
+    )
 
 
 def test_copilot_route_keeps_dedicated_provider_token():
     from agent.copilot_acp_client import _build_subprocess_env
 
-    _assert_safe(_build_subprocess_env())
+    _assert_safe(_build_subprocess_env(), routes=("copilot", "copilot-acp"))
 
 
 def test_copilot_capability_probe_uses_the_same_environment(monkeypatch):
@@ -108,4 +135,4 @@ def test_copilot_capability_probe_uses_the_same_environment(monkeypatch):
     monkeypatch.setattr(acp.subprocess, "run", capture_probe)
     monkeypatch.setattr(acp, "_ACP_PROBE_CACHE", {})
     assert acp._acp_supported("synthetic-copilot", ["--acp"]) is True
-    _assert_safe(captured)
+    _assert_safe(captured, routes=("copilot", "copilot-acp"))

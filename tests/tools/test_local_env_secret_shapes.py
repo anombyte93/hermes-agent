@@ -256,6 +256,41 @@ def test_credential_child_uses_provider_registry_names(monkeypatch):
     _assert_absent(local.hermes_subprocess_env(), (name,))
 
 
+@pytest.mark.parametrize("routes", (("selected",), ("selected", "second"), (), ("unknown",)))
+@pytest.mark.parametrize("inherit_credentials", (False, True))
+def test_credential_child_scopes_registry_names(routes, inherit_credentials, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import auth
+
+    registry = {
+        route: SimpleNamespace(
+            api_key_env_vars=(f"SYNTHETIC_{route.upper()}_API_KEY",),
+            base_url_env_var=f"SYNTHETIC_{route.upper()}_URL",
+            auth_type="api_key",
+        )
+        for route in ("selected", "second", "unrelated")
+    }
+    monkeypatch.setattr(auth, "PROVIDER_REGISTRY", registry)
+    provider_names = {
+        name for provider in registry.values()
+        for name in (*provider.api_key_env_vars, provider.base_url_env_var)
+    }
+    # The static blocklist normally captures registry endpoints at import time.
+    monkeypatch.setattr(local, "_HERMES_PROVIDER_ENV_BLOCKLIST", (
+        local._HERMES_PROVIDER_ENV_BLOCKLIST | provider_names
+    ))
+    os.environ.update(dict.fromkeys(provider_names | {"ANTHROPIC_API_KEY"}, _SENTINEL))
+    result = local.hermes_subprocess_env(
+        inherit_credentials=inherit_credentials, credential_routes=routes,
+    )
+    expected = {
+        name for route, provider in registry.items() if route in routes and inherit_credentials
+        for name in (*provider.api_key_env_vars, provider.base_url_env_var)
+    }
+    _assert_preserved(result, dict.fromkeys(expected, _SENTINEL))
+    _assert_absent(result, (provider_names - expected) | {"ANTHROPIC_API_KEY"})
+
+
 @pytest.mark.parametrize("inherit_credentials", (False, True))
 def test_nonterminal_tier_one_and_internal_secrets_cannot_be_forced(inherit_credentials, monkeypatch):
     names = ("GH_TOKEN", "AUXILIARY_SYNTHETIC_API_KEY", "GATEWAY_RELAY_SECRET")

@@ -3127,9 +3127,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     from tools.environments.local import hermes_subprocess_env, strip_launch_profile_env
 
-    # Workers select their provider in the child but must not inherit unrelated
-    # credentials or parent-supplied _HERMES_FORCE_* escape hatches.
-    env = hermes_subprocess_env(inherit_credentials=True)
+    # Workers resolve their provider in the child. Scrub credentials only so
+    # HOME, the Python runtime and source-checkout PYTHONPATH stay unchanged.
+    # Profile, board and detached-session overrides remain owned below.
+    env = hermes_subprocess_env(inherit_credentials=True, preserve_runtime_env=True)
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP

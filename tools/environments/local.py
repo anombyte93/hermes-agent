@@ -358,14 +358,20 @@ _LEGACY_PROVIDER_ENV_NAMES = frozenset({
 })
 
 
-def _credential_child_env_names() -> frozenset[str]:
-    """Provider-route credentials, not arbitrary tool or messaging secrets."""
-    names = set(_LEGACY_PROVIDER_ENV_NAMES)
+def _credential_child_env_names(
+    credential_routes: tuple[str, ...] | None = None,
+) -> frozenset[str]:
+    """Provider-route credentials; ``None`` retains all registry/legacy routes."""
+    names = set(_LEGACY_PROVIDER_ENV_NAMES) if credential_routes is None else set()
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
         from tools.environments.local_env_policy import _AWS_SDK_CREDENTIAL_ENV_VARS
 
-        for provider in PROVIDER_REGISTRY.values():
+        providers = (
+            PROVIDER_REGISTRY.values() if credential_routes is None else
+            (PROVIDER_REGISTRY[route] for route in credential_routes if route in PROVIDER_REGISTRY)
+        )
+        for provider in providers:
             names.update(provider.api_key_env_vars)
             if provider.base_url_env_var:
                 names.add(provider.base_url_env_var)
@@ -378,25 +384,32 @@ def _credential_child_env_names() -> frozenset[str]:
 
 def hermes_subprocess_env(
     *, inherit_credentials: bool = False, extra_env: dict | None = None,
+    credential_routes: tuple[str, ...] | None = None,
+    preserve_runtime_env: bool = False,
 ) -> dict[str, str]:
     """Build a credential-safe non-terminal child environment.
 
     Credential inheritance retains known provider-route names only; unknown
-    credentials require registered/configured passthrough. Tier-1 and internal
-    secrets cannot be forced. Only explicit ``extra_env`` may unwrap force
-    overrides; never overlay inherited data after calling this helper.
+    credentials require registered/configured passthrough. ``credential_routes``
+    limits the grant to those registry IDs; ``None`` keeps all provider routes.
+    Tier-1 and internal secrets cannot be forced. Only explicit ``extra_env``
+    may unwrap force overrides; never overlay inherited data after this helper.
+
+    ``preserve_runtime_env`` filters credentials without HOME, Python, session
+    or platform rewrites. Kanban owns those overrides at its spawn boundary.
     """
     env: dict[str, str] = {}
     strip = _ALWAYS_STRIP_KEYS | _plugin_terminal_env_strip_keys()
-    names = _credential_child_env_names() if inherit_credentials else frozenset()
+    names = _credential_child_env_names(credential_routes) if inherit_credentials else frozenset()
     stripped = _filter_secret_env(
         os.environ.copy(), env, unwrap_force=False, plugin_strip=strip,
         credential_names=names, terminal_first_party=False)
     stripped.update(_filter_secret_env(
         extra_env or {}, env, unwrap_force=True, plugin_strip=strip,
         credential_names=names, terminal_first_party=False))
-    env.setdefault("PYTHONUTF8", "1")  # Windows UTF-8 safety for spawned processes
-    env = _finalize_child_env(env)
+    if not preserve_runtime_env:
+        env.setdefault("PYTHONUTF8", "1")  # Windows UTF-8 safety for spawned processes
+        env = _finalize_child_env(env)
     _log_stripped_env_once(stripped.difference(env))
     return env
 
