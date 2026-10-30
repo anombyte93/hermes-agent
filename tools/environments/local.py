@@ -462,6 +462,44 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # preserving user-set paths.
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME")
 
+# Unknown third-party credentials must be opt-in too, not just registry names.
+_SECRET_ENV_SUFFIXES = (
+    "_API_KEY", "_AUTH_KEY", "_SECRET", "_SECRET_KEY", "_TOKEN",
+    "_ACCESS_TOKEN", "_REFRESH_TOKEN", "_PASSWORD", "_PASSWD", "_PRIVATE_KEY",
+)
+_SECRET_ENV_NAMES = frozenset({"API_KEY", "TOKEN", "PASSWORD"})
+_SECRET_ENV_EXEMPTIONS = frozenset({
+    # Preserve the general AWS CLI credential chain (#32314), not Bedrock auth.
+    "AWS_SESSION_TOKEN",
+    # User-owned Claude Code OAuth must not fall back to/clobber Keychain (#55878).
+    "CLAUDE_CODE_OAUTH_TOKEN",
+})
+_subprocess_env_strip_log_lock = threading.Lock()
+_subprocess_env_strip_logged = False
+
+
+def _is_secret_shaped_env_name(key: str) -> bool:
+    """Classify only the name, never inspect a credential's value."""
+    upper = key.upper()
+    return upper not in _SECRET_ENV_EXEMPTIONS and (
+        upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES)
+    )
+
+
+def _log_stripped_env_once(names: set[str]) -> None:
+    """Emit one names-only credential scrub diagnostic per process."""
+    global _subprocess_env_strip_logged
+    if not names or not logger.isEnabledFor(logging.DEBUG):
+        return
+    with _subprocess_env_strip_log_lock:
+        if _subprocess_env_strip_logged:
+            return
+        _subprocess_env_strip_logged = True
+    logger.debug(
+        "Stripped %d subprocess environment variables: %s",
+        len(names), ", ".join(sorted(names)),
+    )
+
 
 def _is_hermes_internal_secret(key: str) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
@@ -584,7 +622,16 @@ def _inject_session_context_env(env: dict) -> None:
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+    """Filter Hermes-managed secrets and case-insensitive credential-shaped names.
+
+    A profile that genuinely needs a third-party credential lists its exact
+    name in ``terminal.env_passthrough`` in config.yaml; skill-declared
+    ``required_environment_variables`` use the same existing registry. Values
+    still resolve through the active profile's secret scope. Callers may use
+    ``_HERMES_FORCE_<NAME>`` in ``extra_env`` (or ``build_subprocess_env(extra=)``)
+    for an explicit per-call override. Unprefixed extras are scrubbed as usual;
+    Hermes-internal dynamic secrets remain unconditionally blocked.
+    """
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -595,17 +642,24 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    stripped: set[str] = set()
     _plugin_strip = _plugin_terminal_env_strip_keys()
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            stripped.add(key)
             continue
         if _is_hermes_internal_secret(key):
+            stripped.add(key)
             continue
         if key in _plugin_strip:
+            stripped.add(key)
             continue
         passthrough = _is_passthrough(key)
-        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+        if not passthrough and (
+            key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
+        ):
+            stripped.add(key)
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
@@ -615,15 +669,21 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
+                stripped.add(real_key)
                 continue
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
+            stripped.add(key)
             continue
         elif key in _plugin_strip:
+            stripped.add(key)
             continue
         else:
             passthrough = _is_passthrough(key)
-            if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            if not passthrough and (
+                key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
+            ):
+                stripped.add(key)
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -656,6 +716,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
 
+    _log_stripped_env_once(stripped.difference(sanitized))
     return sanitized
 
 
@@ -750,12 +811,13 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     ``os.environ`` into the returned dict.
     """
     env = os.environ.copy()
+    stripped: set[str] = set()
 
     # Tier 1 — always strip.
-    for key in _ALWAYS_STRIP_KEYS:
-        env.pop(key, None)
-    for key in _plugin_terminal_env_strip_keys():
-        env.pop(key, None)
+    for key in _ALWAYS_STRIP_KEYS | _plugin_terminal_env_strip_keys():
+        if key in env:
+            stripped.add(key)
+            env.pop(key, None)
     # Internal routing hints and Hermes-internal dynamic secrets
     # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
     # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
@@ -763,13 +825,17 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # legitimate use for them. See :func:`_is_hermes_internal_secret`.
     for key in list(env):
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            stripped.add(key)
             env.pop(key, None)
         elif _is_hermes_internal_secret(key):
+            stripped.add(key)
             env.pop(key, None)
-
-    if not inherit_credentials:
-        # Tier 2 — strip provider/tool credentials unless explicitly inherited.
-        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+        elif not inherit_credentials and (
+            key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
+        ):
+            # Tier 2 includes unknown credential names, with the same explicit
+            # inheritance opt-in as registered provider/tool credentials.
+            stripped.add(key)
             env.pop(key, None)
 
     # Windows UTF-8 safety for spawned processes (#31420).
@@ -799,6 +865,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # still see the parent's HERMES_HOME but lose the DB mutation guard.
     env = _scrub_delegated_child_kanban_env(env)
 
+    _log_stripped_env_once(stripped.difference(env))
     return env
 
 
@@ -1424,17 +1491,23 @@ def _make_run_env(env: dict) -> dict:
 
     merged = dict(os.environ | env)
     run_env = {}
+    stripped: set[str] = set()
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
+                stripped.add(real_key)
                 continue
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
+            stripped.add(k)
             continue
         else:
             passthrough = _is_passthrough(k)
-            if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            if not passthrough and (
+                k in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(k)
+            ):
+                stripped.add(k)
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
@@ -1470,6 +1543,7 @@ def _make_run_env(env: dict) -> dict:
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
 
+    _log_stripped_env_once(stripped.difference(run_env))
     return run_env
 
 
