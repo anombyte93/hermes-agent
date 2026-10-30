@@ -232,9 +232,43 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+# Unknown third-party credentials must be opt-in too, not just registry names.
+_SECRET_ENV_SUFFIXES = (
+    "_API_KEY", "_AUTH_KEY", "_SECRET", "_SECRET_KEY", "_TOKEN",
+    "_ACCESS_TOKEN", "_REFRESH_TOKEN", "_PASSWORD", "_PASSWD", "_PRIVATE_KEY",
+)
+_SECRET_ENV_NAMES = frozenset({"API_KEY", "TOKEN", "PASSWORD"})
+_SECRET_ENV_EXEMPTIONS = frozenset({"AWS_SESSION_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"})
+_subprocess_env_strip_log_lock = threading.Lock()
+_subprocess_env_strip_logged = False
+
+
+def _is_secret_shaped_env_name(key: str) -> bool:
+    """Classify only the name, never inspect a credential's value."""
+    upper = key.upper()
+    return upper not in _SECRET_ENV_EXEMPTIONS and (
+        upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES)
+    )
+
+
+def _log_stripped_env_once(names: set[str]) -> None:
+    """Emit one names-only credential scrub diagnostic per process."""
+    global _subprocess_env_strip_logged
+    if not names or not logger.isEnabledFor(logging.DEBUG):
+        return
+    with _subprocess_env_strip_log_lock:
+        if _subprocess_env_strip_logged:
+            return
+        _subprocess_env_strip_logged = True
+    logger.debug(
+        "Stripped %d subprocess environment variables: %s",
+        len(names), ", ".join(sorted(names)),
+    )
+
+
 def _filter_secret_env(
     items: Mapping[str, str], out: dict, *, unwrap_force: bool,
-    plugin_strip: frozenset = frozenset()) -> None:
+    plugin_strip: frozenset = frozenset()) -> set[str]:
     """Copy *items* into *out*, dropping Hermes-managed secrets. ``_HERMES_FORCE_<NAME>``
     unwraps to ``NAME`` when ``unwrap_force`` (caller extras / terminal env), else is
     dropped. Blocklisted names survive only via env_passthrough registration or as
@@ -244,24 +278,32 @@ def _filter_secret_env(
         from tools.env_passthrough import is_env_passthrough, resolve_passthrough_value
     except Exception:
         is_env_passthrough, resolve_passthrough_value = (lambda _: False), (lambda _n, fb: fb)
+    stripped: set[str] = set()
     for key, value in items.items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             if not unwrap_force:
+                stripped.add(key)
                 continue
             key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if not _is_hermes_internal_secret(key):
                 out[key] = value
+            else:
+                stripped.add(key)
             continue
         if _is_hermes_internal_secret(key) or key in plugin_strip:
+            stripped.add(key)
             continue
         first_party = _is_terminal_first_party_env(key)
         passthrough = is_env_passthrough(key)
-        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not (passthrough or first_party):
+        if (key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)) and not (
+                passthrough or first_party):
+            stripped.add(key)
             continue
         if passthrough and not first_party:
             value = resolve_passthrough_value(key, value)
         if value is not None:
             out[key] = value
+    return stripped
 
 
 def _finalize_child_env(env: dict) -> dict:
@@ -281,15 +323,19 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     *fix_path* (always prepending the hermes install dir so bare ``hermes`` resolves
     for children of a systemd/cron-launched gateway), then apply the shared guards."""
     out: dict[str, str] = {}
+    stripped: set[str] = set()
     for items, unwrap_force in parts:
-        _filter_secret_env(items, out, unwrap_force=unwrap_force, plugin_strip=plugin_strip)
+        stripped.update(_filter_secret_env(
+            items, out, unwrap_force=unwrap_force, plugin_strip=plugin_strip))
     path_key = _path_env_key(out)
     # Keep bare ``hermes`` invocations available to child jobs even when the gateway was launched by a
     # service manager or cron without the console script's directory on PATH. The terminal environment
     # already applies this invariant; Cron scripts use this sanitizer directly (#92998).
     if path_key is not None:
         out[path_key] = _prepend_hermes_bin_dir(fix_path(out.get(path_key, "")))
-    return _finalize_child_env(out)
+    out = _finalize_child_env(out)
+    _log_stripped_env_once(stripped.difference(out))
+    return out
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -307,15 +353,20 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     children that legitimately need LLM credentials (user-blessed claude/codex/gemini
     CLI, TUI Node host). Terminal/execute_code use ``_sanitize_subprocess_env``."""
     env = os.environ.copy()
+    stripped: set[str] = set()
     strip = _ALWAYS_STRIP_KEYS | _plugin_terminal_env_strip_keys()
     if not inherit_credentials:
         strip |= _HERMES_PROVIDER_ENV_BLOCKLIST
     for key in list(env):
         if (key in strip or key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
-                or _is_hermes_internal_secret(key)):
+                or _is_hermes_internal_secret(key)
+                or (not inherit_credentials and _is_secret_shaped_env_name(key))):
+            stripped.add(key)
             del env[key]
     env.setdefault("PYTHONUTF8", "1")  # Windows UTF-8 safety for spawned processes
-    return _finalize_child_env(env)
+    env = _finalize_child_env(env)
+    _log_stripped_env_once(stripped.difference(env))
+    return env
 
 
 def build_subprocess_env(
