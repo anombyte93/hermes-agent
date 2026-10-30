@@ -323,9 +323,22 @@ _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({
 })
 
 
+# Legacy OpenAI-compatible provider routes not all represented in the registry.
+_LEGACY_PROVIDER_ENV_NAMES = frozenset({
+    "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION", "OPENROUTER_API_KEY", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "LLM_MODEL", "GOOGLE_API_KEY",
+    # Service-account paths are auth material despite having no secret suffix.
+    "VERTEX_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS",
+    "DEEPSEEK_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY", "TOGETHER_API_KEY",
+    "PERPLEXITY_API_KEY", "COHERE_API_KEY", "FIREWORKS_API_KEY", "XAI_API_KEY",
+    "HELICONE_API_KEY",
+})
+
+
 def _build_provider_env_blocklist() -> frozenset:
     """Derive the blocklist from provider, tool, and gateway config."""
-    blocked: set[str] = set()
+    blocked: set[str] = set(_LEGACY_PROVIDER_ENV_NAMES)
 
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
@@ -350,30 +363,6 @@ def _build_provider_env_blocklist() -> frozenset:
         pass
 
     blocked.update({
-        "OPENAI_BASE_URL",
-        "OPENAI_API_KEY",
-        "OPENAI_API_BASE",
-        "OPENAI_ORG_ID",
-        "OPENAI_ORGANIZATION",
-        "OPENROUTER_API_KEY",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_TOKEN",
-        "LLM_MODEL",
-        "GOOGLE_API_KEY",
-        # Path to a GCP service-account JSON, not a bare key, so
-        # OPTIONAL_ENV_VARS marks it password=False and the loop above skips it.
-        "VERTEX_CREDENTIALS_PATH",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "DEEPSEEK_API_KEY",
-        "MISTRAL_API_KEY",
-        "GROQ_API_KEY",
-        "TOGETHER_API_KEY",
-        "PERPLEXITY_API_KEY",
-        "COHERE_API_KEY",
-        "FIREWORKS_API_KEY",
-        "XAI_API_KEY",
-        "HELICONE_API_KEY",
         "PARALLEL_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
@@ -621,17 +610,14 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets and case-insensitive credential-shaped names.
-
-    A profile that genuinely needs a third-party credential lists its exact
-    name in ``terminal.env_passthrough`` in config.yaml; skill-declared
-    ``required_environment_variables`` use the same existing registry. Values
-    still resolve through the active profile's secret scope. Callers may use
-    ``_HERMES_FORCE_<NAME>`` in ``extra_env`` (or ``build_subprocess_env(extra=)``)
-    for an explicit per-call override. Unprefixed extras are scrubbed as usual;
-    Hermes-internal dynamic secrets remain unconditionally blocked.
-    """
+def _filter_subprocess_env(
+    base_env: dict | None,
+    extra_env: dict | None = None,
+    *,
+    credential_names: frozenset[str] = frozenset(),
+    always_strip: frozenset[str] = frozenset(),
+) -> tuple[dict[str, str], set[str]]:
+    """Filter names, retaining force-override provenance until extras are applied."""
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -643,22 +629,22 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     sanitized: dict[str, str] = {}
     stripped: set[str] = set()
-    _plugin_strip = _plugin_terminal_env_strip_keys()
+    _unconditional_strip = always_strip | _plugin_terminal_env_strip_keys()
+
+    def blocked(key: str) -> bool:
+        return key not in credential_names and (
+            key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
+        )
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             stripped.add(key)
             continue
-        if _is_hermes_internal_secret(key):
-            stripped.add(key)
-            continue
-        if key in _plugin_strip:
+        if _is_hermes_internal_secret(key) or key in _unconditional_strip:
             stripped.add(key)
             continue
         passthrough = _is_passthrough(key)
-        if not passthrough and (
-            key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
-        ):
+        if not passthrough and blocked(key):
             stripped.add(key)
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
@@ -668,27 +654,33 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_hermes_internal_secret(real_key) or real_key in _unconditional_strip:
                 stripped.add(real_key)
                 continue
             sanitized[real_key] = value
-        elif _is_hermes_internal_secret(key):
-            stripped.add(key)
-            continue
-        elif key in _plugin_strip:
+        elif _is_hermes_internal_secret(key) or key in _unconditional_strip:
             stripped.add(key)
             continue
         else:
             passthrough = _is_passthrough(key)
-            if not passthrough and (
-                key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
-            ):
+            if not passthrough and blocked(key):
                 stripped.add(key)
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
                 sanitized[key] = resolved
 
+    return sanitized, stripped
+
+
+def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+    """Scrub secrets, permitting registered passthrough and explicit force extras.
+
+    Inherited ``_HERMES_FORCE_*`` names are never overrides. Third-party
+    credentials require ``terminal.env_passthrough`` or a skill declaration;
+    values still resolve through the active profile's secret scope.
+    """
+    sanitized, stripped = _filter_subprocess_env(base_env, extra_env)
     _inject_context_hermes_home(sanitized)
 
     from hermes_constants import apply_subprocess_home_env
@@ -764,7 +756,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     # between paths: _SECRET / _DELIVERY_KEY are also matched by
     # _is_hermes_internal_secret, but _ID has no secret suffix, so it must be
     # enumerated here to stay stripped on the inherit_credentials=True path
-    # (codex / copilot), which skips the Tier-2 blocklist.
+    # (codex / copilot), which retains provider credentials only.
     "GATEWAY_RELAY_ID",
     "GATEWAY_RELAY_SECRET",
     "GATEWAY_RELAY_DELIVERY_KEY",
@@ -778,65 +770,66 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
-    """Build a sanitized environment dict for a spawned subprocess.
+def _credential_child_env_names(
+    credential_routes: tuple[str, ...] | None = None,
+) -> frozenset[str]:
+    """Names consumed by the selected provider routes.
 
-    Centralized helper for the **non-terminal** spawn surface (browser,
-    ACP/CLI executors, computer-use driver, dep-ensure, TUI Node host,
-    detached gateway).  Use this instead of copying ``os.environ`` directly
-    so strip-by-default is the uniform policy across every spawn site, with a
-    single source of truth (``_HERMES_PROVIDER_ENV_BLOCKLIST``).  The terminal
-    / execute_code path keeps using :func:`_sanitize_subprocess_env`, which is
-    skill-aware (``env_passthrough``); this helper is for spawns that have no
-    skill-passthrough concept.
-
-    Two-tier stripping:
-
-    * **Tier 1 (always):** ``_ALWAYS_STRIP_KEYS`` — gateway bot tokens, GitHub
-      auth, and remote-compute secrets are removed regardless of
-      ``inherit_credentials``.  No child Hermes spawns legitimately needs them.
-    * **Tier 2 (conditional):** the rest of ``_HERMES_PROVIDER_ENV_BLOCKLIST``
-      (LLM provider API keys, tool secrets) is removed unless the caller passes
-      ``inherit_credentials=True``.
-
-    Pass ``inherit_credentials=True`` **only** when the child legitimately
-    needs LLM provider credentials — a user-blessed ``claude`` / ``codex`` /
-    ``gemini`` CLI executor, or the TUI Node host that makes model calls.  The
-    flag is grep-able for audit: ``grep -rn 'inherit_credentials=True'`` lists
-    every spawn site that still receives provider credentials.
-
-    Callers that need a *specific* non-provider secret (e.g. the browser worker
-    needs ``BROWSERBASE_API_KEY`` / ``FIRECRAWL_API_KEY``) should call with
-    ``inherit_credentials=False`` and copy just those keys back from
-    ``os.environ`` into the returned dict.
+    ``None`` retains all registry and legacy names for children that resolve
+    their own provider. Fixed-route children receive only those routes' key
+    and endpoint names; empty or unknown routes grant no credentials.
     """
-    env = os.environ.copy()
-    stripped: set[str] = set()
+    names = set(_LEGACY_PROVIDER_ENV_NAMES) if credential_routes is None else set()
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
 
-    # Tier 1 — always strip.
-    for key in _ALWAYS_STRIP_KEYS | _plugin_terminal_env_strip_keys():
-        if key in env:
-            stripped.add(key)
-            env.pop(key, None)
-    # Internal routing hints and Hermes-internal dynamic secrets
-    # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
-    # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
-    # regardless of ``inherit_credentials`` — a model-driving CLI has no
-    # legitimate use for them. See :func:`_is_hermes_internal_secret`.
-    for key in list(env):
-        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
-            stripped.add(key)
-            env.pop(key, None)
-        elif _is_hermes_internal_secret(key):
-            stripped.add(key)
-            env.pop(key, None)
-        elif not inherit_credentials and (
-            key in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(key)
-        ):
-            # Tier 2 includes unknown credential names, with the same explicit
-            # inheritance opt-in as registered provider/tool credentials.
-            stripped.add(key)
-            env.pop(key, None)
+        providers = (
+            PROVIDER_REGISTRY.values() if credential_routes is None else
+            (PROVIDER_REGISTRY[route] for route in credential_routes if route in PROVIDER_REGISTRY)
+        )
+        for provider in providers:
+            names.update(provider.api_key_env_vars)
+            if provider.base_url_env_var:
+                names.add(provider.base_url_env_var)
+            if provider.auth_type == "aws_sdk":
+                names.update(_AWS_SDK_CREDENTIAL_ENV_VARS)
+    except ImportError:
+        pass
+    return frozenset(names)
+
+
+def hermes_subprocess_env(
+    *, inherit_credentials: bool = False, extra_env: dict | None = None,
+    credential_routes: tuple[str, ...] | None = None,
+    preserve_runtime_env: bool = False,
+) -> dict[str, str]:
+    """Build a credential-safe environment for a non-terminal child.
+
+    ``inherit_credentials=True`` retains known provider-route names only.
+    ``credential_routes`` limits that grant to registry route IDs; ``None``
+    keeps all providers for children that resolve their own route.
+    Unknown secret-shaped names still require ``terminal.env_passthrough``
+    or skill registration, just like terminal children. Tier-1 and internal
+    secrets remain blocked regardless of inheritance, passthrough or force.
+    Callers must pass explicit overrides via ``extra_env``, never update
+    the returned dict with inherited environment data. ``_HERMES_FORCE_*``
+    is honoured only in those explicit extras, not in ``os.environ``.
+
+    ``preserve_runtime_env=True`` applies only credential filtering, with no
+    HOME, Python runtime, session-context or platform rewrites. Kanban workers
+    need their launcher's runtime unchanged and own their explicit profile,
+    board and session overrides at the spawn site.
+    """
+    env, stripped = _filter_subprocess_env(
+        os.environ.copy(), extra_env,
+        credential_names=(
+            _credential_child_env_names(credential_routes) if inherit_credentials else frozenset()
+        ),
+        always_strip=_ALWAYS_STRIP_KEYS,
+    )
+    if preserve_runtime_env:
+        _log_stripped_env_once(stripped.difference(env))
+        return env
 
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")
@@ -1480,38 +1473,7 @@ def _path_env_key(run_env: dict) -> str | None:
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
-    try:
-        from tools.env_passthrough import (
-            is_env_passthrough as _is_passthrough,
-            resolve_passthrough_value as _resolve_passthrough_value,
-        )
-    except Exception:
-        _is_passthrough = lambda _: False  # noqa: E731
-        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
-
-    merged = dict(os.environ | env)
-    run_env = {}
-    stripped: set[str] = set()
-    for k, v in merged.items():
-        if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
-            real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
-                stripped.add(real_key)
-                continue
-            run_env[real_key] = v
-        elif _is_hermes_internal_secret(k):
-            stripped.add(k)
-            continue
-        else:
-            passthrough = _is_passthrough(k)
-            if not passthrough and (
-                k in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_secret_shaped_env_name(k)
-            ):
-                stripped.add(k)
-                continue
-            value = _resolve_passthrough_value(k, v) if passthrough else v
-            if value is not None:
-                run_env[k] = value
+    run_env, stripped = _filter_subprocess_env(os.environ.copy(), env)
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))

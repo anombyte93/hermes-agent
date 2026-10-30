@@ -11972,7 +11972,13 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    from tools.environments.local import hermes_subprocess_env
+
+    # The worker selects its provider inside the child. Scrub credentials only:
+    # unlike terminal children, workers need the dispatcher's HOME, venv and
+    # source-checkout PYTHONPATH unchanged to boot sys.executable -m hermes_cli.main.
+    # Profile, board and detached-session overrides remain owned below.
+    env = hermes_subprocess_env(inherit_credentials=True, preserve_runtime_env=True)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.
