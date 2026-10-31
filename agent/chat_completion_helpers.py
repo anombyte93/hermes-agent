@@ -1829,6 +1829,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    from hermes_cli.fallback_config import fallback_disabled
+    if fallback_disabled(agent):
+        # --no-fallback (#107): the pinned route must fail rather than switch family.
+        logger.warning(
+            "Fallback disabled (%s): staying on %s via %s after %s",
+            agent._fallback_disabled, getattr(agent, "model", "?"), getattr(agent, "provider", "?"),
+            _fallback_reason_text(reason))
+        return False
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
     while True:

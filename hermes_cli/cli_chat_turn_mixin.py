@@ -456,6 +456,7 @@ class CLIChatTurnMixin:
         # box; the sleep lets the renderer paint before we draw.
         sys.stdout.flush()
         time.sleep(0.15)
+        self._last_turn_result = turn.result  # read by the -q exit path (--no-fallback)
         if turn.result:
             self.conversation_history = turn.result.get("messages", self.conversation_history)
         # Mid-turn auto-compression continues in a child session: sync so /status, /resume,
@@ -487,6 +488,14 @@ class CLIChatTurnMixin:
 
         self._chat_print_reasoning_box(turn)
         self._chat_print_response_panel(turn, response)
+        if getattr(self, "_no_fallback", False) and not getattr(self, "_single_query_mode", False):
+            # Interactive --no-fallback: say why the pinned route was not swapped (the -q
+            # exit path reports it on stderr instead).
+            from hermes_cli.no_fallback import no_fallback_failure_reason
+            _nf_reason = no_fallback_failure_reason(
+                turn.result, model=getattr(self.agent, "model", None), provider=getattr(self.agent, "provider", None))
+            if _nf_reason:
+                _cprint(f"\n{_DIM}{_nf_reason}{_RST}")
 
         # History suppressed so the marker is never recorded in _OUTPUT_HISTORY
         # (appending it to `response` duplicated it on redraw).

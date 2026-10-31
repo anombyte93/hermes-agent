@@ -245,6 +245,10 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "Auto-approve any unseen shell hooks declared in config.yaml "
         "without a TTY prompt (see also HERMES_ACCEPT_HOOKS env var and "
         "hooks_auto_accept: in config.yaml)."))
+    add("--no-fallback", action="store_true", default=False, dest="no_fallback", help=(
+        "Never switch to fallback_providers for this run: a rate limit (429) "
+        "or provider error fails the run on the requested model/provider. "
+        "A same-provider credential-pool key rotation still applies."))
     add("--checkpoints", action="store_true", default=False,
         help="Enable filesystem checkpoints before destructive file operations (use /rollback to restore)")
     add("--max-turns", type=int, default=None, metavar="N",

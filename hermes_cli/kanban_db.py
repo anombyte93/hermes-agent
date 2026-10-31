@@ -713,6 +713,9 @@ class Task:
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
+    # --no-fallback (#107): the worker runs ``chat --no-fallback``; a provider error
+    # blocks the card instead of switching to ``fallback_providers``. Old rows: False.
+    no_fallback: bool = False
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
@@ -744,6 +747,7 @@ class Task:
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
+            no_fallback=bool(g("no_fallback")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
 
@@ -940,6 +944,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
+    -- When 1 (``kanban create --no-fallback``), the worker may not switch to
+    -- fallback_providers: a provider error blocks the card. 0 = allowed.
+    no_fallback          INTEGER NOT NULL DEFAULT 0,
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
@@ -1555,7 +1562,7 @@ def create_task(
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
-    block_reason: Optional[str] = None,
+    block_reason: Optional[str] = None, no_fallback: bool = False,
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
@@ -1569,6 +1576,7 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
+    ``no_fallback``: the worker runs with fallback_providers disabled (#107).
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1679,8 +1687,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        block_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        block_reason, no_fallback
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1691,6 +1699,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                         block_reason if task_status == "blocked" else None,
+                        1 if no_fallback else 0,
                     ),
                 )
                 for pid in parents:
@@ -1713,6 +1722,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "no_fallback": bool(no_fallback) or None,
                     },
                 )
                 if task_status == "blocked":

@@ -6,7 +6,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 from utils import base_url_hostname, is_truthy_value
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import fallback_disabled, get_fallback_chain
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -420,7 +420,10 @@ def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) 
     Pinned children (provider, endpoint or model override) never borrow the parent chain;
     unpinned children inherit it when ``fallback_providers`` is absent/null. An explicit ``[]``
     disables fallback either way. Malformed entries are dropped by the canonical normalizer.
+    A ``--no-fallback`` parent (#107) gives its children no chain at all.
     """
+    if fallback_disabled(parent_agent):
+        return None
     default = None if pinned else (getattr(parent_agent, "_fallback_chain", None) or None)
     declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
     if declared is None:

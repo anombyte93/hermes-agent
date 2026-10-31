@@ -1714,6 +1714,10 @@ def cmd_chat(args):
     _confirm_startup_expensive_model_override(args)
 
     passthrough = {k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH}
+    if use_tui and getattr(args, "no_fallback", False):
+        # The TUI builds its agent elsewhere; refuse rather than silently allow fallback.
+        print("Error: --no-fallback is not supported with --tui yet; use --cli.", file=sys.stderr)
+        sys.exit(2)
     if use_tui:
         _launch_tui(
             passthrough.pop("resume"),
@@ -1736,6 +1740,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or safe_mode,
         "ignore_user_config": getattr(args, "ignore_user_config", False) or safe_mode,
         "compact": getattr(args, "compact", False),
+        "no_fallback": bool(getattr(args, "no_fallback", False)),
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH},
     }
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

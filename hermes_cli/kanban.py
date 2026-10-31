@@ -406,6 +406,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
                 max_retries=max_retries, model_override=getattr(args, "model_override", None),
                 provider_override=getattr(args, "provider_override", None),
+                no_fallback=bool(getattr(args, "no_fallback", False)),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
@@ -580,6 +581,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         if _line:
             field("model", _line)
+    if task.no_fallback:
+        field("fallback", "disabled (--no-fallback)")
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
