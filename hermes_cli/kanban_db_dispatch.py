@@ -3057,6 +3057,9 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     ):
         prompt = _output_limit_resume_note_prompt(prompt)
     cmd.extend(["chat", "-q", prompt])
+    if task.no_fallback:
+        # Card pin (#107): a 429/provider error blocks the card, never switches family.
+        cmd.append("--no-fallback")
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the

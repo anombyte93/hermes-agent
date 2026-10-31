@@ -2556,11 +2556,16 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_fallback: bool = False,
     ):
-        """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite."""
+        """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite.
+        ``no_fallback`` (--no-fallback, #107) drops fallback_providers for this run."""
         self._init_display_options(verbose, compact)
         self._init_model_routing(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                  checkpoints, pass_session_id, ignore_rules)
+        self._no_fallback = bool(no_fallback)
+        if self._no_fallback:
+            self._fallback_model = []
         self._init_runtime_state(resume)
 
     def _init_display_options(self, verbose, compact):
@@ -4065,6 +4070,21 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _exit_if_no_fallback_failed(cli, result) -> None:
+    """``--no-fallback`` run that failed on its pinned provider: name it, block a Kanban card, exit 1."""
+    if not getattr(cli, "_no_fallback", False):
+        return
+    from hermes_cli.no_fallback import finish_no_fallback_failure
+
+    agent = getattr(cli, "agent", None)
+    reason = finish_no_fallback_failure(
+        result, model=getattr(agent, "model", None) or getattr(cli, "model", None),
+        provider=getattr(agent, "provider", None) or getattr(cli, "provider", None),
+    )
+    if reason is not None:
+        sys.exit(1)
+
+
 def _sync_cli_session_id_from_agent(cli) -> None:
     """Keep ``cli.session_id`` in sync when mid-run compression rotated the agent's session."""
     if getattr(cli.agent, "session_id", None) and cli.agent.session_id != cli.session_id:
@@ -4111,6 +4131,9 @@ def _run_quiet_single_query(cli, effective_query):
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
+    # --no-fallback: a provider failure blocks a Kanban card with the reason instead of
+    # the quota-wall requeue below (which would retry the same route without a word).
+    _exit_if_no_fallback_failed(cli, result)
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
     # the task without counting a failure (a quota window must not trip the breaker).
@@ -4244,7 +4267,7 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, no_fallback=False):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -4283,6 +4306,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            no_fallback=no_fallback,
         )
     except ImportError as e:
         # Direct `python cli.py` bypasses cmd_chat's partial-update ImportError handler.
@@ -4441,6 +4465,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        _exit_if_no_fallback_failed(cli, getattr(cli, "_last_turn_result", None))
     finally:
         _finalize_single_query(cli)
 
@@ -4472,6 +4497,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_fallback: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -4529,7 +4555,8 @@ def main(
     _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
     query = query or q
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills,
+                               no_fallback=no_fallback)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.

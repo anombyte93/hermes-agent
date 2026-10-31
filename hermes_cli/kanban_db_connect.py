@@ -807,6 +807,8 @@ _LATER_TASK_COLUMNS = (
     ("reasoning_effort", "reasoning_effort TEXT"),
     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
+    # --no-fallback card pin (#107); 0 = fallback allowed, as for every older row.
+    ("no_fallback", "no_fallback INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
     ("session_id", "session_id TEXT"),
