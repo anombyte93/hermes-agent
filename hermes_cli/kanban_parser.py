@@ -29,6 +29,8 @@ def _add_commands(sub: argparse._SubParsersAction, specs) -> None:
         p = sub.add_parser(name, **parser_kw)
         for flags, kw in args:
             p.add_argument(*flags, **kw)
+        if any(kw.get("dest") == "reason_flag" for _flags, kw in args):
+            _keep_trailing_reason(p)
         if children:
             dest, child_specs = children
             _add_commands(p.add_subparsers(dest=dest), child_specs)
@@ -40,6 +42,37 @@ def _json_flag(**kw):
 
 def _reason(help: str):
     return _arg("--reason", help=help)
+
+
+def _reason_flag(help: str):
+    """``--reason`` beside a positional reason (#125); one of the two, not both."""
+    return _arg("--reason", dest="reason_flag", default=None, metavar="TEXT",
+                help=f"{help} Alternative to the positional reason; give one, not both.")
+
+
+def _keep_trailing_reason(parser: argparse.ArgumentParser) -> None:
+    """Keep a positional reason that follows options instead of rejecting it.
+
+    On Python 3.11 argparse fills an empty ``nargs='*'`` positional in the
+    first positional chunk, so ``block T --kind K "text"`` left ``"text"``
+    over as "unrecognized arguments" (#125). Leftover plain words are the
+    reason; anything option-shaped is still left for argparse to reject.
+    """
+    parse_known = parser.parse_known_args
+
+    def parse_known_args(args=None, namespace=None):
+        namespace, extras = parse_known(args, namespace)
+        words = [tok for tok in extras if tok != "--"]
+        if (
+            words
+            and isinstance(getattr(namespace, "reason", None), list)
+            and not any(tok.startswith("-") for tok in words)
+        ):
+            namespace.reason = [*namespace.reason, *words]
+            extras = []
+        return namespace, extras
+
+    parser.parse_known_args = parse_known_args  # type: ignore[method-assign]
 
 
 def _run_state_args(type_help: str):
@@ -298,6 +331,7 @@ _SPECS = [
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
+        _reason_flag("Reason (also appended as a comment)."),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
@@ -309,6 +343,7 @@ _SPECS = [
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        _reason_flag("Reason/timing note (also appended as a comment)."),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
@@ -324,8 +359,11 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
-         help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="*", help="Concrete changes required before re-review"),
+        _reason_flag("Concrete changes required before re-review."),
+    ], help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
@@ -333,6 +371,7 @@ _SPECS = [
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+        _reason_flag("Audit-trail reason (recorded on the task_events row)."),
         _bulk_ids("promote"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),

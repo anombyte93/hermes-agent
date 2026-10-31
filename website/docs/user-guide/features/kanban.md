@@ -962,12 +962,12 @@ hermes kanban comment <id> "<text>" [--author NAME]
 
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."]
-hermes kanban block <id> "<reason>" [--ids <id>...]
+hermes kanban block <id> "<reason>" [--ids <id>...]          # or --reason "<reason>" (block/schedule/promote)
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
-hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
+hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer (or --reason "...")
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
 
 hermes kanban tail <id>                                # follow a single task's event stream
