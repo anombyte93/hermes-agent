@@ -36,6 +36,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from hermes_cli.fallback_config import fallback_disabled
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -1987,9 +1988,10 @@ def _build_child_agent(
     # same class of silent-drag the override_provider filter-clearing below
     # already prevents for OpenRouter routing preferences.  Predictability >
     # liveness for explicit pins: the pinned child fails loudly instead.
+    # A ``--no-fallback`` parent (#107) gives its children no chain at all.
     parent_fallback = (
         None
-        if override_provider
+        if override_provider or fallback_disabled(parent_agent)
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
 

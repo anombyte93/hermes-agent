@@ -516,6 +516,17 @@ def build_top_level_parser():
         ),
     )
     chat_parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        default=False,
+        dest="no_fallback",
+        help=(
+            "Never switch to fallback_providers for this run: a rate limit (429) "
+            "or provider error fails the run on the requested model/provider. "
+            "A same-provider credential-pool key rotation still applies."
+        ),
+    )
+    chat_parser.add_argument(
         "--checkpoints",
         action="store_true",
         default=False,

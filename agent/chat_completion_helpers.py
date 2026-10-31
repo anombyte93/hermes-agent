@@ -2499,6 +2499,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    from hermes_cli.fallback_config import fallback_disabled
+    if fallback_disabled(agent):
+        # --no-fallback (#107): the pinned route must fail rather than switch family.
+        logger.warning(
+            "Fallback disabled (%s): staying on %s via %s after %s",
+            agent._fallback_disabled, getattr(agent, "model", "?"), getattr(agent, "provider", "?"),
+            _fallback_reason_text(reason))
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

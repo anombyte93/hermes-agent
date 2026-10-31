@@ -5075,6 +5075,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_fallback: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -5091,6 +5092,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
+            no_fallback: ``--no-fallback`` (#107): drop fallback_providers for this run
         """
         # Initialize Rich console
         self.console = Console()
@@ -5444,6 +5446,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        self._no_fallback = bool(no_fallback)
+        if self._no_fallback:
+            self._fallback_model = []
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -17230,6 +17235,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             sys.stdout.flush()
             time.sleep(0.15)
 
+            self._last_turn_result = result  # read by the -q exit path (--no-fallback)
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
@@ -17413,6 +17419,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         ))
                     except Exception:
                         pass
+
+            if getattr(self, "_no_fallback", False) and not getattr(self, "_single_query_mode", False):
+                # Interactive --no-fallback: say why the pinned route was not swapped (the -q
+                # exit path reports it on stderr instead).
+                from hermes_cli.no_fallback import no_fallback_failure_reason
+                _nf_reason = no_fallback_failure_reason(
+                    result, model=getattr(self.agent, "model", None),
+                    provider=getattr(self.agent, "provider", None))
+                if _nf_reason:
+                    _cprint(f"\n{_DIM}{_nf_reason}{_RST}")
 
             # #60920: Print interruption marker with history suppressed so it
             # is never recorded in _OUTPUT_HISTORY. The marker was previously
@@ -21505,6 +21521,21 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _exit_if_no_fallback_failed(cli, result) -> None:
+    """``--no-fallback`` run that failed on its pinned provider: name it, block a Kanban card, exit 1."""
+    if not getattr(cli, "_no_fallback", False):
+        return
+    from hermes_cli.no_fallback import finish_no_fallback_failure
+
+    agent = getattr(cli, "agent", None)
+    reason = finish_no_fallback_failure(
+        result, model=getattr(agent, "model", None) or getattr(cli, "model", None),
+        provider=getattr(agent, "provider", None) or getattr(cli, "provider", None),
+    )
+    if reason is not None:
+        sys.exit(1)
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -21532,6 +21563,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_fallback: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21726,6 +21758,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        no_fallback=no_fallback,
     )
 
     if parsed_skills:
@@ -22087,6 +22120,11 @@ def main(
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
+                        # --no-fallback: a provider failure blocks a Kanban card with the
+                        # reason instead of the quota-wall requeue below (which would
+                        # retry the same route without a word).
+                        _exit_if_no_fallback_failed(cli, result)
+
                         # Ensure proper exit code for automation wrappers.
                         #
                         # Kanban workers get a special case: when the run failed
@@ -22138,6 +22176,7 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _exit_if_no_fallback_failed(cli, getattr(cli, "_last_turn_result", None))
         finally:
             _finalize_single_query(cli)
         return

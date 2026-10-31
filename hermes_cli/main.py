@@ -3381,6 +3381,10 @@ def cmd_chat(args):
     _pin_kanban_board_env()
     _confirm_startup_expensive_model_override(args)
 
+    if use_tui and getattr(args, "no_fallback", False):
+        # The TUI builds its agent elsewhere; refuse rather than silently allow fallback.
+        print("Error: --no-fallback is not supported with --tui yet; use --cli.", file=sys.stderr)
+        sys.exit(2)
     if use_tui:
         _launch_tui(
             getattr(args, "resume", None),
@@ -3449,6 +3453,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "no_fallback": bool(getattr(args, "no_fallback", False)),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

@@ -553,6 +553,11 @@ class CLIAgentSetupMixin:
             # forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            if getattr(self, "_no_fallback", False):
+                # --no-fallback (#107): the chain is already empty; the mark also
+                # refuses a chain a later config reload would bring back.
+                from hermes_cli.fallback_config import disable_fallback
+                disable_fallback(self.agent)
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
