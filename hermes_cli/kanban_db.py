@@ -1192,6 +1192,9 @@ class Task:
     # or the worker explicitly blocks/completes. ``False`` (default) =
     # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
     goal_mode: bool = False
+    # --no-fallback (#107): the worker runs ``chat --no-fallback``; a provider error
+    # blocks the card instead of switching to ``fallback_providers``. Old rows: False.
+    no_fallback: bool = False
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
@@ -1292,6 +1295,9 @@ class Task:
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+            ),
+            no_fallback=(
+                bool(row["no_fallback"]) if "no_fallback" in keys and row["no_fallback"] else False
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
@@ -1479,6 +1485,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
+    -- When 1 (``kanban create --no-fallback``), the worker may not switch to
+    -- fallback_providers: a provider error blocks the card. 0 = allowed.
+    no_fallback          INTEGER NOT NULL DEFAULT 0,
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
@@ -2747,6 +2756,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "no_fallback" not in cols:
+        # --no-fallback card pin (#107); 0 = fallback allowed, as for every older row.
+        _add_column_if_missing(
+            conn, "tasks", "no_fallback", "no_fallback INTEGER NOT NULL DEFAULT 0"
+        )
+
     if "goal_max_turns" not in cols:
         # Per-task goal-loop turn budget. NULL = goals-engine default.
         _add_column_if_missing(
@@ -3325,6 +3340,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     block_reason: Optional[str] = None,
+    no_fallback: bool = False,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3366,6 +3382,8 @@ def create_task(
     (``minimal``…``ultra``, or ``none`` to disable thinking), passed as
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
+
+    ``no_fallback``: the worker runs with fallback_providers disabled (#107).
 
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
@@ -3664,8 +3682,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, block_reason, review_mode
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, block_reason, review_mode,
+                        no_fallback
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3693,6 +3712,7 @@ def create_task(
                         session_id,
                         block_reason if task_status == "blocked" else None,
                         review_mode,
+                        1 if no_fallback else 0,
                     ),
                 )
                 for pid in parents:
@@ -3722,6 +3742,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "no_fallback": bool(no_fallback) or None,
                         "review_mode": review_mode,
                     },
                 )
@@ -12131,6 +12152,9 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    if task.no_fallback:
+        # Card pin (#107): a 429/provider error blocks the card, never switches family.
+        cmd.append("--no-fallback")
     # Every dispatcher-owned worker must take the fully-quiet single-query path.
     # That branch maps structured agent failures to rc=1 and provider quota /
     # rate-limit failures to rc=75, allowing the existing reap classifier to

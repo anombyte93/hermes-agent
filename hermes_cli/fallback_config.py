@@ -99,3 +99,32 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+# --no-fallback (#107): one run (``hermes chat --no-fallback``) or one Kanban card
+# (``hermes kanban create --no-fallback``) may forbid every provider/model switch.
+# A same-provider credential-pool rotation is not a fallback: ``_swap_credential``
+# never changes the provider or the conversation's model, so it stays allowed.
+NO_FALLBACK_FLAG = "--no-fallback"
+
+
+def disable_fallback(agent: Any, source: str = NO_FALLBACK_FLAG) -> None:
+    """Forbid ``agent`` from switching to any ``fallback_providers`` entry.
+
+    Empties the chain (the same state as ``fallback_providers: []``) and marks
+    the agent so ``try_activate_fallback`` refuses even if a later config
+    reload repopulates ``_fallback_chain``.
+    """
+    agent._fallback_disabled = source or NO_FALLBACK_FLAG
+    agent._fallback_chain = []
+    agent._fallback_index = 0
+    agent._fallback_model = None
+
+
+def fallback_disabled(agent: Any) -> bool:
+    """True when ``disable_fallback`` has been applied to ``agent``.
+
+    Only the string mark counts, so a mock agent's auto-attribute never reads as disabled.
+    """
+    mark = getattr(agent, "_fallback_disabled", None)
+    return isinstance(mark, str) and bool(mark)

@@ -120,6 +120,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "no_fallback": t.no_fallback,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -563,6 +564,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument("--no-fallback", action="store_true", dest="no_fallback",
+                          help="Never switch to fallback_providers: a provider "
+                               "error or 429 blocks the card.")
     p_create.add_argument("--goal", nargs="?", const=True, default=None,
                           metavar="TEXT", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
@@ -1956,6 +1960,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            no_fallback=bool(getattr(args, "no_fallback", False)),
             goal_mode=goal_mode,
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=initial_status,
@@ -2150,6 +2155,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    if task.no_fallback:
+        print("  fallback:  disabled (--no-fallback)")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
