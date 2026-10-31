@@ -241,9 +241,44 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
 
 
-def _joined_words(words) -> Optional[str]:
-    """Free-text positional ``nargs="*"`` words -> stripped string, or None when absent."""
-    return " ".join(words).strip() if words else None
+def _cli_reason(args: argparse.Namespace) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(reason, error)`` from a positional reason and/or ``--reason`` (#125).
+
+    Verbs with a positional reason store it as a word list in ``reason`` and
+    the option in ``reason_flag``; verbs with only the option store a string
+    in ``reason``.
+    """
+    words = getattr(args, "reason", None)
+    if isinstance(words, (list, tuple)):
+        positional = " ".join(words).strip()
+        flag = getattr(args, "reason_flag", None)
+    else:
+        positional, flag = "", words
+    flag = (flag or "").strip()
+    if positional and flag:
+        return None, "give the reason once, either positionally or with --reason, not both"
+    return (positional or flag or None), None
+
+
+def _ids_reason_error(args: argparse.Namespace) -> Optional[str]:
+    """Refuse a multi-word ``--ids`` value: it is a swallowed reason, not an id."""
+    for tid in getattr(args, "ids", None) or []:
+        if any(ch.isspace() for ch in tid):
+            return (f"--ids value {tid!r} is not a task id; --ids takes every word "
+                    "after it, so pass the reason with --reason (or before --ids)")
+    return None
+
+
+def _reason_or_usage_error(args: argparse.Namespace, verb: str) -> tuple[Optional[str], bool]:
+    """Resolve the reason for ``verb``; print a usage error and return ok=False."""
+    error = _ids_reason_error(args)
+    reason = None
+    if error is None:
+        reason, error = _cli_reason(args)
+    if error is not None:
+        print(f"kanban {verb}: {error}", file=sys.stderr)
+        return None, False
+    return reason, True
 
 
 def _stripped_or_none(value: Optional[str]) -> Optional[str]:
@@ -1013,8 +1048,26 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
     return run
 
 
+def _block_refusal_detail(conn, tid: str) -> Optional[str]:
+    """Why ``block`` refused a triage card, and what to do instead (#125).
+
+    Triage is already the human-decision lane, and ``block_task`` records
+    ``source_status=ready`` for anything not running, so a blocked triage card
+    would later unblock straight to ready and skip ``specify``. The refusal
+    stands; this only explains it. Other refusals keep their plain message.
+    """
+    task = kb.get_task(conn, tid)
+    if task is None or task.status != "triage":
+        return None
+    return (f"status is triage; block accepts running/ready. A triage card already waits "
+            f"for a human decision: record the wait with `kanban comment {tid} \"...\"`, "
+            f"or `kanban specify {tid}` (triage -> todo) and block it once it is ready")
+
+
 def _cmd_block(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, ok = _reason_or_usage_error(args, "block")
+    if not ok:
+        return 2
     kind = getattr(args, "kind", None)
     if reason is None:
         return _err("kanban block: a reason is required — explain what input you need", 2)
@@ -1032,13 +1085,19 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
             return f"Blocked {tid}{suffix}"
 
+        def fail_msg(tid):
+            detail = _block_refusal_detail(conn, tid)
+            return f"cannot block {tid}: {detail}" if detail else f"cannot block {tid}"
+
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
             conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        return _bulk_apply(ids, op, ok_msg, fail_msg)
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, ok = _reason_or_usage_error(args, "schedule")
+    if not ok:
+        return 2
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -1089,7 +1148,11 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
-    reason = " ".join(args.reason).strip()
+    reason, ok = _reason_or_usage_error(args, "request-changes")
+    if not ok:
+        return 2
+    if not reason:
+        return _err("kanban request-changes: a reason is required (positionally or with --reason)", 2)
     with kbc.connect_closing() as conn:
         ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
         if not ok:
@@ -1120,7 +1183,9 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, ok = _reason_or_usage_error(args, "promote")
+    if not ok:
+        return 2
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
