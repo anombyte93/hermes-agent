@@ -89,7 +89,7 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
     try:
         probe = subprocess.run(
             [command, "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, env=_build_subprocess_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
@@ -117,10 +117,11 @@ def _resolve_home_dir() -> str:
 def _build_subprocess_env() -> dict[str, str]:
     from hermes_constants import apply_subprocess_home_env
 
-    # Copilot ACP drives a model and needs LLM provider credentials; the central helper still
-    # strips Tier-1 secrets (bot tokens, GitHub auth, infra).
-    # See #29157.
-    env = hermes_subprocess_env(inherit_credentials=True)
+    # Copilot ACP needs only its dedicated provider token and endpoints.
+    # Generic GitHub auth remains Tier-1 and is always stripped.
+    env = hermes_subprocess_env(
+        inherit_credentials=True, credential_routes=("copilot", "copilot-acp"),
+    )
     env["HOME"] = _resolve_home_dir()
     apply_subprocess_home_env(env)
     return env

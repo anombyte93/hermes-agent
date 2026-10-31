@@ -3125,13 +3125,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    from agent.secret_scope import is_multiplex_active
-    from tools.environments.local import build_subprocess_env, strip_launch_profile_env
+    from tools.environments.local import hermes_subprocess_env, strip_launch_profile_env
 
-    env = build_subprocess_env(
-        scrub_secrets=is_multiplex_active(),
-        inherit_profile_home=True,
-    )
+    # Workers resolve their provider in the child. Scrub credentials only so
+    # HOME, the Python runtime and source-checkout PYTHONPATH stay unchanged.
+    # Profile, board and detached-session overrides remain owned below.
+    env = hermes_subprocess_env(inherit_credentials=True, preserve_runtime_env=True)
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
