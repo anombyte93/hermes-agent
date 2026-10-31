@@ -14,6 +14,8 @@ from tools.environments import local
 
 
 _BUILDERS = ("sanitize", "foreground", "factory", "nonterminal")
+# This release strips Kanban task ownership from ordinary child processes.
+# Use an unprivileged runtime marker here; worker-spawn coverage checks task identity.
 _SHAPES = (
     "SERVICE_API_KEY",
     "SERVICE_AUTH_KEY",
@@ -40,7 +42,7 @@ def synthetic_environment(monkeypatch, tmp_path):
         "HOME": str(tmp_path),
         "HERMES_HOME": str(tmp_path / "hermes-home"),
     })
-    monkeypatch.setattr(env_passthrough, "_config_passthrough", frozenset())
+    monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
     token = env_passthrough._allowed_env_vars_var.set(set())
     try:
         yield
@@ -76,10 +78,10 @@ def _assert_preserved(result, expected):
 @pytest.mark.parametrize("builder", _BUILDERS)
 def test_incident_names_are_stripped(builder):
     names = ("ABUSEIPDB_API_KEY", "SHODAN_API_KEY", "VIRUSTOTAL_API_KEY", "ABUSECH_AUTH_KEY")
-    base = {"HERMES_KANBAN_TASK": "t_synthetic", **dict.fromkeys(names, _SENTINEL)}
+    base = {"HERMES_RUNTIME_MARKER": "t_synthetic", **dict.fromkeys(names, _SENTINEL)}
     result = _build(builder, base)
     _assert_absent(result, names)
-    _assert_preserved(result, {"HERMES_KANBAN_TASK": "t_synthetic"})
+    _assert_preserved(result, {"HERMES_RUNTIME_MARKER": "t_synthetic"})
 
 
 @pytest.mark.parametrize("builder", _BUILDERS)
@@ -98,7 +100,7 @@ def test_each_secret_shape_is_stripped_case_insensitively(builder, name, casing)
 @pytest.mark.parametrize("builder", _BUILDERS)
 def test_non_secret_names_and_required_runtime_names_survive(builder):
     base = {
-        "HERMES_KANBAN_TASK": "t_synthetic",
+        "HERMES_RUNTIME_MARKER": "t_synthetic",
         "HERMES_HOME": "/synthetic/hermes-home",
         "PATH": os.defpath,
         "HOME": "/synthetic/home",
@@ -149,8 +151,8 @@ def test_registered_passthrough_survives(builder, source):
 
 @pytest.mark.parametrize("builder", ("sanitize", "foreground", "factory"))
 def test_profile_config_passthrough_survives(builder, monkeypatch):
-    monkeypatch.setattr(env_passthrough, "_config_passthrough", None)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {
+    monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
+    monkeypatch.setattr("tools.env_passthrough.read_raw_config", lambda: {
         "terminal": {"env_passthrough": ["CUSTOM_AUTH_KEY"]},
     })
     result = _build(builder, {"CUSTOM_AUTH_KEY": _SENTINEL})
@@ -200,8 +202,8 @@ def test_nonterminal_passthrough_uses_existing_opt_ins(inherit_credentials, sour
     if source == "skill":
         env_passthrough.register_env_passthrough(["CUSTOM_AUTH_KEY"])
     else:
-        monkeypatch.setattr(env_passthrough, "_config_passthrough", None)
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {
+        monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
+        monkeypatch.setattr("tools.env_passthrough.read_raw_config", lambda: {
             "terminal": {"env_passthrough": ["CUSTOM_AUTH_KEY"]},
         })
     os.environ["CUSTOM_AUTH_KEY"] = _SENTINEL
@@ -225,7 +227,7 @@ def test_credential_child_keeps_provider_names_not_tool_or_unknown_secrets(monke
     names = ("ABUSEIPDB_API_KEY", "ABUSECH_AUTH_KEY", "abuseipdb_api_key", "FIRECRAWL_API_KEY")
     os.environ.update(dict.fromkeys(names, _SENTINEL))
     os.environ.update({"OPENAI_API_KEY": _SENTINEL, "COPILOT_GITHUB_TOKEN": _SENTINEL})
-    monkeypatch.setattr(local, "_subprocess_env_strip_logged", False)
+    monkeypatch.setattr(local, "_subprocess_env_strip_logged", False, raising=False)
     caplog.set_level(logging.DEBUG, logger=local.__name__)
     result = local.hermes_subprocess_env(inherit_credentials=True)
     _assert_absent(result, names)
@@ -377,7 +379,7 @@ def test_real_child_gets_safe_keys_and_explicit_passthrough(tmp_path):
         "PATH": os.defpath,
         "HOME": str(tmp_path),
         "HERMES_HOME": str(tmp_path / "hermes-home"),
-        "HERMES_KANBAN_TASK": "t_synthetic",
+        "HERMES_RUNTIME_MARKER": "t_synthetic",
         "ABUSEIPDB_API_KEY": _SENTINEL,
         "CUSTOM_AUTH_KEY": _SENTINEL,
     }
@@ -389,5 +391,5 @@ def test_real_child_gets_safe_keys_and_explicit_passthrough(tmp_path):
     )
     names = set(child.stdout.splitlines())
     _assert_absent(names, ("ABUSEIPDB_API_KEY",))
-    expected = {"CUSTOM_AUTH_KEY", "HERMES_KANBAN_TASK", "PATH", "HOME", "HERMES_HOME"}
+    expected = {"CUSTOM_AUTH_KEY", "HERMES_RUNTIME_MARKER", "PATH", "HOME", "HERMES_HOME"}
     assert expected <= names, f"Missing required names: {sorted(expected - names)}"

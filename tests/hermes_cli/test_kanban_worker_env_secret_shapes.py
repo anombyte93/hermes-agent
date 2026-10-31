@@ -16,9 +16,19 @@ from tools.environments import local
 _SENTINEL = "synthetic-value-must-never-appear-in-worker-debug-output"
 
 
+@pytest.fixture(autouse=True)
+def isolated_systemd_bus(monkeypatch, tmp_path):
+    # The release spawn path normalises a real lingering user's bus. Keep that
+    # host-dependent fallback inside the synthetic fixture instead.
+    monkeypatch.setattr(
+        "tools.process_registry._default_user_runtime_dir", lambda: tmp_path / "runtime",
+    )
+
+
 @pytest.mark.parametrize("passthrough", (False, True))
 def test_worker_spawn_scrubs_unknown_credentials(monkeypatch, tmp_path, caplog, passthrough):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     root = tmp_path / "hermes"
     root.mkdir()
@@ -40,13 +50,13 @@ def test_worker_spawn_scrubs_unknown_credentials(monkeypatch, tmp_path, caplog, 
         force: _SENTINEL,
         **dict.fromkeys(names, _SENTINEL),
     })
-    monkeypatch.setattr(env_passthrough, "_config_passthrough", frozenset())
+    monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
     token = env_passthrough._allowed_env_vars_var.set(set())
-    monkeypatch.setattr(local, "_subprocess_env_strip_logged", False)
+    monkeypatch.setattr(local, "_subprocess_env_strip_logged", False, raising=False)
     caplog.set_level(logging.DEBUG, logger=local.__name__)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
-    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
     captured_names = set()
     preserved = {}
 
@@ -78,7 +88,7 @@ def test_worker_spawn_scrubs_unknown_credentials(monkeypatch, tmp_path, caplog, 
     try:
         if passthrough:
             env_passthrough.register_env_passthrough(["CUSTOM_AUTH_KEY"])
-        pid = kb._default_spawn(task, str(workspace))
+        pid = kbd._default_spawn(task, str(workspace))
     finally:
         env_passthrough._allowed_env_vars_var.reset(token)
 
@@ -103,6 +113,7 @@ def test_worker_spawn_scrubs_unknown_credentials(monkeypatch, tmp_path, caplog, 
 @pytest.fixture(params=("profile", "auto"))
 def worker_runtime_environment(monkeypatch, tmp_path, request):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli import profiles
     import hermes_constants
 
@@ -134,11 +145,11 @@ def worker_runtime_environment(monkeypatch, tmp_path, request):
     monkeypatch.setattr(os, "environ", base)
     monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
     monkeypatch.setattr(profiles, "resolve_profile_env", lambda _name: str(tmp_path / "worker"))
-    monkeypatch.setattr(env_passthrough, "_config_passthrough", frozenset())
+    monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
     token = env_passthrough._allowed_env_vars_var.set(set())
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
-    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
-    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
     captured = {}
 
     def capture_spawn(_cmd, **kwargs):
@@ -155,7 +166,7 @@ def worker_runtime_environment(monkeypatch, tmp_path, request):
     try:
         with monkeypatch.context() as spawn_patch:
             spawn_patch.setattr(subprocess, "Popen", capture_spawn)
-            assert kb._default_spawn(task, str(workspace)) == 4242
+            assert kbd._default_spawn(task, str(workspace)) == 4242
         yield SimpleNamespace(
             inherited=lambda name: captured.get(name) == base[name],
             names=frozenset(captured),

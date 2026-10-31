@@ -33,7 +33,7 @@ def synthetic_environment(monkeypatch, tmp_path):
         **dict.fromkeys(_BAD_NAMES, _SENTINEL),
         **dict.fromkeys(_OPENAI_COMPAT_NAMES, _SENTINEL),
     })
-    monkeypatch.setattr(env_passthrough, "_config_passthrough", frozenset())
+    monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
     token = env_passthrough._allowed_env_vars_var.set(set())
     try:
         yield
@@ -142,7 +142,7 @@ def test_tui_supervisor_does_not_restore_parent_environment(monkeypatch, tmp_pat
         return SimpleNamespace(pid=4242)
 
     monkeypatch.setattr(hs.subprocess, "Popen", capture_spawn)
-    monkeypatch.setattr(hs, "_Thread", lambda **_kw: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(hs.threading, "Thread", lambda **_kw: SimpleNamespace(start=lambda: None))
     monkeypatch.setattr(supervisor, "_persist_registry", lambda: None)
     supervisor._spawn_locked(reason="synthetic-test")
     _assert_safe(captured, routes=None, explicit_force=explicit_force)
