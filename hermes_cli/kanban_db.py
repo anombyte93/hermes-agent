@@ -5688,6 +5688,15 @@ def explain_refusal(
         return "task changed during reassign; inspect its current state and retry"
     if status in TERMINAL_STATUSES and status not in accepted:
         return f"already terminal (status is {status}){suffix}"
+    if verb == "block" and status == "triage":
+        # Triage is already the human-decision lane, and blocking it would
+        # let a later unblock send an unspecified card straight to ready.
+        return (
+            f"status is triage{suffix}. A triage card already waits for a "
+            f"human decision: record the wait with `kanban comment {task_id} "
+            f"\"...\"`, or `kanban specify {task_id}` (triage -> todo) and "
+            "block it once it is ready"
+        )
     if status not in accepted:
         return f"status is {status}{suffix}"
     if verb == "reclaim" and status != "running" and task.claim_lock is None:

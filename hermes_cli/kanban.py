@@ -275,6 +275,86 @@ def _add_subcommand_board_arguments(
             _add_subcommand_board_arguments(child, board_help)
 
 
+def _keep_trailing_reason(parser: argparse.ArgumentParser) -> None:
+    """Keep a positional reason that follows options instead of rejecting it.
+
+    On Python 3.11 argparse fills an empty ``nargs='*'`` positional in the
+    first positional chunk, so ``block T --kind K "text"`` left ``"text"``
+    over as "unrecognized arguments" (#125). Leftover plain words are the
+    reason; anything option-shaped is still left for argparse to reject.
+    """
+    parse_known = parser.parse_known_args
+
+    def parse_known_args(args=None, namespace=None):
+        namespace, extras = parse_known(args, namespace)
+        words = [tok for tok in extras if tok != "--"]
+        if (
+            words
+            and isinstance(getattr(namespace, "reason", None), list)
+            and not any(tok.startswith("-") for tok in words)
+        ):
+            namespace.reason = [*namespace.reason, *words]
+            extras = []
+        return namespace, extras
+
+    parser.parse_known_args = parse_known_args  # type: ignore[method-assign]
+
+
+def _add_reason_flag(parser: argparse.ArgumentParser, help_text: str) -> None:
+    """``--reason`` beside a positional reason (#125); one of the two, not both."""
+    parser.add_argument(
+        "--reason", dest="reason_flag", default=None, metavar="TEXT",
+        help=f"{help_text} Alternative to the positional reason; give one, not both.",
+    )
+    _keep_trailing_reason(parser)
+
+
+def _cli_reason(args: argparse.Namespace) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(reason, error)`` from a positional reason and/or ``--reason``.
+
+    Verbs with a positional reason store it as a word list in ``reason`` and
+    the option in ``reason_flag``; verbs with only the option store a string
+    in ``reason``.
+    """
+    words = getattr(args, "reason", None)
+    if isinstance(words, (list, tuple)):
+        positional = " ".join(words).strip()
+        flag = getattr(args, "reason_flag", None)
+    else:
+        positional, flag = "", words
+    flag = (flag or "").strip()
+    if positional and flag:
+        return None, (
+            "give the reason once, either positionally or with --reason, not both"
+        )
+    return (positional or flag or None), None
+
+
+def _ids_reason_error(args: argparse.Namespace) -> Optional[str]:
+    """Refuse a multi-word ``--ids`` value: it is a swallowed reason, not an id."""
+    for tid in getattr(args, "ids", None) or []:
+        if any(ch.isspace() for ch in tid):
+            return (
+                f"--ids value {tid!r} is not a task id; --ids takes every word "
+                "after it, so pass the reason with --reason (or before --ids)"
+            )
+    return None
+
+
+def _reason_or_usage_error(
+    args: argparse.Namespace, verb: str,
+) -> tuple[Optional[str], bool]:
+    """Resolve the reason for ``verb``; print a usage error and return ok=False."""
+    error = _ids_reason_error(args)
+    reason = None
+    if error is None:
+        reason, error = _cli_reason(args)
+    if error is not None:
+        print(f"kanban {verb}: {error}", file=sys.stderr)
+        return None, False
+    return reason, True
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -735,6 +815,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
+    _add_reason_flag(p_block, "Reason (also appended as a comment).")
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
     p_block.add_argument(
@@ -754,6 +835,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
+    _add_reason_flag(p_schedule, "Reason/timing note (also appended as a comment).")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
@@ -799,8 +881,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_request_changes.add_argument("task_id")
     p_request_changes.add_argument(
-        "reason", nargs="+", help="Concrete changes required before re-review",
+        "reason", nargs="*", help="Concrete changes required before re-review",
     )
+    _add_reason_flag(p_request_changes, "Concrete changes required before re-review.")
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
@@ -822,6 +905,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         nargs="*",
         help="Audit-trail reason (recorded on the task_events row)",
     )
+    _add_reason_flag(p_promote, "Audit-trail reason (recorded on the task_events row).")
     p_promote.add_argument(
         "--ids",
         nargs="+",
@@ -2697,7 +2781,9 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
-    reason = " ".join(args.reason).strip() if args.reason else None
+    reason, ok = _reason_or_usage_error(args, "block")
+    if not ok:
+        return 2
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
@@ -2745,7 +2831,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
-    reason = " ".join(args.reason).strip() if args.reason else None
+    reason, ok = _reason_or_usage_error(args, "schedule")
+    if not ok:
+        return 2
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2853,7 +2941,16 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
-    reason = " ".join(args.reason).strip()
+    reason, ok = _reason_or_usage_error(args, "request-changes")
+    if not ok:
+        return 2
+    if not reason:
+        print(
+            "kanban request-changes: a reason is required "
+            "(positionally or with --reason)",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         ok, detail = kb.request_changes(
             conn,
@@ -2902,7 +2999,9 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
-    reason = " ".join(args.reason).strip() if args.reason else None
+    reason, ok = _reason_or_usage_error(args, "promote")
+    if not ok:
+        return 2
     author = _profile_author()
     as_json = getattr(args, "json", False)
     extra_ids = list(getattr(args, "ids", None) or [])
