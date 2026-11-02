@@ -55,6 +55,12 @@ def _require_external(conn, task_id):
 def _require_board(conn, board):
     if not board or board != _db().board_slug_for_conn(conn):
         raise ValueError("wrong board")
+    # A custom file cannot become a named board by ambient context alone.
+    # Resolve the expected layout without HERMES_KANBAN_DB's override.
+    main = next((r for r in conn.execute("PRAGMA database_list") if r[1] == "main"), None)
+    expected = _db()._board_path(None, board, ("kanban.db",), "kanban.db")
+    if main is None or not main[2] or Path(main[2]).resolve() != expected.expanduser().resolve():
+        raise ValueError("board_pin_mismatch")
 
 
 def _require_worktree(task, worktree):

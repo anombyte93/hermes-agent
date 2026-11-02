@@ -407,8 +407,11 @@ alone do not carry earlier rows' changed parents or retirement intent.
 An explicit `--board` must agree with any `HERMES_KANBAN_DB` pin after path
 expansion and symlink resolution, otherwise every board-routed CLI verb refuses
 `board_pin_mismatch` (with JSON when requested), before initialisation or writes.
-A pin without `--board` continues to work. A corrupt read-only check refuses
-`board_unreadable` as JSON rather than printing a traceback.
+A pin without `--board` continues to work for ordinary verbs. External claim and
+handover also compare the opened file with the reservation board's own path:
+a custom pin outside that layout refuses `board_pin_mismatch` even without
+`--board`, rather than trusting the current board's fallback name. A corrupt
+read-only check refuses `board_unreadable` as JSON rather than a traceback.
 
 A refused preflight means the caller must not start creating cards. A check is
 advisory, not a reservation: the writer revalidates under its own immediate
