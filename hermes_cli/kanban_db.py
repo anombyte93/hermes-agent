@@ -1614,6 +1614,10 @@ def create_task(
     ):
         raise ValueError("external_session refuses goal mode, model/provider overrides and skills")
     completion_contract = validate_contract(completion_contract)
+    if execution_kind == "external_session" and completion_contract != "local-only":
+        raise ValueError("external_session_refuses_completion_contract")
+    if execution_kind == "external_session" and reasoning_effort is not None:
+        raise ValueError("external_session refuses reasoning effort")
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1926,8 +1930,6 @@ def set_model_override(
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
     rate-limit-recovery flow (set, then reclaim/retry)."""
-    if execution_kind_of(conn, task_id) == "external_session":
-        raise ValueError("external_session refuses model/provider overrides")
     model, provider = _validate_model_override(model, provider)
     return _set_task_override(
         conn, task_id,
@@ -1944,6 +1946,8 @@ def _set_task_override(
     """Per-task override write: refuse archived tasks, record ``event_kind``,
     then fire the task-updated observer AFTER commit (RFC #58548)."""
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) == "external_session":
+            raise ValueError("external_session refuses model/provider overrides and reasoning effort")
         status = _task_status(conn, task_id)
         if status is None:
             return False
@@ -3556,6 +3560,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            allow_triage=execution_kind_of(conn, task_id) == "worker",
         )
         sql = f"""
                 UPDATE tasks
@@ -3589,7 +3594,7 @@ def block_task(
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, allow_triage: bool = True,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3606,7 +3611,7 @@ def _route_block(
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
+    if allow_triage and recurrences >= BLOCK_RECURRENCE_LIMIT:
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
         payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
@@ -4102,6 +4107,8 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) == "external_session":
+            raise ValueError("external_session_refuses_triage")
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),

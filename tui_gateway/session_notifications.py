@@ -118,7 +118,9 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
 # signaled/protocol_violation/output_limit_reached mirror the gateway notifier's precise-exit kinds.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked")
+_KANBAN_EXTERNAL_KINDS = ("external_claimed", "external_completed", "external_review_requested",
+                          "external_changes_requested", "external_released", "external_handed_over")
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked", *_KANBAN_EXTERNAL_KINDS)
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0  # /loop and /heartbeat share one idle-poll cadence
 
 
@@ -264,6 +266,12 @@ def _kb_timed_out(task, payload: dict, title: str) -> str:
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
 _KANBAN_EVENT_FORMATTERS = {
+    "external_claimed": ("🔗", lambda t, p, title: f" bound to an existing session — {title}"),
+    "external_completed": ("✔", _kb_completed),
+    "external_review_requested": ("🔎", lambda t, p, title: f" handed off for review — {title}"),
+    "external_changes_requested": ("↩", lambda t, p, title: " review requested changes" + _kb_first_line(p.get("reason") or "", 160)),
+    "external_released": ("⏸", lambda t, p, title: " external attempt released" + _kb_first_line(p.get("reason") or "", 160)),
+    "external_handed_over": ("🔗", lambda t, p, title: f" handed over to another existing session — {title}"),
     "completed": ("✔", _kb_completed),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
     "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"

@@ -80,7 +80,12 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     for row in conn.execute("SELECT id,payload FROM task_events WHERE kind LIKE 'external_%'").fetchall():
         if row[1] is None:
             continue
-        payload = json.loads(row[1])
+        try:
+            payload = json.loads(row[1])
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         payload.pop("reservation_id", None)
         payload.pop("owner_host", None)
         conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
@@ -339,34 +344,35 @@ def import_board(
         staged_meta = _read_board_metadata(extracted / "board.json")
 
         board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
-        for tree in ("attachments", "logs"):
-            src = extracted / tree
-            if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
+        board_root.mkdir(parents=True, exist_ok=False)
+        try:
+            shutil.move(str(staged_db), str(board_root / "kanban.db"))
+            for tree in ("attachments", "logs"):
+                src = extracted / tree
+                if src.is_dir():
+                    shutil.move(str(src), str(board_root / tree))
 
-    # Rewritten rather than moved across: the archive's copy names a slug
-    # and a workdir that belong to the exporting machine.
-    name = str(staged_meta.get("name") or manifest.get("board_name") or target)
-    kb.write_board_metadata(
-        target,
-        name=name,
-        description=str(staged_meta.get("description") or ""),
-        icon=str(staged_meta.get("icon") or ""),
-        color=str(staged_meta.get("color") or ""),
-        archived=False,
-    )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
-
-    with kbc.connect_closing(board=target) as conn:
-        stats, warnings = _relocate_imported_rows(conn, target)
-        counts = _count_rows(conn)
-
-    if activate:
-        kb.set_current_board(target)
+            # The archive's metadata names a slug and workdir on another machine.
+            name = str(staged_meta.get("name") or manifest.get("board_name") or target)
+            kb.write_board_metadata(
+                target,
+                name=name,
+                description=str(staged_meta.get("description") or ""),
+                icon=str(staged_meta.get("icon") or ""),
+                color=str(staged_meta.get("color") or ""),
+                archived=False,
+            )
+            kb.init_db(board=target)
+            with kbc.connect_closing(board=target) as conn:
+                stats, warnings = _relocate_imported_rows(conn, target)
+                counts = _count_rows(conn)
+            if activate:
+                kb.set_current_board(target)
+        except BaseException:
+            # Only this import's exclusively created tree, never an existing board.
+            # A failed scrub must not leave dispatchable untrusted rows behind.
+            shutil.rmtree(board_root)
+            raise
 
     return {
         "board": target,

@@ -176,13 +176,20 @@ External cards never enter either dispatcher lane. Default assignment, profile
 lookup failures, retries, dependency promotion and review reopening cannot make
 one spawnable. Ordinary `claim` and `request-review` are worker operations, not a
 way to adopt an external card. External creation refuses triage/decomposition,
-goal mode, model/provider overrides and skills. The kernel also refuses to
+goal mode, model/provider overrides, reasoning effort and skills. PR completion
+contracts refuse with `external_session_refuses_completion_contract`; only
+`local-only` is supported. External completion does not run the worker's
+board-wide `kanban.completion_contract: strict` validator. The kernel also refuses to
 decompose an older or imported external triage row, so it cannot create worker
 children or replace the root's assignee. Dashboard status moves (including bulk)
 and deletion refuse a live external binding with a visible conflict; use the
 exact owner's external lifecycle instead. Idle external cards cannot move into
 triage either, and automatic decomposition skips legacy external triage rows
-without spending the auxiliary-call budget.
+without spending the auxiliary-call budget. Repeated blocks on idle external
+cards stay blocked rather than entering triage. Manual specify/decompose also
+refuses legacy external triage rows with `external_session_refuses_triage` before
+any auxiliary call. An operator can explicitly archive such a legacy row and
+create a new unbound external card; specification never rewrites its intent.
 
 An owner integration first prepares its own reservation, then calls
 `hermes_cli.kanban_db_external.external_claim` or `hermes kanban external claim`.
@@ -235,8 +242,10 @@ owner. The owner must explicitly use one of these token-fenced operations:
 All mutations compare the exact attempt and reservation token. Closed bindings
 remain historical evidence and never mean that the external session ended.
 Completion, deferred child cleanup and archive GC preserve the owner's worktree
-or scratch workspace. A worker card on the same board sharing a binding's path
-cannot clean it up either, including after that binding closes. A board with an
+or scratch workspace. A worker card on any board sharing or containing a binding's
+path (or contained by it) cannot clean it up, including after that binding closes.
+Tilde and symlink spellings are resolved before comparison; an unreadable board
+fails closed. A board with an
 active binding refuses removal with `active_external_binding`. Board transfer
 strips binding authority and reservation/host fields from external events; the
 source remains bound. `show` (text or JSON) carries the kind
@@ -267,7 +276,17 @@ restore a compatible pre-migration database as well.
 Hermes enforces one active binding per process incarnation **on this board**.
 The reservation owner must enforce cross-board exclusivity and validate the live
 process/worktree before claiming. This API neither contacts that owner nor
-silently releases an uncertain reservation. Plan materialisation is separate.
+silently releases an uncertain reservation. A reservation id is single-use on
+one Hermes board, even after its binding closes: moving it from card A to B on
+the same board refuses `reservation_conflict`. A fresh reservation on that board
+works, as does the same id on a different board after closure. Moll-E's
+reservation-handover seam is an open parent ruling; do not weaken stale-attempt
+protection to reuse a closed reservation. Plan materialisation is separate.
+
+Release and handover leave the old attempt's run status `released`, with outcome
+`released` or `handed_over`; the card's separate ready/todo/running state is not
+an attempt status. Requested changes retains the existing worker-compatible
+landing-status convention.
 
 ## Boards (multi-project)
 
