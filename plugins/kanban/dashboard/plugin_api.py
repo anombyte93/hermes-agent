@@ -579,6 +579,8 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
     """Dispatch a status verb; raises ``_StatusRejected`` (user-facing message)
     for ``running`` or an unknown status (``unknown_detail``)."""
     _require_no_external_binding(conn, task_id)
+    if s == "triage" and kanban_db.execution_kind_of(conn, task_id) != "worker":
+        raise _StatusRejected("external_session cards cannot enter triage")
     if s == "running":
         raise _StatusRejected(_RUNNING_DIRECT_MSG)
     handler = _STATUS_HANDLERS.get(s)

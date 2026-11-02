@@ -384,8 +384,10 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "WHERE status = 'archived' AND execution_kind = 'worker'"
         ).fetchall()
+        rows = [row for row in rows if not kbw._externally_owned_workspace(
+            conn, str(row["workspace_path"] or (scratch_root / row["id"])))]
     for row in rows:
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook.

@@ -257,7 +257,7 @@ def test_concurrent_external_claims_have_one_winner(store, target):
 @pytest.mark.parametrize("reaper", ["release_stale_claims", "detect_crashed_workers",
     "detect_stale_running", "enforce_max_runtime", "reconcile_orphaned_running", "startup"])
 def test_lost_contact_never_reaps_binding_or_process(store, monkeypatch, reaper):
-    tid = create(store)
+    tid = create(store, assignee="same-profile")
     claimed = claim(store, tid)
     # Deliberately worker-shaped stale bookkeeping proves the kind is the guard,
     # not the absence of a PID, a remote hostname or the non-expiring claim.
@@ -269,22 +269,27 @@ def test_lost_contact_never_reaps_binding_or_process(store, monkeypatch, reaper)
         store.execute("UPDATE tasks SET claim_lock=NULL,claim_expires=NULL WHERE id=?", (tid,))
     store.commit()
     before = "\n".join(store.iterdump())
-    effects = Mock(return_value=None)
-    monkeypatch.setattr(dispatch, "_terminate_reclaimed_worker", effects)
-    monkeypatch.setattr(dispatch, "_kill_fn", effects)
+    termination = Mock(return_value={})
+    signal = Mock()
+    monkeypatch.setattr(dispatch, "_terminate_reclaimed_worker", termination)
+    monkeypatch.setattr(dispatch, "_kill_fn", lambda *args: signal)
     if reaper == "startup":
         path = Path(store.execute("PRAGMA database_list").fetchone()[2])
         dbc.init_db(path)
-        tick(store, stale_timeout_seconds=1)
+        outcome, expected = None, None
     elif reaper == "release_stale_claims":
-        assert kb.release_stale_claims(store, signal_fn=effects) == 0
+        outcome, expected = kb.release_stale_claims(store, signal_fn=signal), 0
     elif reaper == "detect_stale_running":
-        assert dispatch.detect_stale_running(store, stale_timeout_seconds=1, signal_fn=effects) == []
+        outcome, expected = dispatch.detect_stale_running(store, stale_timeout_seconds=1, signal_fn=signal), []
     elif reaper == "enforce_max_runtime":
-        assert dispatch.enforce_max_runtime(store, signal_fn=effects) == []
+        outcome, expected = dispatch.enforce_max_runtime(store, signal_fn=signal), []
     else:
-        assert getattr(dispatch, reaper)(store) == []
-    assert not effects.called
+        outcome, expected = getattr(dispatch, reaper)(store), []
+    # Exercise dispatch before state/return assertions so a broken reaper plus
+    # missing selection guards produces an observed launch, not a masked RED.
+    tick(store, stale_timeout_seconds=1)
+    assert outcome == expected
+    assert not termination.called and not signal.called
     assert "\n".join(store.iterdump()) == before
 
 
@@ -296,7 +301,7 @@ def test_exact_attempt_and_token_required(store, operation):
     fn = getattr(api, "external_" + operation)
     extra = dict(reason="give up") if operation == "release" else dict(summary="finished")
     if operation == "handover":
-        extra = dict(owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"},
+        extra = dict(board="default", owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"},
                      reservation_id="fixture-r2", new_reservation_token=NEXT_TOKEN,
                      worktree=active["binding"]["worktree"], evidence="explicit transfer")
     for rid, token in [(active["run_id"] + 1, TOKEN), (active["run_id"], NEXT_TOKEN)]:
@@ -311,12 +316,17 @@ def test_release_serial_reuse_and_stale_attempt_refusal(store):
     api = external_api()
     api.external_release(store, first, active["run_id"], reservation_token=TOKEN, reason="explicit give-up")
     assert kb.get_task(store, first).status == "ready"
-    reused = claim(store, second, reservation_id="fixture-r2", reservation_token=NEXT_TOKEN)
+    reused = claim(store, second, reservation_id="fixture-r2", reservation_token=NEXT_TOKEN,
+                   incarnation={**INCARNATION, "pid": "434343", "conversation": "different-owner"})
     assert reused["binding"]["state"] == "active"
-    with pytest.raises(ValueError):
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="stale attempt"):
         api.external_complete(store, first, active["run_id"], reservation_token=TOKEN, summary="stale")
-    with pytest.raises(ValueError):
-        claim(store, first)  # a closed reservation cannot be replayed as a new attempt
+    # The original incarnation is now free: process uniqueness cannot mask
+    # a mutant that wrongly accepts the closed reservation for the first card.
+    with pytest.raises(ValueError, match="reservation_conflict"):
+        claim(store, first)
+    assert "\n".join(store.iterdump()) == before
     tick(store)
 
 
@@ -351,7 +361,7 @@ def test_handover_keeps_old_binding_and_stale_owner_cannot_act(store):
     new = api.external_handover(store, tid, active["run_id"], reservation_token=TOKEN,
         owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343", "conversation": "successor"},
         reservation_id="fixture-r2", new_reservation_token=NEXT_TOKEN,
-        worktree=active["binding"]["worktree"], evidence="explicit parent-approved transfer")
+        worktree=active["binding"]["worktree"], evidence="explicit parent-approved transfer", board="default")
     assert new["run_id"] != active["run_id"]
     old = store.execute("SELECT * FROM task_external_bindings WHERE run_id=?", (active["run_id"],)).fetchone()
     assert old["state"] == "handed_over" and old["closed_at"] is not None
@@ -427,7 +437,7 @@ def test_cli_create_claim_status_show_complete(store, capsys):
     args = parse(["create", "external CLI", "--execution-kind", "external_session", "--json"])
     assert cli.kanban_command(args) == 0
     tid = json.loads(capsys.readouterr().out)["id"]
-    args = parse(["external", "claim", "--task", tid, "--incarnation", json.dumps(INCARNATION),
+    args = parse(["external", "claim", "--expected-board", "default", "--task", tid, "--incarnation", json.dumps(INCARNATION),
         "--owner-host", OWNER_HOST, "--worktree", str(Path.home() / "worktree"), "--reservation-id", "fixture-cli",
         "--reservation-token", TOKEN, "--json"])
     assert cli.kanban_command(args) == 0
@@ -491,7 +501,7 @@ def test_handover_conflict_rolls_back_original_owner(store):
     with pytest.raises(ValueError, match="reservation_conflict"):
         external_api().external_handover(store, first, active["run_id"], reservation_token=TOKEN,
             owner_host=OWNER_HOST, incarnation=occupied, worktree=active["binding"]["worktree"],
-            reservation_id="successor", new_reservation_token=NEXT_TOKEN, evidence="transfer")
+            reservation_id="successor", new_reservation_token=NEXT_TOKEN, evidence="transfer", board="default")
     assert external_api().external_status(store, first) == active
     assert len(kb.list_events(store, first)) == 2
 
@@ -547,7 +557,7 @@ def test_cli_other_external_lifecycle_verbs(store, capsys, verb):
     if verb in {"release", "request-changes"}:
         argv += ["--reason", "explicit parent action"]
     if verb == "handover":
-        argv += ["--owner-host", OWNER_HOST, "--incarnation", json.dumps({**INCARNATION, "pid": "434343"}),
+        argv += ["--expected-board", "default", "--owner-host", OWNER_HOST, "--incarnation", json.dumps({**INCARNATION, "pid": "434343"}),
                  "--worktree", active["binding"]["worktree"], "--reservation-id", "next-cli",
                  "--new-reservation-token", NEXT_TOKEN, "--evidence", "parent transfer"]
     assert cli.kanban_command(parse(argv)) == 0
@@ -693,7 +703,7 @@ def test_worktree_is_binding_local_not_written_back_to_card(store, mode):
     else:
         successor = api.external_handover(store, tid, active["run_id"], reservation_token=TOKEN,
             owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"}, worktree=successor_path,
-            reservation_id="next-worktree", new_reservation_token=NEXT_TOKEN, evidence="explicit transfer")
+            reservation_id="next-worktree", new_reservation_token=NEXT_TOKEN, evidence="explicit transfer", board="default")
     assert successor["binding"]["worktree"] == successor_path
     after = kb.get_task(store, tid)
     assert (after.workspace_path, after.workspace_kind) == (before.workspace_path, before.workspace_kind)
@@ -734,6 +744,8 @@ def test_board_transfer_has_no_external_binding_and_card_can_be_claimed(store, t
         with tarfile.open(archive) as tar:
             payload = tar.extractfile("default/kanban.db").read()
         assert digest.encode() not in payload
+        assert OWNER_HOST.encode() not in payload
+        assert b"fixture-r1" not in payload
         assert json.dumps(INCARNATION, sort_keys=True, separators=(",", ":")).encode() not in payload
         snapshot = tmp_path / "inspect.db"
         snapshot.write_bytes(payload)
@@ -754,6 +766,12 @@ def test_board_transfer_has_no_external_binding_and_card_can_be_claimed(store, t
         assert status["binding"] is None and status["attempt"] is None
         assert status["task"]["execution_kind"] == "external_session"
         assert status["task"]["status"] == "ready"
+        events = kb.list_events(conn, tid)
+        assert events
+        for event in events:
+            if event.payload:
+                assert "reservation_id" not in event.payload
+                assert "owner_host" not in event.payload
         bound = claim(conn, tid, board=imported["board"], reservation_id="imported-reservation")
         assert bound["binding"]["state"] == "active"
         tick(conn)
@@ -797,7 +815,7 @@ def test_cli_token_file_route_and_expected_board(store, tmp_path, capsys, verb):
         if verb in {"release", "request-changes"}:
             argv += ["--reason", "explicit action"]
         if verb == "handover":
-            argv += [*identity, "--new-reservation-token-file", str(next_file), "--evidence", "transfer"]
+            argv += [*identity, "--expected-board", "default", "--new-reservation-token-file", str(next_file), "--evidence", "transfer"]
     assert TOKEN not in argv and NEXT_TOKEN not in argv
     assert cli.kanban_command(parse(argv)) == 0
     output = capsys.readouterr().out
@@ -828,3 +846,84 @@ def test_cli_token_route_refusals_are_value_safe(store, tmp_path, capsys, route)
     assert json.loads(output)["state"] == "refused"
     assert TOKEN not in output
     assert external_api().external_status(store, tid) == active
+
+
+@pytest.mark.parametrize("board", [None, "wrong"])
+def test_cli_claim_never_infers_reservation_board(store, capsys, board):
+    tid = create(store)
+    argv = ["external", "claim", "--task", tid, "--owner-host", OWNER_HOST,
+            "--incarnation", json.dumps(INCARNATION), "--worktree", str(Path.home() / "worktree"),
+            "--reservation-id", "board-fixture", "--reservation-token", TOKEN, "--json"]
+    if board is not None:
+        argv += ["--expected-board", board]
+    before = "\n".join(store.iterdump())
+    assert cli.kanban_command(parse(argv)) == 1
+    assert "board" in json.loads(capsys.readouterr().out)["reason"]
+    assert "\n".join(store.iterdump()) == before
+
+
+@pytest.mark.parametrize("board", [None, "wrong"])
+def test_handover_requires_reservation_board_before_mutating(store, board):
+    tid = create(store)
+    active = claim(store, tid)
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="board"):
+        external_api().external_handover(store, tid, active["run_id"], reservation_token=TOKEN,
+            owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"},
+            worktree=active["binding"]["worktree"], reservation_id="new-board-fixture",
+            new_reservation_token=NEXT_TOKEN, evidence="explicit transfer", board=board)
+    assert "\n".join(store.iterdump()) == before
+
+
+@pytest.mark.parametrize("board", [None, "wrong"])
+def test_cli_handover_compares_successor_reservation_board(store, capsys, board):
+    tid = create(store)
+    active = claim(store, tid)
+    before = "\n".join(store.iterdump())
+    argv = ["external", "handover", "--task", tid, "--run-id", str(active["run_id"]),
+            "--reservation-token", TOKEN, "--owner-host", OWNER_HOST,
+            "--incarnation", json.dumps({**INCARNATION, "pid": "434343"}),
+            "--worktree", active["binding"]["worktree"], "--reservation-id", "successor-board",
+            "--new-reservation-token", NEXT_TOKEN, "--evidence", "explicit transfer", "--json"]
+    if board is not None:
+        argv += ["--expected-board", board]
+    assert cli.kanban_command(parse(argv)) == 1
+    assert "board" in json.loads(capsys.readouterr().out)["reason"]
+    assert "\n".join(store.iterdump()) == before
+
+
+def test_lapsed_claim_does_not_admit_a_second_session(store):
+    tid = create(store, assignee="same-profile")
+    active = claim(store, tid)
+    # Model a TTL written by an older client; the binding, not time, owns the card.
+    with kb.write_txn(store):
+        store.execute("UPDATE tasks SET claim_expires=1 WHERE id=?", (tid,))
+        store.execute("UPDATE task_runs SET claim_expires=1 WHERE id=?", (active["run_id"],))
+    before = "\n".join(store.iterdump())
+    effects = Mock()
+    assert kb.release_stale_claims(store, signal_fn=effects) == 0
+    tick(store)
+    with pytest.raises(ValueError, match="ready|binding"):
+        claim(store, tid, incarnation={**INCARNATION, "pid": "434343", "conversation": "contender"},
+              reservation_id="second-claimant", reservation_token=NEXT_TOKEN)
+    assert not effects.called
+    assert "\n".join(store.iterdump()) == before
+    assert len(kb.list_runs(store, tid)) == 1
+
+
+@pytest.mark.parametrize("archive", [True, False])
+def test_board_removal_refuses_active_external_binding(store, archive):
+    kb.create_board("bound-board")
+    kb.set_current_board("bound-board")
+    with dbc.connect_closing(board="bound-board") as conn:
+        tid = create(conn)
+        active = claim(conn, tid, board="bound-board")
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(ValueError, match="active_external_binding"):
+            kb.remove_board("bound-board", archive=archive)
+        assert kb.get_current_board() == "bound-board"
+        assert kb.board_dir("bound-board").is_dir()
+        assert "\n".join(conn.iterdump()) == before
+        external_api().external_release(conn, tid, active["run_id"],
+            reservation_token=TOKEN, reason="explicitly released")
+    assert kb.remove_board("bound-board", archive=archive)["action"] == ("archived" if archive else "deleted")

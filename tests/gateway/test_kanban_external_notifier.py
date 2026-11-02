@@ -62,7 +62,7 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
             external.external_handover(conn, tid, active["run_id"], reservation_token="a" * 64,
                 owner_host="fixture-host", incarnation={**identity, "pid": "434343"},
                 worktree="/fixture/worktree", reservation_id="fixture-r2", new_reservation_token="b" * 64,
-                evidence="explicit transfer")
+                evidence="explicit transfer", board="default")
         elif action == "review":
             external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64,
                 summary="review evidence", review=True)

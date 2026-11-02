@@ -104,13 +104,13 @@ def _external_commands():
     token = [_arg("--reservation-token", help="Legacy argv input (unsafe for real tokens); prefer --reservation-token-file"),
              _arg("--reservation-token-file", metavar="PATH", help="Read token from an owner-managed private file, not argv")]
     owned = [*common, _arg("--run-id", required=True, type=int), *token]
-    identity = [_arg("--owner-host", required=True), _arg("--incarnation", required=True,
+    identity = [_arg("--expected-board", help="Required reservation board, compared to the selected board"),
+                _arg("--owner-host", required=True), _arg("--incarnation", required=True,
                 help="Literal owner incarnation JSON: session,id,created,pane,pid,backend,conversation"),
                 _arg("--worktree", required=True), _arg("--reservation-id", required=True)]
     return [
         _cmd("status", common, help="Read card, attempt and external binding (no token)"),
-        _cmd("claim", [*common, *identity, *token,
-                       _arg("--expected-board", help="Refuse if the selected board differs from the reservation's board")]),
+        _cmd("claim", [*common, *identity, *token]),
         _cmd("complete", [*owned, _arg("--summary"), _arg("--result"),
                           _arg("--review", action="store_true")]),
         _cmd("request-changes", [*owned, _arg("--reason", required=True)]),
