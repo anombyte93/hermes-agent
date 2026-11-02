@@ -98,11 +98,12 @@ def test_ruling_six_all_five_cases_and_durable_mapping_event(store):
     assert mapped.status == original.status and not kb.list_runs(store, tid)
 
 
-def test_matching_any_earlier_fingerprint_reuses_card_even_after_changed_revision(store):
+def test_only_latest_fingerprint_reuses_card_after_changed_revision(store):
     tid = materialize(store)["task_id"]
     materialize(store, plan_revision="r2", intent_fingerprint="changed", maps_from="r1:build")
-    assert materialize(store, plan_revision="r3") == {"state": "existing", "task_id": tid}
-    assert len(references(store)) == 3
+    assert materialize(store, plan_revision="r3") == {
+        "state": "conflict", "task_id": tid, "reason": "revision_requires_mapping"}
+    assert len(references(store)) == 2
     assert len(kb.list_tasks(store)) == 1
 
 

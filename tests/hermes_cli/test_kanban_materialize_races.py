@@ -47,7 +47,7 @@ def test_claim_and_mapping_race_has_no_started_rewrite_or_ungated_claim(store):
                 return external_claim(conn, child, board="default", owner_host="fixture",
                     incarnation=dict(session="fixture", id="$1", created="1", pane="%1", pid="123",
                                      backend="claude", conversation="fixture"),
-                    worktree="/fixture", reservation_id="fixture", reservation_token="a" * 64)
+                    worktree=str(Path.home()), reservation_id="fixture", reservation_token="a" * 64)
             except ValueError as exc:
                 assert "ready" in str(exc) or "parents" in str(exc)
                 return None

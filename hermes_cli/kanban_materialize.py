@@ -1,6 +1,7 @@
 """CLI boundary for canonical plan materialization. No session-owner effects."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -42,16 +43,20 @@ def materialize_command(args) -> int:
                         raise ValueError("invalid_pending_parent")
                     pending[proposed] = task_id if sep else None
                 options["pending_parents"] = pending
+                prior_file = getattr(args, "prior_rows_file", None)
+                if prior_file:
+                    options["prior_rows"] = json.loads(Path(prior_file).read_text(encoding="utf-8"))
             operation = check_materialization if check else materialize_task
             result = operation(conn, project=args.project, plan_revision=args.plan_revision,
                 proposed_task_id=args.proposed_id, intent_fingerprint=args.fingerprint,
                 title=args.title, body=body, parent_proposed=args.parent_proposed,
                 maps_from=args.maps_from, execution_kind=args.execution_kind, **options)
-    except (OSError, UnicodeError, ValueError) as exc:
+    except (OSError, UnicodeError, ValueError, sqlite3.Error) as exc:
+        reason = "board_unreadable" if isinstance(exc, sqlite3.Error) else str(exc)
         if args.json:
-            _print_json({"state": "refused", "reason": str(exc)})
+            _print_json({"state": "refused", "reason": reason})
             return 1
-        return _err(f"kanban materialize: {exc}")
+        return _err(f"kanban materialize: {reason}")
     if args.json:
         _print_json(result)
     else:

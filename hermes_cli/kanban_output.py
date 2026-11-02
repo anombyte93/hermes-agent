@@ -66,7 +66,13 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""
     failed = False
     for tid in ids:
-        if op(tid):
+        try:
+            ok = op(tid)
+        except ValueError as exc:
+            failed = True
+            print(f"{tid}: {exc}", file=sys.stderr)
+            continue
+        if ok:
             print(ok_msg(tid))
         else:
             failed = True

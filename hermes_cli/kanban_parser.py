@@ -220,7 +220,9 @@ _SPECS = [
          help="Atomically materialize a plan identity into one canonical external-session card"),
     _cmd("materialize-check", [*_MATERIALIZE_ARGS,
          _arg("--pending-parent-proposed", action="append", default=[], metavar="ID[=TASK_ID]",
-              help="Check-only parent from an earlier checked row; omit task id for a new card")],
+              help="Check-only parent from an earlier checked row; omit task id for a new card"),
+         _arg("--prior-rows-file", metavar="PATH",
+              help="Check-only JSON array of earlier row intents, in writer order")],
          help="Check one proposed materialization without changing or creating a board or card"),
     _cmd("create", [
         _arg("title", help="Task title"),

@@ -61,9 +61,23 @@ def test_materialize_process_contract_uses_one_canonical_card(tmp_path):
         0, {"state": "mapped", "task_id": tid})
     assert run("r4", "changed", "--maps-from", "missing:work") == (
         1, {"state": "refused", "reason": "mapping_not_found"})
+    assert run("r4", "intent") == (3, {
+        "state": "conflict", "task_id": tid, "reason": "revision_requires_mapping"})
+    assert run("r4", "intent", "--maps-from", "r3:work") == (0, {"state": "mapped", "task_id": tid})
+    prior = tmp_path / "prior-rows.json"
+    prior.write_text(json.dumps([dict(proposed_task_id="parent", intent_fingerprint="parent-intent", title="Parent")]))
+    assert run("r5", "new-intent", "--maps-from", "r4:work", "--parent-proposed", "parent",
+               "--prior-rows-file", str(prior), check=True) == (0, {"state": "mapped", "task_id": tid})
+    other_pin = home / "other.db"
+    env["HERMES_KANBAN_DB"] = str(other_pin)
+    for check in (False, True):
+        assert run("r5", "new-intent", check=check) == (
+            1, {"state": "refused", "reason": "board_pin_mismatch"})
+    assert not other_pin.exists()
     with connect_closing(home / "kanban.db") as observer:
         tasks = kb.list_tasks(observer)
         assert len(tasks) == 1 and tasks[0].id == tid
         assert tasks[0].execution_kind == "external_session"
-        assert observer.execute("SELECT COUNT(*) FROM task_materializations").fetchone()[0] == 3
-        assert [event.kind for event in kb.list_events(observer, tid)] == ["created", "materialization_mapped"]
+        assert observer.execute("SELECT COUNT(*) FROM task_materializations").fetchone()[0] == 4
+        assert [event.kind for event in kb.list_events(observer, tid)] == [
+            "created", "materialization_mapped", "materialization_mapped"]

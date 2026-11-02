@@ -170,6 +170,15 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: {exc}", 2)
         if not normed:
             return _err("kanban: --board requires a slug", 2)
+        # Resolve the board's own path without the worker DB pin. Calling
+        # kanban_db_path here would compare the pin with itself.
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        own_path = kb._board_path(None, normed, ("kanban.db",), "kanban.db")
+        if pin and Path(pin).expanduser().resolve() != own_path.expanduser().resolve():
+            if getattr(args, "json", False):
+                _print_json({"state": "refused", "reason": "board_pin_mismatch"})
+                return 1
+            return _err("kanban: board_pin_mismatch")
         # Boards other than 'default' must already exist — typoed slugs would otherwise silently
         # create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):

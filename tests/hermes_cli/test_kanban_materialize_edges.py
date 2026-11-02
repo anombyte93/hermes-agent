@@ -25,15 +25,15 @@ def materialize(conn, revision="r1", proposed="work", **kwargs):
         proposed_task_id=proposed, intent_fingerprint="same-intent", title="Acceptance", **kwargs)
 
 
-def test_unchanged_intent_precedes_mapping_and_never_redirects_identity(store):
+def test_unchanged_intent_never_ignores_a_mapping_to_another_card(store):
     canonical = materialize(store)["task_id"]
     other = materialize(store, proposed="another-task")["task_id"]
     assert canonical != other
-    # Ruling 6 is ordered: a real prior fingerprint wins over a supplied map.
+    # Ruling 17: validate the explicit map before returning existing.
     assert materialize(store, revision="r2", maps_from="r1:another-task") == {
-        "state": "existing", "task_id": canonical}
+        "state": "conflict", "task_id": canonical, "reason": "logical_id_retired"}
     assert store.execute("SELECT task_id FROM task_materializations WHERE "
-                         "plan_revision='r2' AND proposed_task_id='work'").fetchone()[0] == canonical
+                         "plan_revision='r2' AND proposed_task_id='work'").fetchone() is None
     assert [event.kind for event in kb.list_events(store, canonical)] == ["created"]
 
 

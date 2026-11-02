@@ -297,15 +297,19 @@ clients therefore read back the same card:
 
 - Same revision and fingerprint: `{"state":"existing","task_id":"t_..."}`.
 - Same revision, different fingerprint: conflict, `materialization_conflict`.
-- New revision with a matching earlier fingerprint: existing, with a reference
-  recorded for the new revision.
+- New revision matching the logical id's latest fingerprint: existing, with a
+  reference recorded for the new revision. Returning to an older fingerprint
+  after an intervening change requires a mapping like any other revision.
 - New revision with changed intent and no mapping: conflict,
   `revision_requires_mapping`.
 - New revision with changed intent (or a renamed id) and
   `--maps-from prior-revision:prior-id` naming a real row:
   `{"state":"mapped","task_id":"t_..."}`. An established logical id cannot
   be redirected to another card. A `materialization_mapped` event records the
-  mapping. A matching earlier fingerprint takes precedence and stays existing.
+  mapping. An explicit mapping is validated even when the fingerprint is
+  unchanged; a mapping onto another existing card refuses `logical_id_retired`
+  rather than being ignored. A valid same-card mapping with an unchanged latest
+  fingerprint returns `existing`, without a second event.
 
 A genuinely new id returns `{"state":"created","task_id":"t_..."}`.
 Created, existing and mapped return exit 0. Conflicts return exit 3 and
@@ -357,6 +361,35 @@ revision, supply `--parent-proposed=P` and check-only
 each pending parent. These explicitly project earlier check results without
 creating placeholder cards. Actual `materialize` still requires real parent
 rows in the exact revision; it never accepts pending-parent flags.
+
+For a revised plan, also pass `--prior-rows-file /absolute/earlier-rows.json`
+with a JSON array containing every earlier row in writer order. This additive
+check-only input projects references, retirements and replaced dependencies, so
+keep/rename conflicts and dependency reversals get the same answer as the writer.
+It creates no placeholder cards. Each object has `proposed_task_id`,
+`intent_fingerprint`, `title`, and optional `body` (literal text or null),
+`parent_proposed` (array), `maps_from` and `execution_kind`. Project and revision
+come from the current command. For example, after checking the mapped row `b`:
+
+```json
+[{"proposed_task_id":"b","intent_fingerprint":"new-b","title":"B","maps_from":"r1:b","parent_proposed":[]}]
+```
+
+```bash
+hermes kanban --board B materialize-check --project P --plan-revision r2 \
+  --proposed-id a --fingerprint new-a --title A --maps-from r1:a \
+  --parent-proposed b --pending-parent-proposed b=t_CANONICAL_B \
+  --prior-rows-file /absolute/earlier-rows.json --execution-kind external_session --json
+```
+
+Without the new input, pending-parent flags retain their existing meaning; they
+alone do not carry earlier rows' changed parents or retirement intent.
+
+An explicit `--board` must agree with any `HERMES_KANBAN_DB` pin after path
+expansion and symlink resolution, otherwise every board-routed CLI verb refuses
+`board_pin_mismatch` (with JSON when requested), before initialisation or writes.
+A pin without `--board` continues to work. A corrupt read-only check refuses
+`board_unreadable` as JSON rather than printing a traceback.
 
 A refused preflight means the caller must not start creating cards. A check is
 advisory, not a reservation: the writer revalidates under its own immediate

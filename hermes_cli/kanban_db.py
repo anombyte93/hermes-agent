@@ -2,8 +2,10 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. DB routing: ``HERMES_KANBAN_DB`` pins the file first; otherwise ``board=`` /
+context override > ``HERMES_KANBAN_BOARD`` > ``<root>/kanban/current`` > ``default``.
+The CLI refuses an explicit board whose own path disagrees with the DB pin.
+The dispatcher injects the board and DB pin into workers.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.

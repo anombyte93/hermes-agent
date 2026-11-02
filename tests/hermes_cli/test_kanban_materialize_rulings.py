@@ -39,7 +39,7 @@ def claim(conn, tid):
     return external_claim(conn, tid, board="default", owner_host="fixture-host",
         incarnation=dict(session="fixture", id="$1", created="1", pane="%1", pid="00123",
                          backend="claude", conversation="fixture-conversation"),
-        worktree="/fixture/worktree", reservation_id="fixture-reservation", reservation_token="a" * 64)
+        worktree=str(Path.home()), reservation_id="fixture-reservation", reservation_token="a" * 64)
 
 
 def dump(conn):
