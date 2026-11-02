@@ -221,17 +221,26 @@ def test_renamed_mapping_replay_matches_check_and_writer(store, capsys, revision
             3, {"state": "conflict", "task_id": tid, "reason": "logical_id_retired"})
 
 
-def test_partial_rename_plan_finishes_on_retry_and_chain_replays(store, capsys, tmp_path):
+def test_partial_rename_plan_finishes_on_retry_and_chain_replays(store, capsys, tmp_path, monkeypatch):
     tid = write(store, proposed="x")["task_id"]
     renamed = row(proposed="y", maps_from="r1:x")
     assert invoke(capsys, "materialize", revision="r2", options=renamed)[1]["state"] == "mapped"
-    # The next write failed after the first row landed. Retrying the corrected
-    # plan must preflight the landed rename as well as the still-missing row.
-    assert invoke(capsys, "materialize", revision="r2", options=row(proposed="z", parent_proposed=["absent"]))[0] == 1
+    child = row(proposed="z", parent_proposed=["y"])
+    # A valid second row can fail after preflight. Retry the identical plan,
+    # not changed intent disguised as a replay of the same revision.
+    before = "\n".join(store.iterdump())
+    assert invoke(capsys, "materialize-check", revision="r2", options=child) == (0, {"state": "created", "task_id": None})
+
+    def unavailable(*args, **kwargs):
+        raise ValueError("fixture_write_failed")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(kb, "create_task", unavailable)
+        assert invoke(capsys, "materialize", revision="r2", options=child) == (
+            1, {"state": "refused", "reason": "fixture_write_failed"})
+    assert "\n".join(store.iterdump()) == before
     prior = tmp_path / "prior.json"
     prior.write_text(json.dumps([renamed]))
-    child = row(proposed="z", parent_proposed=["y"])
-    before = "\n".join(store.iterdump())
     assert invoke(capsys, "materialize-check", revision="r2", options=renamed) == (0, {"state": "existing", "task_id": tid})
     assert invoke(capsys, "materialize-check", revision="r2", options=child,
         extra=("--prior-rows-file", str(prior))) == (0, {"state": "created", "task_id": None})
