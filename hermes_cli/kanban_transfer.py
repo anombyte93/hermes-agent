@@ -344,7 +344,10 @@ def import_board(
         staged_meta = _read_board_metadata(extracted / "board.json")
 
         board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=False)
+        try:
+            board_root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise ValueError("import_destination_exists: existing directory is not an import target") from exc
         try:
             shutil.move(str(staged_db), str(board_root / "kanban.db"))
             for tree in ("attachments", "logs"):

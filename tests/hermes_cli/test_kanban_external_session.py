@@ -931,7 +931,12 @@ def test_board_removal_refuses_active_external_binding(store, archive):
         assert "\n".join(conn.iterdump()) == before
         external_api().external_release(conn, tid, active["run_id"],
             reservation_token=TOKEN, reason="explicitly released")
-    assert kb.remove_board("bound-board", archive=archive)["action"] == ("archived" if archive else "deleted")
+    if not archive:
+        with pytest.raises(ValueError, match="external_binding_history.*archive"):
+            kb.remove_board("bound-board", archive=False)
+        assert kb.get_current_board() == "bound-board"
+        assert kb.board_dir("bound-board").is_dir()
+    assert kb.remove_board("bound-board", archive=True)["action"] == "archived"
 
 
 def test_old_review_attempt_cannot_complete_newer_review(store):

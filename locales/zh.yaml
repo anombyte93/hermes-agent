@@ -172,9 +172,9 @@ gateway:
     truncated_suffix:      "…（已截断；如需完整输出请在终端运行 `hermes kanban …`）"
     no_output:             "（无输出）"
     wake:
-      external_completed: "completed"
-      external_review_requested: "handed off for review; the implementation is done"
-      external_changes_requested: "review requested changes; implementation is not approved"
+      external_completed: "已完成"
+      external_review_requested: "已交付评审；实现已完成"
+      external_changes_requested: "评审要求修改（BLOCK)，实现未获批准"
       external_released: "external attempt released; inspect the card for its dependency-gated state"
       completed:           "已完成"
       gave_up:             "已放弃（重试次数耗尽）"

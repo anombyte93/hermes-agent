@@ -79,6 +79,22 @@ def _seed_board(slug: str = "alpha") -> dict[str, str]:
     return ids
 
 
+def test_stray_import_directory_refuses_without_changing_bytes(kanban_root, tmp_path):
+    _seed_board()
+    archive = tmp_path / "board.tar.gz"
+    kt.export_board("alpha", str(archive))
+    kanban_root("destination")
+    stray = kb.board_dir("stray")
+    stray.mkdir(parents=True)
+    (stray / "keep.bin").write_bytes(b"do not adopt or delete me")
+    before = {p.relative_to(stray): p.read_bytes() for p in stray.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="import_destination_exists"):
+        kt.import_board(str(archive), "stray")
+    assert {p.relative_to(stray): p.read_bytes() for p in stray.rglob("*") if p.is_file()} == before
+    assert not (stray / "kanban.db").exists()
+    assert not (stray / "board.json").exists()
+
+
 @pytest.mark.parametrize("payload", [None, '[1]', '"x"', 'null', 'not JSON', '{"reservation_id":"fixture","owner_host":"fixture"}'])
 def test_untrusted_external_payload_does_not_bypass_import_parking(kanban_root, tmp_path, monkeypatch, payload):
     import sqlite3
