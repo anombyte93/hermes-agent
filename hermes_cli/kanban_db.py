@@ -4184,7 +4184,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    """Delete disposable relations only; canonical plan identities are retained."""
+    from hermes_cli.kanban_db_materialize import require_deletable_card
+    require_deletable_card(conn, task_id)
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
@@ -4193,7 +4195,9 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
+    from hermes_cli.kanban_db_materialize import require_deletable_card
     with write_txn(conn):
+        require_deletable_card(conn, task_id)
         if has_external_attempt(conn, task_id) or _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -4202,8 +4206,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task; an active external binding must be released first."""
+    """Hard-delete a task; external attempts and plan identities are retained."""
+    from hermes_cli.kanban_db_materialize import require_deletable_card
     with write_txn(conn):
+        require_deletable_card(conn, task_id)
         if has_external_attempt(conn, task_id):
             return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))

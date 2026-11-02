@@ -308,10 +308,53 @@ exit 1 and `{"state":"refused","reason":"..."}` with no card created.
 Mappings resolve only inside this project and board and must name a different,
 already-materialized revision.
 
-Reuse and mapping preserve the canonical card's body, dependencies, status and
-attempt history, even if archived. They do not reopen, close or execute it.
+Unchanged reuse preserves the card. A mapped revision applies its supplied
+title, body and complete parent set in the same transaction as its reference
+and mapping event, provided the card has no run or external binding. Changed
+fields after it has started refuse `mapping_card_started` (exit 3). Omitted
+body/parents mean null/empty, not "keep the old fields". Dependency gating is
+recomputed for todo/ready cards, but archived or deliberately parked cards
+are not reopened. External claim independently checks unfinished parents.
+
+A rename retires its source logical id for the project. Subsequent source-id
+materializations refuse `logical_id_retired`, as does a rename when that source
+was already kept in the target revision. Retirement survives upgrades and
+archival. Hard deletion (`archive --rm` or `delete_task`) refuses a materialized
+card with `materialized_card_retained`; plain archive still works. Identity
+rows are never removed to make deletion succeed.
+
 A true replacement requires a new proposed id; closing the old card is an
 explicit parent action. There is no reservation or session-owner side effect.
+
+### Read-only row preflight
+
+Before creating any row in a plan, check every row in dependency order:
+
+```bash
+hermes kanban --board B materialize-check --project P --plan-revision R \
+  --proposed-id X --fingerprint F --title=T \
+  --body-file /absolute/acceptance.md --execution-kind external_session --json
+```
+
+The flags, states, reasons and exit codes match `materialize`. A prospective
+new card returns `{"state":"created","task_id":null}`: no id is allocated.
+Existing/mapped decisions return their canonical id. The source board is
+opened read-only; missing boards are not initialised, and any schema projection
+is in memory. No card, reference, event or retirement is written. Like other
+SQLite readers, it may create transient empty WAL/SHM locking sidecars.
+
+For a parent checked earlier in the plan but not yet materialized in this
+revision, supply `--parent-proposed=P` and check-only
+`--pending-parent-proposed=P` when its check returned null, or
+`--pending-parent-proposed=P=t_...` when it returned a canonical id. Repeat for
+each pending parent. These explicitly project earlier check results without
+creating placeholder cards. Actual `materialize` still requires real parent
+rows in the exact revision; it never accepts pending-parent flags.
+
+A refused preflight means the caller must not start creating cards. A check is
+advisory, not a reservation: the writer revalidates under its own immediate
+transaction. If creation later fails, callers report `partial` with the ids
+already created, never claim a whole-plan `conflict` with no side effects.
 
 ## Boards (multi-project)
 

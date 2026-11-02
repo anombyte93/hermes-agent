@@ -33,17 +33,23 @@ def test_materialize_process_contract_uses_one_canonical_card(tmp_path):
     if "SYSTEMROOT" in os.environ:
         env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
 
-    def run(revision, fingerprint, *extra):
+    def run(revision, fingerprint, *extra, check=False):
         result = subprocess.run([sys.executable, str(launcher), "kanban", "--board", "default",
-            "materialize", "--project", "fixture", "--plan-revision", revision,
+            "materialize-check" if check else "materialize", "--project", "fixture", "--plan-revision", revision,
             "--proposed-id", "work", "--fingerprint", fingerprint, "--title", "Acceptance",
             *extra, "--execution-kind", "external_session", "--json"],
             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30, check=False)
         assert result.stdout.strip(), result.stderr
         return result.returncode, json.loads(result.stdout)
 
+    assert run("r1", "intent", check=True) == (0, {"state": "created", "task_id": None})
+    assert not (home / "kanban.db").exists()
     rc, first = run("r1", "intent")
     tid = first["task_id"]
+    assert run("r1", "changed", check=True) == (3, {
+        "state": "conflict", "task_id": tid, "reason": "materialization_conflict"})
+    assert run("r2", "changed", "--maps-from", "missing:work", check=True) == (
+        1, {"state": "refused", "reason": "mapping_not_found"})
     assert (rc, first) == (0, {"state": "created", "task_id": tid})
     assert run("r1", "intent") == (0, {"state": "existing", "task_id": tid})
     assert run("r1", "changed") == (3, {"state": "conflict", "task_id": tid,

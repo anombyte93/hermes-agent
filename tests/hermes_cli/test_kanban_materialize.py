@@ -92,8 +92,10 @@ def test_ruling_six_all_five_cases_and_durable_mapping_event(store):
         "state": "existing", "task_id": tid}
     assert len(kb.list_events(store, tid)) == 2  # created + mapping, no replay event
     assert len(kb.list_tasks(store)) == 1
-    # Mapping records identity, not fresh execution or a rewrite of the existing card.
-    assert kb.get_task(store, tid) == original
+    # Mapping now carries the supplied intent fields, without fresh execution.
+    mapped = kb.get_task(store, tid)
+    assert mapped.title == original.title and mapped.body is None
+    assert mapped.status == original.status and not kb.list_runs(store, tid)
 
 
 def test_matching_any_earlier_fingerprint_reuses_card_even_after_changed_revision(store):
@@ -288,9 +290,10 @@ def test_exact_cli_contract_body_parents_all_states_and_board_isolation(store, c
         assert (rc, result) == (code, expected)
     assert not kb.list_tasks(store)
     with dbc.connect_closing(board="fixture-board") as conn:
-        assert kb.get_task(conn, tid).body == "Literal acceptance\n"
+        # The r3 mapping supplied neither a body nor parents, so both are removed.
+        assert kb.get_task(conn, tid).body is None
         assert kb.get_task(conn, tid).execution_kind == "external_session"
-        assert kb.parent_ids(conn, tid) == [parent["task_id"]]
+        assert kb.parent_ids(conn, tid) == []
         assert len(kb.list_tasks(conn)) == 2
 
 
