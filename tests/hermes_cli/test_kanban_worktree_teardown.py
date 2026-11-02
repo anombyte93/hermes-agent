@@ -411,6 +411,56 @@ def test_tilde_creation_routes_preserve_bound_worktree(kanban_home, repo, monkey
         assert wt.is_dir()
 
 
+@pytest.mark.parametrize("source", ["current", "archived", "pin"])
+def test_active_scratch_owner_survives_archive_from_every_store(kanban_home, tmp_path, monkeypatch, source):
+    from hermes_cli import kanban_db_external as external
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
+    with kbc.connect_closing() as worker_conn:
+        worker = kb.create_task(worker_conn, title="managed scratch worker")
+        owned = kb.workspaces_root() / worker
+        owned.mkdir(parents=True)
+        marker = owned / "evidence.txt"
+        marker.write_bytes(b"session owned bytes")
+        worker_conn.execute("UPDATE tasks SET workspace_kind='scratch',workspace_path=? WHERE id=?", (str(owned), worker))
+        if source == "archived":
+            kb.create_board("owner-board")
+            owner_path = kb.board_dir("owner-board") / "kanban.db"
+        elif source == "pin":
+            owner_path = tmp_path / "custom-owner.db"
+        else:
+            owner_path = Path(worker_conn.execute("PRAGMA database_list").fetchone()[2])
+        with kbc.connect_closing(owner_path) as owner:
+            tid = kb.create_task(owner, title="external", execution_kind="external_session")
+            active = external.external_claim(owner, tid, board="owner-board" if source == "archived" else "default",
+                owner_host="fixture", incarnation=dict(session="owner", id="$1", created="1", pane="%1", pid="123",
+                    backend="claude", conversation="fixture"), worktree=str(owned),
+                reservation_id="scratch-owner", reservation_token="a" * 64)
+            if source == "archived":
+                external.external_complete(owner, tid, active["run_id"], reservation_token="a" * 64)
+        if source == "archived":
+            assert kb.remove_board("owner-board", archive=True)["action"] == "archived"
+        if source == "pin":
+            monkeypatch.setenv("HERMES_KANBAN_DB", str(owner_path))
+        assert kb.archive_task(worker_conn, worker)
+        assert owned.is_dir()
+        assert marker.read_bytes() == b"session owned bytes"
+
+
+def test_custom_connection_worktree_owner_is_retained(kanban_home, repo, tmp_path, monkeypatch):
+    from hermes_cli import kanban_db_external as external
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
+    with kbc.connect_closing(tmp_path / "custom.db") as conn:
+        worker, wt = _worktree_task(conn, repo)
+        tid = kb.create_task(conn, title="external", execution_kind="external_session")
+        external.external_claim(conn, tid, board="default", owner_host="fixture",
+            incarnation=dict(session="owner", id="$1", created="1", pane="%1", pid="123", backend="claude", conversation="fixture"),
+            worktree=str(wt), reservation_id="custom", reservation_token="a" * 64)
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir()
+        assert (wt / "README.md").read_text() == "hello\n"
+
+
 def test_never_claimed_card_protects_shared_path(kanban_home, repo):
     with kbc.connect_closing() as conn:
         worker, wt = _worktree_task(conn, repo)

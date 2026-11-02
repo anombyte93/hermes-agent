@@ -58,10 +58,10 @@ def test_reservation_cannot_move_cards_on_same_board_but_new_or_other_board_work
         assert claim(other, create(other), board="other")["binding"]["state"] == "active"
 
 
+@pytest.mark.parametrize("contract", ["https://github.com/o/r/pull/1", "o/r"])
 @pytest.mark.parametrize("route", ["kernel", "cli"])
-def test_external_pr_contract_creation_refuses_without_rows(store, capsys, route):
+def test_external_pr_contract_creation_refuses_without_rows(store, capsys, route, contract):
     before = "\n".join(store.iterdump())
-    contract = "https://github.com/o/r/pull/1"
     if route == "kernel":
         with pytest.raises(ValueError, match="external_session_refuses_completion_contract"):
             create(store, completion_contract=contract)
@@ -74,6 +74,48 @@ def test_external_pr_contract_creation_refuses_without_rows(store, capsys, route
         output = capsys.readouterr()
         assert "external_session_refuses_completion_contract" in output.out + output.err
     assert "\n".join(store.iterdump()) == before
+
+
+def test_closed_binding_refuses_hard_delete_but_archive_retains_shared_path(store, monkeypatch):
+    from hermes_cli import kanban_db_workspace as workspace
+    monkeypatch.setattr(workspace, "_cleanup_worker_tmux", lambda *args: None)
+    kb.create_board("owner-board")
+    kb.create_board("worker-board")
+    owned = kb.workspaces_root() / "shared"
+    owned.mkdir(parents=True)
+    (owned / "proof").write_bytes(b"owned")
+    with dbc.connect_closing(board="owner-board") as owner:
+        tid = create(owner)
+        run = claim(owner, tid, board="owner-board", worktree=str(owned))["run_id"]
+        ext.external_complete(owner, tid, run, reservation_token=TOKEN)
+    with pytest.raises(ValueError, match="external_binding_history.*archive"):
+        kb.remove_board("owner-board", archive=False)
+    assert kb.board_dir("owner-board").is_dir()
+    assert kb.remove_board("owner-board", archive=True)["action"] == "archived"
+    with dbc.connect_closing(board="worker-board") as worker:
+        sharing = kb.create_task(worker, title="sharing", workspace_kind="scratch", workspace_path=str(owned))
+        assert kb.archive_task(worker, sharing)
+    assert owned.is_dir() and (owned / "proof").read_bytes() == b"owned"
+    kb.create_board("ordinary")
+    assert kb.remove_board("ordinary", archive=False)["action"] == "deleted"
+    assert not kb.board_dir("ordinary").exists()
+
+
+def test_bulk_delete_external_refusal_continues_to_plain_card(store, capsys):
+    external = create(store)
+    run = claim(store, external)["run_id"]
+    ext.external_complete(store, external, run, reservation_token=TOKEN)
+    plain = kb.create_task(store, title="plain")
+    assert kb.archive_task(store, external) and kb.archive_task(store, plain)
+    parser = argparse.ArgumentParser()
+    cli.build_parser(parser.add_subparsers(dest="command"))
+    code = cli.kanban_command(parser.parse_args(["kanban", "archive", "--rm", external, plain]))
+    output = capsys.readouterr()
+    assert code != 0
+    assert external in output.out + output.err and "external_workspace_retained" in output.out + output.err
+    assert kb.get_task(store, plain) is None
+    assert plain in output.out + output.err
+    assert kb.get_task(store, external) is not None
 
 
 def test_external_block_loop_stays_blocked(store):

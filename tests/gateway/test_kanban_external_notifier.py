@@ -111,6 +111,17 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
     assert (len(adapter.sent), len(adapter.handled)) == counts
 
 
+@pytest.mark.parametrize("language", ["zh", "ar"])
+@pytest.mark.parametrize("kind", ["completed", "review_requested", "changes_requested"])
+def test_external_wake_preserves_existing_translation(language, kind):
+    import yaml
+    from agent.i18n import t
+    catalog = yaml.safe_load((Path(__file__).resolve().parents[2] / "locales" / (language + ".yaml")).read_text(encoding="utf-8"))
+    wake = catalog["gateway"]["kanban"]["wake"]
+    assert wake["external_" + kind] == wake[kind]
+    assert t("gateway.kanban.wake.external_" + kind, lang=language) == wake[kind]
+
+
 @pytest.mark.parametrize("language", ["af", "ar", "de", "en", "es", "fr", "ga", "hu", "it", "ja", "ko", "pt", "ru", "tr", "uk", "zh", "zh-hant"])
 def test_external_wake_strings_exist_in_each_raw_catalog(language):
     import yaml

@@ -661,6 +661,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             binding = conn.execute(
                 "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
             ).fetchone()
+            history = conn.execute("SELECT 1 FROM task_external_bindings LIMIT 1").fetchone()
     except sqlite3.Error as exc:
         raise ValueError(
             f"board_unreadable: cannot verify external ownership on {normed!r}; "
@@ -668,6 +669,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         ) from exc
     if binding is not None:
         raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
+    if not archive and history is not None:
+        raise ValueError("external_binding_history: use the archive route to retain workspace ownership")
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:

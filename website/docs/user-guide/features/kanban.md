@@ -279,9 +279,12 @@ process/worktree before claiming. This API neither contacts that owner nor
 silently releases an uncertain reservation. A reservation id is single-use on
 one Hermes board, even after its binding closes: moving it from card A to B on
 the same board refuses `reservation_conflict`. A fresh reservation on that board
-works, as does the same id on a different board after closure. Moll-E's
-reservation-handover seam is an open parent ruling; do not weaken stale-attempt
-protection to reuse a closed reservation. Plan materialisation is separate.
+works. Once a Hermes claim has used reservation X on a board, the process takes
+its next card on that board with a new reservation Y and X is released. Moll-E's
+`session_reservation_handover` stays valid to another board, or before any Hermes
+claim has used X. Moll-E cannot see Hermes state, so a Hermes refusal after that
+handover is the documented answer; stale-attempt protection is not weakened.
+Plan materialisation is separate.
 
 Release and handover leave the old attempt's run status `released`, with outcome
 `released` or `handed_over`; the card's separate ready/todo/running state is not
@@ -465,7 +468,7 @@ hermes kanban boards rename atm10-server "ATM10 (Prod)"
 # Recoverable by moving the dir back.
 hermes kanban boards rm atm10-server
 
-# Hard delete — `rm -rf` the board dir. No recovery.
+# Hard delete, no recovery. Boards with external binding history must be archived.
 hermes kanban boards rm atm10-server --delete
 ```
 
