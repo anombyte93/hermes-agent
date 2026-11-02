@@ -202,6 +202,110 @@ def test_delete_route_and_bulk_archive_keep_identity_but_continue(store, capsys)
     assert store.execute("SELECT 1 FROM task_materializations WHERE task_id=?", (tid,)).fetchone()
 
 
+@pytest.mark.parametrize("revision,fingerprint,state", [("r2", "A", "existing"),
+    ("r3", "A", "existing"), ("r3", "B", "mapped")])
+def test_renamed_mapping_replay_matches_check_and_writer(store, capsys, revision, fingerprint, state):
+    tid = write(store, proposed="x")["task_id"]
+    write(store, revision="r2", proposed="y", maps_from="r1:x")
+    request = row(proposed="y", fingerprint=fingerprint, maps_from="r1:x")
+    before, changes = "\n".join(store.iterdump()), store.total_changes
+    expected = (0, {"state": state, "task_id": tid})
+    assert invoke(capsys, "materialize-check", revision=revision, options=request) == expected
+    assert "\n".join(store.iterdump()) == before and store.total_changes == changes
+    assert invoke(capsys, "materialize", revision=revision, options=request) == expected
+    assert len(kb.list_tasks(store)) == 1
+    assert store.execute("SELECT 1 FROM task_materializations WHERE plan_revision=? AND proposed_task_id='y'", (revision,)).fetchone()
+    assert sum(e.kind == "materialization_mapped" for e in kb.list_events(store, tid)) == (2 if state == "mapped" else 1)
+    for action in ("materialize-check", "materialize"):
+        assert invoke(capsys, action, options=row(proposed="x")) == (
+            3, {"state": "conflict", "task_id": tid, "reason": "logical_id_retired"})
+
+
+def test_partial_rename_plan_finishes_on_retry_and_chain_replays(store, capsys, tmp_path):
+    tid = write(store, proposed="x")["task_id"]
+    renamed = row(proposed="y", maps_from="r1:x")
+    assert invoke(capsys, "materialize", revision="r2", options=renamed)[1]["state"] == "mapped"
+    # The next write failed after the first row landed. Retrying the corrected
+    # plan must preflight the landed rename as well as the still-missing row.
+    assert invoke(capsys, "materialize", revision="r2", options=row(proposed="z", parent_proposed=["absent"]))[0] == 1
+    prior = tmp_path / "prior.json"
+    prior.write_text(json.dumps([renamed]))
+    child = row(proposed="z", parent_proposed=["y"])
+    before = "\n".join(store.iterdump())
+    assert invoke(capsys, "materialize-check", revision="r2", options=renamed) == (0, {"state": "existing", "task_id": tid})
+    assert invoke(capsys, "materialize-check", revision="r2", options=child,
+        extra=("--prior-rows-file", str(prior))) == (0, {"state": "created", "task_id": None})
+    assert "\n".join(store.iterdump()) == before
+    assert invoke(capsys, "materialize", revision="r2", options=renamed)[1]["state"] == "existing"
+    created = invoke(capsys, "materialize", revision="r2", options=child)[1]["task_id"]
+    assert kb.parent_ids(store, created) == [tid]
+    # Another project makes the x -> y -> z chain a single canonical card.
+    for revision, proposed, mapping in [("r1", "x", None), ("r2", "y", "r1:x"), ("r3", "z", "r2:y")]:
+        request = dict(project="chain", plan_revision=revision, **row(proposed=proposed, maps_from=mapping))
+        expected = api.check_materialization(store, **request)
+        result = api.materialize_task(store, **request)
+        assert result["state"] == expected["state"]
+        assert api.check_materialization(store, **request) == api.materialize_task(store, **request) == {"state": "existing", "task_id": result["task_id"]}
+    assert store.execute("SELECT count(DISTINCT task_id) FROM task_materializations WHERE project='chain'").fetchone()[0] == 1
+
+
+def test_rename_chain_replays_one_card(store):
+    tid = write(store, proposed="x")["task_id"]
+    for revision, proposed, mapping in [("r2", "y", "r1:x"), ("r3", "z", "r2:y")]:
+        request = dict(project="fixture", plan_revision=revision, **row(proposed=proposed, maps_from=mapping))
+        assert api.materialize_task(store, **request) == {"state": "mapped", "task_id": tid}
+        assert api.check_materialization(store, **request) == {"state": "existing", "task_id": tid}
+        assert api.materialize_task(store, **request) == {"state": "existing", "task_id": tid}
+    assert len(kb.list_tasks(store)) == 1
+
+
+@pytest.mark.parametrize("revision,fingerprint", [("r2", "A"), ("r3", "A"), ("r3", "B")])
+def test_projected_rename_retry_matches_writer_copy(store, revision, fingerprint):
+    write(store, proposed="x")
+    write(store, revision="r2", proposed="y", maps_from="r1:x")
+    plan = [row(proposed="y", fingerprint=fingerprint, maps_from="r1:x"), row(proposed="z", parent_proposed=["y"])]
+    before, changes = "\n".join(store.iterdump()), store.total_changes
+    with sqlite3.connect(":memory:", isolation_level=None) as writer:
+        writer.row_factory = sqlite3.Row
+        store.backup(writer)
+        for index, request in enumerate(plan):
+            checked = api.check_materialization(store, project="fixture", plan_revision=revision,
+                prior_rows=plan[:index], **request)
+            written = api.materialize_task(writer, project="fixture", plan_revision=revision, **request)
+            if written["state"] == "created":
+                written["task_id"] = None
+            assert checked == written
+            assert checked["state"] == ("created" if index else "mapped" if fingerprint == "B" else "existing")
+    assert "\n".join(store.iterdump()) == before and store.total_changes == changes
+
+
+@pytest.mark.parametrize("prior", ["bad", {}, [dict(proposed_task_id="n", intent_fingerprint="A", title="N", unknown=True)],
+    [dict(proposed_task_id="n", intent_fingerprint="A", title="N", parent_proposed="missing")],
+    [dict(proposed_task_id="n", intent_fingerprint="A", title="N", parent_proposed=[1])]])
+def test_invalid_prior_rows_refuse_cleanly_without_writes(store, capsys, tmp_path, prior):
+    file = tmp_path / "prior.json"
+    file.write_text(json.dumps(prior))
+    before = "\n".join(store.iterdump())
+    assert invoke(capsys, "materialize-check", extra=("--prior-rows-file", str(file))) == (
+        1, {"state": "refused", "reason": "invalid_prior_rows"})
+    assert "\n".join(store.iterdump()) == before
+
+
+@pytest.mark.parametrize("shape", ["fingerprint", "mapping"])
+def test_duplicate_prior_conflict_never_leaks_pending_id_or_gets_swallowed(store, capsys, tmp_path, shape):
+    write(store, proposed="x")
+    second = row(proposed="n", fingerprint="B") if shape == "fingerprint" else row(proposed="n", maps_from="r1:x")
+    file = tmp_path / "prior.json"
+    file.write_text(json.dumps([row(proposed="n"), second]))
+    before = "\n".join(store.iterdump())
+    code, result = invoke(capsys, "materialize-check", revision="r2", extra=("--prior-rows-file", str(file)))
+    assert code == 3
+    assert result == {"state": "conflict", "task_id": None,
+        "reason": "materialization_conflict" if shape == "fingerprint" else "logical_id_retired"}
+    assert "pending:" not in json.dumps(result)
+    assert "\n".join(store.iterdump()) == before
+
+
 def test_corrupt_check_is_json_and_preserves_bytes(store, capsys):
     path = Path(store.execute("PRAGMA database_list").fetchone()[2])
     store.close()

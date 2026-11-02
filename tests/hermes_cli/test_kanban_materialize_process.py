@@ -14,6 +14,52 @@ from hermes_cli.kanban_db_connect import connect_closing
 ROOT = Path(__file__).parents[2]
 
 
+def test_rename_race_uses_real_processes_and_one_card(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    launcher = tmp_path / "race.py"
+    launcher.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "from hermes_cli.kanban_db_connect import connect_closing\n"
+        "from hermes_cli.kanban_db_materialize import materialize_task\n"
+        "ready, go = map(Path, sys.argv[1:])\n"
+        "with connect_closing(board='default') as conn:\n"
+        "    ready.touch()\n"
+        "    deadline = time.monotonic() + 20\n"
+        "    while not go.exists():\n"
+        "        assert time.monotonic() < deadline\n"
+        "        time.sleep(0.01)\n"
+        "    print(json.dumps(materialize_task(conn, project='race', plan_revision='r2', proposed_task_id='y', intent_fingerprint='A', title='A', maps_from='r1:x')))\n")
+    env = dict(HOME=str(tmp_path), PATH=os.defpath, HERMES_HOME=str(home),
+               HERMES_KANBAN_HOME=str(home), PYTHONPATH=str(ROOT), TMPDIR=str(tmp_path),
+               PYTHONPYCACHEPREFIX=str(tmp_path / 'pycache'))
+    from hermes_cli.kanban_db_materialize import materialize_task
+    with connect_closing(home / "kanban.db") as conn:
+        tid = materialize_task(conn, project="race", plan_revision="r1", proposed_task_id="x",
+                               intent_fingerprint="A", title="A")["task_id"]
+    go = tmp_path / "go"
+    ready = [tmp_path / str(i) for i in range(2)]
+    processes = [subprocess.Popen([sys.executable, str(launcher), str(p), str(go)],
+        cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for p in ready]
+    import time
+    deadline = time.monotonic() + 20
+    while not all(p.exists() for p in ready):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    go.touch()
+    results = []
+    for process in processes:
+        out, err = process.communicate(timeout=30)
+        assert process.returncode == 0, err
+        results.append(json.loads(out))
+    assert sorted(r["state"] for r in results) == ["existing", "mapped"]
+    assert {r["task_id"] for r in results} == {tid}
+    with connect_closing(home / "kanban.db") as conn:
+        assert len(kb.list_tasks(conn)) == 1
+        assert sum(e.kind == "materialization_mapped" for e in kb.list_events(conn, tid)) == 1
+
+
 def test_materialize_process_contract_uses_one_canonical_card(tmp_path):
     home = tmp_path / "hermes"
     home.mkdir()

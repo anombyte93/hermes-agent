@@ -126,8 +126,8 @@ def _parent_tasks(conn: sqlite3.Connection, project: str, plan_revision: str,
 
 def _retired(conn, project, proposed_id, projection=None):
     if projection is not None and proposed_id in projection["retired"]:
-        return {"task_id": projection["retired"][proposed_id]}
-    return conn.execute("SELECT task_id FROM task_materialization_retirements "
+        return projection["retired"][proposed_id]
+    return conn.execute("SELECT task_id, replacement_id FROM task_materialization_retirements "
                         "WHERE project=? AND proposed_task_id=?", (project, proposed_id)).fetchone()
 
 
@@ -186,7 +186,8 @@ def _decision(conn, *, project, plan_revision, proposed_task_id, intent_fingerpr
         reason = "logical_id_retired" if matching else "materialization_conflict"
         return _conflict(prior[0]["task_id"], reason), []
     if mapping is not None and mapping[1] != proposed_task_id:
-        if (_retired(conn, project, mapping[1], projection) is not None
+        retirement = _retired(conn, project, mapping[1], projection)
+        if ((retirement is not None and retirement["replacement_id"] != proposed_task_id)
                 or _reference(conn, project, plan_revision, mapping[1], projection) is not None):
             return _conflict(source["task_id"], "logical_id_retired"), []
     if current is not None:
@@ -244,12 +245,14 @@ def check_materialization(conn: sqlite3.Connection, *, prior_rows=(), **row) -> 
             raise ValueError("invalid_prior_rows")
         for prior in prior_rows:
             if (not isinstance(prior, dict) or set(prior) - allowed
-                    or not {"proposed_task_id", "intent_fingerprint", "title"} <= prior.keys()):
+                    or not {"proposed_task_id", "intent_fingerprint", "title"} <= prior.keys()
+                    or not isinstance(prior.get("parent_proposed", []), list)
+                    or any(not isinstance(p, str) or not p.strip() for p in prior.get("parent_proposed", []))):
                 raise ValueError("invalid_prior_rows")
             result, parents = _decision(conn, project=row["project"], plan_revision=row["plan_revision"],
                                         projection=projection, **prior)
             if result["state"] == "conflict":
-                return result
+                return _public_check_result(result)
             proposed = prior["proposed_task_id"]
             task_id = result["task_id"] or "pending:" + proposed
             reference = dict(task_id=task_id, intent_fingerprint=prior["intent_fingerprint"])
@@ -260,11 +263,15 @@ def check_materialization(conn: sqlite3.Connection, *, prior_rows=(), **row) -> 
                 projection["parents"][task_id] = parents
             mapping = _parse_mapping(prior.get("maps_from"))
             if result["state"] == "mapped" and mapping is not None and mapping[1] != proposed:
-                projection["retired"][mapping[1]] = task_id
+                projection["retired"][mapping[1]] = dict(task_id=task_id, replacement_id=proposed)
         result, _ = _decision(conn, projection=projection if prior_rows else None, **row)
-        if result["task_id"] and result["task_id"].startswith("pending:"):
-            result = {**result, "task_id": None}
-        return result
+        return _public_check_result(result)
+
+
+def _public_check_result(result):
+    if result["task_id"] and result["task_id"].startswith("pending:"):
+        return {**result, "task_id": None}
+    return result
 
 
 def _apply_mapping(conn, task_id, title, body, parents):
@@ -306,7 +313,7 @@ def materialize_task(
             mapping = _parse_mapping(maps_from)
             assert mapping is not None
             if mapping[1] != proposed_task_id:
-                conn.execute("INSERT INTO task_materialization_retirements "
+                conn.execute("INSERT OR IGNORE INTO task_materialization_retirements "
                     "(project,proposed_task_id,task_id,replacement_id) VALUES (?,?,?,?)",
                     (project, mapping[1], task_id, proposed_task_id))
         conn.execute(
