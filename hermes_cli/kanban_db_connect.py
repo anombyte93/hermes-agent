@@ -792,6 +792,7 @@ _RENAMED_TASK_COLUMNS = (
 # NULL / 0 defaults below reproduce the behaviour existing rows had before the
 # column existed.
 _LATER_TASK_COLUMNS = (
+    ("execution_kind", "execution_kind TEXT NOT NULL DEFAULT 'worker'"),
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
@@ -880,6 +881,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
+    from hermes_cli.kanban_external_schema import migrate_external_sessions
+    migrate_external_sessions(conn)
     _ensure_block_reason_guards(conn)
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
@@ -1005,7 +1008,7 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
             "       max_runtime_seconds, last_heartbeat_at, started_at "
             "FROM tasks "
-            "WHERE status = 'running' AND current_run_id IS NULL"
+            "WHERE execution_kind = 'worker' AND status = 'running' AND current_run_id IS NULL"
         ).fetchall()
         for row in inflight:
             started = row["started_at"] or int(time.time())

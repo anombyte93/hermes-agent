@@ -159,6 +159,66 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+## External-session tasks (no spawn)
+
+`execution_kind` is fixed at creation. The default, `worker`, retains the existing
+profile-dispatch behaviour; older populated databases migrate every existing task
+to `worker`. Choose `external_session` for a task owned by a session that already
+exists, even when its assignee happens to name a real profile:
+
+```bash
+hermes kanban --board default create "Work in an existing session" \
+  --execution-kind external_session --workspace dir:/absolute/worktree --json
+hermes kanban --board default external status --task TASK_ID --json
+```
+
+External cards never enter either dispatcher lane. Default assignment, profile
+lookup failures, retries, dependency promotion and review reopening cannot make
+one spawnable. Ordinary `claim` and `request-review` are worker operations, not a
+way to adopt an external card. External creation refuses goal mode, model/provider
+overrides and skills.
+
+An owner integration first prepares its own reservation, then calls
+`hermes_cli.kanban_db_external.external_claim` or `hermes kanban external claim`.
+The claim needs `--task`, `--owner-host`, `--incarnation` (a literal JSON object
+with `session`, `id`, `created`, `pane`, `pid`, `backend`, `conversation`),
+`--worktree`, `--reservation-id` and `--reservation-token`. `created` is a string;
+`pid` is an integer. Identity values are not renamed or normalised. The worktree
+must match the card's workspace when one was specified. The external session is
+stored in its binding, **not** in the task's originating Hermes `session_id`.
+
+A claim opens one attempt and returns `run_id`, `task`, `attempt` and `binding`.
+Repeating an identical reservation and incarnation returns that same attempt.
+There is no expiry or heartbeat requirement. Lost contact, stale-worker sweeps
+and dispatcher startup retain the binding; they never kill, fail or requeue its
+owner. The owner must explicitly use one of these token-fenced operations:
+
+- `external complete --task TASK_ID --run-id RUN_ID --reservation-token TOKEN
+  --summary TEXT [--result TEXT] [--review] --json`: close the attempt as done or
+  hand it to explicit parent review. A parent can approve that exact review
+  handoff with `complete` again, without `--review`.
+- `external request-changes ... --reason TEXT --json`: return that exact review
+  handoff to ready, or todo if dependencies reopened. A fresh reservation is
+  required to claim it again.
+- `external release ... --reason TEXT --json`: give up an active attempt without
+  completing the task.
+- `external handover ... --owner-host HOST --incarnation JSON --worktree PATH
+  --reservation-id NEW_ID --new-reservation-token NEW_TOKEN --evidence TEXT
+  --json`: close the prior binding as `handed_over` and open a successor attempt
+  atomically. No process is stopped or restarted.
+
+All mutations compare the exact attempt and reservation token. Closed bindings
+remain historical evidence and never mean that the external session ended.
+Completion preserves the owner's worktree. `show` (text or JSON) carries the kind
+and latest binding; status responses omit the token and its hash. Only the hash
+is stored. CLI token flags are visible in process arguments and shell history:
+owner integrations should prefer the kernel API and never log or post tokens.
+
+Hermes enforces one active binding per process incarnation **on this board**.
+The reservation owner must enforce cross-board exclusivity and validate the live
+process/worktree before claiming. This API neither contacts that owner nor
+silently releases an uncertain reservation. Plan materialisation is separate.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
