@@ -128,6 +128,8 @@ def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
         task = kb.get_task(conn, task_id)
     if task is None:
         return None, "unknown task id"
+    if task.execution_kind != "worker":
+        return None, "external_session_refuses_triage"
     if task.status != "triage":
         return None, f"task is not in triage (status={task.status!r})"
     return task, ""

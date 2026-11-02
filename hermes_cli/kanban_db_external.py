@@ -195,7 +195,8 @@ def _close_attempt(conn, task_id, run_id, *, status, outcome, summary=None, resu
     ended = conn.execute(
         "UPDATE task_runs SET status=?,outcome=?,summary=?,ended_at=?,claim_lock=NULL,claim_expires=NULL "
         "WHERE task_id=? AND id=? AND ended_at IS NULL",
-        (status, outcome, summary, now, task_id, run_id))
+        ("released" if outcome in {"released", "handed_over"} else status,
+         outcome, summary, now, task_id, run_id))
     if ended.rowcount != 1:
         raise ValueError("external close lost: attempt already ended")
 

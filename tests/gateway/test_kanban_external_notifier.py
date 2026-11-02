@@ -109,3 +109,15 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
     counts = len(adapter.sent), len(adapter.handled)
     asyncio.run(one_tick())
     assert (len(adapter.sent), len(adapter.handled)) == counts
+
+
+@pytest.mark.parametrize("language", ["af", "ar", "de", "en", "es", "fr", "ga", "hu", "it", "ja", "ko", "pt", "ru", "tr", "uk", "zh", "zh-hant"])
+def test_external_wake_strings_exist_in_each_raw_catalog(language):
+    import yaml
+    from gateway.kanban_watchers_notifier import _EXTERNAL_WAKE_KINDS
+
+    catalog = yaml.safe_load((Path(__file__).resolve().parents[2] / "locales" / (language + ".yaml")).read_text(encoding="utf-8"))
+    for kind in _EXTERNAL_WAKE_KINDS:
+        value = catalog["gateway"]["kanban"]["wake"].get(kind)
+        assert isinstance(value, str) and value.strip()
+        assert "gateway.kanban.wake." not in value

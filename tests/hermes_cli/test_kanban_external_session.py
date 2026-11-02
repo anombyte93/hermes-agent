@@ -724,7 +724,8 @@ def test_release_rechecks_parent_gate(store, parent_status, landing):
     released = external_api().external_release(store, tid, active["run_id"],
         reservation_token=TOKEN, reason="parent changed")
     assert released["task"]["status"] == landing
-    assert released["attempt"]["status"] == landing
+    assert released["attempt"]["status"] == "released"
+    assert released["attempt"]["outcome"] == "released"
     assert released["binding"]["state"] == "closed"
     # Avoid dispatching the ordinary parent; the external card remains nonspawnable.
     store.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (parent,))
