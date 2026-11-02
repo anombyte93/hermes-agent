@@ -36,10 +36,8 @@ def _identity(owner_host, incarnation):
         raise ValueError("owner_host is required")
     if not isinstance(incarnation, dict) or set(incarnation) != _INCARNATION_FIELDS:
         raise ValueError("incarnation must contain session, id, created, pane, pid, backend, conversation")
-    if type(incarnation["pid"]) is not int or incarnation["pid"] <= 0:
-        raise ValueError("incarnation pid must be a positive integer")
     if any(not isinstance(incarnation[k], str) or not incarnation[k].strip()
-           for k in _INCARNATION_FIELDS - {"pid"}):
+           for k in _INCARNATION_FIELDS):
         raise ValueError("incarnation text fields must be nonempty strings")
     # Preserve values and their types. Sorting only makes JSON key order stable.
     return json.dumps(incarnation, sort_keys=True, separators=(",", ":"))
@@ -111,10 +109,10 @@ def _open_attempt(conn, task, owner_host, incarnation, identity_json, worktree,
     lock = "external:" + reservation_id
     updated = conn.execute(
         "UPDATE tasks SET status='running',claim_lock=?,claim_expires=NULL,worker_pid=NULL,"
-        "started_at=COALESCE(started_at,?),workspace_path=?,workspace_kind='dir' "
+        "started_at=COALESCE(started_at,?) "
         "WHERE id=? AND execution_kind='external_session' AND status='ready' "
         "AND claim_lock IS NULL AND current_run_id IS NULL",
-        (lock, now, worktree, task.id))
+        (lock, now, task.id))
     if updated.rowcount != 1:
         raise ValueError("external claim lost: task is not ready and unclaimed")
     run_id = conn.execute(
@@ -233,7 +231,8 @@ def external_release(conn: sqlite3.Connection, task_id: str, run_id: int, *,
         raise ValueError("release reason is required")
     with write_txn(conn):
         _owned_binding(conn, task_id, run_id, reservation_token)
-        _close_attempt(conn, task_id, run_id, status="ready", outcome="released", summary=reason)
+        status = _db()._landing_status_after_parents(conn, task_id)
+        _close_attempt(conn, task_id, run_id, status=status, outcome="released", summary=reason)
         _db()._append_event(conn, task_id, "external_released", {"reason": reason}, run_id=run_id)
         return _snapshot(conn, task_id)
 

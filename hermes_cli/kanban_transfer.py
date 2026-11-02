@@ -72,6 +72,11 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
     conn.execute("DELETE FROM kanban_notify_subs")
+    # Binding authority is local to its owner and board. It must never travel,
+    # including on import from an older exporter. DELETE is not enough for the
+    # exported SQLite bytes: export VACUUMs the private snapshot below.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_external_bindings'").fetchone():
+        conn.execute("DELETE FROM task_external_bindings")
     conn.execute(
         """
         UPDATE tasks
@@ -142,6 +147,7 @@ def export_board(
         with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
             _scrub_local_state(snapshot)
             snapshot.commit()
+            snapshot.execute("VACUUM")
             counts = _count_rows(snapshot)
 
         meta = kb.read_board_metadata(slug)
@@ -265,6 +271,7 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
             r["id"]
             for r in conn.execute(
                 "SELECT id FROM tasks WHERE workspace_kind IN ('dir', 'worktree') "
+                "AND execution_kind = 'worker' "
                 f"AND status IN ({_placeholders(_DISPATCHABLE_STATUSES)})",
                 _DISPATCHABLE_STATUSES,
             ).fetchall()

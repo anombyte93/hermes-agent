@@ -104,6 +104,8 @@ def decompose_triage_task(
         write_txn, recompute_ready,
     )
 
+    from hermes_cli.kanban_execution import execution_kind_of
+
     if not children:
         return None
     if root_assignee is not None:
@@ -114,6 +116,8 @@ def decompose_triage_task(
     # (create_task, link_tasks, add_comment) must not be called in here.
     now = int(time.time())
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) != "worker":
+            return None
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?", (task_id,),

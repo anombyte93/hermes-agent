@@ -1592,6 +1592,8 @@ def create_task(
 
     if execution_kind not in VALID_EXECUTION_KINDS:
         raise ValueError("execution_kind must be worker or external_session")
+    if execution_kind == "external_session" and triage:
+        raise ValueError("external_session refuses triage and decomposition")
     if execution_kind == "external_session" and (
         goal_mode or goal_max_turns is not None or model_override is not None
         or provider_override is not None or skills is not None
@@ -4184,7 +4186,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
@@ -4192,7 +4194,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        if has_external_attempt(conn, task_id) or _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -4200,8 +4202,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+    """Hard-delete a task; an active external binding must be released first."""
     with write_txn(conn):
+        if has_external_attempt(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

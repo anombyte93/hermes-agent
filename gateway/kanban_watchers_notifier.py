@@ -36,10 +36,15 @@ def _kbn():
 # output_limit_reached) join the claim set so a dead worker's real cause
 # reaches the creator; only ``signaled`` wakes (the other two are
 # failure-free or self-correcting requeues, not decisions for the creator).
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+_EXTERNAL_WAKE_ALIASES = {
+    "external_completed": "completed", "external_review_requested": "review_requested",
+    "external_changes_requested": "changes_requested", "external_released": None,
+}
+_EXTERNAL_KINDS = (*_EXTERNAL_WAKE_ALIASES, "external_claimed", "external_handed_over")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", *_EXTERNAL_KINDS)
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "signaled", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "signaled", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", *_EXTERNAL_WAKE_ALIASES)
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -356,6 +361,13 @@ def _fmt_changes_requested(ev, n) -> tuple:
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
+    "external_completed": _fmt_completed,
+    "external_review_requested": _fmt_review_requested,
+    "external_changes_requested": _fmt_changes_requested,
+    "external_claimed": lambda ev, n: (f"🔗 {n.head} bound to an existing session", None, None),
+    "external_handed_over": lambda ev, n: (f"🔄 {n.head} handed over to an existing session", None, None),
+    "external_released": lambda ev, n: (
+        f"🔓 {n.head} external attempt released: {_safe_review_reason(_payload(ev, 'reason'))}", None, None),
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": lambda ev, n: (
@@ -516,7 +528,11 @@ class _KanbanNotification:
             # for child tasks; use it only for legacy rows.
             self.session_key = sub["chat_id"] or getattr(task, "session_id", None) or ""
         # i18n keys: gateway.kanban.wake.<kind> for each _WAKE_KINDS entry.
-        _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS if k in self.wake_kinds]
+        _parts = [
+            "external attempt released; inspect the card for its dependency-gated state"
+            if k == "external_released" else t(f"gateway.kanban.wake.{_EXTERNAL_WAKE_ALIASES.get(k, k)}")
+            for k in _WAKE_KINDS if k in self.wake_kinds
+        ]
         _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
         synth = t(
             "gateway.kanban.wake.message",

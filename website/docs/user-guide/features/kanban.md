@@ -168,24 +168,46 @@ exists, even when its assignee happens to name a real profile:
 
 ```bash
 hermes kanban --board default create "Work in an existing session" \
-  --execution-kind external_session --workspace dir:/absolute/worktree --json
+  --execution-kind external_session --json
 hermes kanban --board default external status --task TASK_ID --json
 ```
 
 External cards never enter either dispatcher lane. Default assignment, profile
 lookup failures, retries, dependency promotion and review reopening cannot make
 one spawnable. Ordinary `claim` and `request-review` are worker operations, not a
-way to adopt an external card. External creation refuses goal mode, model/provider
-overrides and skills.
+way to adopt an external card. External creation refuses triage/decomposition,
+goal mode, model/provider overrides and skills. The kernel also refuses to
+decompose an older or imported external triage row, so it cannot create worker
+children or replace the root's assignee. Dashboard status moves (including bulk)
+and deletion refuse a live external binding with a visible conflict; use the
+exact owner's external lifecycle instead.
 
 An owner integration first prepares its own reservation, then calls
 `hermes_cli.kanban_db_external.external_claim` or `hermes kanban external claim`.
 The claim needs `--task`, `--owner-host`, `--incarnation` (a literal JSON object
 with `session`, `id`, `created`, `pane`, `pid`, `backend`, `conversation`),
-`--worktree`, `--reservation-id` and `--reservation-token`. `created` is a string;
-`pid` is an integer. Identity values are not renamed or normalised. The worktree
-must match the card's workspace when one was specified. The external session is
-stored in its binding, **not** in the task's originating Hermes `session_id`.
+`--worktree`, `--reservation-id` and `--reservation-token-file PATH`. `created`
+and `pid` are strings, exactly as the owner returns them. A null or empty
+`conversation` refuses: it is not an exact identity. Values are not renamed or
+normalised. Pass `--expected-board BOARD` from the reservation to refuse a claim
+if `--board` or the ambient board resolves elsewhere. For compatibility, omitting
+it uses the selected board, without that independent assertion.
+
+The claimed worktree is stored only on the binding, never written back to the
+card. After release or handover a different session may use a different worktree.
+If the card was created with an explicit workspace path, claims must still match
+that constraint. The external session is stored in its binding, **not** in the
+task's originating Hermes `session_id`.
+
+For example, the owner writes the token to its private (0600) file without
+printing it or putting its value in a shell command, then passes only that path:
+
+```bash
+hermes kanban --board BOARD external claim --task TASK_ID \
+  --expected-board BOARD --owner-host HOST --incarnation "$INCARNATION_JSON" \
+  --worktree /absolute/worktree --reservation-id RESERVATION_ID \
+  --reservation-token-file /private/reservation.token --json
+```
 
 A claim opens one attempt and returns `run_id`, `task`, `attempt` and `binding`.
 Repeating an identical reservation and incarnation returns that same attempt.
@@ -193,7 +215,7 @@ There is no expiry or heartbeat requirement. Lost contact, stale-worker sweeps
 and dispatcher startup retain the binding; they never kill, fail or requeue its
 owner. The owner must explicitly use one of these token-fenced operations:
 
-- `external complete --task TASK_ID --run-id RUN_ID --reservation-token TOKEN
+- `external complete --task TASK_ID --run-id RUN_ID --reservation-token-file PATH
   --summary TEXT [--result TEXT] [--review] --json`: close the attempt as done or
   hand it to explicit parent review. A parent can approve that exact review
   handoff with `complete` again, without `--review`.
@@ -201,9 +223,10 @@ owner. The owner must explicitly use one of these token-fenced operations:
   handoff to ready, or todo if dependencies reopened. A fresh reservation is
   required to claim it again.
 - `external release ... --reason TEXT --json`: give up an active attempt without
-  completing the task.
+  completing the task. It lands on ready only if every parent is done or archived;
+  otherwise it lands on todo, retaining the closed attempt as evidence.
 - `external handover ... --owner-host HOST --incarnation JSON --worktree PATH
-  --reservation-id NEW_ID --new-reservation-token NEW_TOKEN --evidence TEXT
+  --reservation-id NEW_ID --new-reservation-token-file NEW_PATH --evidence TEXT
   --json`: close the prior binding as `handed_over` and open a successor attempt
   atomically. No process is stopped or restarted.
 
@@ -211,8 +234,28 @@ All mutations compare the exact attempt and reservation token. Closed bindings
 remain historical evidence and never mean that the external session ended.
 Completion preserves the owner's worktree. `show` (text or JSON) carries the kind
 and latest binding; status responses omit the token and its hash. Only the hash
-is stored. CLI token flags are visible in process arguments and shell history:
-owner integrations should prefer the kernel API and never log or post tokens.
+is stored. Every mutating external verb accepts exactly one of the token file
+or legacy token flag, and handover has the same choice for the successor token.
+File input is bounded and never echoed in status, errors or events. Keep the file
+private and owner-managed. The legacy `--reservation-token` and
+`--new-reservation-token` flags remain solely for compatibility with existing
+integrations and synthetic fixtures. They expose values in argv and potentially
+shell history, so do not use them for real tokens. The kernel API is also safe
+from argv exposure; never log or post its token argument.
+
+External lifecycle events reach existing board subscribers. Completion, review,
+requested changes and release wake an opted-in parent; claim and handover are
+passive notices, not authority to start a worker.
+
+Board export removes all external bindings (including hashes and incarnation)
+from its private snapshot and vacuums deleted SQLite pages. Import scrubs again
+for older/untrusted archives. Imported external cards are unbound; they keep their
+kind but carry no reservation authority. The source board and owner are unchanged.
+
+**Rollback warning:** running an older binary on a migrated database is unsafe.
+That binary has no execution-kind filter and may spawn an external card as a
+worker. Do not roll back code alone against this store; an approved rollback must
+restore a compatible pre-migration database as well.
 
 Hermes enforces one active binding per process incarnation **on this board**.
 The reservation owner must enforce cross-board exclusivity and validate the live
