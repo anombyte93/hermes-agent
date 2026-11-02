@@ -45,6 +45,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -269,3 +270,151 @@ def test_external_owner_workspace_survives_every_cleanup_route(kanban_home, repo
             assert (owned / "README.md").read_text() == "hello\n"
         else:
             assert (owned / "evidence.txt").read_text() == "owner's evidence"
+
+
+@pytest.mark.parametrize("route", ["archive", "complete", "gc"])
+@pytest.mark.parametrize("relation", ["equal", "binding-inside", "workspace-inside", "tilde", "symlink"])
+def test_direct_shared_workspace_preserved(kanban_home, repo, monkeypatch, route, relation):
+    from argparse import Namespace
+    from hermes_cli import kanban_db_external as external
+    from hermes_cli.kanban_ops import _cmd_gc
+
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        bound = wt
+        spelling = str(wt)
+        if relation == "binding-inside":
+            # An empty directory is a valid cwd and does not dirty a git tree.
+            bound = wt / "sub"
+            bound.mkdir()
+        elif relation == "workspace-inside":
+            bound = wt.parent
+        elif relation == "tilde":
+            spelling = "~/" + str(wt.relative_to(Path.home()))
+        elif relation == "symlink":
+            alias = Path.home() / "alias"
+            alias.symlink_to(wt)
+            bound = alias
+        tid = kb.create_task(conn, title="owner", execution_kind="external_session")
+        active = external.external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture"),
+            worktree=str(bound), reservation_id="shared", reservation_token="a" * 64)
+        if route != "archive":
+            external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (spelling, worker))
+            if route == "gc":
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (worker,))
+        if route == "gc":
+            assert _cmd_gc(Namespace(event_retention_days=30, log_retention_days=30)) == 0
+        else:
+            assert getattr(kb, route + "_task")(conn, worker)
+        assert wt.is_dir()
+
+
+@pytest.mark.parametrize("other", ["binding", "corrupt", "legacy"])
+def test_other_board_ownership_reads_are_nonmutating(kanban_home, repo, other):
+    import sqlite3
+    from hermes_cli import kanban_db_external as external
+
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        kb.create_board("other")
+        path = kb.board_dir("other") / "kanban.db"
+        if other == "binding":
+            with kbc.connect_closing(board="other") as remote:
+                tid = kb.create_task(remote, title="owner", execution_kind="external_session")
+                external.external_claim(remote, tid, board="other", owner_host="fixture-host",
+                    incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                                     backend="claude", conversation="fixture"),
+                    worktree=str(wt), reservation_id="other", reservation_token="a" * 64)
+        elif other == "corrupt":
+            path.write_bytes(b"not a database")
+        else:
+            with sqlite3.connect(path) as legacy:
+                legacy.execute("DROP TABLE task_external_bindings")
+        # SQLite's read-only WAL reader may initialise locking sidecars, never
+        # durable board content. Preserve the DB, metadata and any existing WAL.
+        before = {p.name: p.read_bytes() for p in path.parent.iterdir()
+                  if p.is_file() and not p.name.endswith(("-shm", "-wal"))}
+        wal = Path(str(path) + "-wal")
+        wal_before = wal.read_bytes() if wal.exists() else b""
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir() == (other != "legacy")
+        assert {p.name: p.read_bytes() for p in path.parent.iterdir()
+                if p.is_file() and not p.name.endswith(("-shm", "-wal"))} == before
+        assert (wal.read_bytes() if wal.exists() else b"") == wal_before
+
+
+@pytest.mark.parametrize("route", ["archive", "complete", "gc", "parent"])
+def test_never_bound_external_workspace_survives_kind_routes(kanban_home, repo, monkeypatch, route):
+    from argparse import Namespace
+    from unittest.mock import Mock
+    from hermes_cli.kanban_ops import _cmd_gc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="never bound", execution_kind="external_session")
+        wt = _make_worktree(repo, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree',workspace_path=? WHERE id=?", (str(wt), tid))
+        # Spy at the removal seam: a second ownership layer must not mask kind coverage.
+        removal = Mock()
+        monkeypatch.setattr(kbw, "_cleanup_worktree_workspace", removal)
+        if route == "parent":
+            child = kb.create_task(conn, title="child", parents=[tid])
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+            kb.recompute_ready(conn)
+            assert kb.complete_task(conn, child)
+        elif route == "gc":
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
+            assert _cmd_gc(Namespace(event_retention_days=30, log_retention_days=30)) == 0
+        elif route == "complete":
+            kbw._cleanup_workspace(conn, tid)
+        else:
+            assert kb.archive_task(conn, tid)
+        assert not removal.called
+        assert wt.is_dir()
+
+
+@pytest.mark.parametrize("route", ["kernel", "tool", "dashboard"])
+def test_tilde_creation_routes_preserve_bound_worktree(kanban_home, repo, monkeypatch, route):
+    import json
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from plugins.kanban.dashboard.plugin_api import router
+    from tools.kanban_tools import _handle_create
+    from hermes_cli import kanban_db_external as external
+
+    wt = _make_worktree(repo, "owner")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="owner", execution_kind="external_session")
+        external.external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture"),
+            worktree=str(wt), reservation_id="tilde", reservation_token="a" * 64)
+        fields = dict(title="sharing worker", assignee="fixture", workspace_kind="worktree",
+                      workspace_path="~/" + str(wt.relative_to(Path.home())))
+        if route == "kernel":
+            worker = kb.create_task(conn, **fields)
+        elif route == "tool":
+            worker = json.loads(_handle_create(fields))["task_id"]
+        else:
+            app = FastAPI()
+            app.include_router(router)
+            response = TestClient(app).post("/tasks", json=fields)
+            assert response.status_code == 200, response.text
+            worker = response.json()["task"]["id"]
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir()
+
+
+def test_never_claimed_card_protects_shared_path(kanban_home, repo):
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        kb.create_task(conn, title="reserved workspace", execution_kind="external_session",
+                       workspace_kind="dir", workspace_path=str(wt))
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir()

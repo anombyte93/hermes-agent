@@ -1249,7 +1249,7 @@ def test_live_external_binding_refuses_dashboard_status_and_delete(client, monke
         active = external_claim(conn, tid, board="default", owner_host="fixture-host",
             incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
                              backend="claude", conversation="fixture-conversation"),
-            worktree="/fixture/worktree", reservation_id="dashboard-fixture", reservation_token="a" * 64)
+            worktree=str(Path.home()), reservation_id="dashboard-fixture", reservation_token="a" * 64)
         before = "\n".join(conn.iterdump())
     if route == "patch":
         response = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": target})
@@ -1286,7 +1286,7 @@ def test_idle_external_card_cannot_enter_triage(client, route, closed):
             active = external_claim(conn, tid, board="default", owner_host="fixture-host",
                 incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
                                  backend="claude", conversation="fixture-conversation"),
-                worktree="/fixture/worktree", reservation_id="idle-fixture", reservation_token="a" * 64)
+                worktree=str(Path.home()), reservation_id="idle-fixture", reservation_token="a" * 64)
             external_release(conn, tid, active["run_id"], reservation_token="a" * 64, reason="released")
         before = "\n".join(conn.iterdump())
     if route == "patch":

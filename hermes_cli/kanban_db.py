@@ -654,12 +654,18 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError(f"board {normed!r} does not exist")
 
     from hermes_cli.kanban_db_connect import connect_closing
-    with connect_closing(board=normed) as conn:
-        binding = conn.execute(
-            "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
-        ).fetchone()
-        if binding is not None:
-            raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
+    try:
+        with connect_closing(board=normed) as conn:
+            binding = conn.execute(
+                "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"board_unreadable: cannot verify external ownership on {normed!r}; "
+            f"run hermes kanban --board {normed} repair and restore a verified backup if unrecoverable"
+        ) from exc
+    if binding is not None:
+        raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
@@ -1920,6 +1926,8 @@ def set_model_override(
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
     rate-limit-recovery flow (set, then reclaim/retry)."""
+    if execution_kind_of(conn, task_id) == "external_session":
+        raise ValueError("external_session refuses model/provider overrides")
     model, provider = _validate_model_override(model, provider)
     return _set_task_override(
         conn, task_id,
@@ -4193,6 +4201,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    if conn.execute("SELECT 1 FROM task_external_bindings WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+        raise ValueError("external_workspace_retained: external binding history preserves workspace ownership")
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
