@@ -291,6 +291,26 @@ def test_invalid_prior_rows_refuse_cleanly_without_writes(store, capsys, tmp_pat
     assert "\n".join(store.iterdump()) == before
 
 
+def test_projected_rename_can_replay_before_any_write(store):
+    tid = write(store, proposed="x")["task_id"]
+    request = row(proposed="y", maps_from="r1:x")
+    before, changes = "\n".join(store.iterdump()), store.total_changes
+    assert api.check_materialization(store, project="fixture", plan_revision="r2", prior_rows=[request],
+        **request) == {"state": "existing", "task_id": tid}
+    assert "\n".join(store.iterdump()) == before and store.total_changes == changes
+    assert api.materialize_task(store, project="fixture", plan_revision="r2", **request)["state"] == "mapped"
+    assert api.materialize_task(store, project="fixture", plan_revision="r2", **request) == {"state": "existing", "task_id": tid}
+
+
+def test_pending_current_reference_is_not_an_output_id(store, capsys, tmp_path):
+    file = tmp_path / "prior.json"
+    file.write_text(json.dumps([row(proposed="n")]))
+    before = "\n".join(store.iterdump())
+    assert invoke(capsys, "materialize-check", revision="r2", options=row(proposed="n"),
+        extra=("--prior-rows-file", str(file))) == (0, {"state": "existing", "task_id": None})
+    assert "\n".join(store.iterdump()) == before
+
+
 @pytest.mark.parametrize("shape", ["fingerprint", "mapping"])
 def test_duplicate_prior_conflict_never_leaks_pending_id_or_gets_swallowed(store, capsys, tmp_path, shape):
     write(store, proposed="x")

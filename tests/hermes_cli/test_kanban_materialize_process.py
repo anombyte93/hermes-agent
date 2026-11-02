@@ -75,6 +75,7 @@ def test_materialize_process_contract_uses_one_canonical_card(tmp_path):
                HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home),
                HERMES_RUNTIME_DIR=str(tmp_path / "runtime"),
                HERMES_TEST_ISOLATION=str(home), PYTHONPATH=str(ROOT),
+               PYTHONPYCACHEPREFIX=str(tmp_path / "pycache"), TMPDIR=str(tmp_path),
                TEMP=str(tmp_path), TMP=str(tmp_path), TZ="UTC", LANG="C.UTF-8")
     if "SYSTEMROOT" in os.environ:
         env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
