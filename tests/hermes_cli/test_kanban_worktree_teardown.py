@@ -422,16 +422,14 @@ def test_active_scratch_owner_survives_archive_from_every_store(kanban_home, tmp
         marker = owned / "evidence.txt"
         marker.write_bytes(b"session owned bytes")
         worker_conn.execute("UPDATE tasks SET workspace_kind='scratch',workspace_path=? WHERE id=?", (str(owned), worker))
-        if source == "archived":
+        if source in {"archived", "pin"}:
             kb.create_board("owner-board")
             owner_path = kb.board_dir("owner-board") / "kanban.db"
-        elif source == "pin":
-            owner_path = tmp_path / "custom-owner.db"
         else:
             owner_path = Path(worker_conn.execute("PRAGMA database_list").fetchone()[2])
         with kbc.connect_closing(owner_path) as owner:
             tid = kb.create_task(owner, title="external", execution_kind="external_session")
-            active = external.external_claim(owner, tid, board="owner-board" if source == "archived" else "default",
+            active = external.external_claim(owner, tid, board="owner-board" if source != "current" else "default",
                 owner_host="fixture", incarnation=dict(session="owner", id="$1", created="1", pane="%1", pid="123",
                     backend="claude", conversation="fixture"), worktree=str(owned),
                 reservation_id="scratch-owner", reservation_token="a" * 64)
@@ -440,7 +438,11 @@ def test_active_scratch_owner_survives_archive_from_every_store(kanban_home, tmp
         if source == "archived":
             assert kb.remove_board("owner-board", archive=True)["action"] == "archived"
         if source == "pin":
-            monkeypatch.setenv("HERMES_KANBAN_DB", str(owner_path))
+            # Move a store with existing ownership, rather than making a new
+            # claim at a custom path (the materialize stack rightly refuses it).
+            custom = tmp_path / "custom-owner.db"
+            owner_path.rename(custom)
+            monkeypatch.setenv("HERMES_KANBAN_DB", str(custom))
         assert kb.archive_task(worker_conn, worker)
         assert owned.is_dir()
         assert marker.read_bytes() == b"session owned bytes"
@@ -450,12 +452,16 @@ def test_custom_connection_worktree_owner_is_retained(kanban_home, repo, tmp_pat
     from hermes_cli import kanban_db_external as external
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
-    with kbc.connect_closing(tmp_path / "custom.db") as conn:
+    custom = tmp_path / "custom.db"
+    with kbc.connect_closing() as conn:
         worker, wt = _worktree_task(conn, repo)
         tid = kb.create_task(conn, title="external", execution_kind="external_session")
         external.external_claim(conn, tid, board="default", owner_host="fixture",
             incarnation=dict(session="owner", id="$1", created="1", pane="%1", pid="123", backend="claude", conversation="fixture"),
             worktree=str(wt), reservation_id="custom", reservation_token="a" * 64)
+        original = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    original.rename(custom)
+    with kbc.connect_closing(custom) as conn:
         assert kb.archive_task(conn, worker)
         assert wt.is_dir()
         assert (wt / "README.md").read_text() == "hello\n"
