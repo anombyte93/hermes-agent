@@ -28,6 +28,7 @@ from hermes_cli.kanban_output import (
     _json_out, _obj_dict, _print_json, _task_to_dict,
 )
 from hermes_cli.kanban_external import external_command
+from hermes_cli.kanban_materialize import materialize_command
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -213,7 +214,7 @@ def _profile_author() -> str:
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "init", "create", "materialize", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -1419,6 +1420,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm, "external": external_command,
+    "materialize": materialize_command,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,

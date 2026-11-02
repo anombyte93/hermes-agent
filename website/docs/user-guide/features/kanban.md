@@ -219,6 +219,57 @@ The reservation owner must enforce cross-board exclusivity and validate the live
 process/worktree before claiming. This API neither contacts that owner nor
 silently releases an uncertain reservation. Plan materialisation is separate.
 
+## Plan materialization
+
+Planning clients use the board-owned identity, not a local reference file, to
+avoid duplicate work. The kernel API is
+`hermes_cli.kanban_db_materialize.materialize_task`; the equivalent CLI is:
+
+```bash
+hermes kanban --board B materialize --project P --plan-revision R \
+  --proposed-id X --fingerprint F --title T \
+  --body-file /absolute/acceptance.md --parent-proposed parent-one parent-two \
+  --execution-kind external_session --json
+```
+
+`--body-file` and `--parent-proposed` are optional. Parent ids must already be
+materialized in this project and revision; materialize a plan in dependency
+order. `--parent-proposed` accepts several ids and may be repeated. The project
+is a logical namespace within the board, independent of any profile's local
+project registry. A new card starts ready, or todo until its parents finish,
+with a scratch workspace placeholder; claiming it supplies the owner's actual
+worktree. It is never a dispatcher worker.
+
+`task_materializations` has the database primary key
+`(project, plan_revision, proposed_task_id)`. One immediate write transaction
+covers the lookup, card, dependency links, event and reference. Concurrent
+clients therefore read back the same card:
+
+- Same revision and fingerprint: `{"state":"existing","task_id":"t_..."}`.
+- Same revision, different fingerprint: conflict, `materialization_conflict`.
+- New revision with a matching earlier fingerprint: existing, with a reference
+  recorded for the new revision.
+- New revision with changed intent and no mapping: conflict,
+  `revision_requires_mapping`.
+- New revision with changed intent (or a renamed id) and
+  `--maps-from prior-revision:prior-id` naming a real row:
+  `{"state":"mapped","task_id":"t_..."}`. An established logical id cannot
+  be redirected to another card. A `materialization_mapped` event records the
+  mapping. A matching earlier fingerprint takes precedence and stays existing.
+
+A genuinely new id returns `{"state":"created","task_id":"t_..."}`.
+Created, existing and mapped return exit 0. Conflicts return exit 3 and
+`{"state":"conflict","task_id":"t_...","reason":"..."}`. Invalid
+requests, including a missing mapping source (`mapping_not_found`), return
+exit 1 and `{"state":"refused","reason":"..."}` with no card created.
+Mappings resolve only inside this project and board and must name a different,
+already-materialized revision.
+
+Reuse and mapping preserve the canonical card's body, dependencies, status and
+attempt history, even if archived. They do not reopen, close or execute it.
+A true replacement requires a new proposed id; closing the old card is an
+explicit parent action. There is no reservation or session-owner side effect.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,

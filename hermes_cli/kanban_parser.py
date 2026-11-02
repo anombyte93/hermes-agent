@@ -197,6 +197,19 @@ _SPECS = [
              "loop — tasks on one board cannot collide with tasks on another. The first board is "
              "'default' and always exists."
          )),
+    _cmd("materialize", [
+        _arg("--project", required=True, help="Logical project namespace on this board"),
+        _arg("--plan-revision", required=True),
+        _arg("--proposed-id", required=True),
+        _arg("--fingerprint", required=True),
+        _arg("--title", required=True),
+        _arg("--body-file", help="Read the opening post as UTF-8"),
+        _arg("--parent-proposed", nargs="+", action="extend", default=[],
+             help="Parent logical ids already materialized in this revision (repeatable)"),
+        _arg("--maps-from", metavar="REVISION:ID", help="Explicit reference to a real prior logical task"),
+        _arg("--execution-kind", choices=["external_session"], required=True),
+        _json_flag(),
+    ], help="Atomically materialize a plan identity into one canonical external-session card"),
     _cmd("create", [
         _arg("title", help="Task title"),
         _arg("--execution-kind", choices=["worker", "external_session"], default="worker",
