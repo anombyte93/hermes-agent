@@ -1274,3 +1274,32 @@ def test_live_external_binding_refuses_dashboard_status_and_delete(client, monke
         assert released["binding"]["state"] == "closed"
     assert not effects.called
 
+
+@pytest.mark.parametrize("route", ["patch", "bulk"])
+@pytest.mark.parametrize("closed", [False, True])
+def test_idle_external_card_cannot_enter_triage(client, route, closed):
+    from hermes_cli.kanban_db_external import external_claim, external_release
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="external owner", execution_kind="external_session")
+        if closed:
+            active = external_claim(conn, tid, board="default", owner_host="fixture-host",
+                incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                                 backend="claude", conversation="fixture-conversation"),
+                worktree="/fixture/worktree", reservation_id="idle-fixture", reservation_token="a" * 64)
+            external_release(conn, tid, active["run_id"], reservation_token="a" * 64, reason="released")
+        before = "\n".join(conn.iterdump())
+    if route == "patch":
+        response = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "triage"})
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+    else:
+        response = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [tid], "status": "triage"})
+        assert response.status_code == 200
+        entry = response.json()["results"][0]
+        assert entry["ok"] is False
+        detail = entry["error"]
+    assert "external_session" in detail and "triage" in detail
+    with kbc.connect_closing() as conn:
+        assert "\n".join(conn.iterdump()) == before
+

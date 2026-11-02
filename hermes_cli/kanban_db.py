@@ -653,6 +653,14 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing(board=normed) as conn:
+        binding = conn.execute(
+            "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
+        ).fetchone()
+        if binding is not None:
+            raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
+
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()

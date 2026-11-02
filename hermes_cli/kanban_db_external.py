@@ -257,12 +257,13 @@ def external_request_changes(conn: sqlite3.Connection, task_id: str, run_id: int
 
 def external_handover(conn: sqlite3.Connection, task_id: str, run_id: int, *, reservation_token: str,
                       owner_host: str, incarnation: dict, worktree: str, reservation_id: str,
-                      new_reservation_token: str, evidence: str) -> dict:
+                      new_reservation_token: str, evidence: str, board: str | None = None) -> dict:
     if not isinstance(evidence, str) or not evidence.strip():
         raise ValueError("handover evidence is required")
     identity_json = _identity(owner_host, incarnation)
     token_hash = _token_hash(new_reservation_token)
     with write_txn(conn):
+        _require_board(conn, board)
         task, _ = _owned_binding(conn, task_id, run_id, reservation_token)
         _require_worktree(task, worktree)
         _close_attempt(conn, task_id, run_id, status="ready", outcome="handed_over",

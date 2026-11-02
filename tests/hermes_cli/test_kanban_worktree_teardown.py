@@ -222,3 +222,50 @@ def test_parent_worktree_deferred_until_children_done(
         assert kb.complete_task(conn, child, summary="child done")
     # last child terminal -> deferred parent worktree reaped
     assert not parent_wt.exists()
+
+
+@pytest.mark.parametrize("shared_worker", [False, True])
+@pytest.mark.parametrize("route", ["archive-gc", "child-complete"])
+@pytest.mark.parametrize("kind", ["worktree", "scratch"])
+def test_external_owner_workspace_survives_every_cleanup_route(kanban_home, repo, route, kind, shared_worker):
+    from argparse import Namespace
+    from hermes_cli import kanban_db_external as external
+    from hermes_cli.kanban_ops import _cmd_gc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="session owns workspace", execution_kind="external_session")
+        if kind == "worktree":
+            owned = _make_worktree(repo, tid)
+        else:
+            owned = kb.workspaces_root() / tid
+            owned.mkdir(parents=True)
+            (owned / "evidence.txt").write_text("owner's evidence")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind=?,workspace_path=?,branch_name=? WHERE id=?",
+                         (kind, str(owned), f"wt/{tid}", tid))
+        active = external.external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree=str(owned), reservation_id="cleanup-reservation", reservation_token="a" * 64)
+        target = tid
+        if shared_worker:
+            target = kb.create_task(conn, title="worker sharing the session path", workspace_kind=kind,
+                                    workspace_path=str(owned))
+        child = kb.create_task(conn, title="worker child", parents=[target], workspace_kind="dir",
+                               workspace_path=str(repo))
+        external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64)
+        if shared_worker:
+            assert kb.complete_task(conn, target)
+        assert owned.is_dir()
+        if route == "archive-gc":
+            assert kb.archive_task(conn, target)
+            assert _cmd_gc(Namespace(event_retention_days=30, log_retention_days=30)) == 0
+        else:
+            assert kb.complete_task(conn, child)
+        assert owned.is_dir(), "board removed the external session's workspace"
+        assert external.external_status(conn, tid)["binding"]["state"] == "closed"
+        if kind == "worktree":
+            assert _branch_exists(repo, f"wt/{tid}")
+            assert (owned / "README.md").read_text() == "hello\n"
+        else:
+            assert (owned / "evidence.txt").read_text() == "owner's evidence"

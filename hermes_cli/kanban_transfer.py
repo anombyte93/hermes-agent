@@ -77,6 +77,13 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     # exported SQLite bytes: export VACUUMs the private snapshot below.
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_external_bindings'").fetchone():
         conn.execute("DELETE FROM task_external_bindings")
+    for row in conn.execute("SELECT id,payload FROM task_events WHERE kind LIKE 'external_%'").fetchall():
+        if row[1] is None:
+            continue
+        payload = json.loads(row[1])
+        payload.pop("reservation_id", None)
+        payload.pop("owner_host", None)
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
     conn.execute(
         """
         UPDATE tasks

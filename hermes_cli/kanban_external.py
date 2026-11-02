@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_external as external
 from hermes_cli.kanban_db_connect import connect_closing
 from hermes_cli.kanban_output import _err, _print_json
@@ -35,8 +34,7 @@ def _claim(args, conn):
         incarnation = json.loads(args.incarnation)
     except (ValueError, TypeError):
         raise ValueError("incarnation must be a JSON object") from None
-    board = kb.get_current_board() if args.expected_board is None else args.expected_board
-    return external.external_claim(conn, args.task, board=board,
+    return external.external_claim(conn, args.task, board=args.expected_board,
         owner_host=args.owner_host, incarnation=incarnation, worktree=args.worktree,
         reservation_id=args.reservation_id, reservation_token=args.reservation_token)
 
@@ -61,7 +59,7 @@ def _handover(args, conn):
         incarnation = json.loads(args.incarnation)
     except (ValueError, TypeError):
         raise ValueError("incarnation must be a JSON object") from None
-    return external.external_handover(conn, args.task, args.run_id,
+    return external.external_handover(conn, args.task, args.run_id, board=args.expected_board,
         reservation_token=args.reservation_token, owner_host=args.owner_host, incarnation=incarnation,
         worktree=args.worktree, reservation_id=args.reservation_id,
         new_reservation_token=args.new_reservation_token, evidence=args.evidence)

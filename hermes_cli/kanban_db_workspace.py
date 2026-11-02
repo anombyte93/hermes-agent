@@ -110,6 +110,13 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _externally_owned_workspace(conn: sqlite3.Connection, path: str) -> bool:
+    """Closed attempts do not give the board ownership of the session's files."""
+    target = Path(path).resolve()
+    return any(Path(row[0]).resolve() == target for row in conn.execute(
+        "SELECT DISTINCT worktree FROM task_external_bindings"))
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -125,6 +132,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if path and _externally_owned_workspace(conn, path):
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind not in _REMOVABLE_KINDS or not path:
             # Not removable itself, but completing may still unblock a deferred
             # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
@@ -232,11 +242,15 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             (task_id,),
         ).fetchall()
         for (parent_id,) in parents:
+            from hermes_cli.kanban_execution import execution_kind_of
+            if execution_kind_of(conn, parent_id) != "worker":
+                continue
             row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
             if (
                 not row
                 or row["workspace_kind"] not in _REMOVABLE_KINDS
                 or not row["workspace_path"]
+                or _externally_owned_workspace(conn, row["workspace_path"])
                 or _has_active_children(conn, parent_id)
             ):
                 continue

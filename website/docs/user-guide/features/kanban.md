@@ -180,7 +180,9 @@ goal mode, model/provider overrides and skills. The kernel also refuses to
 decompose an older or imported external triage row, so it cannot create worker
 children or replace the root's assignee. Dashboard status moves (including bulk)
 and deletion refuse a live external binding with a visible conflict; use the
-exact owner's external lifecycle instead.
+exact owner's external lifecycle instead. Idle external cards cannot move into
+triage either, and automatic decomposition skips legacy external triage rows
+without spending the auxiliary-call budget.
 
 An owner integration first prepares its own reservation, then calls
 `hermes_cli.kanban_db_external.external_claim` or `hermes kanban external claim`.
@@ -189,9 +191,9 @@ with `session`, `id`, `created`, `pane`, `pid`, `backend`, `conversation`),
 `--worktree`, `--reservation-id` and `--reservation-token-file PATH`. `created`
 and `pid` are strings, exactly as the owner returns them. A null or empty
 `conversation` refuses: it is not an exact identity. Values are not renamed or
-normalised. Pass `--expected-board BOARD` from the reservation to refuse a claim
-if `--board` or the ambient board resolves elsewhere. For compatibility, omitting
-it uses the selected board, without that independent assertion.
+normalised. Claim and handover require `--expected-board BOARD` from the prepared
+reservation and compare it with the selected board. Missing or mismatched reservation
+board refuses, including when `--board` or the ambient board resolves elsewhere.
 
 The claimed worktree is stored only on the binding, never written back to the
 card. After release or handover a different session may use a different worktree.
@@ -225,14 +227,19 @@ owner. The owner must explicitly use one of these token-fenced operations:
 - `external release ... --reason TEXT --json`: give up an active attempt without
   completing the task. It lands on ready only if every parent is done or archived;
   otherwise it lands on todo, retaining the closed attempt as evidence.
-- `external handover ... --owner-host HOST --incarnation JSON --worktree PATH
+- `external handover ... --expected-board BOARD --owner-host HOST --incarnation JSON --worktree PATH
   --reservation-id NEW_ID --new-reservation-token-file NEW_PATH --evidence TEXT
   --json`: close the prior binding as `handed_over` and open a successor attempt
   atomically. No process is stopped or restarted.
 
 All mutations compare the exact attempt and reservation token. Closed bindings
 remain historical evidence and never mean that the external session ended.
-Completion preserves the owner's worktree. `show` (text or JSON) carries the kind
+Completion, deferred child cleanup and archive GC preserve the owner's worktree
+or scratch workspace. A worker card on the same board sharing a binding's path
+cannot clean it up either, including after that binding closes. A board with an
+active binding refuses removal with `active_external_binding`. Board transfer
+strips binding authority and reservation/host fields from external events; the
+source remains bound. `show` (text or JSON) carries the kind
 and latest binding; status responses omit the token and its hash. Only the hash
 is stored. Every mutating external verb accepts exactly one of the token file
 or legacy token flag, and handover has the same choice for the successor token.
