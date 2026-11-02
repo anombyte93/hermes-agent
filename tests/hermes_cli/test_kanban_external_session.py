@@ -27,7 +27,7 @@ TOKEN = "a" * 64
 NEXT_TOKEN = "b" * 64
 OWNER_HOST = "fixture-host"
 INCARNATION = dict(session="existing-owner", id="$7", created="1000", pane="%9",
-                   pid=424242, backend="claude", conversation="fixture-conversation")
+                   pid="424242", backend="claude", conversation="fixture-conversation")
 
 
 @pytest.fixture
@@ -296,7 +296,7 @@ def test_exact_attempt_and_token_required(store, operation):
     fn = getattr(api, "external_" + operation)
     extra = dict(reason="give up") if operation == "release" else dict(summary="finished")
     if operation == "handover":
-        extra = dict(owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": 434343},
+        extra = dict(owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"},
                      reservation_id="fixture-r2", new_reservation_token=NEXT_TOKEN,
                      worktree=active["binding"]["worktree"], evidence="explicit transfer")
     for rid, token in [(active["run_id"] + 1, TOKEN), (active["run_id"], NEXT_TOKEN)]:
@@ -349,7 +349,7 @@ def test_handover_keeps_old_binding_and_stale_owner_cannot_act(store):
     active = claim(store, tid)
     api = external_api()
     new = api.external_handover(store, tid, active["run_id"], reservation_token=TOKEN,
-        owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": 434343, "conversation": "successor"},
+        owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343", "conversation": "successor"},
         reservation_id="fixture-r2", new_reservation_token=NEXT_TOKEN,
         worktree=active["binding"]["worktree"], evidence="explicit parent-approved transfer")
     assert new["run_id"] != active["run_id"]
@@ -373,14 +373,19 @@ def test_lifecycle_routes_never_make_external_kind_spawnable(store, transition):
     elif transition == "reclaim":
         claim(store, tid)
         assert not kb.reclaim_task(store, tid, signal_fn=Mock())
-    elif transition in {"promote", "unblock", "recompute", "retry"}:
+    elif transition == "recompute":
+        # A promotable row is essential: a sticky blocked row never reaches
+        # dispatch even when every external guard is removed.
+        store.execute("UPDATE tasks SET status='todo',assignee='same-profile' WHERE id=?", (tid,))
+        store.commit()
+        assert kb.recompute_ready(store) == 1
+        assert kb.get_task(store, tid).status == "ready"
+    elif transition in {"promote", "unblock", "retry"}:
         assert kb.block_task(store, tid, reason="fixture hold")
         if transition == "promote":
             assert kb.promote_task(store, tid, actor="parent")[0]
-        elif transition in {"unblock", "retry"}:
-            assert kb.unblock_task(store, tid)
         else:
-            kb.recompute_ready(store)
+            assert kb.unblock_task(store, tid)
     elif transition == "parent-unlock":
         parent = kb.create_task(store, title="parent")
         kb.link_tasks(store, parent, tid)
@@ -449,7 +454,7 @@ def test_idempotency_key_cannot_return_the_other_execution_kind(store):
 
 
 @pytest.mark.parametrize("field,replacement", [("session", "other"), ("id", "$8"),
-    ("created", "1001"), ("pane", "%10"), ("pid", 434343),
+    ("created", "1001"), ("pane", "%10"), ("pid", "434343"),
     ("backend", "codex"), ("conversation", "other-conversation")])
 def test_replay_compares_every_literal_identity_field(store, field, replacement):
     tid = create(store)
@@ -481,7 +486,7 @@ def test_simultaneous_replay_returns_same_attempt(store):
 def test_handover_conflict_rolls_back_original_owner(store):
     first, second = create(store), create(store)
     active = claim(store, first)
-    occupied = {**INCARNATION, "pid": 434343}
+    occupied = {**INCARNATION, "pid": "434343"}
     claim(store, second, incarnation=occupied, reservation_id="occupied")
     with pytest.raises(ValueError, match="reservation_conflict"):
         external_api().external_handover(store, first, active["run_id"], reservation_token=TOKEN,
@@ -542,7 +547,7 @@ def test_cli_other_external_lifecycle_verbs(store, capsys, verb):
     if verb in {"release", "request-changes"}:
         argv += ["--reason", "explicit parent action"]
     if verb == "handover":
-        argv += ["--owner-host", OWNER_HOST, "--incarnation", json.dumps({**INCARNATION, "pid": 434343}),
+        argv += ["--owner-host", OWNER_HOST, "--incarnation", json.dumps({**INCARNATION, "pid": "434343"}),
                  "--worktree", active["binding"]["worktree"], "--reservation-id", "next-cli",
                  "--new-reservation-token", NEXT_TOKEN, "--evidence", "parent transfer"]
     assert cli.kanban_command(parse(argv)) == 0
@@ -593,4 +598,233 @@ def test_cli_wrong_token_refuses_as_json_without_effects(store, capsys):
     output = capsys.readouterr().out
     assert json.loads(output)["state"] == "refused"
     assert TOKEN not in output and NEXT_TOKEN not in output
+    assert external_api().external_status(store, tid) == active
+
+
+@pytest.mark.parametrize("identity", [{**INCARNATION, "conversation": None},
+    {**INCARNATION, "pid": 424242}])
+def test_owner_identity_is_literal_and_conversation_must_be_known(store, identity):
+    tid = create(store)
+    with pytest.raises(ValueError):
+        claim(store, tid, incarnation=identity)
+    assert not kb.list_runs(store, tid)
+
+
+def test_pid_column_and_migration_preserve_literal_string(store):
+    from hermes_cli.kanban_external_schema import migrate_external_sessions
+
+    # Model an already populated first-generation INTEGER-affinity binding table.
+    store.execute("DROP TABLE task_external_bindings")
+    store.execute("""CREATE TABLE task_external_bindings (
+        task_id TEXT NOT NULL, run_id INTEGER NOT NULL, owner_host TEXT NOT NULL,
+        incarnation TEXT NOT NULL, pid INTEGER NOT NULL, conversation TEXT NOT NULL,
+        worktree TEXT NOT NULL, reservation_id TEXT NOT NULL UNIQUE,
+        reservation_token_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+        bound_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT,
+        PRIMARY KEY(task_id,run_id))""")
+    tid = create(store)
+    literal = {**INCARNATION, "pid": "00424242"}
+    active = claim(store, tid, incarnation=literal)
+    assert store.execute("SELECT pid FROM task_external_bindings").fetchone()[0] == 424242
+    for _ in range(2):
+        migrate_external_sessions(store)
+    row = store.execute("SELECT pid,incarnation FROM task_external_bindings WHERE task_id=?", (tid,)).fetchone()
+    assert row["pid"] == literal["pid"]
+    assert json.loads(row["incarnation"]) == literal
+    after = claim(store, tid, incarnation=literal)
+    assert after == {**active, "binding": {**active["binding"], "pid": literal["pid"]}}
+    # The rebuilt uniqueness indexes still reject two active owners.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.execute("INSERT INTO task_external_bindings SELECT task_id,run_id+1,owner_host,incarnation,pid,"
+            "conversation,worktree,reservation_id||'-duplicate',reservation_token_sha256,state,bound_at,"
+            "closed_at,close_reason FROM task_external_bindings")
+
+
+def test_external_triage_refused_at_creation_and_decomposition(store, capsys):
+    with pytest.raises(ValueError, match="triage"):
+        create(store, triage=True)
+    assert cli.kanban_command(parse(["create", "external triage", "--triage",
+        "--execution-kind", "external_session", "--json"])) != 0
+    capsys.readouterr()
+    assert not kb.list_tasks(store)
+
+
+def test_decomposition_cannot_insert_spawnable_children_or_replace_assignee(store):
+    tid = create(store, assignee="existing-owner")
+    # Legacy/imported rows can predate the creation refusal.
+    store.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+    store.commit()
+    before = "\n".join(store.iterdump())
+    from hermes_cli.kanban_db_graph import decompose_triage_task
+    children = decompose_triage_task(store, tid, root_assignee="same-profile",
+        children=[dict(title="must not spawn", assignee="same-profile")])
+    # Run the spy even on the broken implementation, so the failure exposes
+    # the spawned child rather than merely the decomposition's return value.
+    tick(store)
+    assert children is None
+    assert "\n".join(store.iterdump()) == before
+
+
+@pytest.mark.parametrize("lookup_phase", ["resolver", "predicate"])
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_dispatch_tick_survives_raising_profile_lookup(store, monkeypatch, lookup_phase, lane):
+    tid = create(store, assignee="same-profile")
+    store.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
+    store.commit()
+    fail = Mock(side_effect=RuntimeError("fixture lookup unavailable"))
+    monkeypatch.setattr(dispatch, "_profile_exists_fn", fail if lookup_phase == "resolver" else lambda: fail)
+    tick(store)
+    assert kb.get_task(store, tid).status == lane
+    assert not kb.list_runs(store, tid)
+    assert not fail.called
+
+
+@pytest.mark.parametrize("mode", ["release", "handover"])
+def test_worktree_is_binding_local_not_written_back_to_card(store, mode):
+    tid = create(store)
+    before = kb.get_task(store, tid)
+    active = claim(store, tid)
+    successor_path = str(Path.home() / "other-worktree")
+    api = external_api()
+    if mode == "release":
+        api.external_release(store, tid, active["run_id"], reservation_token=TOKEN, reason="switch owner")
+        successor = claim(store, tid, worktree=successor_path, reservation_id="next-worktree",
+                          reservation_token=NEXT_TOKEN)
+    else:
+        successor = api.external_handover(store, tid, active["run_id"], reservation_token=TOKEN,
+            owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"}, worktree=successor_path,
+            reservation_id="next-worktree", new_reservation_token=NEXT_TOKEN, evidence="explicit transfer")
+    assert successor["binding"]["worktree"] == successor_path
+    after = kb.get_task(store, tid)
+    assert (after.workspace_path, after.workspace_kind) == (before.workspace_path, before.workspace_kind)
+    tick(store)
+
+
+@pytest.mark.parametrize("parent_status,landing", [("ready", "todo"), ("archived", "ready")])
+def test_release_rechecks_parent_gate(store, parent_status, landing):
+    parent = kb.create_task(store, title="parent")
+    assert kb.complete_task(store, parent)
+    tid = create(store, parents=[parent])
+    active = claim(store, tid)
+    store.execute("UPDATE tasks SET status=? WHERE id=?", (parent_status, parent))
+    store.commit()
+    released = external_api().external_release(store, tid, active["run_id"],
+        reservation_token=TOKEN, reason="parent changed")
+    assert released["task"]["status"] == landing
+    assert released["attempt"]["status"] == landing
+    assert released["binding"]["state"] == "closed"
+    # Avoid dispatching the ordinary parent; the external card remains nonspawnable.
+    store.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (parent,))
+    store.commit()
+    tick(store)
+
+
+@pytest.mark.parametrize("source", ["export", "untrusted-import"])
+def test_board_transfer_has_no_external_binding_and_card_can_be_claimed(store, tmp_path, source):
+    import tarfile
+    from hermes_cli import kanban_transfer as transfer
+    from hermes_cli.archive_safe import make_targz
+
+    tid = create(store, workspace_kind="dir", workspace_path=str(Path.home() / "worktree"))
+    active = claim(store, tid)
+    original = external_api().external_status(store, tid)
+    digest = store.execute("SELECT reservation_token_sha256 FROM task_external_bindings").fetchone()[0]
+    if source == "export":
+        archive = transfer.export_board("default", str(tmp_path / "export"))["archive"]
+        with tarfile.open(archive) as tar:
+            payload = tar.extractfile("default/kanban.db").read()
+        assert digest.encode() not in payload
+        assert json.dumps(INCARNATION, sort_keys=True, separators=(",", ":")).encode() not in payload
+        snapshot = tmp_path / "inspect.db"
+        snapshot.write_bytes(payload)
+        with sqlite3.connect(snapshot) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_external_bindings").fetchone()[0] == 0
+    else:
+        root = tmp_path / "untrusted"
+        root.mkdir()
+        staged = root / "source"
+        staged.mkdir()
+        transfer._snapshot_db(kb.kanban_db_path("default"), staged / "kanban.db")
+        (staged / "manifest.json").write_text(json.dumps({"format": transfer.ARCHIVE_FORMAT,
+            "format_version": 1, "board": "source"}))
+        archive = make_targz(str(tmp_path / "untrusted-export"), str(root), "source")
+    imported = transfer.import_board(archive, slug="copy")
+    with dbc.connect_closing(board=imported["board"]) as conn:
+        status = external_api().external_status(conn, tid)
+        assert status["binding"] is None and status["attempt"] is None
+        assert status["task"]["execution_kind"] == "external_session"
+        assert status["task"]["status"] == "ready"
+        bound = claim(conn, tid, board=imported["board"], reservation_id="imported-reservation")
+        assert bound["binding"]["state"] == "active"
+        tick(conn)
+    assert external_api().external_status(store, tid) == original
+    assert active == original
+
+
+def test_kernel_delete_refuses_live_binding_but_removes_closed_history(store):
+    tid = create(store)
+    active = claim(store, tid)
+    before = "\n".join(store.iterdump())
+    assert not kb.delete_task(store, tid)
+    assert "\n".join(store.iterdump()) == before
+    external_api().external_release(store, tid, active["run_id"], reservation_token=TOKEN, reason="released")
+    assert kb.delete_task(store, tid)
+    assert not store.execute("SELECT 1 FROM task_external_bindings WHERE task_id=?", (tid,)).fetchone()
+
+
+@pytest.mark.parametrize("verb", ["claim", "complete", "release", "request-changes", "handover"])
+def test_cli_token_file_route_and_expected_board(store, tmp_path, capsys, verb):
+    token_file = tmp_path / "reservation.token"
+    token_file.write_text(TOKEN + "\n")
+    next_file = tmp_path / "successor.token"
+    next_file.write_text(NEXT_TOKEN + "\n")
+    tid = create(store)
+    identity = ["--owner-host", OWNER_HOST, "--incarnation", json.dumps(INCARNATION),
+                "--worktree", str(Path.home() / "worktree"), "--reservation-id", "file-route"]
+    if verb == "claim":
+        argv = ["external", verb, "--task", tid, *identity, "--reservation-token-file", str(token_file),
+                "--expected-board", "wrong", "--json"]
+        assert cli.kanban_command(parse(argv)) == 1
+        assert json.loads(capsys.readouterr().out)["reason"] == "wrong board"
+        assert not kb.list_runs(store, tid)
+        argv[argv.index("wrong")] = "default"
+    else:
+        active = claim(store, tid)
+        if verb == "request-changes":
+            external_api().external_complete(store, tid, active["run_id"], reservation_token=TOKEN, review=True)
+        argv = ["external", verb, "--task", tid, "--run-id", str(active["run_id"]),
+                "--reservation-token-file", str(token_file), "--json"]
+        if verb in {"release", "request-changes"}:
+            argv += ["--reason", "explicit action"]
+        if verb == "handover":
+            argv += [*identity, "--new-reservation-token-file", str(next_file), "--evidence", "transfer"]
+    assert TOKEN not in argv and NEXT_TOKEN not in argv
+    assert cli.kanban_command(parse(argv)) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)["task"]["execution_kind"] == "external_session"
+    assert TOKEN not in output and NEXT_TOKEN not in output
+
+
+@pytest.mark.parametrize("route", ["missing", "both", "unreadable", "malformed", "oversized", "extra-newlines"])
+def test_cli_token_route_refusals_are_value_safe(store, tmp_path, capsys, route):
+    tid = create(store)
+    active = claim(store, tid)
+    argv = ["external", "release", "--task", tid, "--run-id", str(active["run_id"]),
+            "--reason", "fixture", "--json"]
+    if route == "both":
+        token_file = tmp_path / "conflict.token"
+        token_file.write_text(TOKEN)
+        argv += ["--reservation-token", TOKEN, "--reservation-token-file", str(token_file)]
+    elif route == "unreadable":
+        argv += ["--reservation-token-file", str(tmp_path / "absent")]
+    elif route in {"malformed", "oversized", "extra-newlines"}:
+        token_file = tmp_path / "invalid.token"
+        content = {"malformed": "invalid-fixture", "oversized": TOKEN + "c" * 1000,
+                   "extra-newlines": TOKEN + "\n" * 1000}[route]
+        token_file.write_text(content)
+        argv += ["--reservation-token-file", str(token_file)]
+    assert cli.kanban_command(parse(argv)) == 1
+    output = capsys.readouterr().out
+    assert json.loads(output)["state"] == "refused"
+    assert TOKEN not in output
     assert external_api().external_status(store, tid) == active

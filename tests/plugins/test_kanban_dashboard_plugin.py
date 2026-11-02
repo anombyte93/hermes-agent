@@ -1234,3 +1234,43 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("route", ["patch", "bulk", "delete"])
+@pytest.mark.parametrize("target", ["ready", "todo", "triage", "done", "review", "archived"])
+def test_live_external_binding_refuses_dashboard_status_and_delete(client, monkeypatch, route, target):
+    from unittest.mock import Mock
+    from hermes_cli import kanban_db_dispatch as dispatch
+    from hermes_cli.kanban_db_external import external_claim, external_release, external_status
+
+    effects = Mock(side_effect=AssertionError("external process effect"))
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", effects)
+    monkeypatch.setattr(dispatch, "_pid_alive", effects)
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="external owner", execution_kind="external_session")
+        active = external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree="/fixture/worktree", reservation_id="dashboard-fixture", reservation_token="a" * 64)
+        before = "\n".join(conn.iterdump())
+    if route == "patch":
+        response = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": target})
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+    elif route == "delete":
+        response = client.delete(f"/api/plugins/kanban/tasks/{tid}")
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+    else:
+        response = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [tid], "status": target})
+        assert response.status_code == 200
+        entry = response.json()["results"][0]
+        assert entry["ok"] is False
+        detail = entry["error"]
+    assert "external" in detail and "binding" in detail
+    with kbc.connect_closing() as conn:
+        assert "\n".join(conn.iterdump()) == before
+        assert external_status(conn, tid) == active
+        # Still recoverable through the exact owner's lifecycle.
+        released = external_release(conn, tid, active["run_id"], reservation_token="a" * 64, reason="give up")
+        assert released["binding"]["state"] == "closed"
+    assert not effects.called
+

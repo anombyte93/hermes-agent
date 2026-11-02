@@ -544,6 +544,11 @@ class _StatusRejected(Exception):
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
 
 
+def _require_no_external_binding(conn, task_id: str) -> None:
+    if kanban_db.has_external_attempt(conn, task_id):
+        raise _conflict("Cannot move or delete a card with a live external binding; use external release or complete")
+
+
 def _drag_to(conn, task_id: str, s: str) -> bool:
     """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
     leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
@@ -573,6 +578,7 @@ _STATUS_HANDLERS: dict[str, Any] = {
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
     """Dispatch a status verb; raises ``_StatusRejected`` (user-facing message)
     for ``running`` or an unknown status (``unknown_detail``)."""
+    _require_no_external_binding(conn, task_id)
     if s == "running":
         raise _StatusRejected(_RUNNING_DIRECT_MSG)
     handler = _STATUS_HANDLERS.get(s)
@@ -654,6 +660,8 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
+        if payload.status is not None:
+            _require_no_external_binding(conn, task_id)
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
@@ -678,7 +686,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
+        _require_no_external_binding(conn, task_id)
         if not kanban_db.delete_task(conn, task_id):
+            _require_no_external_binding(conn, task_id)
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
 
@@ -705,6 +715,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
+        _require_no_external_binding(conn, task_id)
         prev = conn.execute(
             "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if prev is None:
