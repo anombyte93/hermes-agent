@@ -110,11 +110,58 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _externally_owned_workspace(conn: sqlite3.Connection, path: str) -> bool:
-    """Closed attempts do not give the board ownership of the session's files."""
-    target = Path(path).resolve()
-    return any(Path(row[0]).resolve() == target for row in conn.execute(
-        "SELECT DISTINCT worktree FROM task_external_bindings"))
+def _external_workspace_paths(conn: sqlite3.Connection):
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "task_external_bindings" in tables:
+        yield from (row[0] for row in conn.execute("SELECT DISTINCT worktree FROM task_external_bindings"))
+    if "tasks" in tables:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "execution_kind" in columns:
+            yield from (row[0] for row in conn.execute(
+                "SELECT workspace_path FROM tasks WHERE execution_kind='external_session' "
+                "AND workspace_path IS NOT NULL"))
+
+
+def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> bool:
+    """Fail closed at removal: a session owns overlapping paths on every board.
+
+    Inspect other boards read-only, without initialisation or migration. Neither
+    attempt closure nor a board archive grants ownership of the session's files.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    try:
+        target = Path(path).expanduser().resolve()
+
+        def overlaps(source):
+            owned = Path(source).expanduser().resolve()
+            return target.is_relative_to(owned) or owned.is_relative_to(target)
+
+        current = None
+        if conn is not None:
+            if any(overlaps(source) for source in _external_workspace_paths(conn)):
+                return True
+            current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        paths = {_kb.kanban_home() / "kanban.db"}
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pin:
+            paths.add(Path(pin).expanduser())
+        root = _kb.boards_root()
+        if root.exists():
+            for entry in root.iterdir():
+                if entry.is_dir() and entry.name != "_archived":
+                    paths.add(entry / "kanban.db")
+                elif entry.name == "_archived" and entry.is_dir():
+                    paths.update(child / "kanban.db" for child in entry.iterdir() if child.is_dir())
+        for db in paths:
+            if db.resolve() == current or not (db.exists() or db.is_symlink()):
+                continue
+            with contextlib.closing(connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)) as other:
+                if any(overlaps(source) for source in _external_workspace_paths(other)):
+                    return True
+        return False
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return True
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
@@ -132,9 +179,6 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
-        if path and _externally_owned_workspace(conn, path):
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
         if kind not in _REMOVABLE_KINDS or not path:
             # Not removable itself, but completing may still unblock a deferred
             # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
@@ -163,7 +207,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # ``workspace_kind='scratch'`` with a user path pointing at a real
             # source tree; without this, completion would rmtree the user's data.
             # See #28818.
-            if _is_managed_scratch_path(wp):
+            if _is_managed_scratch_path(wp) and not _externally_owned_workspace(conn, str(wp)):
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
@@ -198,7 +242,7 @@ def _cleanup_worktree_workspace(
         return  # CLI safety predicates unavailable — preserve
     try:
         wp = Path(path).expanduser()
-        if not wp.is_dir():
+        if not wp.is_dir() or _externally_owned_workspace(None, path):
             return
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
@@ -250,7 +294,6 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 not row
                 or row["workspace_kind"] not in _REMOVABLE_KINDS
                 or not row["workspace_path"]
-                or _externally_owned_workspace(conn, row["workspace_path"])
                 or _has_active_children(conn, parent_id)
             ):
                 continue
@@ -258,7 +301,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
                 continue
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
+            if wp.is_dir() and _is_managed_scratch_path(wp) and not _externally_owned_workspace(conn, str(wp)):
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:

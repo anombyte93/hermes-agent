@@ -62,6 +62,8 @@ def _require_worktree(task, worktree):
         raise ValueError("worktree must be an absolute path")
     if task.workspace_path is not None and task.workspace_path != worktree:
         raise ValueError("worktree does not match the task workspace")
+    if not Path(worktree).is_dir():
+        raise ValueError("worktree_not_found: external worktree must be an existing directory")
 
 
 def _snapshot(conn, task_id):

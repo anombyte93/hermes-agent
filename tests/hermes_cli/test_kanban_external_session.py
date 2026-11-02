@@ -34,6 +34,8 @@ INCARNATION = dict(session="existing-owner", id="$7", created="1000", pane="%9",
 def store(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    (tmp_path / "worktree").mkdir()
+    (tmp_path / "other-worktree").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
@@ -592,7 +594,8 @@ def test_closed_binding_still_excludes_workspace_and_tmux_cleanup(store, monkeyp
     effects = Mock(side_effect=AssertionError("owner cleanup"))
     monkeypatch.setattr(workspace, "_cleanup_worker_tmux", effects)
     monkeypatch.setattr(workspace, "_cleanup_worktree_workspace", effects)
-    store.execute("UPDATE tasks SET workspace_kind='worktree' WHERE id=?", (tid,))
+    store.execute("UPDATE tasks SET workspace_kind='worktree',workspace_path=? WHERE id=?",
+                  (active["binding"]["worktree"], tid))
     store.commit()
     workspace._cleanup_workspace(store, tid)
     assert not effects.called
@@ -779,15 +782,16 @@ def test_board_transfer_has_no_external_binding_and_card_can_be_claimed(store, t
     assert active == original
 
 
-def test_kernel_delete_refuses_live_binding_but_removes_closed_history(store):
+def test_kernel_delete_refuses_live_binding_and_retains_closed_history(store):
     tid = create(store)
     active = claim(store, tid)
     before = "\n".join(store.iterdump())
     assert not kb.delete_task(store, tid)
     assert "\n".join(store.iterdump()) == before
     external_api().external_release(store, tid, active["run_id"], reservation_token=TOKEN, reason="released")
-    assert kb.delete_task(store, tid)
-    assert not store.execute("SELECT 1 FROM task_external_bindings WHERE task_id=?", (tid,)).fetchone()
+    with pytest.raises(ValueError, match="external_workspace_retained"):
+        kb.delete_task(store, tid)
+    assert store.execute("SELECT 1 FROM task_external_bindings WHERE task_id=?", (tid,)).fetchone()
 
 
 @pytest.mark.parametrize("verb", ["claim", "complete", "release", "request-changes", "handover"])
@@ -927,3 +931,106 @@ def test_board_removal_refuses_active_external_binding(store, archive):
         external_api().external_release(conn, tid, active["run_id"],
             reservation_token=TOKEN, reason="explicitly released")
     assert kb.remove_board("bound-board", archive=archive)["action"] == ("archived" if archive else "deleted")
+
+
+def test_old_review_attempt_cannot_complete_newer_review(store):
+    tid = create(store)
+    first = claim(store, tid)
+    api = external_api()
+    api.external_complete(store, tid, first["run_id"], reservation_token=TOKEN, review=True)
+    assert kb.reopen_review_task(store, tid)
+    second = claim(store, tid, reservation_id="second-review", reservation_token=NEXT_TOKEN)
+    api.external_complete(store, tid, second["run_id"], reservation_token=NEXT_TOKEN, review=True)
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="stale"):
+        api.external_complete(store, tid, first["run_id"], reservation_token=TOKEN)
+    assert "\n".join(store.iterdump()) == before
+
+
+@pytest.mark.parametrize("route", ["claim-parent", "complete-parent", "handover-path", "handover-reuse", "request-changes"])
+def test_independent_external_lifecycle_guards(store, route):
+    api = external_api()
+    parent = kb.create_task(store, title="unfinished parent")
+    tid = create(store)
+    if route == "claim-parent":
+        kb.link_tasks(store, parent, tid)
+        with kb.write_txn(store):
+            store.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        with pytest.raises(ValueError, match="parents"):
+            claim(store, tid)
+        return
+    if route == "handover-path":
+        with kb.write_txn(store):
+            store.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(Path.home() / "worktree"), tid))
+    first = claim(store, tid)
+    if route == "complete-parent":
+        kb.link_tasks(store, parent, tid)
+        with pytest.raises(ValueError, match="parents"):
+            api.external_complete(store, tid, first["run_id"], reservation_token=TOKEN)
+    elif route == "request-changes":
+        # A reviewer is running after a claim from review. Model legacy/imported
+        # worker provenance, otherwise status/provenance checks mask the kind.
+        with kb.write_txn(store):
+            kb._append_event(store, tid, "review_requested", {"implementer": "fixture"})
+            kb._append_event(store, tid, "claimed", {"source_status": "review"}, run_id=first["run_id"])
+        before = "\n".join(store.iterdump())
+        assert not kb.request_changes(store, tid, reason="wrong API")[0]
+        assert "\n".join(store.iterdump()) == before
+    else:
+        reservation, token = "successor", NEXT_TOKEN
+        if route == "handover-reuse":
+            api.external_release(store, tid, first["run_id"], reservation_token=TOKEN, reason="release")
+            first = claim(store, tid, reservation_id="second", reservation_token=NEXT_TOKEN)
+            reservation, token = "fixture-r1", TOKEN
+        before = "\n".join(store.iterdump())
+        with pytest.raises(ValueError, match="worktree|reservation_conflict"):
+            api.external_handover(store, tid, first["run_id"], board="default",
+                reservation_token=NEXT_TOKEN if route == "handover-reuse" else TOKEN,
+                owner_host=OWNER_HOST, incarnation={**INCARNATION, "pid": "434343"},
+                worktree=str(Path.home() / ("other-worktree" if route == "handover-path" else "worktree")),
+                reservation_id=reservation, new_reservation_token=token, evidence="transfer")
+        assert "\n".join(store.iterdump()) == before
+
+
+def test_external_does_not_count_as_running_worker_or_accept_worker_heartbeat(store):
+    tid = create(store)
+    active = claim(store, tid)
+    before = "\n".join(store.iterdump())
+    assert dispatch.count_running_tasks(store) == 0
+    assert not dispatch.heartbeat_worker(store, tid, expected_run_id=active["run_id"])
+    assert "\n".join(store.iterdump()) == before
+    worker = kb.create_task(store, title="worker")
+    assert kb.claim_task(store, worker, claimer="fixture")
+    assert dispatch.count_running_tasks(store) == 1
+    assert dispatch.heartbeat_worker(store, worker)
+
+
+@pytest.mark.parametrize("method", ["delete_task", "delete_archived_task"])
+def test_closed_owner_history_is_retained(store, method):
+    tid = create(store)
+    active = claim(store, tid)
+    external_api().external_release(store, tid, active["run_id"], reservation_token=TOKEN, reason="release")
+    assert kb.archive_task(store, tid)
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="external_workspace_retained"):
+        getattr(kb, method)(store, tid)
+    assert "\n".join(store.iterdump()) == before
+    worker = kb.create_task(store, title="sharing", workspace_kind="scratch", workspace_path=active["binding"]["worktree"])
+    assert kb.archive_task(store, worker)
+    assert Path(active["binding"]["worktree"]).is_dir()
+
+
+def test_external_claim_refuses_missing_worktree(store):
+    tid = create(store)
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="worktree_not_found"):
+        claim(store, tid, worktree=str(Path.home() / "missing"))
+    assert "\n".join(store.iterdump()) == before
+
+
+def test_external_model_override_is_refused_without_storage(store):
+    tid = create(store)
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="external_session"):
+        kb.set_model_override(store, tid, "fixture-model", "fixture-provider")
+    assert "\n".join(store.iterdump()) == before

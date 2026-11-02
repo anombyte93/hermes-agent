@@ -35,6 +35,8 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
     identity = dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
                     backend="claude", conversation="fixture-conversation")
     with kbc.connect_closing() as conn:
@@ -43,7 +45,7 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
             kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
                 thread_id="topic-7", chat_type="thread", delivery_mode="notify+wake")
         active = external.external_claim(conn, tid, board="default", owner_host="fixture-host",
-            incarnation=identity, worktree="/fixture/worktree", reservation_id="fixture-r1",
+            incarnation=identity, worktree=str(worktree), reservation_id="fixture-r1",
             reservation_token="a" * 64)
         if action == "changes":
             external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64,
@@ -61,12 +63,17 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
         elif action == "handover":
             external.external_handover(conn, tid, active["run_id"], reservation_token="a" * 64,
                 owner_host="fixture-host", incarnation={**identity, "pid": "434343"},
-                worktree="/fixture/worktree", reservation_id="fixture-r2", new_reservation_token="b" * 64,
+                worktree=str(worktree), reservation_id="fixture-r2", new_reservation_token="b" * 64,
                 evidence="explicit transfer", board="default")
         elif action == "review":
             external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64,
                 summary="review evidence", review=True)
 
+    from unittest.mock import Mock
+    from gateway import kanban_watchers_notifier as notifier
+
+    catalog = Mock(wraps=notifier.t)
+    monkeypatch.setattr(notifier, "t", catalog)
     adapter = RecordingAdapter()
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
@@ -97,6 +104,8 @@ def test_external_lifecycle_notifier_tick_is_routed_deduplicated_and_token_free(
     if wakes:
         assert adapter.handled[0].source.thread_id == "topic-7"
         assert "gateway.kanban.wake.external_" not in adapter.handled[0].text
+        kind = {"complete": "completed", "review": "review_requested", "changes": "changes_requested", "release": "released"}[action]
+        catalog.assert_any_call("gateway.kanban.wake.external_" + kind)
     counts = len(adapter.sent), len(adapter.handled)
     asyncio.run(one_tick())
     assert (len(adapter.sent), len(adapter.handled)) == counts
