@@ -1057,10 +1057,12 @@ def _reclaim_dead_workers(
     conn: sqlite3.Connection, board: Optional[str] = None,
 ) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
+    from hermes_cli.kanban_rate_limit import contains_provider_limit, provider_limit_details, worker_log_tail
+
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1089,6 +1091,16 @@ def _reclaim_dead_workers(
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"])
+            if dead.run_outcome in ("crashed", "protocol_violation", "rate_limited"):
+                tail = worker_log_tail(row["id"], run_id=row["current_run_id"], board=board)
+                if dead.rate_limited or contains_provider_limit(tail):
+                    error, details = provider_limit_details(
+                        conn, row["id"], tail, int(time.time()), _kb._resolve_rate_limit_cooldown_seconds(),
+                    )
+                    payload = dict(dead.event_payload)
+                    payload.pop("protocol_violation", None)
+                    payload.update(details)
+                    dead = _DeadWorker(dead.kind, dead.code, error, "rate_limited", payload, rate_limited=True)
             if (
                 not dead.rate_limited
                 and not dead.protocol_violation
@@ -1553,9 +1565,9 @@ def check_respawn_guard(
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
@@ -1564,11 +1576,14 @@ def check_respawn_guard(
             # the stamped rate-limit text doesn't re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        until = _kb._json_dict(latest_run["metadata"]).get("rate_limit_until")
+        if not isinstance(until, (int, float)):
+            # Pre-deadline runs retain their original fixed-cooldown behaviour.
+            until = int(ended_at) + rl_cooldown
+        if now < until:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # Deadline elapsed: allow one probe without blocker_auth trapping the
+        # stamped provider-limit reason forever.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
@@ -3078,7 +3093,13 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
-    return open(log_path, "ab")
+    stream = open(log_path, "ab")
+    if task.current_run_id is not None:
+        # A short earlier attempt can still be inside the 64 KiB tail. Fence
+        # it before spawning so even a worker that prints nothing owns a tail.
+        stream.write(f"\n[kanban run {task.current_run_id}]\n".encode())
+        stream.flush()
+    return stream
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
