@@ -167,7 +167,8 @@ def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> b
     try:
         current = None
         if conn is not None:
-            if _store_owns_external_workspace(conn, path):
+            # ``None`` (unreadable store) is ownership: fail closed, keep the path.
+            if _store_owns_external_workspace(conn, path) is not False:
                 return True
             current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
         paths = {_kb.kanban_home() / "kanban.db"}
@@ -185,7 +186,7 @@ def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> b
             if db.resolve() == current or not (db.exists() or db.is_symlink()):
                 continue
             with contextlib.closing(connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)) as other:
-                if _store_owns_external_workspace(other, path):
+                if _store_owns_external_workspace(other, path) is not False:
                     return True
         return False
     except (OSError, RuntimeError, ValueError, sqlite3.Error):
