@@ -657,7 +657,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError(f"board {normed!r} does not exist")
 
     from hermes_cli.kanban_db_connect import connect_closing
-    from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
+    from hermes_cli.kanban_db_workspace import _externally_owned_workspace, _store_owns_external_workspace
     try:
         with connect_closing(board=normed) as conn:
             binding = conn.execute(
@@ -676,6 +676,16 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # only a verified no-ownership (False) may hard-delete.
     if not archive and history is not False:
         raise ValueError("external_binding_history: use the archive route to retain workspace ownership")
+    # Gate (b): before ANY filesystem removal of the board directory (delete
+    # or archive-move), ask whether any store owns a path overlapping it —
+    # another board's external card or live binding may sit inside this
+    # board's workspaces/. ``_externally_owned_workspace`` already fails
+    # closed (an unreadable store anywhere reads as ownership).
+    if _externally_owned_workspace(None, str(d)):
+        raise ValueError(
+            f"externally_owned_workspace: board {normed!r} contains a path owned by "
+            "another store's external session; release that ownership first"
+        )
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
