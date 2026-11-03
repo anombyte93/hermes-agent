@@ -663,6 +663,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             binding = conn.execute(
                 "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
             ).fetchone()
+            # None (unreadable store) is ownership: fail closed, keep the board.
             history = _store_owns_external_workspace(conn)
     except sqlite3.Error as exc:
         raise ValueError(
@@ -671,7 +672,9 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         ) from exc
     if binding is not None:
         raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
-    if not archive and history is not None:
+    # Fail closed: refuse on ownership (True) or an unreadable store (None);
+    # only a verified no-ownership (False) may hard-delete.
+    if not archive and history is not False:
         raise ValueError("external_binding_history: use the archive route to retain workspace ownership")
 
     # If the user removed the currently-active board, revert to default.
@@ -4233,7 +4236,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
-    if _store_owns_external_workspace(conn):
+    # Task-scoped, fail closed: refuse when THIS card owns (or may own) an
+    # external workspace; other cards' ownership is theirs to release.
+    if _store_owns_external_workspace(conn, task_id=task_id) is not False:
         raise ValueError("external_workspace_retained: external binding history preserves workspace ownership")
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):

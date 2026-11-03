@@ -110,40 +110,54 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _external_workspace_paths(conn: sqlite3.Connection):
+def _external_workspace_paths(conn: sqlite3.Connection, task_id: str | None = None):
     """``workspace_path`` of every external card that ever bound or reserved one.
 
     Never-claimed ``external_session`` cards carry their reservation in
     ``tasks.workspace_path``; claimed sessions additionally record it in
     ``task_external_bindings.worktree``. Both arms are ownership: a board or
     task row leaving this store must not silently drop the reserved path.
+    ``task_id`` narrows both arms to one card (task deletion refuses on the
+    deleted card's own ownership, not on anything else the store owns).
     """
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "task_external_bindings" in tables:
-        yield from (row[0] for row in conn.execute("SELECT DISTINCT worktree FROM task_external_bindings"))
+        if task_id is None:
+            yield from (row[0] for row in conn.execute("SELECT DISTINCT worktree FROM task_external_bindings"))
+        else:
+            yield from (row[0] for row in conn.execute(
+                "SELECT DISTINCT worktree FROM task_external_bindings WHERE task_id = ?", (task_id,)))
     if "tasks" in tables:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         if "execution_kind" in columns:
-            yield from (row[0] for row in conn.execute(
-                "SELECT workspace_path FROM tasks WHERE execution_kind='external_session' "
-                "AND workspace_path IS NOT NULL"))
+            if task_id is None:
+                yield from (row[0] for row in conn.execute(
+                    "SELECT workspace_path FROM tasks WHERE execution_kind='external_session' "
+                    "AND workspace_path IS NOT NULL"))
+            else:
+                yield from (row[0] for row in conn.execute(
+                    "SELECT workspace_path FROM tasks WHERE execution_kind='external_session' "
+                    "AND workspace_path IS NOT NULL AND id = ?", (task_id,)))
 
 
-def _store_owns_external_workspace(conn: sqlite3.Connection, path: str | None = None) -> bool | None:
-    """Does this store own an external workspace at ``path`` (or at all)?
+def _store_owns_external_workspace(
+    conn: sqlite3.Connection, path: str | None = None, *, task_id: str | None = None,
+) -> bool | None:
+    """Does this store (or one of its tasks) own an external workspace?
 
     The single ownership predicate behind every removal route: the binding
     history (``task_external_bindings``) and every ``external_session`` card's
     reserved ``workspace_path``, including never-claimed cards. With ``path``,
     ownership means the path overlaps a recorded workspace; without one, any
-    recorded workspace on the store counts (board removal's history check).
+    recorded workspace counts (board removal's history check). ``task_id``
+    narrows the question to one card's own ownership (task deletion).
 
     Overlap follows :func:`_externally_owned_workspace`: either path contains
     the other. ``None`` means the store could not be read (unknown ownership);
     callers decide how to fail, and every removal route fails closed.
     """
     try:
-        sources = list(_external_workspace_paths(conn))
+        sources = list(_external_workspace_paths(conn, task_id))
         if path is None:
             return bool(sources)
         target = Path(path).expanduser().resolve()
