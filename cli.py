@@ -4134,19 +4134,9 @@ def _run_quiet_single_query(cli, effective_query):
     # --no-fallback: a provider failure blocks a Kanban card with the reason instead of
     # the quota-wall requeue below (which would retry the same route without a word).
     _exit_if_no_fallback_failed(cli, result)
-    # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
-    # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
-    # the task without counting a failure (a quota window must not trip the breaker).
-    _exit_code = 0
-    if isinstance(result, dict) and result.get("failed"):
-        _exit_code = 1
-        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-            try:
-                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-                _exit_code = _RL_CODE
-            except Exception:
-                _exit_code = 1
-    sys.exit(_exit_code)
+    from hermes_cli.cli_single_query import single_query_exit_code
+
+    sys.exit(single_query_exit_code(result))
 
 
 def _route_single_query_images(cli, query, effective_query, single_query_images, single_query_image_urls):
@@ -4465,7 +4455,11 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
-        _exit_if_no_fallback_failed(cli, getattr(cli, "_last_turn_result", None))
+        result = getattr(cli, "_last_turn_result", None)
+        _exit_if_no_fallback_failed(cli, result)
+        from hermes_cli.cli_single_query import single_query_exit_code
+
+        sys.exit(single_query_exit_code(result))
     finally:
         _finalize_single_query(cli)
 

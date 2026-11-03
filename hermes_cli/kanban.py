@@ -597,6 +597,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     field("status", task.status)
     if task.status == "blocked" and task.block_reason:
         field("blocked", task.block_reason)
+    if task.last_failure_error and task.last_failure_error.startswith("provider usage limit (HTTP 429)"):
+        field("waiting", task.last_failure_error)
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)

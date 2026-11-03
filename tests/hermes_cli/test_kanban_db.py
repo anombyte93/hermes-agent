@@ -319,7 +319,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
         # Last failure error stamped so the respawn guard recognizes the
         # quota wall.
-        assert task.last_failure_error and "rate-limited" in task.last_failure_error
+        assert task.last_failure_error and "provider usage limit (HTTP 429)" in task.last_failure_error
 
         # A ``rate_limited`` run outcome was recorded (not ``crashed``).
         outcomes = [
