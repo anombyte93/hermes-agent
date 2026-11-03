@@ -1303,3 +1303,43 @@ def test_idle_external_card_cannot_enter_triage(client, route, closed):
     with kbc.connect_closing() as conn:
         assert "\n".join(conn.iterdump()) == before
 
+
+def test_dashboard_board_delete_refuses_cross_store_owned_path(client, tmp_path, monkeypatch):
+    """The dashboard board-delete route inherits remove_board's two gates.
+
+    A path under the deleted board's directory that ANOTHER store owns (a
+    never-claimed external_session card on the default board) must make
+    DELETE /boards/{slug}?delete=true fail with 400 and keep both the board
+    and the owned path. Kills the ``dash_board_bypass`` mutant, which
+    rmtree's the board directory without consulting remove_board.
+    """
+    from hermes_cli import kanban_db_workspace as kbw
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *a, **k: None)
+
+    kb.create_board("owner-a")
+    kb.create_board("holder-b")
+    p = kb.workspaces_root(board="holder-b") / "shared"
+    p.mkdir(parents=True)
+    (p / "proof").write_bytes(b"owned")
+    with kbc.connect_closing(board="owner-a") as owner:
+        kb.create_task(owner, title="reserved external workspace",
+                       execution_kind="external_session",
+                       workspace_kind="dir", workspace_path=str(p))
+
+    response = client.delete("/api/plugins/kanban/boards/holder-b?delete=true")
+    assert response.status_code == 400, response.text
+    assert "externally_owned_workspace" in response.text
+    assert kb.board_dir("holder-b").is_dir()
+    assert (p / "proof").read_bytes() == b"owned"
+
+    # Control: with the reservation released (workspace_path cleared on the
+    # owner card — deleting the card itself is rightly refused while it owns
+    # the path), the same route hard-deletes the board.
+    with kbc.connect_closing(board="owner-a") as owner:
+        owner.execute("UPDATE tasks SET workspace_path = NULL WHERE execution_kind = 'external_session'")
+        owner.commit()
+    response = client.delete("/api/plugins/kanban/boards/holder-b?delete=true")
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["action"] == "deleted"
+    assert not kb.board_dir("holder-b").exists()
+
