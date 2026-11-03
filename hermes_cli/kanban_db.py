@@ -3866,11 +3866,25 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    with_reason: bool = False,
+):
+    """Resume a blocked/scheduled card, or reasoned block-loop triage.
+
+    Normal holds keep their resumable phase and block-loop memory. Only a
+    breaker-entered triage may reset it, with a recorded answer. Returns bool,
+    or ``(ok, refusal_reason)`` when ``with_reason=True``.
+    """
+    def _ret(ok: bool, detail: Optional[str] = None):
+        return (ok, detail) if with_reason else ok
+
     now = int(time.time())
     with write_txn(conn):
+        if _task_status(conn, task_id) == "triage":
+            from hermes_cli.kanban_db_unblock import unblock_loop_triage
+
+            return _ret(*unblock_loop_triage(conn, task_id, reason=reason, now=now))
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3898,7 +3912,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
-            return False
+            return _ret(False, "not blocked/scheduled or unknown task")
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -3907,7 +3921,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
-        return True
+        return _ret(True)
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:

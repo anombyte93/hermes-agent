@@ -376,10 +376,20 @@ times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
 — where a cron would just keep unblocking it — and routes it to `triage` for a
 human decision. This is a deterministic DB guard, not an LLM judgment call, and
 a task's body text cannot opt out of it: the recurrence counter deliberately
-survives each unblock (it resets only on a successful `complete`). To keep an
-unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
-parent, missing input, unmet capability) before unblocking, or raise
-`BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+survives each ordinary unblock. It resets on successful `complete`, or when the
+parent answers a **block-loop triage** hold with a reason:
+
+```bash
+hermes kanban unblock t_abc --reason "Parent answered: prerequisite is now available"
+```
+
+That triage recovery is allowed only when the latest status-entering event is
+`block_loop_detected`; comments and assignment edits do not change the provenance.
+The reason is required, the recurrence counter and block kind are cleared, and one
+`unblocked` event records `from: triage`, the reason and the previous recurrence
+count. It returns to `ready`, or `todo` while a parent remains unfinished. A plain
+triage card (or a later manual move back to triage) still needs `hermes kanban specify`.
+Resolve *why the card keeps re-blocking* before returning it to the work pool.
 :::
 
 ## Enabling tools for a chat profile
