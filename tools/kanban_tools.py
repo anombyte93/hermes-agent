@@ -1198,7 +1198,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 @_kanban_handler("kanban_unblock")
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition a blocked task to ready, or todo while parents remain open."""
+    """Resume a hold, including reasoned block-loop triage, with parent gating."""
     _reject_delegated_child_mutation("kanban_unblock")
     _require_orchestrator_tool("kanban_unblock")
     tid = args.get("task_id")
@@ -1206,7 +1206,8 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+        ok, detail = kb.unblock_task(conn, tid, reason=args.get("reason"), with_reason=True)
+        _check(ok, f"could not unblock {tid}: {detail}")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
