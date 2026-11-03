@@ -111,6 +111,13 @@ def _is_managed_scratch_path(p: Path) -> bool:
 
 
 def _external_workspace_paths(conn: sqlite3.Connection):
+    """``workspace_path`` of every external card that ever bound or reserved one.
+
+    Never-claimed ``external_session`` cards carry their reservation in
+    ``tasks.workspace_path``; claimed sessions additionally record it in
+    ``task_external_bindings.worktree``. Both arms are ownership: a board or
+    task row leaving this store must not silently drop the reserved path.
+    """
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "task_external_bindings" in tables:
         yield from (row[0] for row in conn.execute("SELECT DISTINCT worktree FROM task_external_bindings"))
@@ -122,6 +129,33 @@ def _external_workspace_paths(conn: sqlite3.Connection):
                 "AND workspace_path IS NOT NULL"))
 
 
+def _store_owns_external_workspace(conn: sqlite3.Connection, path: str | None = None) -> bool | None:
+    """Does this store own an external workspace at ``path`` (or at all)?
+
+    The single ownership predicate behind every removal route: the binding
+    history (``task_external_bindings``) and every ``external_session`` card's
+    reserved ``workspace_path``, including never-claimed cards. With ``path``,
+    ownership means the path overlaps a recorded workspace; without one, any
+    recorded workspace on the store counts (board removal's history check).
+
+    Overlap follows :func:`_externally_owned_workspace`: either path contains
+    the other. ``None`` means the store could not be read (unknown ownership);
+    callers decide how to fail, and every removal route fails closed.
+    """
+    try:
+        sources = list(_external_workspace_paths(conn))
+        if path is None:
+            return bool(sources)
+        target = Path(path).expanduser().resolve()
+        for source in sources:
+            owned_path = Path(source).expanduser().resolve()
+            if target.is_relative_to(owned_path) or owned_path.is_relative_to(target):
+                return True
+        return False
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return None
+
+
 def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> bool:
     """Fail closed at removal: a session owns overlapping paths on every board.
 
@@ -131,15 +165,9 @@ def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> b
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     try:
-        target = Path(path).expanduser().resolve()
-
-        def overlaps(source):
-            owned = Path(source).expanduser().resolve()
-            return target.is_relative_to(owned) or owned.is_relative_to(target)
-
         current = None
         if conn is not None:
-            if any(overlaps(source) for source in _external_workspace_paths(conn)):
+            if _store_owns_external_workspace(conn, path):
                 return True
             current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
         paths = {_kb.kanban_home() / "kanban.db"}
@@ -157,7 +185,7 @@ def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> b
             if db.resolve() == current or not (db.exists() or db.is_symlink()):
                 continue
             with contextlib.closing(connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)) as other:
-                if any(overlaps(source) for source in _external_workspace_paths(other)):
+                if _store_owns_external_workspace(other, path):
                     return True
         return False
     except (OSError, RuntimeError, ValueError, sqlite3.Error):

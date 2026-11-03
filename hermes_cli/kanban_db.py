@@ -657,12 +657,13 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError(f"board {normed!r} does not exist")
 
     from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
     try:
         with connect_closing(board=normed) as conn:
             binding = conn.execute(
                 "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
             ).fetchone()
-            history = conn.execute("SELECT 1 FROM task_external_bindings LIMIT 1").fetchone()
+            history = _store_owns_external_workspace(conn)
     except sqlite3.Error as exc:
         raise ValueError(
             f"board_unreadable: cannot verify external ownership on {normed!r}; "
@@ -4231,7 +4232,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
-    if conn.execute("SELECT 1 FROM task_external_bindings WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+    from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
+    if _store_owns_external_workspace(conn):
         raise ValueError("external_workspace_retained: external binding history preserves workspace ownership")
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):
@@ -4250,14 +4252,19 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task; an active external binding must be released first."""
+    """Hard-delete a task; an active external binding must be released first.
+
+    The ownership check runs before the row delete: refusing (a never-claimed
+    external reservation or a binding history) must leave the whole store
+    untouched, not a half-deleted card.
+    """
     with write_txn(conn):
         if has_external_attempt(conn, task_id):
             return False
+        _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
 
