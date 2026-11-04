@@ -354,14 +354,17 @@ def test_history_refusal_names_the_archive_route_when_it_would_succeed(kanban_tm
     path OUTSIDE the board directory. Hard delete refuses on binding history;
     the archive route would succeed (no active binding, gate (b) False on the
     board directory), so the refusal must NAME it — not send the user to a
-    release/delete route that refuses."""
+    release/delete route that refuses. The assertion pins the OFFERING
+    wording, so a hint that never offers the archive route (or offers it only
+    by accident of the word 'archive') is caught."""
     x = _own_x_outside_home(kanban_tmp_home, "never_claimed")
     with pytest.raises(ValueError) as exc:
         kb.remove_board("holder-b", archive=False)
     msg = str(exc.value)
     assert "external_binding_history" in msg
     assert str(x) in msg, msg
-    assert "archive" in msg, msg  # the route that actually works is named
+    assert "archive the board instead" in msg, msg  # the route that works is offered
+    assert "refuses too" not in msg, msg  # ...and the refusing wording is absent
     assert "another store" not in msg, msg
     assert kb.board_dir("holder-b").is_dir()
     assert (x / "work").read_bytes() == b"live work"
