@@ -277,3 +277,24 @@ def test_attachments_root_pin_wins_for_a_named_board(world, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(forced))
     assert kb.attachments_root(board="other") == forced
     assert kb.task_attachments_dir("t_x", board="other") == forced / "t_x"
+
+
+# --- Defect E (round 9): an invalid slug under a root pin returns the pin ---
+
+
+def test_invalid_slug_with_a_root_pin_returns_the_pin(world, monkeypatch):
+    """Defect E: with ``HERMES_KANBAN_WORKSPACES_ROOT`` set, an invalid slug
+    such as ``workspaces_root(board='Bad Slug!')`` returns the pin, exactly
+    as at base — the env override is checked before the slug is normalised.
+    Rounds 7/8 normalised first, so the same call raised ValueError."""
+    home, pin = world
+    forced = home.parent / "forced-workspaces"
+    forced_att = home.parent / "forced-attachments"
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(forced))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(forced_att))
+    assert kb.workspaces_root(board="Bad Slug!") == forced
+    assert kb.attachments_root(board="Bad Slug!") == forced_att
+    # And without a pin the invalid slug still raises, as at base.
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
+    with pytest.raises(ValueError):
+        kb.workspaces_root(board="Bad Slug!")
