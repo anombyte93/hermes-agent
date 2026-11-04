@@ -1,0 +1,48 @@
+Query: work kanban task t_e56bd193
+Initializing agent...
+────────────────────────────────────────
+
+⚠ Auxiliary title generation failed: HTTP 429: You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab...
+⚠️  API call failed (attempt 1/3): RateLimitError [HTTP 429]
+   🔌 Provider: kimi-coding  Model: k3.1-pro
+   🌐 Endpoint: https://api.kimi.com/coding
+   📝 Error: HTTP 429: You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota
+   📋 Details: {'error': {'type': 'rate_limit_error', 'message': "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota"}, 'type': 'error'}
+   ⏱️  Elapsed: 1.31s  Context: 2 msgs, ~11,421 tokens
+⏱️ Rate limited. Waiting 2.5s (attempt 2/3)...
+⚠️  API call failed (attempt 2/3): RateLimitError [HTTP 429]
+   🔌 Provider: kimi-coding  Model: k3.1-pro
+   🌐 Endpoint: https://api.kimi.com/coding
+   📝 Error: HTTP 429: You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota
+   📋 Details: {'error': {'type': 'rate_limit_error', 'message': "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota"}, 'type': 'error'}
+   ⏱️  Elapsed: 5.09s  Context: 2 msgs, ~11,421 tokens
+⏱️ Rate limited. Waiting 5.0s (attempt 3/3)...
+⚠️  API call failed (attempt 3/3): RateLimitError [HTTP 429]
+   🔌 Provider: kimi-coding  Model: k3.1-pro
+   🌐 Endpoint: https://api.kimi.com/coding
+   📝 Error: HTTP 429: You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota
+   📋 Details: {'error': {'type': 'rate_limit_error', 'message': "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota"}, 'type': 'error'}
+   ⏱️  Elapsed: 11.27s  Context: 2 msgs, ~11,421 tokens
+❌ Rate limited after 3 retries — HTTP 429: You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota
+   💀 Final error: HTTP 429: You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota
+ ─  ☤ Hermes  ───────────────────────────────────────────────────────────────── 
+                                                                                
+ API call failed after 3 retries: HTTP 429: You've reached your 5-hour usage    
+ limit. Your quota will reset when the current 5-hour window ends. To continue  
+ now, purchase extra usage or upgrade your plan:                                
+ https://www.kimi.com/membership/subscription?tab=quota                         
+                                                                                
+ ────────────────────────────────────────────────────────────────────────────── 
+
+Resume this session with:
+  hermes --resume 20261102_100141_e353e2 -p evo
+  hermes -c "work kanban task t_e56bd193" -p evo
+
+Session:        20261102_100141_e353e2
+Title:          work kanban task t_e56bd193
+Duration:       17s
+Messages:       1 (1 user, 0 tool calls)
+Query: work kanban task t_e56bd193
+Initializing agent...
+────────────────────────────────────────
+

@@ -159,8 +159,12 @@ def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
 
-    slug = args.slug or kb.get_current_board()
-    output = args.output or f"{slug}.tar.gz"
+    # An explicit slug is one the user typed. With no slug, pass None through
+    # so `export_board` resolves as at base and a HERMES_KANBAN_DB pin wins;
+    # the active board is consulted only for the default output filename
+    # (display), never to pick the store.
+    slug = args.slug
+    output = args.output or f"{slug or kb.get_current_board()}.tar.gz"
     try:
         res = kanban_transfer.export_board(
             slug, output, include_attachments=not args.no_attachments, include_logs=args.include_logs,

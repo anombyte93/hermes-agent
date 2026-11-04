@@ -474,3 +474,71 @@ def test_never_claimed_card_protects_shared_path(kanban_home, repo):
                        workspace_kind="dir", workspace_path=str(wt))
         assert kb.archive_task(conn, worker)
         assert wt.is_dir()
+
+
+def test_deferred_parent_cleanup_pins_conn_after_store_move(kanban_home, repo, tmp_path, monkeypatch):
+    """D1: the deferred-parent cleanup must pass its live ``conn``.
+
+    A store claimed on the canonical board, closed, then moved to a custom DB
+    path with no ``HERMES_KANBAN_DB`` pin is invisible to a fresh connection —
+    only the caller's ``conn`` (pinned to the moved store via
+    ``PRAGMA database_list``) still sees the active binding on the parent's
+    worktree. Dropping ``conn=conn`` from the deferred-parent
+    ``_cleanup_worktree_workspace`` call silently reaps the worktree the moved
+    store still owns. The unbound control removes its worktree through the
+    same route, proving the route itself still reaps.
+    """
+    from hermes_cli import kanban_db_external as external
+
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
+    with kbc.connect_closing() as conn:
+        # A store claimed on the canonical board, then closed (binding history
+        # only: no active binding row anywhere on the moved store).
+        owner = kb.create_task(conn, title="external owner", execution_kind="external_session")
+        active = external.external_claim(conn, owner, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree=str(repo), reservation_id="move-fixture", reservation_token="a" * 64)
+        external.external_release(conn, owner, active["run_id"],
+                                  reservation_token="a" * 64, reason="store moving")
+
+        parent, parent_wt = _worktree_task(conn, repo, title="deferred parent")
+        # An ACTIVE binding on the parent's worktree, recorded after the store
+        # moved (the path only this conn can still see).
+        holder = kb.create_task(conn, title="active binding holder",
+                                execution_kind="external_session")
+        external.external_claim(conn, holder, board="default", owner_host="fixture-host",
+            incarnation=dict(session="holder", id="$8", created="1000", pane="%9", pid="424243",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree=str(parent_wt), reservation_id="hold-fixture", reservation_token="b" * 64)
+
+        # Move the store to a custom path with no pin: fresh connections land
+        # on an empty canonical DB that knows nothing about the binding.
+        original = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        custom = tmp_path / "moved-store.db"
+    original.rename(custom)
+    with kbc.connect_closing(custom) as conn:
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        assert kb.archive_task(conn, parent)  # deferred: its child is active
+        assert parent_wt.is_dir()
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert kb.claim_task(conn, child, claimer="worker") is not None
+        assert kb.complete_task(conn, child, summary="done")
+        # The moved store still owns the parent worktree via the active
+        # binding; only the caller's conn can see it. Kept.
+        assert parent_wt.is_dir(), "deferred parent cleanup dropped the moved store's binding"
+
+    # Unbound control: the same route removes an unbound worktree.
+    with kbc.connect_closing() as conn:
+        control, control_wt = _worktree_task(conn, repo, title="unbound control")
+        control_child = kb.create_task(conn, title="control child", parents=[control], assignee="worker")
+        assert kb.archive_task(conn, control)  # deferred: its child is active
+        assert control_wt.is_dir()
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (control_child,))
+        assert kb.claim_task(conn, control_child, claimer="worker") is not None
+        assert kb.complete_task(conn, control_child, summary="done")
+        assert not control_wt.exists(), "unbound control worktree was not reaped"

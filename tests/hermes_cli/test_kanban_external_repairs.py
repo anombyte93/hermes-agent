@@ -88,7 +88,7 @@ def test_closed_binding_refuses_hard_delete_but_archive_retains_shared_path(stor
         tid = create(owner)
         run = claim(owner, tid, board="owner-board", worktree=str(owned))["run_id"]
         ext.external_complete(owner, tid, run, reservation_token=TOKEN)
-    with pytest.raises(ValueError, match="external_binding_history.*archive"):
+    with pytest.raises(ValueError, match="external_binding_history.*before removal"):
         kb.remove_board("owner-board", archive=False)
     assert kb.board_dir("owner-board").is_dir()
     assert kb.remove_board("owner-board", archive=True)["action"] == "archived"

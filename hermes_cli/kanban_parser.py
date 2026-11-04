@@ -384,9 +384,12 @@ _SPECS = [
         _reason_flag("Reason (also appended as a comment)."),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
-             help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
-                  "parents finish, no human); 'needs_input'/'capability' go to "
-                  "blocked for a human; 'transient' marks a maybe-flaky failure. "
+             help="Typed block reason. 'dependency' only when this card has an "
+                  "unfinished parent card (it waits in todo and is auto-promoted "
+                  "when the parents finish); with none it lands in blocked for a "
+                  "human. A question for whoever filed the card is "
+                  "kind='needs_input'. 'needs_input'/'capability' go to blocked "
+                  "for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),
@@ -397,9 +400,9 @@ _SPECS = [
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
-        _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _reason("Reason/note, required for block-loop triage; recorded as a comment and on the triage unblock event. Quote multi-word reasons."),
         _TASK_IDS,
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    ], help="Resume blocked/scheduled or reasoned block-loop triage tasks; plain triage needs specify"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

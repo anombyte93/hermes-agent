@@ -93,6 +93,9 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
+# Dependency waits use todo only with an unfinished parent, without counting
+# recurrences. With no unfinished parent they block for a human and count
+# toward the same recurrence limit as other kinds.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Stamped onto legacy blocked rows during migration: their true cause is not
 # recoverable, so persist an explicit unknown label rather than guessing.
@@ -475,6 +478,25 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _own_store_path(slug: str) -> Path:
+    """The real store a board's OWN decisions must open, never ``_board_path``.
+
+    ``_board_path`` gives the ``HERMES_KANBAN_DB`` pin the highest precedence
+    for every caller, as at base — but an OWNERSHIP decision (import scrub,
+    explicit export, remove_board, gate (b) and the binding checks) that NAMES
+    a board must read that board's own store, or a pinned worker would
+    scrub/export/remove the wrong store (S6/S7). For ``default`` the pin wins
+    (it re-anchors the legacy ``<root>/kanban.db`` layout, as at base); for
+    any other slug it is always ``board_dir(slug)/kanban.db``.
+    """
+    if slug == DEFAULT_BOARD:
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pin:
+            return Path(pin).expanduser()
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
@@ -656,12 +678,32 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError(f"board {normed!r} does not exist")
 
     from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_db_workspace import (
+        _externally_owned_workspace_detail,
+        _own_external_paths_detail,
+        _store_owns_external_workspace,
+    )
+    # Open the removed board's OWN store by path, never through the resolver:
+    # ``_board_path`` gives ``HERMES_KANBAN_DB`` the highest precedence (as at
+    # base), and the dispatcher pins that override into every worker's
+    # environment, so a name-based open would read the PINNED store and
+    # removal would sail past a board that owns external workspaces (S6).
+    # ``_own_store_path`` is the one ownership-decision resolver: a named
+    # board's own store, never the pin.
+    own_db = _own_store_path(normed)
     try:
-        with connect_closing(board=normed) as conn:
+        with connect_closing(own_db) as conn:
             binding = conn.execute(
                 "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
             ).fetchone()
-            history = conn.execute("SELECT 1 FROM task_external_bindings LIMIT 1").fetchone()
+            # None (unreadable store) is ownership: fail closed, keep the board.
+            history = _store_owns_external_workspace(conn)
+            # Evidence for the refusal messages below: which of THIS store's
+            # cards reserve paths inside the board directory (gate (b)), and
+            # every reservation the store holds (the history check owns any
+            # path, wherever it points). Computed while the connection is open.
+            own_paths = _own_external_paths_detail(conn, str(d))
+            own_any = _own_external_paths_detail(conn, None)
     except sqlite3.Error as exc:
         raise ValueError(
             f"board_unreadable: cannot verify external ownership on {normed!r}; "
@@ -669,8 +711,52 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         ) from exc
     if binding is not None:
         raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
-    if not archive and history is not None:
-        raise ValueError("external_binding_history: use the archive route to retain workspace ownership")
+    # Fail closed: refuse on ownership (True) or an unreadable store (None);
+    # only a verified no-ownership (False) may hard-delete.
+    if not archive and history is not False:
+        # Name the board's own reservation the user must resolve first, and
+        # the route that actually works: when no active binding exists and
+        # gate (b) is False on the board directory, `archive=True` succeeds
+        # (A4's closed-history shape) — name it. When the archive route
+        # refuses too, say WHY it refuses — the real cause from gate (b),
+        # never an invented one: the board's own reservation inside the
+        # directory, another store owning a path inside it, or a store that
+        # could not be read (release and delete both refuse on closed
+        # history, so the tail must send the user to the true blocker).
+        owned_elsewhere, archive_detail = _externally_owned_workspace_detail(None, str(d))
+        if not owned_elsewhere:
+            raise ValueError(
+                f"external_binding_history: board {normed!r}'s own cards reserve external "
+                f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
+                "release or clear those reservations before removal, or archive the board "
+                f"instead (`hermes kanban boards rm {normed}` keeps the board's bytes and "
+                "retains the reserved paths)")
+        cause = (
+            "a reserved path lies inside the board directory" if own_paths else archive_detail)
+        raise ValueError(
+            f"external_binding_history: board {normed!r}'s own cards reserve external "
+            f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
+            "release or clear those reservations before removal — the archive route "
+            f"refuses too ({cause})")
+    # Gate (b): before ANY filesystem removal of the board directory (delete
+    # or archive-move), ask whether any store owns a path overlapping it —
+    # another board's external card or live binding may sit inside this
+    # board's workspaces/. ``_externally_owned_workspace`` already fails
+    # closed (an unreadable store anywhere reads as ownership).
+    owned, owned_detail = _externally_owned_workspace_detail(None, str(d))
+    if owned:
+        if own_paths:
+            raise ValueError(
+                f"externally_owned_workspace: board {normed!r} contains a path reserved "
+                f"by its own store's external session card ({own_paths}); resolve that "
+                f"card first — moving the board would break the session it reserves")
+        if owned_detail is not None:
+            raise ValueError(
+                f"externally_owned_workspace: {owned_detail}; refusing to remove "
+                f"board {normed!r} while ownership cannot be ruled out")
+        raise ValueError(
+            f"externally_owned_workspace: board {normed!r} contains a path owned by "
+            "another store's external session; release that ownership first")
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
@@ -979,9 +1065,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- larger boards.
     session_id           TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
+    -- NULL for legacy/un-typed blocks). ``dependency`` goes to ``todo`` only
+    -- with an unfinished parent; otherwise it goes to ``blocked`` for a human,
+    -- like the other kinds. Preserved across unblock so a re-block for
     -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
@@ -3565,6 +3651,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            parents_satisfied=_parents_satisfied(conn, task_id),
             allow_triage=execution_kind_of(conn, task_id) == "worker",
         )
         sql = f"""
@@ -3589,7 +3676,7 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        if event_kind == "dependency_wait":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
             return True
@@ -3599,13 +3686,14 @@ def block_task(
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int, allow_triage: bool = True,
+    prev_kind: Optional[str], prev_recurrences: int, parents_satisfied: bool,
+    allow_triage: bool = True,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
-    ``dependency`` never enters the human ``blocked`` bucket: it waits in
-    ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Every other kind counts unblock-loop
+    ``dependency`` waits in ``todo`` only while a parent is unfinished;
+    otherwise it lands in ``blocked`` for a human. A genuine wait cannot spin
+    and keeps the recurrence counter unchanged. Other paths count unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
@@ -3613,8 +3701,9 @@ def _route_block(
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
-    if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+    if kind == "dependency" and not parents_satisfied:
+        set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+        return "todo", "dependency_wait", set_sql, (kind, prev_recurrences), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     if allow_triage and recurrences >= BLOCK_RECURRENCE_LIMIT:
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
@@ -3922,11 +4011,25 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    with_reason: bool = False,
+):
+    """Resume a blocked/scheduled card, or reasoned block-loop triage.
+
+    Normal holds keep their resumable phase and block-loop memory. Only a
+    breaker-entered triage may reset it, with a recorded answer. Returns bool,
+    or ``(ok, refusal_reason)`` when ``with_reason=True``.
+    """
+    def _ret(ok: bool, detail: Optional[str] = None):
+        return (ok, detail) if with_reason else ok
+
     now = int(time.time())
     with write_txn(conn):
+        if _task_status(conn, task_id) == "triage":
+            from hermes_cli.kanban_db_unblock import unblock_loop_triage
+
+            return _ret(*unblock_loop_triage(conn, task_id, reason=reason, now=now))
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3954,7 +4057,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
-            return False
+            return _ret(False, "not blocked/scheduled or unknown task")
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -3963,7 +4066,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
-        return True
+        return _ret(True)
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4215,7 +4318,10 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete disposable relations only; canonical identities and ownership remain."""
     from hermes_cli.kanban_db_materialize import require_deletable_card
     require_deletable_card(conn, task_id)
-    if conn.execute("SELECT 1 FROM task_external_bindings WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+    from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
+    # Task-scoped, fail closed: refuse when THIS card owns (or may own) an
+    # external workspace; other cards' ownership is theirs to release.
+    if _store_owns_external_workspace(conn, task_id=task_id) is not False:
         raise ValueError("external_workspace_retained: external binding history preserves workspace ownership")
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):
@@ -4236,16 +4342,21 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task; external attempts and plan identities are retained."""
+    """Hard-delete a task; external attempts and plan identities are retained.
+
+    The ownership check runs before the row delete: refusing (a never-claimed
+    external reservation or a binding history) must leave the whole store
+    untouched, not a half-deleted card.
+    """
     from hermes_cli.kanban_db_materialize import require_deletable_card
     with write_txn(conn):
         require_deletable_card(conn, task_id)
         if has_external_attempt(conn, task_id):
             return False
+        _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
 

@@ -622,6 +622,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("binding", json.dumps(binding, ensure_ascii=False))
     if task.status == "blocked" and task.block_reason:
         field("blocked", task.block_reason)
+    if task.last_failure_error and task.last_failure_error.startswith("provider usage limit (HTTP 429)"):
+        field("waiting", task.last_failure_error)
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -1142,9 +1144,16 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        refusals = {}
+
+        def unblock(tid):
+            ok, detail = kb.unblock_task(conn, tid, reason=reason, with_reason=True)
+            refusals[tid] = detail
+            return ok
+
+        op = _commented(conn, reason, author, "UNBLOCK", unblock)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid}: {refusals[tid]}")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
