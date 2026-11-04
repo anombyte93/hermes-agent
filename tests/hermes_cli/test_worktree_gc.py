@@ -334,4 +334,53 @@ class TestReclaimRespectsExternalSessionOwnership:
                                 RuntimeError("ownership unanswerable")))
         actions = worktree_gc.reclaim_worktrees(str(repo))
         assert tree.is_dir(), actions
-        assert any("hermes-answerless" in a and "external" in a for a in actions), actions
+        assert any("hermes-answerless" in a and "could not be read" in a for a in actions), actions
+
+    def test_kept_reason_says_ownership_could_not_be_read_not_owned(
+            self, repo, home, monkeypatch):
+        """Defect 5: when the ownership question cannot be ANSWERED (import
+        failure or unreadable store), the kept reason must say ownership
+        could not be read — not claim 'external session owns the worktree',
+        which sends the user hunting for a binding that may not exist."""
+        tree, branch = _add_worktree(repo, "hermes-answerless")
+        (tree / "session.txt").write_text("session work\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "session work"], tree)
+        _git(["push", "origin", f"{branch}:{branch}"], repo)
+        from hermes_cli import kanban_db_workspace as kbw
+        monkeypatch.setattr(kbw, "_externally_owned_workspace",
+                            lambda conn, path: (_ for _ in ()).throw(
+                                RuntimeError("ownership unanswerable")))
+        actions = worktree_gc.reclaim_worktrees(str(repo))
+        assert tree.is_dir(), actions
+        kept = [a for a in actions if "hermes-answerless" in a]
+        assert kept, actions
+        assert "could not be read" in kept[0], kept[0]
+        assert "owns the worktree" not in kept[0], kept[0]
+
+    def test_unreadable_store_kept_reason_names_the_store_not_an_owner(
+            self, repo, home):
+        """Defect 5, the unreadable-store path through the REAL gate (no
+        monkeypatch): a board whose kanban.db is mode 000 cannot be opened,
+        so ownership is unanswerable and the tree is kept — but the kept
+        line must say ownership could not be read, not that a session owns
+        the worktree."""
+        import os
+        from hermes_cli import kanban_db as kb
+        tree, branch = _add_worktree(repo, "hermes-answerless")
+        (tree / "session.txt").write_text("session work\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "session work"], tree)
+        _git(["push", "origin", f"{branch}:{branch}"], repo)
+        kb.create_board("broken-store")
+        broken = kb.board_dir("broken-store") / "kanban.db"
+        os.chmod(broken, 0)
+        try:
+            actions = worktree_gc.reclaim_worktrees(str(repo))
+        finally:
+            os.chmod(broken, 0o644)
+        assert tree.is_dir(), actions
+        kept = [a for a in actions if "hermes-answerless" in a]
+        assert kept, actions
+        assert "could not be read" in kept[0], kept[0]
+        assert "owns the worktree" not in kept[0], kept[0]

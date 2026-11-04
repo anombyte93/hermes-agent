@@ -259,7 +259,17 @@ def _externally_owned_workspace_detail(
         for db in paths:
             if db.resolve() == current or not (db.exists() or db.is_symlink()):
                 continue
-            with contextlib.closing(connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)) as other:
+            try:
+                other = connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)
+            except (OSError, sqlite3.Error):
+                # sqlite refuses some stores at OPEN (mode 000, dangling
+                # symlink target): ownership there is unknowable, which is
+                # fail-closed — and the refusal must name the store rather
+                # than claim another store owns a path.
+                return True, (
+                    f"kanban store {db} could not be read to rule out external "
+                    f"ownership of {path}")
+            with contextlib.closing(other):
                 owns = _store_owns_external_workspace(other, path)
                 if owns is not False:
                     detail = (

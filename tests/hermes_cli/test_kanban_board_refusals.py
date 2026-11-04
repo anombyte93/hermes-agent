@@ -281,6 +281,39 @@ def test_refusal_names_the_unreadable_store(kanban_tmp_home, archive):
     assert broken_db.read_bytes() == b"not a sqlite database" * 100
 
 
+@pytest.mark.parametrize("breakage", ["mode000", "dangling"])
+def test_refusal_names_the_unopenable_store(kanban_tmp_home, breakage):
+    """Defect 3: a store that cannot even be OPENED (mode 000, or a dangling
+    kanban.db symlink) gets the same true reason as the garbage-bytes case —
+    'kanban store <path> could not be read' — not 'another store's external
+    session owns' it. sqlite refuses these at connect(), so the per-store
+    open must carry the detail out."""
+    import os
+    kb.create_board("victim")
+    kb.create_board("broken")
+    broken_db = kb.board_dir("broken") / "kanban.db"
+    if breakage == "mode000":
+        broken_db.write_bytes(b"not a sqlite database" * 100)
+        os.chmod(broken_db, 0)
+    else:  # dangling symlink
+        gone = kanban_tmp_home / "gone-store.db"
+        broken_db.unlink()
+        broken_db.symlink_to(gone)
+
+    with pytest.raises(ValueError) as exc:
+        kb.remove_board("victim", archive=True)
+    msg = str(exc.value)
+    assert "externally_owned_workspace" in msg
+    assert str(broken_db) in msg, msg
+    assert "could not be read" in msg, msg
+    assert "another store" not in msg, msg
+    assert kb.board_dir("victim").is_dir()
+    if breakage == "mode000":
+        os.chmod(broken_db, 0o644)  # restore so tmp cleanup can unlink it
+    else:
+        assert broken_db.is_symlink()
+
+
 def test_own_card_reserving_path_inside_own_board_is_named(kanban_tmp_home):
     """Case 2: the board's OWN never-claimed card reserves a path inside its
     own directory. Archive=True rightly refuses (moving the board breaks that

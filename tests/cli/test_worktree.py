@@ -968,6 +968,33 @@ class TestStartupPrunerRespectsExternalSessionOwnership:
         worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
         assert p.is_dir(), "fail closed: unanswerable ownership must keep the tree"
 
+    def test_unreadable_store_kept_reason_says_could_not_be_read(
+            self, git_repo, kanban_home, caplog):
+        """Defect 5 (this route): an unopenable store keeps the tree, and the
+        kept reason says ownership could not be read — not that an external
+        session owns the worktree."""
+        import os
+        import logging
+        from hermes_cli import worktree_ops
+        from hermes_cli import kanban_db as kb
+        p = self._aged_owned_reap_verdict(git_repo, "hermes-answerless")
+        kb.create_board("broken-store")
+        broken = kb.board_dir("broken-store") / "kanban.db"
+        os.chmod(broken, 0)
+        try:
+            verdicts = worktree_ops._classify_prune_candidates(
+                str(git_repo), [(p, p.stat().st_mtime, True)])
+            with caplog.at_level(logging.DEBUG, logger="cli"):
+                worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        finally:
+            os.chmod(broken, 0o644)
+        assert p.is_dir(), "fail closed: unopenable store must keep the tree"
+        kept_lines = [r.getMessage() for r in caplog.records
+                      if "hermes-answerless" in r.getMessage()]
+        assert kept_lines, caplog.records and [r.getMessage() for r in caplog.records]
+        assert "could not be read" in kept_lines[0], kept_lines[0]
+        assert "owns the worktree" not in kept_lines[0], kept_lines[0]
+
 
 
 class TestWorktreeLockPredicate:
