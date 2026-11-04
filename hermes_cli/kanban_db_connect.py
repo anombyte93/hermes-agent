@@ -882,7 +882,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
     from hermes_cli.kanban_external_schema import migrate_external_sessions
+    from hermes_cli.kanban_db_materialize import migrate_materializations
     migrate_external_sessions(conn)
+    migrate_materializations(conn)
     _ensure_block_reason_guards(conn)
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns

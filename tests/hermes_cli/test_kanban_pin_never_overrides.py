@@ -274,6 +274,36 @@ def test_pin_still_wins_for_the_default_board(s7_world, monkeypatch):
 # --- S7: boards import must scrub the IMPORTED store -------------------------
 
 
+def test_named_board_on_pinned_custom_store_still_refuses(s7_world, monkeypatch):
+    """A named board (not ``default``) claimed on a pinned custom store keeps
+    refusing ``board_pin_mismatch``: the pin is only the ``default`` board's
+    own store (round 9); for any other slug the store is
+    ``board_dir(slug)/kanban.db``, never the pin."""
+    home, worker_db = s7_world
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
+    # The ambient board names "other" too, so the claim is refused by the
+    # store check, not by the slug check.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other")
+    from hermes_cli import kanban_db_external as ext
+    x = home / "session-worktree"
+    x.mkdir()
+    (x / "work").write_bytes(b"live work")
+    with kbc.connect_closing(db_path=worker_db) as conn:
+        tid = kb.create_task(conn, title="named claim", execution_kind="external_session")
+        with pytest.raises(ValueError, match="board_pin_mismatch"):
+            ext.external_claim(conn, tid, board="other", owner_host="s7-host",
+                               incarnation=_INCARNATION, worktree=str(x),
+                               reservation_id="s7-named", reservation_token="c" * 64)
+        # The refusal happened before any binding, run or status change landed.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_external_bindings").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        assert kb.get_task(conn, tid) is not None
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"
+
+
 @pytest.mark.parametrize("owner", _OWNER_MODES)
 @pytest.mark.parametrize("route", ["kernel", "cli", "dashboard"])
 def test_pinned_import_scrubs_the_imported_store_not_the_pin(
@@ -282,7 +312,10 @@ def test_pinned_import_scrubs_the_imported_store_not_the_pin(
     The scrub must land on the IMPORTED store; the pinned store's ownership,
     gate (b) answer, cards and events are untouched."""
     home, worker_db = s7_world
-    # X ownership lives on the PINNED store (the worker's own board).
+    # Set the pin first, then put X ownership on the PINNED store (the
+    # worker's own board): round 9 makes the pin the default board's own
+    # store, so external_claim(board="default") opens it legitimately.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
     from hermes_cli import kanban_db_external as ext
     x = home / "session-worktree"
     x.mkdir()
@@ -298,7 +331,6 @@ def test_pinned_import_scrubs_the_imported_store_not_the_pin(
                                incarnation=_INCARNATION, worktree=str(x),
                                reservation_id="s7-pin", reservation_token="c" * 64)
     archive = _sharing_archive(tmp_path, owner)
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
     # Gate (b) sees the pinned store's ownership only through the pin (the
     # store sits at a custom path outside the kanban home) — the exact
     # precondition the S7 damage route requires.
@@ -335,13 +367,15 @@ def test_end_to_end_sharing_archive_after_pinned_import_keeps_x(
     x = kb.workspaces_root(board="board-c") / "shared"
     x.mkdir(parents=True)
     (x / "work").write_bytes(b"live work")
+    # Round 9: the pin is the default board's own store, so claim X's
+    # ownership on the pinned store as the worker's own board, under the pin.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
     with kbc.connect_closing(db_path=worker_db) as conn:
         from hermes_cli import kanban_db_external as ext
         tid = kb.create_task(conn, title="live session", execution_kind="external_session")
         ext.external_claim(conn, tid, board="default", owner_host="s7-host",
                            incarnation=_INCARNATION, worktree=str(x),
                            reservation_id="s7-e2e", reservation_token="c" * 64)
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
     assert _gate_b(x) is True
 
     archive = _sharing_archive(tmp_path, "active_binding")

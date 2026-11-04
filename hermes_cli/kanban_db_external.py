@@ -55,6 +55,14 @@ def _require_external(conn, task_id):
 def _require_board(conn, board):
     if not board or board != _db().board_slug_for_conn(conn):
         raise ValueError("wrong board")
+    # A custom file cannot become a named board by ambient context alone, under
+    # the one rule PR 181 round 9 already fixed (_own_store_path): a
+    # HERMES_KANBAN_DB pin IS the default board's own store, and any other
+    # slug's store is board_dir(slug)/kanban.db, never the pin.
+    main = next((r for r in conn.execute("PRAGMA database_list") if r[1] == "main"), None)
+    expected = _db()._own_store_path(board)
+    if main is None or not main[2] or Path(main[2]).resolve() != expected.expanduser().resolve():
+        raise ValueError("board_pin_mismatch")
 
 
 def _require_worktree(task, worktree):

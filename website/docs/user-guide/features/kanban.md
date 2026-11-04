@@ -291,6 +291,136 @@ Release and handover leave the old attempt's run status `released`, with outcome
 an attempt status. Requested changes retains the existing worker-compatible
 landing-status convention.
 
+## Plan materialization
+
+Planning clients use the board-owned identity, not a local reference file, to
+avoid duplicate work. The kernel API is
+`hermes_cli.kanban_db_materialize.materialize_task`; the equivalent CLI is:
+
+```bash
+hermes kanban --board B materialize --project P --plan-revision R \
+  --proposed-id X --fingerprint F --title T \
+  --body-file /absolute/acceptance.md --parent-proposed parent-one parent-two \
+  --execution-kind external_session --json
+```
+
+`--body-file` and `--parent-proposed` are optional. Parent ids must already be
+materialized in this project and revision; materialize a plan in dependency
+order. `--parent-proposed` accepts several ids and may be repeated. The project
+is a logical namespace within the board, independent of any profile's local
+project registry. A new card starts ready, or todo until its parents finish,
+with a scratch workspace placeholder; claiming it supplies the owner's actual
+worktree. It is never a dispatcher worker.
+
+`task_materializations` has the database primary key
+`(project, plan_revision, proposed_task_id)`. One immediate write transaction
+covers the lookup, card, dependency links, event and reference. Concurrent
+clients therefore read back the same card:
+
+- Same revision and fingerprint: `{"state":"existing","task_id":"t_..."}`.
+- Same revision, different fingerprint: conflict, `materialization_conflict`.
+- New revision matching the logical id's latest fingerprint: existing, with a
+  reference recorded for the new revision. Returning to an older fingerprint
+  after an intervening change requires a mapping like any other revision.
+- New revision with changed intent and no mapping: conflict,
+  `revision_requires_mapping`.
+- New revision with changed intent (or a renamed id) and
+  `--maps-from prior-revision:prior-id` naming a real row:
+  `{"state":"mapped","task_id":"t_..."}`. An established logical id cannot
+  be redirected to another card. A `materialization_mapped` event records the
+  mapping. An explicit mapping is validated even when the fingerprint is
+  unchanged; a mapping onto another existing card refuses `logical_id_retired`
+  rather than being ignored. A valid same-card mapping with an unchanged latest
+  fingerprint returns `existing`, without a second event.
+
+A genuinely new id returns `{"state":"created","task_id":"t_..."}`.
+Created, existing and mapped return exit 0. Conflicts return exit 3 and
+`{"state":"conflict","task_id":"t_...","reason":"..."}`. Invalid
+requests, including a missing mapping source (`mapping_not_found`), return
+exit 1 and `{"state":"refused","reason":"..."}` with no card created.
+Mappings resolve only inside this project and board and must name a different,
+already-materialized revision.
+
+Unchanged reuse preserves the card. A mapped revision applies its supplied
+title, body and complete parent set in the same transaction as its reference
+and mapping event, provided the card has no run or external binding. Changed
+fields after it has started refuse `mapping_card_started` (exit 3). Omitted
+body/parents mean null/empty, not "keep the old fields". Dependency gating is
+recomputed for todo/ready cards, but archived or deliberately parked cards
+are not reopened. External claim independently checks unfinished parents.
+
+A rename retires its source logical id for the project. Subsequent source-id
+materializations refuse `logical_id_retired`, as does a rename when that source
+was already kept in the target revision. Retirement survives upgrades and
+archival. Hard deletion (`archive --rm` or `delete_task`) refuses a materialized
+card with `materialized_card_retained`; plain archive still works. Identity
+rows are never removed to make deletion succeed.
+
+A true replacement requires a new proposed id; closing the old card is an
+explicit parent action. There is no reservation or session-owner side effect.
+
+### Read-only row preflight
+
+Before creating any row in a plan, check every row in dependency order:
+
+```bash
+hermes kanban --board B materialize-check --project P --plan-revision R \
+  --proposed-id X --fingerprint F --title=T \
+  --body-file /absolute/acceptance.md --execution-kind external_session --json
+```
+
+The flags, states, reasons and exit codes match `materialize`. A prospective
+new card returns `{"state":"created","task_id":null}`: no id is allocated.
+Existing/mapped decisions return their canonical id. The source board is
+opened read-only; missing boards are not initialised, and any schema projection
+is in memory. No card, reference, event or retirement is written. Like other
+SQLite readers, it may create transient empty WAL/SHM locking sidecars.
+
+For a parent checked earlier in the plan but not yet materialized in this
+revision, supply `--parent-proposed=P` and check-only
+`--pending-parent-proposed=P` when its check returned null, or
+`--pending-parent-proposed=P=t_...` when it returned a canonical id. Repeat for
+each pending parent. These explicitly project earlier check results without
+creating placeholder cards. Actual `materialize` still requires real parent
+rows in the exact revision; it never accepts pending-parent flags.
+
+For a revised plan, also pass `--prior-rows-file /absolute/earlier-rows.json`
+with a JSON array containing every earlier row in writer order. This additive
+check-only input projects references, retirements and replaced dependencies, so
+keep/rename conflicts and dependency reversals get the same answer as the writer.
+It creates no placeholder cards. Each object has `proposed_task_id`,
+`intent_fingerprint`, `title`, and optional `body` (literal text or null),
+`parent_proposed` (array), `maps_from` and `execution_kind`. Project and revision
+come from the current command. For example, after checking the mapped row `b`:
+
+```json
+[{"proposed_task_id":"b","intent_fingerprint":"new-b","title":"B","maps_from":"r1:b","parent_proposed":[]}]
+```
+
+```bash
+hermes kanban --board B materialize-check --project P --plan-revision r2 \
+  --proposed-id a --fingerprint new-a --title A --maps-from r1:a \
+  --parent-proposed b --pending-parent-proposed b=t_CANONICAL_B \
+  --prior-rows-file /absolute/earlier-rows.json --execution-kind external_session --json
+```
+
+Without the new input, pending-parent flags retain their existing meaning; they
+alone do not carry earlier rows' changed parents or retirement intent.
+
+An explicit `--board` must agree with any `HERMES_KANBAN_DB` pin after path
+expansion and symlink resolution, otherwise every board-routed CLI verb refuses
+`board_pin_mismatch` (with JSON when requested), before initialisation or writes.
+A pin without `--board` continues to work for ordinary verbs. External claim and
+handover also compare the opened file with the reservation board's own path:
+a custom pin outside that layout refuses `board_pin_mismatch` even without
+`--board`, rather than trusting the current board's fallback name. A corrupt
+read-only check refuses `board_unreadable` as JSON rather than a traceback.
+
+A refused preflight means the caller must not start creating cards. A check is
+advisory, not a reservation: the writer revalidates under its own immediate
+transaction. If creation later fails, callers report `partial` with the ids
+already created, never claim a whole-plan `conflict` with no side effects.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,

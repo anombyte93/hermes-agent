@@ -2,8 +2,10 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. DB routing: ``HERMES_KANBAN_DB`` pins the file first; otherwise ``board=`` /
+context override > ``HERMES_KANBAN_BOARD`` > ``<root>/kanban/current`` > ``default``.
+The CLI refuses an explicit board whose own path disagrees with the DB pin.
+The dispatcher injects the board and DB pin into workers.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -4313,7 +4315,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    """Delete disposable relations only; canonical identities and ownership remain."""
+    from hermes_cli.kanban_db_materialize import require_deletable_card
+    require_deletable_card(conn, task_id)
     from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
     # Task-scoped, fail closed: refuse when THIS card owns (or may own) an
     # external workspace; other cards' ownership is theirs to release.
@@ -4327,7 +4331,9 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
+    from hermes_cli.kanban_db_materialize import require_deletable_card
     with write_txn(conn):
+        require_deletable_card(conn, task_id)
         if has_external_attempt(conn, task_id) or _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -4336,13 +4342,15 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task; an active external binding must be released first.
+    """Hard-delete a task; external attempts and plan identities are retained.
 
     The ownership check runs before the row delete: refusing (a never-claimed
     external reservation or a binding history) must leave the whole store
     untouched, not a half-deleted card.
     """
+    from hermes_cli.kanban_db_materialize import require_deletable_card
     with write_txn(conn):
+        require_deletable_card(conn, task_id)
         if has_external_attempt(conn, task_id):
             return False
         _delete_task_relations(conn, task_id)

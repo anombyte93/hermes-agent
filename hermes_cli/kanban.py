@@ -28,6 +28,7 @@ from hermes_cli.kanban_output import (
     _json_out, _obj_dict, _print_json, _task_to_dict,
 )
 from hermes_cli.kanban_external import external_command
+from hermes_cli.kanban_materialize import materialize_command
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -169,6 +170,15 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: {exc}", 2)
         if not normed:
             return _err("kanban: --board requires a slug", 2)
+        # Resolve the board's own path without the worker DB pin. Calling
+        # kanban_db_path here would compare the pin with itself.
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        own_path = kb._board_path(None, normed, ("kanban.db",), "kanban.db")
+        if pin and Path(pin).expanduser().resolve() != own_path.expanduser().resolve():
+            if getattr(args, "json", False):
+                _print_json({"state": "refused", "reason": "board_pin_mismatch"})
+                return 1
+            return _err("kanban: board_pin_mismatch")
         # Boards other than 'default' must already exist — typoed slugs would otherwise silently
         # create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
@@ -181,6 +191,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
             return _cmd_repair(args)
+        if action == "materialize-check":
+            return materialize_command(args)
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
@@ -213,7 +225,7 @@ def _profile_author() -> str:
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "init", "create", "materialize", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -1428,6 +1440,8 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm, "external": external_command,
+    "materialize": materialize_command,
+    "materialize-check": materialize_command,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
