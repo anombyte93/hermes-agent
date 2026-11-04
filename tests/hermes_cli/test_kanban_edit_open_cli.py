@@ -1,0 +1,167 @@
+"""CLI surface for amending an open card: `hermes kanban edit` two modes (#180).
+
+`edit <id> --result ...` keeps today's done-card recovery behaviour byte for
+byte. `edit <id> --body-file F [--title T]` (or `--title` alone) amends the
+brief of a card that is not done: usage errors are usage errors, a worker
+context never rewrites a brief, and a running card prints the next-run note.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban as kc
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb.init_db()
+    return home
+
+
+NEW_BODY = "Corrected brief via the CLI."
+
+
+def _make(tmp_path, title, body="Original brief.", status="ready"):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title=title, body=body)
+        if status != "ready":
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+            conn.commit()
+        return tid
+
+
+def _body_file(tmp_path, text):
+    path = tmp_path / "body.md"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# Amend mode
+# ---------------------------------------------------------------------------
+
+
+def test_edit_body_file_amends_ready_card(kanban_home, tmp_path):
+    tid = _make(tmp_path, "ready card")
+    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "Edited" in out or "edited" in out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == NEW_BODY
+
+
+def test_edit_body_file_on_running_card_prints_next_run_note(kanban_home, tmp_path):
+    tid = _make(tmp_path, "running card")
+    with kbc.connect() as conn:
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "next run" in out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == NEW_BODY
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_edit_title_alone_amends(kanban_home, tmp_path):
+    tid = _make(tmp_path, "title card")
+    out = kc.run_slash(f"edit {tid} --title 'Fixed title'")
+    assert "Edited" in out
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.title == "Fixed title"
+        assert task.body == "Original brief."
+
+
+def test_edit_amend_refused_for_worker_context(kanban_home, tmp_path, monkeypatch):
+    tid = _make(tmp_path, "worker guard")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_somethingelse")
+    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "orchestrator-only" in out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "Original brief."
+
+
+def test_edit_amend_usage_errors(kanban_home, tmp_path):
+    tid = _make(tmp_path, "usage card")
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n", encoding="utf-8")
+
+    # Neither mode.
+    out = kc.run_slash(f"edit {tid}")
+    assert "usage" in out.lower()
+    # Both modes.
+    out = kc.run_slash(f"edit {tid} --result r --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "usage" in out.lower() or "--result" in out
+    # Empty body file.
+    out = kc.run_slash(f"edit {tid} --body-file {empty}")
+    assert "blank" in out.lower() or "empty" in out.lower()
+    # Missing file.
+    out = kc.run_slash(f"edit {tid} --body-file {tmp_path / 'nope.md'}")
+    assert "nope.md" in out or "read" in out.lower()
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "Original brief."
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
+
+
+def test_edit_amend_done_card_refuses_with_pointer_to_result(kanban_home, tmp_path):
+    tid = _make(tmp_path, "done via cli")
+    with kbc.connect() as conn:
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="done") is True
+    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "--result" in out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "Original brief."
+
+
+def test_edit_amend_archived_card_refuses(kanban_home, tmp_path):
+    tid = _make(tmp_path, "archived via cli")
+    with kbc.connect() as conn:
+        assert kb.archive_task(conn, tid) is True
+    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "archived" in out
+
+
+def test_edit_amend_delegated_child_refused(kanban_home, tmp_path, monkeypatch):
+    tid = _make(tmp_path, "child guard")
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
+    assert "delegate_task child contexts" in out
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "Original brief."
+
+
+# ---------------------------------------------------------------------------
+# Recovery mode is unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_edit_result_on_done_card_still_backfills(kanban_home, tmp_path):
+    tid = _make(tmp_path, "recovery card")
+    with kbc.connect() as conn:
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="first take") is True
+    out = kc.run_slash(f"edit {tid} --result 'better take'")
+    assert "Edited" in out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).result == "better take"
+
+
+def test_edit_result_on_open_card_still_refuses(kanban_home, tmp_path):
+    tid = _make(tmp_path, "open card")
+    out = kc.run_slash(f"edit {tid} --result 'nope'")
+    assert "not done" in out
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.result is None
+        assert task.body == "Original brief."
