@@ -253,13 +253,23 @@ def test_pin_naming_the_boards_own_store_still_applies(s7_world, monkeypatch):
 
 
 def test_pin_still_wins_for_the_default_board(s7_world, monkeypatch):
-    """``default`` keeps today's behaviour: its store IS the root layout the
-    pin re-anchors, so the pin applies to board=None and board='default'
-    alike (the pin's stated purpose)."""
+    """Round 8: ``board=None`` keeps the pin (the pin's purpose after the
+    ``-p`` HOME rewrite), but a NAMED ``default`` checks its real store
+    (``<root>/kanban.db``): the pin applies to it only when it resolves to
+    that same file — never as a free pass."""
     home, worker_db = s7_world
     monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
     assert kb.kanban_db_path() == worker_db
-    assert kb.kanban_db_path(board="default") == worker_db
+    # Named default under a FOREIGN pin: default's real store, not the pin.
+    real_default = kb.kanban_home() / "kanban.db"
+    assert kb.kanban_db_path(board="default") == real_default
+    # Same file as default's real store (through a symlink): the pin applies.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(real_default))
+    assert kb.kanban_db_path(board="default") == real_default
+    link = home / "pin-link.db"
+    link.symlink_to(real_default)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(link))
+    assert kb.kanban_db_path(board="default") == link
 
 
 # --- S7: boards import must scrub the IMPORTED store -------------------------
