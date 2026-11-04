@@ -3243,6 +3243,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
+    # #195: the worker and everything it runs must carry the kernel
+    # no_new_privs flag — sudo cannot gain root whatever the model types. Both
+    # spawn forms exec in place, so one outer setpriv wrap covers both; on a
+    # non-Linux platform the argv is unchanged, and a missing setpriv fails
+    # closed (RuntimeError) rather than launching an unflagged worker.
+    from tools.process_registry import no_new_privs_argv
+    cmd = no_new_privs_argv(cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)

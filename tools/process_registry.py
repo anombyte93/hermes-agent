@@ -294,6 +294,37 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
 _scope_degraded_warned = False
 
 
+def no_new_privs_argv(command: List[str]) -> List[str]:
+    """Prefix *command* with ``setpriv --no-new-privs --`` (#195).
+
+    Every Kanban card worker must carry the kernel ``no_new_privs`` flag so a
+    setuid binary (sudo, su, pkexec) cannot raise privileges whatever the
+    model types — a mechanism, not a brief line. The flag set before exec is
+    inherited across exec and fork, and both Kanban spawn forms exec in place
+    (the direct argv and ``systemd-run --user --scope`` whose client execs the
+    worker from the same Popen child), so one outer wrap covers both.
+
+    Fails closed: on Linux, an unresolvable ``setpriv`` raises rather than
+    launching an unflagged worker. Non-Linux platforms never have the kernel
+    flag, so the command is returned unchanged (spawn behaves exactly as
+    today). A fork-time child callback is deliberately not used: it is
+    forbidden in this module (``tests/tools/test_windows_compat.py``) and
+    unsafe in the threaded dispatcher; ``setpriv`` execs in place, keeping
+    PID semantics identical.
+    """
+    import shutil
+
+    if not _IS_LINUX:
+        return command
+    binary = shutil.which("setpriv")
+    if binary is None:
+        raise RuntimeError(
+            "cannot spawn Kanban worker without no_new_privs: the `setpriv` "
+            "binary was not found on PATH (install util-linux)"
+        )
+    return [binary, "--no-new-privs", "--", *command]
+
+
 def _warn_scope_degraded_once(detail: str) -> None:
     """Warn once per process: the condition is host-level and the probe verdict
     is cached, so this would otherwise fire on every cron dispatch."""
