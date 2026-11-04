@@ -384,12 +384,16 @@ _SETPRIV_CANDIDATES = ("/usr/bin/setpriv", "/bin/setpriv")
 def no_new_privs_argv(command: List[str]) -> List[str]:
     """Prefix *command* with ``setpriv --no-new-privs --`` (#195).
 
-    Every Kanban card worker must carry the kernel ``no_new_privs`` flag so a
-    setuid binary (sudo, su, pkexec) cannot raise privileges whatever the
-    model types — a mechanism, not a brief line. The flag set before exec is
-    inherited across exec and fork, and both Kanban spawn forms exec in place
-    (the direct argv and ``systemd-run --user --scope`` whose client execs the
-    worker from the same Popen child), so one outer wrap covers both.
+    Every Kanban card worker must carry the kernel ``no_new_privs`` flag so
+    it cannot gain privileges through a setuid binary (sudo, su, pkexec)
+    inside its own process tree, no matter what the card or the model asks
+    it to run. The flag set
+    before exec is inherited across exec and fork, and both Kanban spawn
+    forms exec in place (the direct argv and ``systemd-run --user --scope``
+    whose client execs the worker from the same Popen child), so one outer
+    wrap covers both. Routes that start a process for the uid without the
+    flag — the systemd user manager, an existing tmux server, cron, or
+    root-equivalent group membership — are outside this control (#201).
 
     Fails closed: on Linux, a setpriv that is not a root-owned, non-writable
     system binary raises rather than launching an unflagged worker — it is

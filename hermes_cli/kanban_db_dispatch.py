@@ -3244,10 +3244,15 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
     # #195: the worker and everything it runs must carry the kernel
-    # no_new_privs flag — sudo cannot gain root whatever the model types. Both
-    # spawn forms exec in place, so one outer setpriv wrap covers both; on a
-    # non-Linux platform the argv is unchanged, and a missing setpriv fails
-    # closed (RuntimeError) rather than launching an unflagged worker.
+    # no_new_privs flag, so the worker cannot gain privileges through a
+    # setuid binary (sudo, su, pkexec) inside its own process tree, no
+    # matter what the card or the model asks it to run. Both spawn
+    # forms exec in place, so one outer setpriv wrap covers both; on a
+    # non-Linux platform the argv is unchanged, and
+    # a missing setpriv fails closed (RuntimeError) rather than launching
+    # an unflagged worker. Routes that start a process for the uid without
+    # the flag (user manager, tmux server, cron, root-equivalent groups)
+    # are out of scope here — see #201.
     from tools.process_registry import no_new_privs_argv
     cmd = no_new_privs_argv(cmd)
     from tools.process_registry import systemd_user_bus_env
