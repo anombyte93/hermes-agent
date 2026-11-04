@@ -658,8 +658,16 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli.kanban_db_workspace import _externally_owned_workspace, _store_owns_external_workspace
+    # Open the removed board's OWN store by path, never by board name: a
+    # name-based open resolves through ``_board_path``, which returns the
+    # ``HERMES_KANBAN_DB`` override before it looks at ``board`` — and the
+    # dispatcher pins that override into every worker's environment, so under
+    # a pin the active-binding check and gate (a) below would read the
+    # PINNED store instead and removal would sail past a board that owns
+    # external workspaces (S6).
+    own_db = d / "kanban.db"
     try:
-        with connect_closing(board=normed) as conn:
+        with connect_closing(own_db) as conn:
             binding = conn.execute(
                 "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
             ).fetchone()

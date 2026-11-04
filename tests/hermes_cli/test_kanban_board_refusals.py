@@ -105,3 +105,153 @@ def test_remove_board_without_external_owner_still_removes_or_moves(two_boards, 
     assert not kb.board_dir("holder-b").exists()
     if archive:
         assert list((kb.boards_root() / "_archived").glob("holder-b-*"))
+
+
+# --- S6: remove_board under a HERMES_KANBAN_DB pin (every dispatched worker) ---
+
+@pytest.fixture
+def kanban_tmp_home(tmp_path, monkeypatch):
+    """Temp kanban home with the default store initialised and pin env cleared."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME",
+                "HERMES_KANBAN_WORKSPACES_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+    from hermes_cli import kanban_db_workspace as kbw
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *a, **k: None)
+    kb.init_db()
+    return tmp_path
+
+
+def _own_x_outside_home(home, owner: str) -> Path:
+    """holder-b's OWN store owns X (never-claimed card or active binding),
+    with X outside holder-b's board directory, so gate (b) cannot see it."""
+    from hermes_cli import kanban_db_external as ext
+    kb.create_board("holder-b")
+    x = home / "session-worktree"
+    x.mkdir()
+    (x / "work").write_bytes(b"live work")
+    with kbc.connect_closing(board="holder-b") as b:
+        if owner == "never_claimed":
+            kb.create_task(b, title="reserved", execution_kind="external_session",
+                           workspace_kind="dir", workspace_path=str(x))
+        else:
+            tid = kb.create_task(b, title="live session", execution_kind="external_session")
+            ext.external_claim(b, tid, board="holder-b", owner_host="host-b",
+                               incarnation=_INCARNATION, worktree=str(x),
+                               reservation_id="s6-fixture", reservation_token="b" * 64)
+    return x
+
+
+def _pin_clean_store(home, monkeypatch) -> Path:
+    """A worker-style pin: HERMES_KANBAN_DB naming a clean store C."""
+    clean = home / "worker-pin" / "kanban.db"
+    clean.parent.mkdir(parents=True, exist_ok=True)
+    kb.init_db(db_path=clean)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(clean))
+    return clean
+
+
+def _remove_holder_b(route: str, archive: bool) -> str:
+    if route == "kernel":
+        try:
+            return "removed:" + kb.remove_board("holder-b", archive=archive)["action"]
+        except ValueError as exc:
+            return f"refused:{exc}"
+    if route == "dashboard":
+        app = FastAPI()
+        app.include_router(router)
+        response = TestClient(app, raise_server_exceptions=False).delete(
+            "/boards/holder-b" + ("" if archive else "?delete=true"))
+        if response.status_code == 200:
+            return f"removed:HTTP {response.status_code}"
+        return f"refused:HTTP {response.status_code}"
+    parser = argparse.ArgumentParser()
+    cli.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(
+        ["kanban", "boards", "rm", "holder-b"] + ([] if archive else ["--delete"]))
+    rc = cli.kanban_command(args)
+    return f"removed:rc={rc}" if rc == 0 else f"refused:rc={rc}"
+
+
+@pytest.mark.parametrize("route", ["kernel", "cli", "dashboard"])
+@pytest.mark.parametrize("archive", [False, True])
+@pytest.mark.parametrize("owner", ["never_claimed", "active_binding"])
+def test_pinned_remove_board_reads_the_removed_boards_own_store(
+        kanban_tmp_home, monkeypatch, owner, archive, route):
+    """S6: the dispatcher pins HERMES_KANBAN_DB into every worker's environment,
+    so a name-based store open resolves to the PINNED store, not the board being
+    removed. Removal must instead open the removed board's own store by path and
+    refuse exactly as it does without the pin. The unpinned halves of these
+    contracts are pinned by test_remove_board_refuses_while_another_store_owns_a_path_inside
+    and tests/hermes_cli/test_kanban_store_owns_path.py.
+
+    The never-claimed + archive=True cell legitimately archives (no active
+    binding; the reserved path lies outside the board directory); every other
+    cell must refuse."""
+    x = _own_x_outside_home(kanban_tmp_home, owner)
+    clean = _pin_clean_store(kanban_tmp_home, monkeypatch)
+    # Document the trap the fix must avoid: a name-based open reads store C.
+    with kbc.connect_closing(board="holder-b") as probe:
+        opened = Path(probe.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    assert opened == clean.resolve()
+
+    outcome = _remove_holder_b(route, archive)
+    if archive and owner == "never_claimed":
+        # Legitimate: no active binding, and the reserved path lies outside the
+        # board directory, so archive=True moves the board and keeps X.
+        assert outcome.startswith("removed"), outcome
+        assert (x / "work").read_bytes() == b"live work"
+        return
+    assert outcome.startswith("refused"), (
+        f"pinned removal of holder-b (owner={owner}, archive={archive}, route={route}) "
+        f"went through: {outcome}")
+    assert kb.board_dir("holder-b").is_dir()
+    assert (x / "work").read_bytes() == b"live work"
+
+
+@pytest.mark.parametrize("archive", [False, True])
+def test_pinned_remove_board_without_owner_still_removes_or_moves(
+        kanban_tmp_home, monkeypatch, archive):
+    """Control: with the pin set and no owner on holder-b's own store, both
+    modes still delete or move the board."""
+    kb.create_board("holder-b")
+    _pin_clean_store(kanban_tmp_home, monkeypatch)
+    assert kb.remove_board("holder-b", archive=archive)["action"] == (
+        "archived" if archive else "deleted")
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_pinned_board_delete_then_sharing_archive_keeps_live_worktree(
+        kanban_tmp_home, monkeypatch, pinned):
+    """End-to-end damage case: X lives in board-c's managed workspaces and is
+    owned by holder-b's ACTIVE binding (a live session). A worker process
+    (HERMES_KANBAN_DB pinned to its own clean store) runs `boards rm holder-b
+    --delete`; later a sharing scratch worker on board-c is archived. The
+    delete must refuse, or the archive silently removes X."""
+    from hermes_cli import kanban_db_external as ext
+    kb.create_board("holder-b")
+    kb.create_board("board-c")
+    x = kb.workspaces_root(board="board-c") / "shared"
+    x.mkdir(parents=True)
+    (x / "work").write_bytes(b"live work")
+    with kbc.connect_closing(board="holder-b") as b:
+        tid = kb.create_task(b, title="live session", execution_kind="external_session")
+        ext.external_claim(b, tid, board="holder-b", owner_host="host-b",
+                           incarnation=_INCARNATION, worktree=str(x),
+                           reservation_id="s6-damage", reservation_token="d" * 64)
+    if pinned:
+        _pin_clean_store(kanban_tmp_home, monkeypatch)
+    parser = argparse.ArgumentParser()
+    cli.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["kanban", "boards", "rm", "holder-b", "--delete"])
+    rc = cli.kanban_command(args)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    with kbc.connect_closing(board="board-c") as c:
+        sharing = kb.create_task(c, title="sharing scratch worker",
+                                 workspace_kind="scratch", workspace_path=str(x))
+        assert kb.archive_task(c, sharing)
+    assert rc != 0, "pinned boards rm --delete succeeded while holder-b holds an active binding"
+    assert x.is_dir() and (x / "work").read_bytes() == b"live work"
