@@ -1,18 +1,19 @@
-"""Round 8: the store pin applies whenever NO board is named; a named board
-(including ``default``) checks its own real store; the root pins behave as at
-base.
+"""Round 9: the ``HERMES_KANBAN_DB`` pin keeps its base precedence in the
+resolver (highest, beats every board source, named or not); only ownership
+decisions open a named board's own store, through ``_own_store_path``. The
+root pins behave as at base.
 
 The dispatcher pins ``HERMES_KANBAN_DB`` (and the workspaces/attachments
 roots) into every worker's environment so the worker's own board still
-resolves after ``hermes -p`` rewrites ``HERMES_HOME``. The resolver contract
-ruled for this round:
+resolves after ``hermes -p`` rewrites ``HERMES_HOME``. Rounds 7 and 8 moved a
+named-board rule into the shared resolver, which broke 37 pre-existing tests
+and the documented precedence; round 9 restored the resolver to base and
+keeps the S6/S7 guarantees at the ownership sites. The resolver contract:
 
-* ``named`` is what the CALLER passed. The active board (``HERMES_KANBAN_BOARD``,
-  the current-board file, a CLI ``--board`` resolved later) never counts as named.
-* the ``HERMES_KANBAN_DB`` pin applies when ``named is None`` — whatever the
-  active board is — or when the named board's own real store resolves to the
-  pin's file. A named ``default`` has a real store (``kanban_home()/kanban.db``),
-  never a free pass;
+* ``board=None`` reads the pinned store, whatever the active board is —
+  the pin's whole purpose;
+* a NAMED board (``default`` included) also reads the pin through the
+  resolver, exactly as at base;
 * the ``HERMES_KANBAN_WORKSPACES_ROOT`` / ``HERMES_KANBAN_ATTACHMENTS_ROOT``
   pins behave exactly as at base: the pin wins, for named boards too.
 """
@@ -190,41 +191,45 @@ def test_disagreeing_roots_worker_finds_its_own_card(world, monkeypatch):
         "disagreeing roots: board=None did not find the worker's own card through the pin")
 
 
-# --- Defect 2: a named ``default`` checks its real store --------------------
+# --- Defect 2 (round 9): the named-default rule moved to the helper --------
 
 
-def test_named_default_checks_its_real_store(world, monkeypatch):
-    """``kanban_db_path(board='default')`` under a pin to another file must
-    resolve to default's real store (``kanban_home()/kanban.db``), not take
-    the pin as a free pass."""
+def test_named_default_resolver_keeps_base_the_pin_wins(world, monkeypatch):
+    """Round 9: ``_board_path`` is base again — a NAMED ``default`` resolves
+    to the pin (``HERMES_KANBAN_DB`` has the highest precedence, as at base
+    and as environment-variables.md documents). The named-default rule lives
+    only in ``_own_store_path``."""
     home, pin = world
-    real_default = home / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
-    assert kb.kanban_db_path(board="default") == real_default
-    assert _open_store("default") == real_default.resolve()
+    assert kb.kanban_db_path(board="default") == pin
+    assert _open_store("default") == pin.resolve()
 
 
-def test_named_default_same_file_takes_the_pin(world, monkeypatch):
-    """Same-file rule for ``default``: when the pin IS default's real store
-    (resolved), the pin applies."""
+def test_own_store_path_default_is_the_pin_else_the_real_store(world, monkeypatch):
+    """``_own_store_path('default')``: the pin when one is set (it re-anchors
+    the legacy default layout, as at base), else ``kanban_home()/kanban.db``."""
     home, pin = world
     real_default = home / "kanban.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(real_default))
-    assert kb.kanban_db_path(board="default") == real_default
+    assert kb._own_store_path("default") == real_default
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    assert kb._own_store_path("default") == pin
     link = home / "pin-link.db"
     link.symlink_to(real_default)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(link))
-    assert kb.kanban_db_path(board="default") == link
+    assert kb._own_store_path("default") == link
 
 
-def test_export_board_default_under_a_foreign_pin_exports_default_real_store(world, monkeypatch, tmp_path):
-    """``export_board('default')`` under a pin to another file exports
-    default's real store (2 tasks), not the pinned store (1 task)."""
+def test_export_board_default_explicit_keeps_base_the_pin_re_anchors_it(world, monkeypatch, tmp_path):
+    """Ruling, default arm: ``_own_store_path('default')`` is the pin when one
+    is set (the pin re-anchors the legacy default layout, as at base), so an
+    explicit ``export_board('default')`` under a foreign pin exports the PIN's
+    cards (1), exactly as at base — default is never diverted to its real
+    store by the helper."""
     from hermes_cli import kanban_transfer as kt
     home, pin = world
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
     result = kt.export_board("default", str(tmp_path / "default.tar.gz"))
-    assert result["counts"]["tasks"] == 2, result
+    assert result["counts"]["tasks"] == 1, result
 
 
 def test_export_board_default_under_a_pin_to_its_real_store_exports_that_store(world, monkeypatch, tmp_path):
@@ -235,6 +240,20 @@ def test_export_board_default_under_a_pin_to_its_real_store_exports_that_store(w
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     result = kt.export_board("default", str(tmp_path / "default.tar.gz"))
     assert result["counts"]["tasks"] == 2, result
+
+
+def test_export_board_no_slug_keeps_base_the_pin_wins(world, monkeypatch, tmp_path):
+    """Round 9: an export with NO slug is not an ownership decision on a
+    named board — base behaviour. The active board's rows resolve through the
+    resolver, where the pin wins: ``export_board(None)`` exports the pin's
+    cards (1), not default's real store (2)."""
+    from hermes_cli import kanban_transfer as kt
+    home, pin = world
+    kb.set_current_board("default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    result = kt.export_board(None, str(tmp_path / "pinned.tar.gz"))
+    assert result["counts"]["tasks"] == 1, result
+    assert result["board"] == "default"
 
 
 # --- Defect 3: the root pins behave exactly as at base (the pin wins) -------

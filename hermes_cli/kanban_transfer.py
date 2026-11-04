@@ -142,7 +142,14 @@ def export_board(
     if not kb.board_exists(slug):
         raise ValueError(f"board {slug!r} does not exist")
 
-    db_path = kb.kanban_db_path(slug)
+    # An explicit export of a named board is an ownership decision: it must
+    # read that board's OWN store even under a ``HERMES_KANBAN_DB`` pin, or a
+    # pinned worker exports the wrong store (the round-7 export test). An
+    # export with no slug keeps base behaviour (the pin wins).
+    if kb._normalize_board_slug(board) is not None:
+        db_path = kb._own_store_path(slug)
+    else:
+        db_path = kb.kanban_db_path(slug)
     if not db_path.exists():
         raise FileNotFoundError(f"board {slug!r} has no database at {db_path}")
 
@@ -366,7 +373,12 @@ def import_board(
                 archived=False,
             )
             kb.init_db(board=target)
-            with kbc.connect_closing(board=target) as conn:
+            # S7: the scrub is an ownership decision about the IMPORTED board,
+            # so it opens the imported board's own store by path — never
+            # ``connect_closing(board=...)``, which under a worker's
+            # ``HERMES_KANBAN_DB`` pin would resolve to the PINNED store and
+            # scrub the worker's own ownership instead.
+            with kbc.connect_closing(db_path=kb._own_store_path(target)) as conn:
                 stats, warnings = _relocate_imported_rows(conn, target)
                 counts = _count_rows(conn)
             if activate:

@@ -193,12 +193,14 @@ def test_pinned_remove_board_reads_the_removed_boards_own_store(
     cell must refuse."""
     x = _own_x_outside_home(kanban_tmp_home, owner)
     clean = _pin_clean_store(kanban_tmp_home, monkeypatch)
-    # Document the resolver rule the S6 fix relies on: under a pin, an open
-    # that NAMES holder-b reads holder-b's own store (the pin only applies to
-    # board=None or the same file). S6 keeps its by-path open regardless.
+    # Round 9: the resolver keeps base precedence (the pin wins even for a
+    # named board), so a NAME-based open reads the PINNED store — exactly the
+    # trap S6 fixed. Removal must instead open the removed board's own store
+    # through _own_store_path and refuse exactly as it does without the pin.
     with kbc.connect_closing(board="holder-b") as probe:
         opened = Path(probe.execute("PRAGMA database_list").fetchone()[2]).resolve()
-    assert opened == (kb.board_dir("holder-b") / "kanban.db").resolve()
+    assert opened == clean.resolve()
+    assert kb._own_store_path("holder-b") == kb.board_dir("holder-b") / "kanban.db"
 
     outcome = _remove_holder_b(route, archive)
     if archive and owner == "never_claimed":

@@ -476,48 +476,37 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def _resolve_same_file(a: Path, b: Path) -> bool:
-    """Whether ``a`` and ``b`` name the same file once resolved (symlinks and
-    relative paths followed; a dangling symlink still resolves to its target
-    path). Comparison failures read as "not the same file"."""
-    try:
-        return a.expanduser().resolve() == b.expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return False
+def _own_store_path(slug: str) -> Path:
+    """The real store a board's OWN decisions must open, never ``_board_path``.
+
+    ``_board_path`` gives the ``HERMES_KANBAN_DB`` pin the highest precedence
+    for every caller, as at base — but an OWNERSHIP decision (import scrub,
+    explicit export, remove_board, gate (b) and the binding checks) that NAMES
+    a board must read that board's own store, or a pinned worker would
+    scrub/export/remove the wrong store (S6/S7). For ``default`` the pin wins
+    (it re-anchors the legacy ``<root>/kanban.db`` layout, as at base); for
+    any other slug it is always ``board_dir(slug)/kanban.db``.
+    """
+    if slug == DEFAULT_BOARD:
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pin:
+            return Path(pin).expanduser()
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
 
 
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
     """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``.
-
-    The ``HERMES_KANBAN_DB`` pin (``env_var`` set, the store-pin case) applies
-    whenever the caller passed NO board — whatever the ACTIVE board is (a
-    ``HERMES_KANBAN_BOARD`` env var, a current-board file, or a CLI ``--board``
-    resolved later never counts as "named") — or when it resolves to the same
-    file as the named board's own real store; a named ``default`` checks its
-    real store (``<root>/<default_parts>``) like any other board, never a free
-    pass. Letting the pin win for a named board is how a pinned worker scrubbed,
-    exported or removed the wrong store (S6/S7). The WORKSPACES_ROOT and
-    ATTACHMENTS_ROOT pins behave exactly as at base — the pin wins for named
-    boards too: unlike the store, a board has no separate pinned root of its
-    own to consult, and the dispatcher relies on the pin re-anchoring every
-    workspace/attachment path."""
-    named = _normalize_board_slug(board)
+    for the ``default`` board, else ``board_dir(slug)/leaf``."""
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
-            if env_var != "HERMES_KANBAN_DB":
-                return Path(override).expanduser()
-            override_path = Path(override).expanduser()
-            if named is None:
-                return override_path
-            named_store = (kanban_home().joinpath(*default_parts) if named == DEFAULT_BOARD
-                           else board_dir(named) / leaf)
-            if _resolve_same_file(override_path, named_store):
-                return override_path
-    slug = named if named is not None else get_current_board()
+            return Path(override).expanduser()
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home().joinpath(*default_parts)
     return board_dir(slug) / leaf
@@ -692,14 +681,14 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         _own_external_paths_detail,
         _store_owns_external_workspace,
     )
-    # Open the removed board's OWN store by path, never by board name: a
-    # name-based open resolves through ``_board_path``, which returns the
-    # ``HERMES_KANBAN_DB`` override before it looks at ``board`` — and the
-    # dispatcher pins that override into every worker's environment, so under
-    # a pin the active-binding check and gate (a) below would read the
-    # PINNED store instead and removal would sail past a board that owns
-    # external workspaces (S6).
-    own_db = d / "kanban.db"
+    # Open the removed board's OWN store by path, never through the resolver:
+    # ``_board_path`` gives ``HERMES_KANBAN_DB`` the highest precedence (as at
+    # base), and the dispatcher pins that override into every worker's
+    # environment, so a name-based open would read the PINNED store and
+    # removal would sail past a board that owns external workspaces (S6).
+    # ``_own_store_path`` is the one ownership-decision resolver: a named
+    # board's own store, never the pin.
+    own_db = _own_store_path(normed)
     try:
         with connect_closing(own_db) as conn:
             binding = conn.execute(

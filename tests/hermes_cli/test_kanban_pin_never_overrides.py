@@ -1,21 +1,26 @@
-"""S7, closed at the root: a ``HERMES_KANBAN_DB`` pin never overrides a NAMED board.
+"""S6/S7, closed at the ownership sites: a ``HERMES_KANBAN_DB`` pin keeps its
+base precedence for every resolver caller, and only ownership decisions open
+a named board's own store through ``_own_store_path``.
 
 The dispatcher pins ``HERMES_KANBAN_DB`` into every worker's environment so
 the worker's own board (``board=None``) still resolves after ``hermes -p``
 rewrites ``HERMES_HOME``. Rounds 1-6 fixed one route at a time (remove_board
 opens by path, prune gates, export); the seventh variant (``boards import``
 scrubbing the PINNED store instead of the imported one) showed the defect
-lives in the shared resolver ``kanban_db._board_path``, which returned the
-override before it looked at an explicitly named board.
+lives in ownership decisions acting on the pinned store when the operation
+named another board. Rounds 7 and 8 moved that rule into the shared resolver
+``_board_path`` itself, which broke 37 pre-existing tests and the documented
+precedence ("HERMES_KANBAN_DB has the highest precedence; beats
+HERMES_KANBAN_BOARD"); round 9 restored the resolver to base and moved the
+rule into one helper the ownership sites call.
 
-This file pins the root contract and its three damage routes:
+This file pins the restored contract and its three damage routes:
 
 * ``board=None`` keeps opening the pinned store — the pin's whole purpose;
-* an explicitly named board opens ITS OWN store under the pin (the pin only
-  applies when it resolves to that same file);
+* the import scrub, an explicit ``export_board('<slug>')`` and ``remove_board``
+  open the NAMED board's own store under the pin (``_own_store_path``);
 * ``boards import`` (kernel, CLI, dashboard) must scrub the IMPORTED store
   and leave the pinned store byte-for-byte ownership-identical;
-* ``export_board('<slug>')`` exports the named board's own store;
 * ``remove_board`` (S6) keeps refusing exactly as without the pin.
 """
 
@@ -208,20 +213,17 @@ def _import_archive_real_cli(archive: Path, home: Path, pin: Path, tmp_path: Pat
 
 @pytest.mark.parametrize("owner", _OWNER_MODES)
 def test_named_board_opens_its_own_store_under_the_pin(s7_world, monkeypatch, owner):
-    """With HERMES_KANBAN_DB pinned, an open that NAMES a board resolves to
-    that board's own store; board=None keeps the pinned store."""
+    """Round 9: the resolver keeps base behaviour (the pin wins for every
+    caller), and the ownership-decision helper ``_own_store_path`` returns
+    the named board's own store; ``board=None`` keeps the pinned store."""
     home, worker_db = s7_world
     _own_x_on("other", home, owner)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
 
-    assert kb.kanban_db_path(board="other") == kb.board_dir("other") / "kanban.db"
-    conn = kbc.connect(board="other")
-    try:
-        opened = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
-    finally:
-        conn.close()
-    assert opened == (kb.board_dir("other") / "kanban.db").resolve()
-    assert opened != worker_db.resolve()
+    # The resolver is base again: a NAMED board open reads the pin (highest
+    # precedence, as at base); only _own_store_path names the board's own store.
+    assert kb.kanban_db_path(board="other") == worker_db
+    assert kb._own_store_path("other") == kb.board_dir("other") / "kanban.db"
 
     conn = kbc.connect()
     try:
@@ -232,44 +234,41 @@ def test_named_board_opens_its_own_store_under_the_pin(s7_world, monkeypatch, ow
 
 
 def test_pin_naming_the_boards_own_store_still_applies(s7_world, monkeypatch):
-    """Same-file rule: when the pin resolves to the named board's own store,
-    the pin applies — including through a symlink (re-anchored layouts)."""
+    """Round 9: ``_own_store_path`` never consults same-file rules — a named
+    non-default board always gets its own store, and a named ``default``
+    gets the pin when one is set (the pin re-anchors the legacy default
+    layout, as at base)."""
     home, worker_db = s7_world
     own = kb.board_dir("other") / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(own))
-    assert kb.kanban_db_path(board="other") == own
+    assert kb._own_store_path("other") == own
 
     link = home / "pin-link.db"
     link.symlink_to(own)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(link))
-    assert kb.kanban_db_path(board="other") == link
+    assert kb._own_store_path("other") == own  # never the pin for a named slug
 
-    conn = kbc.connect(board="other")
-    try:
-        opened = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
-    finally:
-        conn.close()
-    assert opened == own.resolve()
+    # default: the pin re-anchors the legacy default layout.
+    assert kb._own_store_path("default") == link
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    assert kb._own_store_path("default") == kb.kanban_home() / "kanban.db"
 
 
 def test_pin_still_wins_for_the_default_board(s7_world, monkeypatch):
-    """Round 8: ``board=None`` keeps the pin (the pin's purpose after the
-    ``-p`` HOME rewrite), but a NAMED ``default`` checks its real store
-    (``<root>/kanban.db``): the pin applies to it only when it resolves to
-    that same file — never as a free pass."""
+    """Round 9: ``board=None`` keeps the pin (the pin's purpose after the
+    ``-p`` HOME rewrite), and the resolver keeps base behaviour for a named
+    ``default`` too: the pin wins there as well. ``_own_store_path('default')``
+    is the pin when one is set, else default's real store."""
     home, worker_db = s7_world
     monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
     assert kb.kanban_db_path() == worker_db
-    # Named default under a FOREIGN pin: default's real store, not the pin.
-    real_default = kb.kanban_home() / "kanban.db"
-    assert kb.kanban_db_path(board="default") == real_default
-    # Same file as default's real store (through a symlink): the pin applies.
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(real_default))
-    assert kb.kanban_db_path(board="default") == real_default
-    link = home / "pin-link.db"
-    link.symlink_to(real_default)
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(link))
-    assert kb.kanban_db_path(board="default") == link
+    # Named default under the resolver: base behaviour, the pin.
+    assert kb.kanban_db_path(board="default") == worker_db
+    # The ownership-decision helper for default is the pin too.
+    assert kb._own_store_path("default") == worker_db
+    # Without a pin, default's own store is the legacy <root>/kanban.db.
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    assert kb._own_store_path("default") == kb.kanban_home() / "kanban.db"
 
 
 # --- S7: boards import must scrub the IMPORTED store -------------------------
