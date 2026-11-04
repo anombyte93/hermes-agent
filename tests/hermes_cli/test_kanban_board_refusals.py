@@ -389,3 +389,60 @@ def test_history_refusal_points_only_at_the_card_when_archive_refuses_too(kanban
     assert "archive route refuses" in msg, msg
     assert kb.board_dir("selfblock").is_dir()
     assert (x / "proof").read_bytes() == b"owned"
+
+
+# --- Defect 4: the hint's tail must name the REAL cause ----------------------
+
+
+def test_hint_names_the_unreadable_store_not_a_path_inside(kanban_tmp_home):
+    """Defect 4, cause 1: holder-b's own card reserves a path OUTSIDE the
+    board, but ANOTHER store is unreadable (mode 000), so gate (b) refuses
+    and the archive route refuses with it. The tail must say that store
+    could not be read (naming it), not invent 'a reserved path lies inside
+    the board directory'."""
+    import os
+    home = kanban_tmp_home
+    x = _own_x_outside_home(home, "never_claimed")
+    kb.create_board("broken-holder")
+    broken_db = kb.board_dir("broken-holder") / "kanban.db"
+    os.chmod(broken_db, 0)
+    try:
+        with pytest.raises(ValueError) as exc:
+            kb.remove_board("holder-b", archive=False)
+    finally:
+        os.chmod(broken_db, 0o644)
+    msg = str(exc.value)
+    assert "external_binding_history" in msg
+    assert "archive route refuses" in msg, msg
+    assert str(broken_db) in msg, msg
+    assert "could not be read" in msg, msg
+    assert "lies inside the board directory" not in msg, msg
+    assert kb.board_dir("holder-b").is_dir()
+    assert (x / "work").read_bytes() == b"live work"
+
+
+def test_hint_names_another_store_owning_a_path_inside_the_board(kanban_tmp_home):
+    """Defect 4, cause 2: holder-b's own card reserves a path OUTSIDE the
+    board, and ANOTHER store owns a path INSIDE holder-b's directory, so
+    gate (b) refuses and the archive route refuses with it. The tail must
+    say another store owns a path inside the board, not invent 'a reserved
+    path lies inside the board directory'."""
+    home = kanban_tmp_home
+    x = _own_x_outside_home(home, "never_claimed")
+    kb.create_board("owner-c")
+    inside = kb.board_dir("holder-b") / "workspaces" / "c-session"
+    inside.mkdir(parents=True)
+    (inside / "proof").write_bytes(b"owned by c")
+    with kbc.connect_closing(board="owner-c") as c:
+        kb.create_task(c, title="c's session", execution_kind="external_session",
+                       workspace_kind="dir", workspace_path=str(inside))
+    with pytest.raises(ValueError) as exc:
+        kb.remove_board("holder-b", archive=False)
+    msg = str(exc.value)
+    assert "external_binding_history" in msg
+    assert "archive route refuses" in msg, msg
+    assert "another store" in msg or "store" in msg, msg
+    assert "lies inside the board directory" not in msg, msg
+    assert kb.board_dir("holder-b").is_dir()
+    assert (x / "work").read_bytes() == b"live work"
+    assert (inside / "proof").read_bytes() == b"owned by c"

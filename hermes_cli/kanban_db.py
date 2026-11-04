@@ -726,23 +726,27 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         # Name the board's own reservation the user must resolve first, and
         # the route that actually works: when no active binding exists and
         # gate (b) is False on the board directory, `archive=True` succeeds
-        # (A4's closed-history shape) — name it. When the reservation lies
-        # INSIDE the board directory the archive route refuses too, so say so
-        # instead of sending the user down a dead end (release and delete
-        # both refuse on closed history).
-        archive_would = not _externally_owned_workspace_detail(None, str(d))[0]
-        if archive_would:
+        # (A4's closed-history shape) — name it. When the archive route
+        # refuses too, say WHY it refuses — the real cause from gate (b),
+        # never an invented one: the board's own reservation inside the
+        # directory, another store owning a path inside it, or a store that
+        # could not be read (release and delete both refuse on closed
+        # history, so the tail must send the user to the true blocker).
+        owned_elsewhere, archive_detail = _externally_owned_workspace_detail(None, str(d))
+        if not owned_elsewhere:
             raise ValueError(
                 f"external_binding_history: board {normed!r}'s own cards reserve external "
                 f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
                 "release or clear those reservations before removal, or archive the board "
                 f"instead (`hermes kanban boards rm {normed}` keeps the board's bytes and "
                 "retains the reserved paths)")
+        cause = (
+            "a reserved path lies inside the board directory" if own_paths else archive_detail)
         raise ValueError(
             f"external_binding_history: board {normed!r}'s own cards reserve external "
             f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
             "release or clear those reservations before removal — the archive route "
-            "refuses too (a reserved path lies inside the board directory)")
+            f"refuses too ({cause})")
     # Gate (b): before ANY filesystem removal of the board directory (delete
     # or archive-move), ask whether any store owns a path overlapping it —
     # another board's external card or live binding may sit inside this
