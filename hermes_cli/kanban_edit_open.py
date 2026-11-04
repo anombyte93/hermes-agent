@@ -104,9 +104,10 @@ def amend_open_task(
 
         if not changed_fields:
             # A no-op is refused, never returned as quiet success: the caller
-            # must not mistake "nothing changed" for a recorded edit.
+            # must not mistake "nothing changed" for a recorded edit. The id is
+            # NOT repeated here — the CLI prefix already names the card.
             raise RefusedEditError(
-                f"{task_id}: nothing changed (body and title already current)"
+                "nothing changed (body and title already current)"
             )
 
         if current_run_id:

@@ -162,7 +162,10 @@ def test_edit_amend_noop_body_refused_not_accepted(kanban_home, tmp_path, capsys
     rc = _edit(tid, "--body-file", _body_file(tmp_path, "same text"))
     out = capsys.readouterr()
     assert rc == 1, out
-    assert "nothing changed" in (out.out + out.err).lower()
+    combined = out.out + out.err
+    assert "nothing changed" in combined.lower()
+    # One line, and the card id appears exactly once in it (no "<id>: <id>:").
+    assert combined.count(tid) == 1, combined
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).body == "same text"
         assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
@@ -173,7 +176,10 @@ def test_edit_amend_noop_title_refused_not_accepted(kanban_home, tmp_path, capsy
     rc = _edit(tid, "--title", "same")
     out = capsys.readouterr()
     assert rc == 1, out
-    assert "nothing changed" in (out.out + out.err).lower()
+    combined = out.out + out.err
+    assert "nothing changed" in combined.lower()
+    # One line, and the card id appears exactly once in it (no "<id>: <id>:").
+    assert combined.count(tid) == 1, combined
     with kbc.connect() as conn:
         assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
 
