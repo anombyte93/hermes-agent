@@ -1057,13 +1057,71 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
-    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
-    if rc:
-        return rc
+    body_file = getattr(args, "body_file", None)
+    title = getattr(args, "title", None)
+    result = getattr(args, "result", None)
+
+    if body_file is None and title is None:
+        # Recovery mode: exactly as before, minus argparse's required=True (the
+        # handler now owns the "neither mode" refusal).
+        if result is None:
+            return _err(
+                "usage: kanban edit: pass --result (done-task recovery) or "
+                "--body-file/--title (amend a card that is not done)", 2)
+        metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+        if rc:
+            return rc
+        with kbc.connect_closing() as conn:
+            ok = kb.edit_completed_task_result(conn, args.task_id, result=result,
+                                               summary=getattr(args, "summary", None), metadata=metadata)
+        return _ok_or_err(ok, f"cannot edit {args.task_id} (unknown id or task is not done)",
+                          f"Edited {args.task_id}")
+
+    # Amend mode: correct the brief of a card that is not done (#180).
+    if result is not None:
+        return _err(
+            "usage: kanban edit: --result is the done-task recovery mode and cannot "
+            "be combined with --body-file/--title (the amend mode)", 2)
+    # --summary/--metadata belong to recovery mode only; in amend mode they would
+    # be silently dropped (even invalid metadata would go unparsed), so refuse
+    # them as a usage error before anything is read or written.
+    if getattr(args, "summary", None) is not None or getattr(args, "metadata", None) is not None:
+        return _err(
+            "usage: kanban edit: --summary/--metadata are done-task recovery flags "
+            "and cannot be combined with --body-file/--title (the amend mode)", 2)
+    from hermes_cli import kanban_edit_open as keo
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban edit (body/title) is orchestrator-only; "
+                    "a worker never rewrites a brief")
+    body: Optional[str] = None
+    if body_file is not None:
+        try:
+            body = Path(body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            return _err(f"kanban edit: cannot read --body-file {body_file}: {exc}", 2)
+        except UnicodeDecodeError as exc:
+            # A file that is not valid UTF-8 is an unreadable body file, not a
+            # runtime error: same usage refusal (exit 2) as a missing file.
+            return _err(f"kanban edit: cannot read --body-file {body_file}: "
+                        f"not valid UTF-8 ({exc})", 2)
     with kbc.connect_closing() as conn:
-        ok = kb.edit_completed_task_result(conn, args.task_id, result=args.result,
-                                           summary=getattr(args, "summary", None), metadata=metadata)
-    return _ok_or_err(ok, f"cannot edit {args.task_id} (unknown id or task is not done)", f"Edited {args.task_id}")
+        try:
+            ok = keo.amend_open_task(conn, args.task_id, body=body, title=title)
+        except keo.RefusedEditError as refused:
+            # Unknown id, done/archived, or a no-op (identical body and title):
+            # refused by the DB layer — no event, no notify, exit 1.
+            return _err(f"cannot edit {args.task_id}: {refused.reason}")
+        except ValueError as exc:
+            return _err(f"kanban edit: {exc}", 2)
+        if ok:
+            status = kb._task_status(conn, args.task_id)
+            print(f"Edited {args.task_id}")
+            if status == "running":
+                print(f"note: {args.task_id} is running; the current worker keeps "
+                      "the text it started with — the correction applies from the next run.")
+            return 0
+    return _err(f"kanban edit: {args.task_id} was not amended", 1)
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):

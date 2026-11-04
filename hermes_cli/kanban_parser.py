@@ -375,9 +375,13 @@ _SPECS = [
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
-        _arg("--result", required=True, help="Backfilled task result text for a done task"),
+        _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--body-file",
+             help="Path to a file with the corrected body (amend mode: card not yet done)"),
+        _arg("--title", help="Corrected title (amend mode; use alone or with --body-file)"),
         *_STEP_HANDOFF,
-    ], help="Edit recovery fields on an already-completed task"),
+    ], help="Edit a task: --result backfills a done task's recovery fields; "
+            "--body-file/--title amend the brief of a card that is not done"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
