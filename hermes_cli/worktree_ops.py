@@ -728,6 +728,23 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
 _PRESERVE_REASONS = {"dirty": "uncommitted changes", "unpushed": "unpushed commits"}
 
 
+def _externally_owned_or_unanswerable(path: str) -> bool:
+    """Gate (b): does any kanban store own a path overlapping ``path``?
+
+    Imported lazily so a Hermes without the kanban modules still imports this
+    module; if the question cannot be asked (import failure, unreadable store),
+    the answer is "owned" — removal routes fail closed and keep the tree.
+    """
+    try:
+        from hermes_cli.kanban_db_workspace import _externally_owned_workspace
+    except Exception:
+        return True
+    try:
+        return bool(_externally_owned_workspace(None, path))
+    except Exception:
+        return True
+
+
 def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: float) -> tuple[list, set]:
     """Phase 3, serial unlock / remove / branch -D -> ``(preserved_stale, kept_branches)``.
 
@@ -744,6 +761,13 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
             continue
         if verdict == "locked-live":
             logger.debug("Skipping live-locked worktree: %s", entry.name)
+            continue
+
+        # Gate (b): a kanban external session (active binding or never-claimed
+        # card) may own this tree in a store git cannot see. Owned or
+        # unanswerable means keep — removal routes fail closed.
+        if _externally_owned_or_unanswerable(str(entry)):
+            logger.debug("Keeping externally-owned worktree: %s", entry.name)
             continue
 
         if lock_state == "dead":

@@ -247,3 +247,91 @@ class TestBranchGC:
         by_name = {record.name: record for record in records}
         assert by_name["main"].verdict == "keep"
         assert by_name[branch].verdict == "keep"
+
+
+# --- An externally-owned worktree is never reclaimed (gate (b)) ---
+
+class TestReclaimRespectsExternalSessionOwnership:
+    """``reclaim_worktrees`` removes linked worktrees that the git-tier gates
+    (clean, pushed, merged) consider reaping. A kanban external session may own
+    such a tree through an active binding or a never-claimed card — recorded in
+    a kanban store, invisible to git. Before removing path P the route must ask
+    ``_externally_owned_workspace(None, P)`` (gate (b)); True or unanswerable
+    means keep, with the reason reported."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        h = tmp_path / ".hermes"
+        h.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(h))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                    "HERMES_KANBAN_HOME", "HERMES_KANBAN_WORKSPACES_ROOT"):
+            monkeypatch.delenv(key, raising=False)
+        from hermes_cli import kanban_db as kb
+        kb.init_db()
+        return tmp_path
+
+    @staticmethod
+    def _own(worktree: Path) -> None:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        from hermes_cli import kanban_db_external as ext
+        with kbc.connect_closing() as c:
+            tid = kb.create_task(c, title="live session",
+                                 execution_kind="external_session")
+            ext.external_claim(
+                c, tid, board="default", owner_host="test-host",
+                incarnation=dict(session="prune", id="$7", created="1", pane="%7",
+                                 pid="0777", backend="claude", conversation="prune-c"),
+                worktree=str(worktree), reservation_id="prune-res",
+                reservation_token="e" * 64)
+
+    def test_owned_clean_pushed_tree_is_kept(self, repo, home):
+        """The review's exact input: a clean, pushed linked worktree
+        ``.worktrees/moll-e-session`` owned by an active external_claim."""
+        tree, branch = _add_worktree(repo, "moll-e-session")
+        (tree / "session.txt").write_text("session work\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "session work"], tree)
+        _git(["push", "origin", f"{branch}:{branch}"], repo)
+        self._own(tree)
+        from hermes_cli import kanban_db_workspace as kbw
+        assert kbw._externally_owned_workspace(None, str(tree)) is True, (
+            "precondition: gate (b) says the tree is owned")
+        actions = worktree_gc.reclaim_worktrees(str(repo))
+        assert tree.is_dir(), (
+            f"reclaim removed the live session's owned worktree: {actions}")
+        assert any("moll-e-session" in a and "external" in a for a in actions), actions
+
+    def test_unowned_clean_pushed_tree_is_still_removed(self, repo, home):
+        """Control: same shape, no owner — the route still reclaims."""
+        tree, branch = _add_worktree(repo, "hermes-unowned")
+        (tree / "session.txt").write_text("session work\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "session work"], tree)
+        _git(["push", "origin", f"{branch}:{branch}"], repo)
+        actions = worktree_gc.reclaim_worktrees(str(repo))
+        assert not tree.exists(), actions
+
+    def test_kanban_t_hex_name_is_still_kept(self, repo, home):
+        """Control: the t_<hex> name exclusion is untouched."""
+        _add_worktree(repo, "t_abc123", branch="kanban/t_abc123")
+        actions = worktree_gc.reclaim_worktrees(str(repo))
+        assert (repo / ".worktrees" / "t_abc123").is_dir(), actions
+
+    def test_unreadable_ownership_keeps_the_tree(self, repo, home, monkeypatch):
+        """Fail closed: when the ownership question cannot be answered, keep."""
+        tree, branch = _add_worktree(repo, "hermes-answerless")
+        (tree / "session.txt").write_text("session work\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "session work"], tree)
+        _git(["push", "origin", f"{branch}:{branch}"], repo)
+        from hermes_cli import kanban_db_workspace as kbw
+        monkeypatch.setattr(kbw, "_externally_owned_workspace",
+                            lambda conn, path: (_ for _ in ()).throw(
+                                RuntimeError("ownership unanswerable")))
+        actions = worktree_gc.reclaim_worktrees(str(repo))
+        assert tree.is_dir(), actions
+        assert any("hermes-answerless" in a and "external" in a for a in actions), actions

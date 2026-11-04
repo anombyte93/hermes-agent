@@ -177,6 +177,23 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
 _REAP_VERDICTS = {"reap", "reap-archive", "reap-keep-branch"}
 
 
+def _externally_owned_or_unanswerable(path: str) -> bool:
+    """Gate (b): does any kanban store own a path overlapping ``path``?
+
+    Imported lazily so a Hermes without the kanban modules still imports this
+    module; if the question cannot be asked (import failure, unreadable store),
+    the answer is "owned" — removal routes fail closed and keep the tree.
+    """
+    try:
+        from hermes_cli.kanban_db_workspace import _externally_owned_workspace
+    except Exception:
+        return True
+    try:
+        return bool(_externally_owned_workspace(None, path))
+    except Exception:
+        return True
+
+
 def reclaim_worktrees(
     repo_root: str, *, dry_run: bool = False, records: Optional[List[TreeRecord]] = None
 ) -> List[str]:
@@ -190,6 +207,13 @@ def reclaim_worktrees(
             continue
         if dry_run:
             actions.append(f"would remove {record.name} ({record.reason})")
+            continue
+
+        # Gate (b): a kanban external session (active binding or never-claimed
+        # card) may own this tree in a store git cannot see. Owned or
+        # unanswerable means keep — removal routes fail closed.
+        if _externally_owned_or_unanswerable(record.path):
+            actions.append(f"kept {record.name} (external session owns the worktree)")
             continue
 
         entry = Path(record.path)
