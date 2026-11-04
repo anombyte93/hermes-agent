@@ -45,7 +45,13 @@ def materialize_command(args) -> int:
                 options["pending_parents"] = pending
                 prior_file = getattr(args, "prior_rows_file", None)
                 if prior_file:
-                    options["prior_rows"] = json.loads(Path(prior_file).read_text(encoding="utf-8"))
+                    try:
+                        options["prior_rows"] = json.loads(Path(prior_file).read_text(encoding="utf-8"))
+                    except RecursionError as exc:
+                        # A deeply nested JSON array overflows the decoder's
+                        # stack; report it as a malformed prior-rows file, not
+                        # a traceback.
+                        raise ValueError("invalid_prior_rows") from exc
             operation = check_materialization if check else materialize_task
             result = operation(conn, project=args.project, plan_revision=args.plan_revision,
                 proposed_task_id=args.proposed_id, intent_fingerprint=args.fingerprint,

@@ -300,6 +300,17 @@ def test_invalid_prior_rows_refuse_cleanly_without_writes(store, capsys, tmp_pat
     assert "\n".join(store.iterdump()) == before
 
 
+def test_deeply_nested_prior_rows_file_refuses_without_traceback(store, capsys, tmp_path):
+    """A prior-rows file nested past the JSON decoder's recursion limit is a
+    malformed file (invalid_prior_rows, exit 1, no traceback), not a crash."""
+    file = tmp_path / "nested.json"
+    file.write_text("[" * 1000 + "]" * 1000)
+    before = "\n".join(store.iterdump())
+    assert invoke(capsys, "materialize-check", extra=("--prior-rows-file", str(file))) == (
+        1, {"state": "refused", "reason": "invalid_prior_rows"})
+    assert "\n".join(store.iterdump()) == before
+
+
 def test_projected_rename_can_replay_before_any_write(store):
     tid = write(store, proposed="x")["task_id"]
     request = row(proposed="y", maps_from="r1:x")
