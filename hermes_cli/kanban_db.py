@@ -476,18 +476,40 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _resolve_same_file(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` name the same file once resolved (symlinks and
+    relative paths followed; a dangling symlink still resolves to its target
+    path). Comparison failures read as "not the same file"."""
+    try:
+        return a.expanduser().resolve() == b.expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
     """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``."""
-    if env_var:
-        override = os.environ.get(env_var, "").strip()
-        if override:
-            return Path(override).expanduser()
+    for the ``default`` board, else ``board_dir(slug)/leaf``.
+
+    The override pins the ACTIVE board's paths into dispatched workers (whose
+    ``hermes -p`` HOME rewrite would otherwise re-resolve them), so it applies
+    only when no board is named — or when it resolves to the same file as the
+    named board's own store. A board named explicitly always opens its own
+    paths; letting the pin win here is how a pinned worker scrubbed, exported
+    or removed the wrong store (S6/S7)."""
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    if env_var:
+        override = os.environ.get(env_var, "").strip()
+        if override:
+            override_path = Path(override).expanduser()
+            # ``default`` keeps the pin: its store/root IS the legacy layout
+            # the pin re-anchors (no board_dir store of its own to consult).
+            if slug is None or slug == DEFAULT_BOARD or _resolve_same_file(
+                    override_path, board_dir(slug) / leaf):
+                return override_path
     if slug == DEFAULT_BOARD:
         return kanban_home().joinpath(*default_parts)
     return board_dir(slug) / leaf

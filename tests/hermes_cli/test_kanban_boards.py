@@ -101,11 +101,19 @@ class TestPathResolution:
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """``HERMES_KANBAN_DB`` pins the ACTIVE board (``board=None``); a board
+        named explicitly always opens its own store, and the pin applies to a
+        named board only when it resolves to that board's own store file."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        assert kb.kanban_db_path(board="default") == forced
+        # A named board opens its own store, not the pin (S6/S7 root rule).
+        assert kb.kanban_db_path(board="named") == fresh_home / "kanban" / "boards" / "named" / "kanban.db"
+        # Same file as the named board's own store: the pin still applies.
+        own = kb.board_dir("named") / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(own))
+        assert kb.kanban_db_path(board="named") == own
 
 
 # ---------------------------------------------------------------------------
