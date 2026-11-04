@@ -288,6 +288,20 @@ class TestReclaimRespectsExternalSessionOwnership:
                 worktree=str(worktree), reservation_id="prune-res",
                 reservation_token="e" * 64)
 
+    def test_kanban_import_failure_keeps_the_tree(self, repo, home, monkeypatch):
+        """Defect 4: the gate imports the kanban module lazily; if that import
+        fails the answer must be 'owned' — the tree is kept."""
+        tree, branch = _add_worktree(repo, "hermes-importless")
+        (tree / "session.txt").write_text("session work\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "session work"], tree)
+        _git(["push", "origin", f"{branch}:{branch}"], repo)
+        import sys
+        monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db_workspace", None)
+        actions = worktree_gc.reclaim_worktrees(str(repo))
+        assert tree.is_dir(), actions
+        assert any("hermes-importless" in a and "kept" in a for a in actions), actions
+
     def test_owned_clean_pushed_tree_is_kept(self, repo, home):
         """The review's exact input: a clean, pushed linked worktree
         ``.worktrees/moll-e-session`` owned by an active external_claim."""

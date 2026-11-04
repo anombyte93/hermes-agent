@@ -956,6 +956,18 @@ class TestStartupPrunerRespectsExternalSessionOwnership:
         cli._prune_stale_worktrees(str(git_repo))
         assert p.is_dir(), "control: the t_<hex> name exclusion (phase 1) is untouched"
 
+    def test_kanban_import_failure_keeps_the_tree(self, git_repo, kanban_home, monkeypatch):
+        """Defect 4 (this route): when the kanban module import fails, the
+        ownership question is unanswerable and the tree must be kept."""
+        import sys
+        from hermes_cli import worktree_ops
+        p = self._aged_owned_reap_verdict(git_repo, "hermes-importless")
+        monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db_workspace", None)
+        verdicts = worktree_ops._classify_prune_candidates(
+            str(git_repo), [(p, p.stat().st_mtime, True)])
+        worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        assert p.is_dir(), "kanban import failure must keep the tree"
+
     def test_unreadable_ownership_keeps_the_tree(self, git_repo, kanban_home, monkeypatch):
         from hermes_cli import worktree_ops
         from hermes_cli import kanban_db_workspace as kbw
