@@ -105,6 +105,24 @@ def test_edit_amend_refused_for_worker_context(kanban_home, tmp_path, monkeypatc
         assert kb.get_task(conn, tid).body == "Original brief."
 
 
+def test_edit_amend_non_utf8_body_file_refused_as_usage(kanban_home, tmp_path, capsys):
+    tid = _make(tmp_path, "binary guard")
+    binary = tmp_path / "binary.md"
+    binary.write_bytes(b"\xff\xfebroken")
+    rc = _edit(tid, "--body-file", str(binary))
+    out = capsys.readouterr()
+    assert rc == 2, out
+    # One exit code and one message shape for every unreadable body file
+    # (missing, directory, non-UTF-8): the generic codec traceback must not
+    # leak through as the CLI's answer.
+    assert "cannot read --body-file" in out.out + out.err
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.body == "Original brief."
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
+
+
 def test_edit_amend_usage_errors(kanban_home, tmp_path):
     tid = _make(tmp_path, "usage card")
     empty = tmp_path / "empty.md"

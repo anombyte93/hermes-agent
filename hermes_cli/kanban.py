@@ -1088,6 +1088,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             body = Path(body_file).read_text(encoding="utf-8")
         except OSError as exc:
             return _err(f"kanban edit: cannot read --body-file {body_file}: {exc}", 2)
+        except UnicodeDecodeError as exc:
+            # A file that is not valid UTF-8 is an unreadable body file, not a
+            # runtime error: same usage refusal (exit 2) as a missing file.
+            return _err(f"kanban edit: cannot read --body-file {body_file}: "
+                        f"not valid UTF-8 ({exc})", 2)
     with kbc.connect_closing() as conn:
         try:
             ok = keo.amend_open_task(conn, args.task_id, body=body, title=title)
