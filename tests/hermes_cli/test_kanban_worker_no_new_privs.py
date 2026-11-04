@@ -120,11 +120,11 @@ def test_default_spawn_wraps_worker_argv_with_setpriv(monkeypatch, tmp_path):
     kbd._default_spawn(task, str(tmp_path / "ws"))
 
     cmd = captured["cmd"]
-    import shutil
+    from tools.process_registry import _SETPRIV_CANDIDATES
 
-    setpriv = shutil.which("setpriv")
-    assert setpriv is not None, "Linux test host must have setpriv (util-linux)"
-    assert cmd[:3] == [setpriv, "--no-new-privs", "--"], cmd
+    # D2: the binary comes from the fixed system candidates, never PATH.
+    assert cmd[0] in _SETPRIV_CANDIDATES, cmd
+    assert cmd[:3] == [cmd[0], "--no-new-privs", "--"], cmd
     # The worker argv survives unchanged after the wrap separator.
     inner = cmd[3:]
     assert inner[0].endswith("/hermes") or inner[0] == "hermes", inner
@@ -210,14 +210,18 @@ def test_scoped_route_keeps_setpriv_outside_systemd_run(monkeypatch, tmp_path):
 
 @pytest.mark.linux_only
 def test_spawn_fails_closed_when_setpriv_is_missing(monkeypatch, tmp_path):
-    """No setpriv on a Linux host -> RuntimeError, and no child is started."""
+    """No trusted setpriv on a Linux host -> RuntimeError, no child started.
+
+    The candidates are a fixed system list, so "missing" is proved by
+    monkeypatching the list itself — no PATH trick can make this pass.
+    """
     popen_calls: list[list[str]] = []
 
     def fail_popen(cmd, **kwargs):
         popen_calls.append(list(cmd))
         raise AssertionError("an unflagged worker must never be launched")
 
-    monkeypatch.setattr("shutil.which", lambda name: None if name == "setpriv" else name)
+    monkeypatch.setattr("tools.process_registry._SETPRIV_CANDIDATES", [])
     monkeypatch.setattr(subprocess, "Popen", fail_popen)
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
@@ -227,6 +231,84 @@ def test_spawn_fails_closed_when_setpriv_is_missing(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="no_new_privs"):
         kbd._default_spawn(_make_task(), str(tmp_path / "ws"))
     assert popen_calls == []
+
+
+@pytest.mark.linux_only
+def test_path_shim_is_not_used_and_real_flag_is_set(synthetic_spawn_env, monkeypatch):
+    """D2: a setpriv shim planted FIRST on PATH must not be used.
+
+    Red at the pre-D2 head: the binary was resolved with a bare-name PATH
+    lookup, so a worker could plant a shim that strips --no-new-privs and
+    every later worker would spawn unflagged, with no error (gen-17
+    defect 2). The shim writes a marker if it runs; the marker must be
+    absent and the real kernel flag must still reach the worker.
+    """
+    shim_dir = synthetic_spawn_env["workspace"] / "shim-bin"
+    shim_dir.mkdir()
+    marker = synthetic_spawn_env["workspace"] / "shim-ran.txt"
+    shim = shim_dir / "setpriv"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf 'ran\\n' > {marker}\n"
+        "shift; shift; exec \"$@\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    # The shim sits FIRST on the dispatcher's PATH, before /usr/bin.
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            **os.environ,
+            "PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+        },
+    )
+
+    task = _make_task("t_nnp_shim")
+    pid = kbd._default_spawn(task, str(synthetic_spawn_env["workspace"]))
+    assert pid
+
+    receipt = synthetic_spawn_env["receipt"]
+    deadline = time.monotonic() + 20
+    while not receipt.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert receipt.exists(), "fake hermes never wrote its NoNewPrivs receipt"
+    assert not marker.exists(), "a PATH shim must never be used as setpriv"
+    assert "NoNewPrivs:\t1" in receipt.read_text(encoding="utf-8")
+
+
+@pytest.mark.linux_only
+def test_spawn_fails_closed_when_candidate_fails_ownership_check(monkeypatch, tmp_path):
+    """D2: an untrusted setpriv candidate (not owned by root) makes the spawn
+    raise; nothing is launched.
+
+    Red at the pre-D2 head: no ownership check existed, so the existing
+    /usr/bin/setpriv was used blindly and the spawn proceeded. The stat is
+    monkeypatched — nothing is ever chowned.
+    """
+    import tools.process_registry as pr
+
+    candidate = "/usr/bin/setpriv"
+    real_lstat = os.lstat
+
+    def untrusted_lstat(path, *args, **kwargs):
+        if str(path) == candidate:
+            # Regular executable file owned by uid 1000, not root.
+            return os.stat_result((0o100755, 0, 1000, 1000, 1, 1, 47200, 1, 1, 1))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(pr, "_SETPRIV_CANDIDATES", [candidate])
+    monkeypatch.setattr(os, "lstat", untrusted_lstat)
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda cmd, **kw: (_ for _ in ()).throw(AssertionError("spawned"))
+    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="no_new_privs"):
+        kbd._default_spawn(_make_task(), str(tmp_path / "ws"))
 
 
 def test_non_linux_platform_spawns_exactly_as_today(monkeypatch, tmp_path):

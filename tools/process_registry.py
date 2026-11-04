@@ -294,6 +294,77 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
 _scope_degraded_warned = False
 
 
+def _setpriv_trusted_path() -> str:
+    """The first system-owned setpriv from :data:`_SETPRIV_CANDIDATES` that is
+    safe to exec as the no_new_privs setter, or ``""`` with the rejection
+    reasons filled in.
+
+    A bare-name PATH lookup is not trusted (gen-17 defect 2): the gateway
+    unit prepends worker-writable directories to PATH, so a worker could
+    plant a shim that strips the flag and later workers would spawn
+    unflagged with no error. Trust only a fixed absolute path whose file
+    and every directory on its path are owned by root (uid 0) and are not
+    group- or world-writable.
+    """
+    rejected: list[str] = []
+    for candidate in _SETPRIV_CANDIDATES:
+        path = Path(candidate)
+        try:
+            # Lstat the candidate itself (a symlink is untrusted as an
+            # exec target); stat (follow) every parent so the check covers
+            # the directory the kernel actually resolves through.
+            file_st = os.lstat(path)
+            mode = file_st.st_mode
+            if stat.S_ISLNK(mode):
+                rejected.append(f"{candidate}: symlink")
+                continue
+            if not stat.S_ISREG(mode):
+                rejected.append(f"{candidate}: not a regular file")
+                continue
+            if file_st.st_uid != 0:
+                rejected.append(f"{candidate}: not owned by root (uid {file_st.st_uid})")
+                continue
+            if mode & 0o022:
+                rejected.append(f"{candidate}: group- or world-writable ({stat.filemode(mode)})")
+                continue
+            if not os.access(path, os.X_OK):
+                rejected.append(f"{candidate}: not executable")
+                continue
+            weak_dir = _untrusted_path_directory(candidate)
+            if weak_dir:
+                rejected.append(f"{candidate}: {weak_dir}")
+                continue
+            return candidate
+        except FileNotFoundError:
+            rejected.append(f"{candidate}: not present")
+        except OSError as exc:
+            rejected.append(f"{candidate}: {exc}")
+    if rejected:
+        _setpriv_trusted_path.reason = "; ".join(rejected)  # type: ignore[attr-defined]
+    else:
+        _setpriv_trusted_path.reason = "no candidates"  # type: ignore[attr-defined]
+    return ""
+
+
+def _untrusted_path_directory(candidate: str) -> str:
+    """Why *candidate's* directory chain is untrusted, or ``""`` when every
+    directory is root-owned and not group- or world-writable."""
+    for parent in Path(candidate).parents:
+        try:
+            st = os.stat(parent)
+        except OSError as exc:
+            return f"{parent}: {exc}"
+        if st.st_uid != 0:
+            return f"directory {parent} is not owned by root (uid {st.st_uid})"
+        if st.st_mode & 0o022:
+            return f"directory {parent} is group- or world-writable ({stat.filemode(st.st_mode)})"
+    return ""
+
+
+# Fixed system candidates, in order; never resolved through PATH (#195).
+_SETPRIV_CANDIDATES = ("/usr/bin/setpriv", "/bin/setpriv")
+
+
 def no_new_privs_argv(command: List[str]) -> List[str]:
     """Prefix *command* with ``setpriv --no-new-privs --`` (#195).
 
@@ -304,23 +375,25 @@ def no_new_privs_argv(command: List[str]) -> List[str]:
     (the direct argv and ``systemd-run --user --scope`` whose client execs the
     worker from the same Popen child), so one outer wrap covers both.
 
-    Fails closed: on Linux, an unresolvable ``setpriv`` raises rather than
-    launching an unflagged worker. Non-Linux platforms never have the kernel
+    Fails closed: on Linux, a setpriv that is not a root-owned, non-writable
+    system binary raises rather than launching an unflagged worker — it is
+    resolved from the fixed :data:`_SETPRIV_CANDIDATES` list, never through
+    PATH, because the worker's uid can write to PATH directories the gateway
+    unit puts ahead of ``/usr/bin``. Non-Linux platforms never have the kernel
     flag, so the command is returned unchanged (spawn behaves exactly as
     today). A fork-time child callback is deliberately not used: it is
     forbidden in this module (``tests/tools/test_windows_compat.py``) and
     unsafe in the threaded dispatcher; ``setpriv`` execs in place, keeping
     PID semantics identical.
     """
-    import shutil
-
     if not _IS_LINUX:
         return command
-    binary = shutil.which("setpriv")
-    if binary is None:
+    binary = _setpriv_trusted_path()
+    if not binary:
         raise RuntimeError(
-            "cannot spawn Kanban worker without no_new_privs: the `setpriv` "
-            "binary was not found on PATH (install util-linux)"
+            "cannot spawn Kanban worker without no_new_privs: no trusted system "
+            "`setpriv` found (install util-linux); candidates rejected: "
+            f"{getattr(_setpriv_trusted_path, 'reason', 'unknown')}"
         )
     return [binary, "--no-new-privs", "--", *command]
 
