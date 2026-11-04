@@ -163,6 +163,45 @@ def test_edit_amend_noop_body_with_changed_title_still_edits_title(kanban_home, 
         assert kinds.count("body_edited") == 1
 
 
+def test_edit_amend_refuses_result_mode_flags_before_any_read(kanban_home, tmp_path, capsys):
+    tid = _make(tmp_path, "flag guard")
+    # A missing body file must not even be reported: the usage refusal comes
+    # before anything is read or written.
+    rc = _edit(tid, "--body-file", str(tmp_path / "nope.md"), "--summary", "dropped?")
+    out = capsys.readouterr()
+    assert rc == 2, out
+    text = out.out + out.err
+    assert "usage" in text.lower() and "--summary" in text
+    # The same refusal with a perfectly valid body file: the flags are the
+    # problem, not the input.
+    rc = _edit(tid, "--body-file", _body_file(tmp_path, NEW_BODY), "--summary", "dropped?")
+    out = capsys.readouterr()
+    assert rc == 2, out
+    assert "usage" in (out.out + out.err).lower()
+    # --title alone takes no --metadata either.
+    rc = _edit(tid, "--title", "Fixed title", "--metadata", '{"x": 1}')
+    out = capsys.readouterr()
+    assert rc == 2, out
+    text = out.out + out.err
+    assert "usage" in text.lower() and "--metadata" in text
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.body == "Original brief."
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
+
+
+def test_edit_result_mode_still_takes_summary_and_metadata(kanban_home, tmp_path, capsys):
+    tid = _make(tmp_path, "recovery flags")
+    with kbc.connect() as conn:
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="first take") is True
+    rc = _edit(tid, "--result", "better", "--summary", "s2", "--metadata", '{"k": 1}')
+    out = capsys.readouterr()
+    assert rc == 0, out
+    assert "Edited" in out.out
+
+
 def test_edit_amend_done_card_refuses_with_pointer_to_result(kanban_home, tmp_path):
     tid = _make(tmp_path, "done via cli")
     with kbc.connect() as conn:

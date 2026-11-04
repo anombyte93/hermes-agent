@@ -1070,6 +1070,13 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         return _err(
             "usage: kanban edit: --result is the done-task recovery mode and cannot "
             "be combined with --body-file/--title (the amend mode)", 2)
+    # --summary/--metadata belong to recovery mode only; in amend mode they would
+    # be silently dropped (even invalid metadata would go unparsed), so refuse
+    # them as a usage error before anything is read or written.
+    if getattr(args, "summary", None) is not None or getattr(args, "metadata", None) is not None:
+        return _err(
+            "usage: kanban edit: --summary/--metadata are done-task recovery flags "
+            "and cannot be combined with --body-file/--title (the amend mode)", 2)
     from hermes_cli import kanban_edit_open as keo
 
     if os.environ.get("HERMES_KANBAN_TASK"):
