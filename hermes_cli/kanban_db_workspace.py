@@ -257,15 +257,16 @@ def _externally_owned_workspace_detail(
                 elif entry.name == "_archived" and entry.is_dir():
                     paths.update(child / "kanban.db" for child in entry.iterdir() if child.is_dir())
         for db in paths:
-            if db.resolve() == current or not (db.exists() or db.is_symlink()):
-                continue
             try:
+                if db.resolve() == current or not (db.exists() or db.is_symlink()):
+                    continue
                 other = connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)
             except (OSError, sqlite3.Error):
                 # sqlite refuses some stores at OPEN (mode 000, dangling
-                # symlink target): ownership there is unknowable, which is
-                # fail-closed — and the refusal must name the store rather
-                # than claim another store owns a path.
+                # symlink target) — and a mode-000 board DIRECTORY makes the
+                # existence probe itself raise EACCES. Ownership there is
+                # unknowable, which is fail-closed — and the refusal must
+                # name the store rather than claim another store owns a path.
                 return True, (
                     f"kanban store {db} could not be read to rule out external "
                     f"ownership of {path}")

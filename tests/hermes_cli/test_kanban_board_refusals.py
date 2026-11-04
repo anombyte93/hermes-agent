@@ -446,3 +446,69 @@ def test_hint_names_another_store_owning_a_path_inside_the_board(kanban_tmp_home
     assert kb.board_dir("holder-b").is_dir()
     assert (x / "work").read_bytes() == b"live work"
     assert (inside / "proof").read_bytes() == b"owned by c"
+
+
+# --- Defect 5: a mode-000 board DIRECTORY names the store, not an owner -----
+
+
+def test_mode000_board_directory_remove_board_names_the_store(kanban_tmp_home):
+    """Defect 5, remove_board route: a board DIRECTORY with mode 000 makes
+    ``db.exists()`` raise EACCES inside gate (b); the refusal must say the
+    kanban store could not be read (naming it), not 'another store's
+    external session'."""
+    import os
+    home = kanban_tmp_home
+    x = _own_x_outside_home(home, "never_claimed")
+    kb.create_board("locked-dir")
+    locked_dir = kb.board_dir("locked-dir")
+    os.chmod(locked_dir, 0)
+    try:
+        with pytest.raises(ValueError) as exc:
+            kb.remove_board("holder-b", archive=False)
+    finally:
+        os.chmod(locked_dir, 0o755)
+    msg = str(exc.value)
+    assert "could not be read" in msg, msg
+    assert str(locked_dir / "kanban.db") in msg, msg
+    assert "another store's external session" not in msg, msg
+    assert kb.board_dir("holder-b").is_dir()
+    assert (x / "work").read_bytes() == b"live work"
+
+
+def test_mode000_board_directory_gc_prune_names_ownership_unreadable(kanban_tmp_home, tmp_path):
+    """Defect 5, worktree_gc route: a board DIRECTORY with mode 000 makes
+    the kept line say ownership could not be read, not 'external session
+    owns the worktree'."""
+    import os
+    from hermes_cli import worktree_gc
+    home = kanban_tmp_home
+    kb.create_board("locked-dir")
+    locked_dir = kb.board_dir("locked-dir")
+    os.chmod(locked_dir, 0)
+    try:
+        gate = worktree_gc._externally_owned_or_unanswerable(str(home / "some-tree"))
+    finally:
+        os.chmod(locked_dir, 0o755)
+    owned, reason = gate if isinstance(gate, tuple) else (gate, None)
+    assert owned is True
+    assert reason is not None and "could not be read" in reason, gate
+    assert "owns the worktree" not in (reason or ""), gate
+
+
+def test_mode000_board_directory_ops_prune_names_ownership_unreadable(kanban_tmp_home):
+    """Defect 5, worktree_ops route: same shape through
+    ``_externally_owned_or_unanswerable``."""
+    import os
+    from hermes_cli import worktree_ops
+    home = kanban_tmp_home
+    kb.create_board("locked-dir")
+    locked_dir = kb.board_dir("locked-dir")
+    os.chmod(locked_dir, 0)
+    try:
+        gate = worktree_ops._externally_owned_or_unanswerable(str(home / "some-tree"))
+    finally:
+        os.chmod(locked_dir, 0o755)
+    owned, reason = gate if isinstance(gate, tuple) else (gate, None)
+    assert owned is True
+    assert reason is not None and "could not be read" in reason, gate
+    assert "owns the worktree" not in (reason or ""), gate
