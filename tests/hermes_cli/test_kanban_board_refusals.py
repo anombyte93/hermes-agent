@@ -255,3 +255,58 @@ def test_pinned_board_delete_then_sharing_archive_keeps_live_worktree(
         assert kb.archive_task(c, sharing)
     assert rc != 0, "pinned boards rm --delete succeeded while holder-b holds an active binding"
     assert x.is_dir() and (x / "work").read_bytes() == b"live work"
+
+
+# --- True refusal reasons (refuse identically, name the real cause) ---
+
+@pytest.mark.parametrize("archive", [False, True])
+def test_refusal_names_the_unreadable_store(kanban_tmp_home, archive):
+    """Case 1: an unrelated board's store cannot be read, so every board
+    removal fails closed — right. The reason must name that store and say
+    ownership could not be read, not claim another store owns a path."""
+    kb.create_board("victim")
+    kb.create_board("broken")
+    broken_db = kb.board_dir("broken") / "kanban.db"
+    broken_db.write_bytes(b"not a sqlite database" * 100)
+    with pytest.raises(ValueError) as exc:
+        kb.remove_board("victim", archive=archive)
+    msg = str(exc.value)
+    assert "externally_owned_workspace" in msg
+    assert str(broken_db) in msg, msg
+    assert "could not be read" in msg, msg
+    assert "another store" not in msg, msg
+    assert kb.board_dir("victim").is_dir()
+    assert broken_db.read_bytes() == b"not a sqlite database" * 100
+
+
+def test_own_card_reserving_path_inside_own_board_is_named(kanban_tmp_home):
+    """Case 2: the board's OWN never-claimed card reserves a path inside its
+    own directory. Archive=True rightly refuses (moving the board breaks that
+    session) and must name this board's own card and store, not "another
+    store"; the hard-delete hint must point at the card to resolve, not at an
+    archive route that also refuses here."""
+    from hermes_cli import kanban_db_workspace as kbw
+    kbw  # (import kept local: the helper under test)
+    kb.create_board("selfowner")
+    x = kb.board_dir("selfowner") / "workspaces" / "reserved"
+    x.mkdir(parents=True)
+    (x / "proof").write_bytes(b"owned")
+    with kbc.connect_closing(board="selfowner") as conn:
+        tid = kb.create_task(conn, title="reserved", execution_kind="external_session",
+                             workspace_kind="dir", workspace_path=str(x))
+
+    with pytest.raises(ValueError) as archive_exc:
+        kb.remove_board("selfowner", archive=True)
+    msg = str(archive_exc.value)
+    assert "externally_owned_workspace" in msg
+    assert tid in msg and str(x) in msg, msg
+    assert "its own store" in msg, msg
+    assert "another store" not in msg, msg
+
+    with pytest.raises(ValueError) as history_exc:
+        kb.remove_board("selfowner", archive=False)
+    hint = str(history_exc.value)
+    assert "external_binding_history" in hint
+    assert tid in hint and str(x) in hint, hint
+    assert kb.board_dir("selfowner").is_dir()
+    assert (x / "proof").read_bytes() == b"owned"

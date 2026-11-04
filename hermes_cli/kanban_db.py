@@ -657,7 +657,11 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError(f"board {normed!r} does not exist")
 
     from hermes_cli.kanban_db_connect import connect_closing
-    from hermes_cli.kanban_db_workspace import _externally_owned_workspace, _store_owns_external_workspace
+    from hermes_cli.kanban_db_workspace import (
+        _externally_owned_workspace_detail,
+        _own_external_paths_detail,
+        _store_owns_external_workspace,
+    )
     # Open the removed board's OWN store by path, never by board name: a
     # name-based open resolves through ``_board_path``, which returns the
     # ``HERMES_KANBAN_DB`` override before it looks at ``board`` — and the
@@ -673,6 +677,10 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             ).fetchone()
             # None (unreadable store) is ownership: fail closed, keep the board.
             history = _store_owns_external_workspace(conn)
+            # Evidence for the refusal messages below: which of THIS store's
+            # cards reserve paths inside the board directory. Computed while
+            # the connection is open.
+            own_paths = _own_external_paths_detail(conn, str(d))
     except sqlite3.Error as exc:
         raise ValueError(
             f"board_unreadable: cannot verify external ownership on {normed!r}; "
@@ -683,17 +691,32 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # Fail closed: refuse on ownership (True) or an unreadable store (None);
     # only a verified no-ownership (False) may hard-delete.
     if not archive and history is not False:
-        raise ValueError("external_binding_history: use the archive route to retain workspace ownership")
+        # Name the board's own reservation the user must resolve first; the
+        # archive route refuses too whenever the own store owns any path, so
+        # pointing at it here would send the user to a dead end.
+        raise ValueError(
+            f"external_binding_history: board {normed!r}'s own cards reserve external "
+            f"workspaces ({own_paths or f'see `hermes kanban --board {normed} list`'}); "
+            "release or clear those reservations before removal")
     # Gate (b): before ANY filesystem removal of the board directory (delete
     # or archive-move), ask whether any store owns a path overlapping it —
     # another board's external card or live binding may sit inside this
     # board's workspaces/. ``_externally_owned_workspace`` already fails
     # closed (an unreadable store anywhere reads as ownership).
-    if _externally_owned_workspace(None, str(d)):
+    owned, owned_detail = _externally_owned_workspace_detail(None, str(d))
+    if owned:
+        if own_paths:
+            raise ValueError(
+                f"externally_owned_workspace: board {normed!r} contains a path reserved "
+                f"by its own store's external session card ({own_paths}); resolve that "
+                f"card first — moving the board would break the session it reserves")
+        if owned_detail is not None:
+            raise ValueError(
+                f"externally_owned_workspace: {owned_detail}; refusing to remove "
+                f"board {normed!r} while ownership cannot be ruled out")
         raise ValueError(
             f"externally_owned_workspace: board {normed!r} contains a path owned by "
-            "another store's external session; release that ownership first"
-        )
+            "another store's external session; release that ownership first")
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:

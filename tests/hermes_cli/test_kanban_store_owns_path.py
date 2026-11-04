@@ -64,7 +64,7 @@ def test_remove_board_delete_refuses_never_claimed_external_owner(store, tmp_pat
         with kbc.connect_closing(board="default") as other:
             kb.create_task(other, title="sharing scratch worker", workspace_kind="scratch",
                            workspace_path=str(owned))
-        with pytest.raises(ValueError, match="external_binding_history.*archive"):
+        with pytest.raises(ValueError, match="external_binding_history.*before removal"):
             kb.remove_board("owner-board", archive=False)
         assert kb.get_current_board() == "owner-board"
         assert kb.board_dir("owner-board").is_dir()

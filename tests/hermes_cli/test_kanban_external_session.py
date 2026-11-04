@@ -932,7 +932,7 @@ def test_board_removal_refuses_active_external_binding(store, archive):
         external_api().external_release(conn, tid, active["run_id"],
             reservation_token=TOKEN, reason="explicitly released")
     if not archive:
-        with pytest.raises(ValueError, match="external_binding_history.*archive"):
+        with pytest.raises(ValueError, match="external_binding_history.*before removal"):
             kb.remove_board("bound-board", archive=False)
         assert kb.get_current_board() == "bound-board"
         assert kb.board_dir("bound-board").is_dir()

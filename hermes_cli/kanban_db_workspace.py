@@ -170,11 +170,71 @@ def _store_owns_external_workspace(
         return None
 
 
+def _own_external_paths_detail(conn: sqlite3.Connection, path: str | None) -> str | None:
+    """Human-readable ``<task_id> at <path>`` list of THIS store's own external
+    reservations overlapping ``path`` (any reservation when ``path`` is None).
+
+    Companion to :func:`_store_owns_external_workspace`: same inputs, but the
+    answer is the evidence (which card, which path) so refusal messages can
+    name the card the user must resolve instead of blaming another store.
+    Unreadable inputs yield ``None`` — callers already fail closed.
+    """
+    try:
+        target = Path(path).expanduser().resolve() if path is not None else None
+        found: list[str] = []
+        for task_id, source in _own_external_path_rows(conn):
+            if target is None:
+                found.append(f"task {task_id} at {source}")
+                continue
+            owned_path = Path(source).expanduser().resolve()
+            if target.is_relative_to(owned_path) or owned_path.is_relative_to(target):
+                found.append(f"task {task_id} at {source}")
+        return "; ".join(found) if found else None
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return None
+
+
+def _own_external_path_rows(conn: sqlite3.Connection):
+    """``(task_id, workspace_path)`` for every external reservation this store holds.
+
+    The never-claimed arm keeps ``tasks.id`` so the refusal can name the card;
+    the bindings arm falls back to the bound task id. Overlapping paths are
+    filtered by the caller (:func:`_own_external_paths_detail`).
+    """
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "task_external_bindings" in tables:
+        for row in conn.execute(
+            "SELECT task_id, worktree FROM task_external_bindings WHERE worktree IS NOT NULL"
+        ):
+            yield row[0], row[1]
+    if "tasks" in tables:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "execution_kind" in columns:
+            for row in conn.execute(
+                "SELECT id, workspace_path FROM tasks WHERE execution_kind='external_session' "
+                "AND workspace_path IS NOT NULL"
+            ):
+                yield row[0], row[1]
+
+
 def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> bool:
     """Fail closed at removal: a session owns overlapping paths on every board.
 
     Inspect other boards read-only, without initialisation or migration. Neither
     attempt closure nor a board archive grants ownership of the session's files.
+    """
+    return _externally_owned_workspace_detail(conn, path)[0]
+
+
+def _externally_owned_workspace_detail(
+    conn: sqlite3.Connection | None, path: str,
+) -> tuple[bool, Optional[str]]:
+    """``_externally_owned_workspace`` with the reason as a human-readable detail.
+
+    Returns ``(owned, detail)``. ``owned`` is exactly what the boolean gate
+    answers (True also when ownership could not be read — fail closed); the
+    detail names the owning card/binding, the board's own store, or the store
+    whose ownership could not be read, so refusal messages can say why.
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
@@ -183,7 +243,7 @@ def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> b
         if conn is not None:
             # ``None`` (unreadable store) is ownership: fail closed, keep the path.
             if _store_owns_external_workspace(conn, path) is not False:
-                return True
+                return True, None  # the caller's own store; remove_board reports it separately
             current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
         paths = {_kb.kanban_home() / "kanban.db"}
         pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
@@ -200,11 +260,16 @@ def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> b
             if db.resolve() == current or not (db.exists() or db.is_symlink()):
                 continue
             with contextlib.closing(connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)) as other:
-                if _store_owns_external_workspace(other, path) is not False:
-                    return True
-        return False
+                owns = _store_owns_external_workspace(other, path)
+                if owns is not False:
+                    detail = (
+                        f"kanban store {db} could not be read to rule out external "
+                        f"ownership of {path}" if owns is None else
+                        f"kanban store {db} owns a path overlapping {path}")
+                    return True, detail
+        return False, None
     except (OSError, RuntimeError, ValueError, sqlite3.Error):
-        return True
+        return True, None
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
