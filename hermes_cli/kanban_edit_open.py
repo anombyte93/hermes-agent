@@ -49,11 +49,11 @@ def amend_open_task(
 
     One audited event (``body_edited``) with the changed field names, old/new
     body SHA-256 and lengths, the status at edit time and ``current_run_id``
-    when running — never the text. True when something changed, False for a
-    no-op (identical body and title; no event), :class:`RefusedEditError` for
-    an unknown id or a frozen status, ``ValueError`` for blank input or when
-    neither field is given. ``notify_task_updated`` fires after commit with
-    the changed field names only.
+    when running — never the text. True when something changed;
+    :class:`RefusedEditError` for an unknown id, a frozen status or a no-op
+    (identical body and title: refused without an event or a notify),
+    ``ValueError`` for blank input or when neither field is given.
+    ``notify_task_updated`` fires after commit with the changed field names only.
     """
     if body is None and title is None:
         raise ValueError("nothing to edit: pass --body-file and/or --title")
@@ -103,7 +103,11 @@ def amend_open_task(
         payload["fields"] = changed_fields
 
         if not changed_fields:
-            return False  # no-op: identical body and title, no event
+            # A no-op is refused, never returned as quiet success: the caller
+            # must not mistake "nothing changed" for a recorded edit.
+            raise RefusedEditError(
+                f"{task_id}: nothing changed (body and title already current)"
+            )
 
         if current_run_id:
             payload["current_run_id"] = int(current_run_id)

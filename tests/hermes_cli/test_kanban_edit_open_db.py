@@ -201,7 +201,8 @@ def test_amend_refuses_blank_body_and_blank_title(kanban_home):
 def test_amend_identical_body_is_noop_without_event(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="noop guard", body="same text")
-        assert keo.amend_open_task(conn, tid, body="same text") is False
+        with pytest.raises(keo.RefusedEditError, match=r"nothing changed"):
+            keo.amend_open_task(conn, tid, body="same text")
         assert _task(conn, tid).body == "same text"
         assert _edited_events(conn, tid) == []
 
@@ -209,7 +210,8 @@ def test_amend_identical_body_is_noop_without_event(kanban_home):
 def test_amend_identical_title_is_noop_without_event(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="same", body="text")
-        assert keo.amend_open_task(conn, tid, title="same") is False
+        with pytest.raises(keo.RefusedEditError, match=r"nothing changed"):
+            keo.amend_open_task(conn, tid, title="same")
         assert _edited_events(conn, tid) == []
 
 

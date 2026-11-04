@@ -1085,6 +1085,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         try:
             ok = keo.amend_open_task(conn, args.task_id, body=body, title=title)
         except keo.RefusedEditError as refused:
+            # Unknown id, done/archived, or a no-op (identical body and title):
+            # refused by the DB layer — no event, no notify, exit 1.
             return _err(f"cannot edit {args.task_id}: {refused.reason}")
         except ValueError as exc:
             return _err(f"kanban edit: {exc}", 2)
@@ -1095,8 +1097,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 print(f"note: {args.task_id} is running; the current worker keeps "
                       "the text it started with — the correction applies from the next run.")
             return 0
-    print(f"Edited {args.task_id} (no change: body and title already current)")
-    return 0
+    return _err(f"kanban edit: {args.task_id} was not amended", 1)
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):

@@ -8,6 +8,7 @@ context never rewrites a brief, and a running card prints the next-run note.
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,20 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+
+
+def _edit(*argv: str) -> int:
+    """Drive ``kanban edit`` through the real parser and dispatch; return the
+    exit code (argparse usage errors surface as their SystemExit code, exactly
+    as a shell caller would see them)."""
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    try:
+        args = parser.parse_args(["kanban", "edit", *argv])
+    except SystemExit as exc:
+        return int(exc.code or 2)
+    return kc.kanban_command(args)
 
 
 @pytest.fixture
@@ -110,6 +125,42 @@ def test_edit_amend_usage_errors(kanban_home, tmp_path):
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).body == "Original brief."
         assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
+
+
+def test_edit_amend_noop_body_refused_not_accepted(kanban_home, tmp_path, capsys):
+    tid = _make(tmp_path, "noop guard", body="same text")
+    rc = _edit(tid, "--body-file", _body_file(tmp_path, "same text"))
+    out = capsys.readouterr()
+    assert rc == 1, out
+    assert "nothing changed" in (out.out + out.err).lower()
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "same text"
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
+
+
+def test_edit_amend_noop_title_refused_not_accepted(kanban_home, tmp_path, capsys):
+    tid = _make(tmp_path, "same")
+    rc = _edit(tid, "--title", "same")
+    out = capsys.readouterr()
+    assert rc == 1, out
+    assert "nothing changed" in (out.out + out.err).lower()
+    with kbc.connect() as conn:
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
+
+
+def test_edit_amend_noop_body_with_changed_title_still_edits_title(kanban_home, tmp_path, capsys):
+    tid = _make(tmp_path, "same", body="same text")
+    rc = _edit(tid, "--body-file", _body_file(tmp_path, "same text"), "--title", "Fixed title")
+    out = capsys.readouterr()
+    assert rc == 0, out
+    assert "Edited" in out.out
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.title == "Fixed title"
+        assert task.body == "same text"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("body_edited") == 1
 
 
 def test_edit_amend_done_card_refuses_with_pointer_to_result(kanban_home, tmp_path):
