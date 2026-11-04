@@ -187,6 +187,10 @@ gateway:
     truncated_suffix:      "… (truncated; use `hermes kanban …` in your terminal for full output)"
     no_output:             "(no output)"
     wake:
+      external_completed: "completed"
+      external_review_requested: "handed off for review; the implementation is done"
+      external_changes_requested: "review requested changes; implementation is not approved"
+      external_released: "external attempt released; inspect the card for its dependency-gated state"
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"
       crashed:             "crashed (worker exited); dispatcher will retry"

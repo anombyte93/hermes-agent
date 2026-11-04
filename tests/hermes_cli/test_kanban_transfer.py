@@ -79,6 +79,87 @@ def _seed_board(slug: str = "alpha") -> dict[str, str]:
     return ids
 
 
+def test_stray_import_directory_refuses_without_changing_bytes(kanban_root, tmp_path):
+    _seed_board()
+    archive = tmp_path / "board.tar.gz"
+    kt.export_board("alpha", str(archive))
+    kanban_root("destination")
+    stray = kb.board_dir("stray")
+    stray.mkdir(parents=True)
+    (stray / "keep.bin").write_bytes(b"do not adopt or delete me")
+    before = {p.relative_to(stray): p.read_bytes() for p in stray.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="import_destination_exists"):
+        kt.import_board(str(archive), "stray")
+    assert {p.relative_to(stray): p.read_bytes() for p in stray.rglob("*") if p.is_file()} == before
+    assert not (stray / "kanban.db").exists()
+    assert not (stray / "board.json").exists()
+
+
+@pytest.mark.parametrize("payload", [None, '[1]', '"x"', 'null', 'not JSON', '{"reservation_id":"fixture","owner_host":"fixture"}'])
+def test_untrusted_external_payload_does_not_bypass_import_parking(kanban_root, tmp_path, monkeypatch, payload):
+    import sqlite3
+    from unittest.mock import Mock
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    kb.create_board("source")
+    with kbc.connect_closing(board="source") as conn:
+        tid = kb.create_task(conn, title="untrusted", assignee="fixture", workspace_kind="dir", workspace_path=str(tmp_path))
+        conn.execute("INSERT INTO kanban_notify_subs(task_id,platform,chat_id,created_at) VALUES(?,'telegram','fixture',1)", (tid,))
+        if payload is not None:
+            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,'external_claimed',?,1)", (tid, payload))
+        conn.commit()
+    # Craft from the unsanitised source to exercise import independently of export.
+    stage = tmp_path / "archive" / "source"
+    stage.mkdir(parents=True)
+    kt._snapshot_db(kb.kanban_db_path("source"), stage / "kanban.db")
+    (stage / "manifest.json").write_text(json.dumps({"format": kt.ARCHIVE_FORMAT, "format_version": 1, "board": "source"}))
+    archive = tmp_path / "untrusted.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(stage, arcname="source")
+    result = kt.import_board(str(archive), "imported")
+    monkeypatch.setattr(dispatch, "_profile_exists_fn", lambda: lambda name: True)
+    monkeypatch.setattr(dispatch, "_system_memory_sample", lambda: {})
+    with kbc.connect_closing(board="imported") as conn:
+        spy = Mock(return_value=None)
+        dispatch.dispatch_once(conn, spawn_fn=spy)
+        spy.assert_not_called()
+        task = kb.get_task(conn, tid)
+        assert result["tasks_parked"] == 1 and task.status == "triage" and task.workspace_path is None
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
+        for event in conn.execute("SELECT payload FROM task_events WHERE kind='external_claimed'"):
+            assert "reservation_id" not in event[0] and "owner_host" not in event[0]
+            assert isinstance(json.loads(event[0]), dict)
+
+
+@pytest.mark.parametrize("payload", ['[1]', '"x"', 'null', 'not JSON'])
+def test_export_tolerates_malformed_external_payload(kanban_root, tmp_path, payload):
+    _seed_board()
+    with kbc.connect_closing(board="alpha") as conn:
+        tid = kb.list_tasks(conn)[0].id
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,'external_claimed',?,1)", (tid, payload))
+        conn.commit()
+    result = kt.export_board("alpha", str(tmp_path / "export.tar.gz"))
+    assert Path(result["archive"]).is_file()
+
+
+@pytest.mark.parametrize("edge", ["metadata", "migration", "relocation"])
+def test_failed_import_leaves_no_published_board(kanban_root, tmp_path, monkeypatch, edge):
+    _seed_board()
+    archive = kt.export_board("alpha", str(tmp_path / "source.tar.gz"))["archive"]
+    before = {b["slug"] for b in kb.list_boards()}
+
+    def fail(*args, **kwargs):
+        raise ValueError("fixture_import_failure")
+
+    target, name = {"metadata": (kb, "write_board_metadata"), "migration": (kb, "init_db"),
+                    "relocation": (kt, "_relocate_imported_rows")}[edge]
+    monkeypatch.setattr(target, name, fail)
+    with pytest.raises(ValueError, match="fixture_import_failure"):
+        kt.import_board(archive, "failed")
+    assert not kb.board_dir("failed").exists()
+    assert {b["slug"] for b in kb.list_boards()} == before
+
+
 def _claim(task_id: str, slug: str = "alpha") -> None:
     """Put a task into the state a live worker would leave behind."""
     with kbc.connect_closing(board=slug) as conn:

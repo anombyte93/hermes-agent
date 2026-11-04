@@ -99,6 +99,29 @@ def _bulk_ids(verb: str):
     return _arg("--ids", nargs="+", help=f"Additional task ids to {verb} with the same reason (bulk mode)")
 
 
+def _external_commands():
+    common = [_arg("--task", required=True), _json_flag()]
+    token = [_arg("--reservation-token", help="Legacy argv input (unsafe for real tokens); prefer --reservation-token-file"),
+             _arg("--reservation-token-file", metavar="PATH", help="Read token from an owner-managed private file, not argv")]
+    owned = [*common, _arg("--run-id", required=True, type=int), *token]
+    identity = [_arg("--expected-board", help="Required reservation board, compared to the selected board"),
+                _arg("--owner-host", required=True), _arg("--incarnation", required=True,
+                help="Literal owner incarnation JSON: session,id,created,pane,pid,backend,conversation"),
+                _arg("--worktree", required=True), _arg("--reservation-id", required=True)]
+    return [
+        _cmd("status", common, help="Read card, attempt and external binding (no token)"),
+        _cmd("claim", [*common, *identity, *token]),
+        _cmd("complete", [*owned, _arg("--summary"), _arg("--result"),
+                          _arg("--review", action="store_true")]),
+        _cmd("request-changes", [*owned, _arg("--reason", required=True)]),
+        _cmd("release", [*owned, _arg("--reason", required=True)]),
+        _cmd("handover", [*owned, *identity,
+                          _arg("--new-reservation-token", help="Legacy argv input; prefer --new-reservation-token-file"),
+                          _arg("--new-reservation-token-file", metavar="PATH"),
+                          _arg("--evidence", required=True)]),
+    ]
+
+
 _TASK_ID = _arg("task_id")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
@@ -180,6 +203,8 @@ _SPECS = [
          )),
     _cmd("create", [
         _arg("title", help="Task title"),
+        _arg("--execution-kind", choices=["worker", "external_session"], default="worker",
+             help="worker dispatches a profile; external_session binds an existing owner and never spawns"),
         _arg("--body", help="Optional opening post"),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
@@ -241,6 +266,8 @@ _SPECS = [
                   "--initial-status=blocked; recorded on the card)."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
+    _cmd("external", children=("external_action", _external_commands()),
+         help="Bind and manage an existing external session without spawning"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
         _arg("--worker", action="append", default=[], metavar="PROFILE:TITLE[:SKILL,SKILL]",

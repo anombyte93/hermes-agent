@@ -45,6 +45,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -222,3 +223,322 @@ def test_parent_worktree_deferred_until_children_done(
         assert kb.complete_task(conn, child, summary="child done")
     # last child terminal -> deferred parent worktree reaped
     assert not parent_wt.exists()
+
+
+@pytest.mark.parametrize("shared_worker", [False, True])
+@pytest.mark.parametrize("route", ["archive-gc", "child-complete"])
+@pytest.mark.parametrize("kind", ["worktree", "scratch"])
+def test_external_owner_workspace_survives_every_cleanup_route(kanban_home, repo, route, kind, shared_worker):
+    from argparse import Namespace
+    from hermes_cli import kanban_db_external as external
+    from hermes_cli.kanban_ops import _cmd_gc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="session owns workspace", execution_kind="external_session")
+        if kind == "worktree":
+            owned = _make_worktree(repo, tid)
+        else:
+            owned = kb.workspaces_root() / tid
+            owned.mkdir(parents=True)
+            (owned / "evidence.txt").write_text("owner's evidence")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind=?,workspace_path=?,branch_name=? WHERE id=?",
+                         (kind, str(owned), f"wt/{tid}", tid))
+        active = external.external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree=str(owned), reservation_id="cleanup-reservation", reservation_token="a" * 64)
+        target = tid
+        if shared_worker:
+            target = kb.create_task(conn, title="worker sharing the session path", workspace_kind=kind,
+                                    workspace_path=str(owned))
+        child = kb.create_task(conn, title="worker child", parents=[target], workspace_kind="dir",
+                               workspace_path=str(repo))
+        external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64)
+        if shared_worker:
+            assert kb.complete_task(conn, target)
+        assert owned.is_dir()
+        if route == "archive-gc":
+            assert kb.archive_task(conn, target)
+            assert _cmd_gc(Namespace(event_retention_days=30, log_retention_days=30)) == 0
+        else:
+            assert kb.complete_task(conn, child)
+        assert owned.is_dir(), "board removed the external session's workspace"
+        assert external.external_status(conn, tid)["binding"]["state"] == "closed"
+        if kind == "worktree":
+            assert _branch_exists(repo, f"wt/{tid}")
+            assert (owned / "README.md").read_text() == "hello\n"
+        else:
+            assert (owned / "evidence.txt").read_text() == "owner's evidence"
+
+
+@pytest.mark.parametrize("route", ["archive", "complete", "gc"])
+@pytest.mark.parametrize("relation", ["equal", "binding-inside", "workspace-inside", "tilde", "symlink"])
+def test_direct_shared_workspace_preserved(kanban_home, repo, monkeypatch, route, relation):
+    from argparse import Namespace
+    from hermes_cli import kanban_db_external as external
+    from hermes_cli.kanban_ops import _cmd_gc
+
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        bound = wt
+        spelling = str(wt)
+        if relation == "binding-inside":
+            # An empty directory is a valid cwd and does not dirty a git tree.
+            bound = wt / "sub"
+            bound.mkdir()
+        elif relation == "workspace-inside":
+            bound = wt.parent
+        elif relation == "tilde":
+            spelling = "~/" + str(wt.relative_to(Path.home()))
+        elif relation == "symlink":
+            alias = Path.home() / "alias"
+            alias.symlink_to(wt)
+            bound = alias
+        tid = kb.create_task(conn, title="owner", execution_kind="external_session")
+        active = external.external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture"),
+            worktree=str(bound), reservation_id="shared", reservation_token="a" * 64)
+        if route != "archive":
+            external.external_complete(conn, tid, active["run_id"], reservation_token="a" * 64)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (spelling, worker))
+            if route == "gc":
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (worker,))
+        if route == "gc":
+            assert _cmd_gc(Namespace(event_retention_days=30, log_retention_days=30)) == 0
+        else:
+            assert getattr(kb, route + "_task")(conn, worker)
+        assert wt.is_dir()
+
+
+@pytest.mark.parametrize("other", ["binding", "corrupt", "legacy"])
+def test_other_board_ownership_reads_are_nonmutating(kanban_home, repo, other):
+    import sqlite3
+    from hermes_cli import kanban_db_external as external
+
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        kb.create_board("other")
+        path = kb.board_dir("other") / "kanban.db"
+        if other == "binding":
+            with kbc.connect_closing(board="other") as remote:
+                tid = kb.create_task(remote, title="owner", execution_kind="external_session")
+                external.external_claim(remote, tid, board="other", owner_host="fixture-host",
+                    incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                                     backend="claude", conversation="fixture"),
+                    worktree=str(wt), reservation_id="other", reservation_token="a" * 64)
+        elif other == "corrupt":
+            path.write_bytes(b"not a database")
+        else:
+            with sqlite3.connect(path) as legacy:
+                legacy.execute("DROP TABLE task_external_bindings")
+        # SQLite's read-only WAL reader may initialise locking sidecars, never
+        # durable board content. Preserve the DB, metadata and any existing WAL.
+        before = {p.name: p.read_bytes() for p in path.parent.iterdir()
+                  if p.is_file() and not p.name.endswith(("-shm", "-wal"))}
+        wal = Path(str(path) + "-wal")
+        wal_before = wal.read_bytes() if wal.exists() else b""
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir() == (other != "legacy")
+        assert {p.name: p.read_bytes() for p in path.parent.iterdir()
+                if p.is_file() and not p.name.endswith(("-shm", "-wal"))} == before
+        assert (wal.read_bytes() if wal.exists() else b"") == wal_before
+
+
+@pytest.mark.parametrize("route", ["archive", "complete", "gc", "parent"])
+def test_never_bound_external_workspace_survives_kind_routes(kanban_home, repo, monkeypatch, route):
+    from argparse import Namespace
+    from unittest.mock import Mock
+    from hermes_cli.kanban_ops import _cmd_gc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="never bound", execution_kind="external_session")
+        wt = _make_worktree(repo, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree',workspace_path=? WHERE id=?", (str(wt), tid))
+        # Spy at the removal seam: a second ownership layer must not mask kind coverage.
+        removal = Mock()
+        monkeypatch.setattr(kbw, "_cleanup_worktree_workspace", removal)
+        if route == "parent":
+            child = kb.create_task(conn, title="child", parents=[tid])
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+            kb.recompute_ready(conn)
+            assert kb.complete_task(conn, child)
+        elif route == "gc":
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
+            assert _cmd_gc(Namespace(event_retention_days=30, log_retention_days=30)) == 0
+        elif route == "complete":
+            kbw._cleanup_workspace(conn, tid)
+        else:
+            assert kb.archive_task(conn, tid)
+        assert not removal.called
+        assert wt.is_dir()
+
+
+@pytest.mark.parametrize("route", ["kernel", "tool", "dashboard"])
+def test_tilde_creation_routes_preserve_bound_worktree(kanban_home, repo, monkeypatch, route):
+    import json
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from plugins.kanban.dashboard.plugin_api import router
+    from tools.kanban_tools import _handle_create
+    from hermes_cli import kanban_db_external as external
+
+    wt = _make_worktree(repo, "owner")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="owner", execution_kind="external_session")
+        external.external_claim(conn, tid, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture"),
+            worktree=str(wt), reservation_id="tilde", reservation_token="a" * 64)
+        fields = dict(title="sharing worker", assignee="fixture", workspace_kind="worktree",
+                      workspace_path="~/" + str(wt.relative_to(Path.home())))
+        if route == "kernel":
+            worker = kb.create_task(conn, **fields)
+        elif route == "tool":
+            worker = json.loads(_handle_create(fields))["task_id"]
+        else:
+            app = FastAPI()
+            app.include_router(router)
+            response = TestClient(app).post("/tasks", json=fields)
+            assert response.status_code == 200, response.text
+            worker = response.json()["task"]["id"]
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir()
+
+
+@pytest.mark.parametrize("source", ["current", "archived", "pin"])
+def test_active_scratch_owner_survives_archive_from_every_store(kanban_home, tmp_path, monkeypatch, source):
+    from hermes_cli import kanban_db_external as external
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
+    with kbc.connect_closing() as worker_conn:
+        worker = kb.create_task(worker_conn, title="managed scratch worker")
+        owned = kb.workspaces_root() / worker
+        owned.mkdir(parents=True)
+        marker = owned / "evidence.txt"
+        marker.write_bytes(b"session owned bytes")
+        worker_conn.execute("UPDATE tasks SET workspace_kind='scratch',workspace_path=? WHERE id=?", (str(owned), worker))
+        if source in {"archived", "pin"}:
+            kb.create_board("owner-board")
+            owner_path = kb.board_dir("owner-board") / "kanban.db"
+        else:
+            owner_path = Path(worker_conn.execute("PRAGMA database_list").fetchone()[2])
+        with kbc.connect_closing(owner_path) as owner:
+            tid = kb.create_task(owner, title="external", execution_kind="external_session")
+            active = external.external_claim(owner, tid, board="owner-board" if source != "current" else "default",
+                owner_host="fixture", incarnation=dict(session="owner", id="$1", created="1", pane="%1", pid="123",
+                    backend="claude", conversation="fixture"), worktree=str(owned),
+                reservation_id="scratch-owner", reservation_token="a" * 64)
+            if source == "archived":
+                external.external_complete(owner, tid, active["run_id"], reservation_token="a" * 64)
+        if source == "archived":
+            assert kb.remove_board("owner-board", archive=True)["action"] == "archived"
+        if source == "pin":
+            # Move a store with existing ownership, rather than making a new
+            # claim at a custom path (the materialize stack rightly refuses it).
+            custom = tmp_path / "custom-owner.db"
+            owner_path.rename(custom)
+            monkeypatch.setenv("HERMES_KANBAN_DB", str(custom))
+        assert kb.archive_task(worker_conn, worker)
+        assert owned.is_dir()
+        assert marker.read_bytes() == b"session owned bytes"
+
+
+def test_custom_connection_worktree_owner_is_retained(kanban_home, repo, tmp_path, monkeypatch):
+    from hermes_cli import kanban_db_external as external
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
+    custom = tmp_path / "custom.db"
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        tid = kb.create_task(conn, title="external", execution_kind="external_session")
+        external.external_claim(conn, tid, board="default", owner_host="fixture",
+            incarnation=dict(session="owner", id="$1", created="1", pane="%1", pid="123", backend="claude", conversation="fixture"),
+            worktree=str(wt), reservation_id="custom", reservation_token="a" * 64)
+        original = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    original.rename(custom)
+    with kbc.connect_closing(custom) as conn:
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir()
+        assert (wt / "README.md").read_text() == "hello\n"
+
+
+def test_never_claimed_card_protects_shared_path(kanban_home, repo):
+    with kbc.connect_closing() as conn:
+        worker, wt = _worktree_task(conn, repo)
+        kb.create_task(conn, title="reserved workspace", execution_kind="external_session",
+                       workspace_kind="dir", workspace_path=str(wt))
+        assert kb.archive_task(conn, worker)
+        assert wt.is_dir()
+
+
+def test_deferred_parent_cleanup_pins_conn_after_store_move(kanban_home, repo, tmp_path, monkeypatch):
+    """D1: the deferred-parent cleanup must pass its live ``conn``.
+
+    A store claimed on the canonical board, closed, then moved to a custom DB
+    path with no ``HERMES_KANBAN_DB`` pin is invisible to a fresh connection —
+    only the caller's ``conn`` (pinned to the moved store via
+    ``PRAGMA database_list``) still sees the active binding on the parent's
+    worktree. Dropping ``conn=conn`` from the deferred-parent
+    ``_cleanup_worktree_workspace`` call silently reaps the worktree the moved
+    store still owns. The unbound control removes its worktree through the
+    same route, proving the route itself still reaps.
+    """
+    from hermes_cli import kanban_db_external as external
+
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(kbw, "_cleanup_worker_tmux", lambda *args: None)
+    with kbc.connect_closing() as conn:
+        # A store claimed on the canonical board, then closed (binding history
+        # only: no active binding row anywhere on the moved store).
+        owner = kb.create_task(conn, title="external owner", execution_kind="external_session")
+        active = external.external_claim(conn, owner, board="default", owner_host="fixture-host",
+            incarnation=dict(session="owner", id="$7", created="1000", pane="%9", pid="424242",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree=str(repo), reservation_id="move-fixture", reservation_token="a" * 64)
+        external.external_release(conn, owner, active["run_id"],
+                                  reservation_token="a" * 64, reason="store moving")
+
+        parent, parent_wt = _worktree_task(conn, repo, title="deferred parent")
+        # An ACTIVE binding on the parent's worktree, recorded after the store
+        # moved (the path only this conn can still see).
+        holder = kb.create_task(conn, title="active binding holder",
+                                execution_kind="external_session")
+        external.external_claim(conn, holder, board="default", owner_host="fixture-host",
+            incarnation=dict(session="holder", id="$8", created="1000", pane="%9", pid="424243",
+                             backend="claude", conversation="fixture-conversation"),
+            worktree=str(parent_wt), reservation_id="hold-fixture", reservation_token="b" * 64)
+
+        # Move the store to a custom path with no pin: fresh connections land
+        # on an empty canonical DB that knows nothing about the binding.
+        original = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        custom = tmp_path / "moved-store.db"
+    original.rename(custom)
+    with kbc.connect_closing(custom) as conn:
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        assert kb.archive_task(conn, parent)  # deferred: its child is active
+        assert parent_wt.is_dir()
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert kb.claim_task(conn, child, claimer="worker") is not None
+        assert kb.complete_task(conn, child, summary="done")
+        # The moved store still owns the parent worktree via the active
+        # binding; only the caller's conn can see it. Kept.
+        assert parent_wt.is_dir(), "deferred parent cleanup dropped the moved store's binding"
+
+    # Unbound control: the same route removes an unbound worktree.
+    with kbc.connect_closing() as conn:
+        control, control_wt = _worktree_task(conn, repo, title="unbound control")
+        control_child = kb.create_task(conn, title="control child", parents=[control], assignee="worker")
+        assert kb.archive_task(conn, control)  # deferred: its child is active
+        assert control_wt.is_dir()
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (control_child,))
+        assert kb.claim_task(conn, control_child, claimer="worker") is not None
+        assert kb.complete_task(conn, control_child, summary="done")
+        assert not control_wt.exists(), "unbound control worktree was not reaped"

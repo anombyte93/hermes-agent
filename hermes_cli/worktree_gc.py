@@ -177,6 +177,37 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
 _REAP_VERDICTS = {"reap", "reap-archive", "reap-keep-branch"}
 
 
+def _externally_owned_or_unanswerable(path: str) -> bool | tuple[bool, "str | None"]:
+    """Gate (b): does any kanban store own a path overlapping ``path``?
+
+    Imported lazily so a Hermes without the kanban modules still imports this
+    module; if the question cannot be asked (import failure, unreadable store),
+    the answer is "owned" — removal routes fail closed and keep the tree.
+    Returns the boolean gate, or ``(owned, reason)`` so the kept line can say
+    ownership could not be READ instead of claiming a session owns the tree.
+    """
+    try:
+        from hermes_cli.kanban_db_workspace import _externally_owned_workspace
+    except Exception:
+        return True, "kanban ownership could not be read (kanban module import failed)"
+    try:
+        owned = bool(_externally_owned_workspace(None, path))
+    except Exception:
+        return True, "kanban ownership could not be read"
+    if not owned:
+        return False, None
+    # Kept: word the reason truthfully. An unreadable store is not an owning
+    # session — never send the user hunting for a binding that may not exist.
+    try:
+        from hermes_cli.kanban_db_workspace import _externally_owned_workspace_detail
+        detail = _externally_owned_workspace_detail(None, path)[1] or ""
+    except Exception:
+        detail = ""
+    if "could not be read" in detail:
+        return True, "kanban ownership could not be read; keeping the worktree"
+    return True, None
+
+
 def reclaim_worktrees(
     repo_root: str, *, dry_run: bool = False, records: Optional[List[TreeRecord]] = None
 ) -> List[str]:
@@ -190,6 +221,20 @@ def reclaim_worktrees(
             continue
         if dry_run:
             actions.append(f"would remove {record.name} ({record.reason})")
+            continue
+
+        # Gate (b): a kanban external session (active binding or never-claimed
+        # card) may own this tree in a store git cannot see. Owned or
+        # unanswerable means keep — removal routes fail closed. An
+        # unanswerable gate keeps the tree but must not claim a session owns
+        # it; the reason says ownership could not be read.
+        gate = _externally_owned_or_unanswerable(record.path)
+        if isinstance(gate, tuple):
+            owned, gate_reason = gate
+        else:
+            owned, gate_reason = gate, None
+        if owned:
+            actions.append(f"kept {record.name} ({gate_reason or 'external session owns the worktree'})")
             continue
 
         entry = Path(record.path)

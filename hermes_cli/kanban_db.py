@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
+from hermes_cli.kanban_execution import VALID_EXECUTION_KINDS, execution_kind_of, has_external_attempt
 
 _log = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "output_limit", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable", "skipped_assignee_not_allowed", "skipped_board_unreadable",
+    "skipped_nonspawnable", "skipped_external_session", "skipped_assignee_not_allowed", "skipped_board_unreadable",
 )
 
 
@@ -475,6 +476,25 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _own_store_path(slug: str) -> Path:
+    """The real store a board's OWN decisions must open, never ``_board_path``.
+
+    ``_board_path`` gives the ``HERMES_KANBAN_DB`` pin the highest precedence
+    for every caller, as at base — but an OWNERSHIP decision (import scrub,
+    explicit export, remove_board, gate (b) and the binding checks) that NAMES
+    a board must read that board's own store, or a pinned worker would
+    scrub/export/remove the wrong store (S6/S7). For ``default`` the pin wins
+    (it re-anchors the legacy ``<root>/kanban.db`` layout, as at base); for
+    any other slug it is always ``board_dir(slug)/kanban.db``.
+    """
+    if slug == DEFAULT_BOARD:
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pin:
+            return Path(pin).expanduser()
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
@@ -655,6 +675,87 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_db_workspace import (
+        _externally_owned_workspace_detail,
+        _own_external_paths_detail,
+        _store_owns_external_workspace,
+    )
+    # Open the removed board's OWN store by path, never through the resolver:
+    # ``_board_path`` gives ``HERMES_KANBAN_DB`` the highest precedence (as at
+    # base), and the dispatcher pins that override into every worker's
+    # environment, so a name-based open would read the PINNED store and
+    # removal would sail past a board that owns external workspaces (S6).
+    # ``_own_store_path`` is the one ownership-decision resolver: a named
+    # board's own store, never the pin.
+    own_db = _own_store_path(normed)
+    try:
+        with connect_closing(own_db) as conn:
+            binding = conn.execute(
+                "SELECT task_id FROM task_external_bindings WHERE state='active' LIMIT 1"
+            ).fetchone()
+            # None (unreadable store) is ownership: fail closed, keep the board.
+            history = _store_owns_external_workspace(conn)
+            # Evidence for the refusal messages below: which of THIS store's
+            # cards reserve paths inside the board directory (gate (b)), and
+            # every reservation the store holds (the history check owns any
+            # path, wherever it points). Computed while the connection is open.
+            own_paths = _own_external_paths_detail(conn, str(d))
+            own_any = _own_external_paths_detail(conn, None)
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"board_unreadable: cannot verify external ownership on {normed!r}; "
+            f"run hermes kanban --board {normed} repair and restore a verified backup if unrecoverable"
+        ) from exc
+    if binding is not None:
+        raise ValueError(f"active_external_binding: board {normed!r} is bound to task {binding[0]}")
+    # Fail closed: refuse on ownership (True) or an unreadable store (None);
+    # only a verified no-ownership (False) may hard-delete.
+    if not archive and history is not False:
+        # Name the board's own reservation the user must resolve first, and
+        # the route that actually works: when no active binding exists and
+        # gate (b) is False on the board directory, `archive=True` succeeds
+        # (A4's closed-history shape) — name it. When the archive route
+        # refuses too, say WHY it refuses — the real cause from gate (b),
+        # never an invented one: the board's own reservation inside the
+        # directory, another store owning a path inside it, or a store that
+        # could not be read (release and delete both refuse on closed
+        # history, so the tail must send the user to the true blocker).
+        owned_elsewhere, archive_detail = _externally_owned_workspace_detail(None, str(d))
+        if not owned_elsewhere:
+            raise ValueError(
+                f"external_binding_history: board {normed!r}'s own cards reserve external "
+                f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
+                "release or clear those reservations before removal, or archive the board "
+                f"instead (`hermes kanban boards rm {normed}` keeps the board's bytes and "
+                "retains the reserved paths)")
+        cause = (
+            "a reserved path lies inside the board directory" if own_paths else archive_detail)
+        raise ValueError(
+            f"external_binding_history: board {normed!r}'s own cards reserve external "
+            f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
+            "release or clear those reservations before removal — the archive route "
+            f"refuses too ({cause})")
+    # Gate (b): before ANY filesystem removal of the board directory (delete
+    # or archive-move), ask whether any store owns a path overlapping it —
+    # another board's external card or live binding may sit inside this
+    # board's workspaces/. ``_externally_owned_workspace`` already fails
+    # closed (an unreadable store anywhere reads as ownership).
+    owned, owned_detail = _externally_owned_workspace_detail(None, str(d))
+    if owned:
+        if own_paths:
+            raise ValueError(
+                f"externally_owned_workspace: board {normed!r} contains a path reserved "
+                f"by its own store's external session card ({own_paths}); resolve that "
+                f"card first — moving the board would break the session it reserves")
+        if owned_detail is not None:
+            raise ValueError(
+                f"externally_owned_workspace: {owned_detail}; refusing to remove "
+                f"board {normed!r} while ownership cannot be ruled out")
+        raise ValueError(
+            f"externally_owned_workspace: board {normed!r} contains a path owned by "
+            "another store's external session; release that ownership first")
+
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()
@@ -734,6 +835,7 @@ class Task:
     # blocked-write path, cleared by the trg_tasks_block_reason_clear trigger.
     block_reason: Optional[str] = None
     completion_contract: Optional[str] = None
+    execution_kind: Optional[str] = "worker"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -764,7 +866,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "execution_kind",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -882,6 +984,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
+    execution_kind       TEXT NOT NULL DEFAULT 'worker',
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
@@ -1569,7 +1672,7 @@ def create_task(
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
-    completion_contract: Optional[str] = None,
+    completion_contract: Optional[str] = None, execution_kind: str = "worker",
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1590,7 +1693,20 @@ def create_task(
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
+    if execution_kind not in VALID_EXECUTION_KINDS:
+        raise ValueError("execution_kind must be worker or external_session")
+    if execution_kind == "external_session" and triage:
+        raise ValueError("external_session refuses triage and decomposition")
+    if execution_kind == "external_session" and (
+        goal_mode or goal_max_turns is not None or model_override is not None
+        or provider_override is not None or skills is not None
+    ):
+        raise ValueError("external_session refuses goal mode, model/provider overrides and skills")
     completion_contract = validate_contract(completion_contract)
+    if execution_kind == "external_session" and completion_contract != "local-only":
+        raise ValueError("external_session_refuses_completion_contract")
+    if execution_kind == "external_session" and reasoning_effort is not None:
+        raise ValueError("external_session refuses reasoning effort")
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1639,16 +1755,18 @@ def create_task(
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, execution_kind FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
+            if row["execution_kind"] != execution_kind:
+                raise ValueError("idempotency_key conflicts with execution_kind")
             return row["id"]
 
     # After the idempotency lookup: a retry of an existing card returns it rather than
     # being refused by a guard that was switched on after the card was made.
-    if assignee and initial_status == "running" and not triage:
+    if execution_kind == "worker" and assignee and initial_status == "running" and not triage:
         _require_dispatchable_assignee(assignee)
         # Board-level allowlist (board.json ``allowed_assignees``). Same exemption as
         # above: a human-parked card can never be spawned without passing dispatch,
@@ -1690,8 +1808,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        block_reason, no_fallback
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        block_reason, no_fallback, execution_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1702,7 +1820,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                         block_reason if task_status == "blocked" else None,
-                        1 if no_fallback else 0,
+                        1 if no_fallback else 0, execution_kind,
                     ),
                 )
                 for pid in parents:
@@ -1726,6 +1844,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "no_fallback": bool(no_fallback) or None,
+                        "execution_kind": execution_kind,
                     },
                 )
                 if task_status == "blocked":
@@ -1916,6 +2035,8 @@ def _set_task_override(
     """Per-task override write: refuse archived tasks, record ``event_kind``,
     then fire the task-updated observer AFTER commit (RFC #58548)."""
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) == "external_session":
+            raise ValueError("external_session refuses model/provider overrides and reasoning effort")
         status = _task_status(conn, task_id)
         if status is None:
             return False
@@ -2551,6 +2672,11 @@ def claim_task(
     lock = claimer or _claim_lock_for_conn(conn)
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        kind = execution_kind_of(conn, task_id)
+        if kind != "worker":
+            if kind == "external_session":
+                _append_event(conn, task_id, "claim_rejected", {"reason": "external_session"})
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2584,6 +2710,11 @@ def claim_review_task(
     lock = claimer or _claim_lock_for_conn(conn)
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        kind = execution_kind_of(conn, task_id)
+        if kind != "worker":
+            if kind == "external_session":
+                _append_event(conn, task_id, "claim_rejected", {"reason": "external_session"})
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2671,7 +2802,7 @@ def heartbeat_claim(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
+            "WHERE id = ? AND execution_kind = 'worker' AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
         )
         if cur.rowcount != 1:
             return False
@@ -2715,7 +2846,7 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
         "       assignee "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE execution_kind = 'worker' AND status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
@@ -2838,6 +2969,8 @@ def reclaim_task(
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
+    if execution_kind_of(conn, task_id) != "worker":
+        return False
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -3071,6 +3204,8 @@ def complete_task(
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
     now = int(time.time())
+    if execution_kind_of(conn, task_id) != "worker":
+        return False
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
@@ -3496,6 +3631,8 @@ def block_task(
     if reason is None:
         raise ValueError("block reason is required")
     with write_txn(conn):
+        if has_external_attempt(conn, task_id):
+            return False
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3513,6 +3650,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
             parents_satisfied=_parents_satisfied(conn, task_id),
+            allow_triage=execution_kind_of(conn, task_id) == "worker",
         )
         sql = f"""
                 UPDATE tasks
@@ -3547,6 +3685,7 @@ def block_task(
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int, parents_satisfied: bool,
+    allow_triage: bool = True,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3564,7 +3703,7 @@ def _route_block(
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
         return "todo", "dependency_wait", set_sql, (kind, prev_recurrences), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
+    if allow_triage and recurrences >= BLOCK_RECURRENCE_LIMIT:
         set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
         payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
@@ -3613,6 +3752,8 @@ def request_review(
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) != "worker":
+            return _ret(False, "use external_complete for external_session")
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -3728,6 +3869,8 @@ def request_changes(
         return False, "reason is required"
 
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) != "worker":
+            return False, "use external_request_changes for external_session"
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3993,7 +4136,7 @@ def invalidate_descendants_for_parent_reopen(
                 FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
+            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock, t.execution_kind
             FROM descendants d
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
@@ -4001,6 +4144,9 @@ def invalidate_descendants_for_parent_reopen(
             (task_id,),
         ).fetchall()
         for row in rows:
+            if row["execution_kind"] == "external_session" and has_external_attempt(conn, row["id"]):
+                # Reopened dependencies do not revoke an external owner's reservation.
+                continue
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
@@ -4067,6 +4213,8 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if execution_kind_of(conn, task_id) == "external_session":
+            raise ValueError("external_session_refuses_triage")
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -4127,6 +4275,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     the ``archived`` event stays atomic with the status flip.
     """
     with write_txn(conn):
+        if has_external_attempt(conn, task_id):
+            return False
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
             (task_id,),
@@ -4164,8 +4314,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    from hermes_cli.kanban_db_workspace import _store_owns_external_workspace
+    # Task-scoped, fail closed: refuse when THIS card owns (or may own) an
+    # external workspace; other cards' ownership is theirs to release.
+    if _store_owns_external_workspace(conn, task_id=task_id) is not False:
+        raise ValueError("external_workspace_retained: external binding history preserves workspace ownership")
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "task_external_bindings"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
@@ -4173,7 +4328,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        if has_external_attempt(conn, task_id) or _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -4181,12 +4336,19 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+    """Hard-delete a task; an active external binding must be released first.
+
+    The ownership check runs before the row delete: refusing (a never-claimed
+    external reservation or a binding history) must leave the whole store
+    untouched, not a half-deleted card.
+    """
     with write_txn(conn):
+        if has_external_attempt(conn, task_id):
+            return False
+        _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
 
@@ -4198,6 +4360,8 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
+        if has_external_attempt(conn, task_id):
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

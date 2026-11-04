@@ -195,6 +195,10 @@ gateway:
     truncated_suffix:      "… (مقتطع؛ استخدم `hermes kanban …` في الطرفية للخرج الكامل)"
     no_output:             "(لا يوجد خرج)"
     wake:
+      external_completed: "اكتملت"
+      external_review_requested: "أُحيلت للمراجعة؛ اكتمل التنفيذ"
+      external_changes_requested: "طلبت المراجعة تغييرات (BLOCK)؛ التنفيذ غير معتمد"
+      external_released: "external attempt released; inspect the card for its dependency-gated state"
       completed:           "اكتملت"
       gave_up:             "استسلم (نفدت المحاولات)"
       crashed:             "تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة"

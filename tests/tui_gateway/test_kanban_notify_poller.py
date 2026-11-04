@@ -25,6 +25,56 @@ from tui_gateway.server import (
 SESSION_KEY = "tui-session-key-1"
 
 
+def test_external_lifecycle_delivers_all_six_events_once_with_worker_control(tmp_path, monkeypatch):
+    from pathlib import Path
+    from hermes_cli import kanban_db_external as ext
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    identity = dict(session="fixture", id="$1", created="1", pane="%1", pid="123",
+                    backend="claude", conversation="fixture")
+    token = "a" * 64
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="external", execution_kind="external_session")
+        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=SESSION_KEY)
+
+        def take(words):
+            texts = _collect_kanban_notifications(_session())
+            assert len(texts) == 1 and tid in texts[0] and words in texts[0]
+            assert _collect_kanban_notifications(_session()) == []
+
+        def claim(reservation):
+            return ext.external_claim(conn, tid, board="default", owner_host="fixture", incarnation=identity,
+                worktree=str(tmp_path), reservation_id=reservation, reservation_token=token)["run_id"]
+
+        run = claim("first")
+        take("bound")
+        ext.external_complete(conn, tid, run, reservation_token=token, review=True)
+        take("review")
+        ext.external_request_changes(conn, tid, run, reservation_token=token, reason="adjust")
+        take("changes")
+        run = claim("second")
+        take("bound")
+        ext.external_release(conn, tid, run, reservation_token=token, reason="pause")
+        take("released")
+        run = claim("third")
+        take("bound")
+        successor = ext.external_handover(conn, tid, run, reservation_token=token, board="default",
+            owner_host="fixture", incarnation={**identity, "pid": "456"}, worktree=str(tmp_path),
+            reservation_id="fourth", new_reservation_token="b" * 64, evidence="handoff")["run_id"]
+        take("handed over")
+        ext.external_complete(conn, tid, successor, reservation_token="b" * 64, summary="verified")
+        take("done")
+        worker = kb.create_task(conn, title="worker")
+        kbn.add_notify_sub(conn, task_id=worker, platform="tui", chat_id=SESSION_KEY)
+        assert kb.complete_task(conn, worker, summary="control")
+        texts = _collect_kanban_notifications(_session())
+        assert len(texts) == 1 and worker in texts[0] and "done" in texts[0]
+        assert _collect_kanban_notifications(_session()) == []
+
+
 def _session(key: str = SESSION_KEY) -> dict:
     return {"session_key": key}
 

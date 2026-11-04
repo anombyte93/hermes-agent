@@ -72,6 +72,23 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
     conn.execute("DELETE FROM kanban_notify_subs")
+    # Binding authority is local to its owner and board. It must never travel,
+    # including on import from an older exporter. DELETE is not enough for the
+    # exported SQLite bytes: export VACUUMs the private snapshot below.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_external_bindings'").fetchone():
+        conn.execute("DELETE FROM task_external_bindings")
+    for row in conn.execute("SELECT id,payload FROM task_events WHERE kind LIKE 'external_%'").fetchall():
+        if row[1] is None:
+            continue
+        try:
+            payload = json.loads(row[1])
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.pop("reservation_id", None)
+        payload.pop("owner_host", None)
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
     conn.execute(
         """
         UPDATE tasks
@@ -125,7 +142,14 @@ def export_board(
     if not kb.board_exists(slug):
         raise ValueError(f"board {slug!r} does not exist")
 
-    db_path = kb.kanban_db_path(slug)
+    # An explicit export of a named board is an ownership decision: it must
+    # read that board's OWN store even under a ``HERMES_KANBAN_DB`` pin, or a
+    # pinned worker exports the wrong store (the round-7 export test). An
+    # export with no slug keeps base behaviour (the pin wins).
+    if kb._normalize_board_slug(board) is not None:
+        db_path = kb._own_store_path(slug)
+    else:
+        db_path = kb.kanban_db_path(slug)
     if not db_path.exists():
         raise FileNotFoundError(f"board {slug!r} has no database at {db_path}")
 
@@ -142,6 +166,7 @@ def export_board(
         with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
             _scrub_local_state(snapshot)
             snapshot.commit()
+            snapshot.execute("VACUUM")
             counts = _count_rows(snapshot)
 
         meta = kb.read_board_metadata(slug)
@@ -265,6 +290,7 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
             r["id"]
             for r in conn.execute(
                 "SELECT id FROM tasks WHERE workspace_kind IN ('dir', 'worktree') "
+                "AND execution_kind = 'worker' "
                 f"AND status IN ({_placeholders(_DISPATCHABLE_STATUSES)})",
                 _DISPATCHABLE_STATUSES,
             ).fetchall()
@@ -325,34 +351,43 @@ def import_board(
         staged_meta = _read_board_metadata(extracted / "board.json")
 
         board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
-        for tree in ("attachments", "logs"):
-            src = extracted / tree
-            if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
+        try:
+            board_root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise ValueError("import_destination_exists: existing directory is not an import target") from exc
+        try:
+            shutil.move(str(staged_db), str(board_root / "kanban.db"))
+            for tree in ("attachments", "logs"):
+                src = extracted / tree
+                if src.is_dir():
+                    shutil.move(str(src), str(board_root / tree))
 
-    # Rewritten rather than moved across: the archive's copy names a slug
-    # and a workdir that belong to the exporting machine.
-    name = str(staged_meta.get("name") or manifest.get("board_name") or target)
-    kb.write_board_metadata(
-        target,
-        name=name,
-        description=str(staged_meta.get("description") or ""),
-        icon=str(staged_meta.get("icon") or ""),
-        color=str(staged_meta.get("color") or ""),
-        archived=False,
-    )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
-
-    with kbc.connect_closing(board=target) as conn:
-        stats, warnings = _relocate_imported_rows(conn, target)
-        counts = _count_rows(conn)
-
-    if activate:
-        kb.set_current_board(target)
+            # The archive's metadata names a slug and workdir on another machine.
+            name = str(staged_meta.get("name") or manifest.get("board_name") or target)
+            kb.write_board_metadata(
+                target,
+                name=name,
+                description=str(staged_meta.get("description") or ""),
+                icon=str(staged_meta.get("icon") or ""),
+                color=str(staged_meta.get("color") or ""),
+                archived=False,
+            )
+            kb.init_db(board=target)
+            # S7: the scrub is an ownership decision about the IMPORTED board,
+            # so it opens the imported board's own store by path — never
+            # ``connect_closing(board=...)``, which under a worker's
+            # ``HERMES_KANBAN_DB`` pin would resolve to the PINNED store and
+            # scrub the worker's own ownership instead.
+            with kbc.connect_closing(db_path=kb._own_store_path(target)) as conn:
+                stats, warnings = _relocate_imported_rows(conn, target)
+                counts = _count_rows(conn)
+            if activate:
+                kb.set_current_board(target)
+        except BaseException:
+            # Only this import's exclusively created tree, never an existing board.
+            # A failed scrub must not leave dispatchable untrusted rows behind.
+            shutil.rmtree(board_root)
+            raise
 
     return {
         "board": target,

@@ -876,6 +876,138 @@ class TestWorktreeLockReaping:
         assert wt.exists(), "dirty worktree must survive even past the 72h tier"
 
 
+class TestStartupPrunerRespectsExternalSessionOwnership:
+    """``_reap_prune_verdicts`` (the startup ``_prune_stale_worktrees`` phase 3)
+    removes linked worktrees past the age tiers. A kanban external session may
+    own such a tree through an active binding or a never-claimed card — recorded
+    in a kanban store, invisible to git. Before removing path P the route must
+    ask ``_externally_owned_workspace(None, P)`` (gate (b)); True or unanswerable
+    means keep."""
+
+    @pytest.fixture
+    def kanban_home(self, tmp_path, monkeypatch):
+        h = tmp_path / ".hermes"
+        h.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(h))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                    "HERMES_KANBAN_HOME", "HERMES_KANBAN_WORKSPACES_ROOT"):
+            monkeypatch.delenv(key, raising=False)
+        from hermes_cli import kanban_db as kb
+        kb.init_db()
+        return tmp_path
+
+    @staticmethod
+    def _own(worktree: Path) -> None:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        from hermes_cli import kanban_db_external as ext
+        with kbc.connect_closing() as c:
+            tid = kb.create_task(c, title="live session",
+                                 execution_kind="external_session")
+            ext.external_claim(
+                c, tid, board="default", owner_host="test-host",
+                incarnation=dict(session="prune", id="$7", created="1", pane="%7",
+                                 pid="0777", backend="claude", conversation="prune-c"),
+                worktree=str(worktree), reservation_id="prune-res",
+                reservation_token="e" * 64)
+
+    @staticmethod
+    def _aged_owned_reap_verdict(repo, name, age_h=100):
+        """A stale (past every tier), clean, pushed-branch worktree — the exact
+        input the startup pruner reaps — returned as a phase-3 verdict tuple."""
+        import time
+        p = repo / ".worktrees" / name
+        (repo / ".worktrees").mkdir(exist_ok=True)
+        subprocess.run(["git", "worktree", "add", str(p), "-b", name, "HEAD"],
+                       cwd=repo, capture_output=True)
+        # The tree's branch must be reachable from a remote-tracking ref so the
+        # classify tier reads it as pushed, not unpushed work.
+        subprocess.run(["git", "update-ref", f"refs/remotes/origin/{name}", "HEAD"],
+                       cwd=p, capture_output=True)
+        t = time.time() - (age_h * 3600)
+        os.utime(p, (t, t))
+        return p
+
+    def test_owned_stale_clean_tree_is_kept(self, git_repo, kanban_home):
+        from hermes_cli import worktree_ops
+        from hermes_cli import kanban_db_workspace as kbw
+        p = self._aged_owned_reap_verdict(git_repo, "moll-e-session")
+        self._own(p)
+        assert kbw._externally_owned_workspace(None, str(p)) is True, (
+            "precondition: gate (b) says the tree is owned")
+        verdicts = worktree_ops._classify_prune_candidates(
+            str(git_repo), [(p, p.stat().st_mtime, True)])
+        kept_branches = worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        assert p.is_dir(), "startup pruner removed the live session's owned worktree"
+
+    def test_unowned_stale_clean_tree_is_still_removed(self, git_repo, kanban_home):
+        from hermes_cli import worktree_ops
+        p = self._aged_owned_reap_verdict(git_repo, "hermes-unowned")
+        verdicts = worktree_ops._classify_prune_candidates(
+            str(git_repo), [(p, p.stat().st_mtime, True)])
+        worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        assert not p.exists(), "control: same shape, no owner — must still reap"
+
+    def test_kanban_t_hex_name_is_still_kept(self, git_repo, kanban_home):
+        import cli
+        p = self._aged_owned_reap_verdict(git_repo, "t_abc123")
+        cli._prune_stale_worktrees(str(git_repo))
+        assert p.is_dir(), "control: the t_<hex> name exclusion (phase 1) is untouched"
+
+    def test_kanban_import_failure_keeps_the_tree(self, git_repo, kanban_home, monkeypatch):
+        """Defect 4 (this route): when the kanban module import fails, the
+        ownership question is unanswerable and the tree must be kept."""
+        import sys
+        from hermes_cli import worktree_ops
+        p = self._aged_owned_reap_verdict(git_repo, "hermes-importless")
+        monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db_workspace", None)
+        verdicts = worktree_ops._classify_prune_candidates(
+            str(git_repo), [(p, p.stat().st_mtime, True)])
+        worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        assert p.is_dir(), "kanban import failure must keep the tree"
+
+    def test_unreadable_ownership_keeps_the_tree(self, git_repo, kanban_home, monkeypatch):
+        from hermes_cli import worktree_ops
+        from hermes_cli import kanban_db_workspace as kbw
+        p = self._aged_owned_reap_verdict(git_repo, "hermes-answerless")
+        monkeypatch.setattr(kbw, "_externally_owned_workspace",
+                            lambda conn, path: (_ for _ in ()).throw(
+                                RuntimeError("ownership unanswerable")))
+        verdicts = worktree_ops._classify_prune_candidates(
+            str(git_repo), [(p, p.stat().st_mtime, True)])
+        worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        assert p.is_dir(), "fail closed: unanswerable ownership must keep the tree"
+
+    def test_unreadable_store_kept_reason_says_could_not_be_read(
+            self, git_repo, kanban_home, caplog):
+        """Defect 5 (this route): an unopenable store keeps the tree, and the
+        kept reason says ownership could not be read — not that an external
+        session owns the worktree."""
+        import os
+        import logging
+        from hermes_cli import worktree_ops
+        from hermes_cli import kanban_db as kb
+        p = self._aged_owned_reap_verdict(git_repo, "hermes-answerless")
+        kb.create_board("broken-store")
+        broken = kb.board_dir("broken-store") / "kanban.db"
+        os.chmod(broken, 0)
+        try:
+            verdicts = worktree_ops._classify_prune_candidates(
+                str(git_repo), [(p, p.stat().st_mtime, True)])
+            with caplog.at_level(logging.DEBUG, logger="cli"):
+                worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 0.0)
+        finally:
+            os.chmod(broken, 0o644)
+        assert p.is_dir(), "fail closed: unopenable store must keep the tree"
+        kept_lines = [r.getMessage() for r in caplog.records
+                      if "hermes-answerless" in r.getMessage()]
+        assert kept_lines, caplog.records and [r.getMessage() for r in caplog.records]
+        assert "could not be read" in kept_lines[0], kept_lines[0]
+        assert "owns the worktree" not in kept_lines[0], kept_lines[0]
+
+
 
 class TestWorktreeLockPredicate:
     """_worktree_lock_is_live classification (real cli helper)."""

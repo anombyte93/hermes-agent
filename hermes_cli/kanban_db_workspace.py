@@ -110,6 +110,202 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _external_workspace_paths(conn: sqlite3.Connection, task_id: str | None = None):
+    """``workspace_path`` of every external card that ever bound or reserved one.
+
+    Never-claimed ``external_session`` cards carry their reservation in
+    ``tasks.workspace_path``; claimed sessions additionally record it in
+    ``task_external_bindings.worktree``. Both arms are ownership: a board or
+    task row leaving this store must not silently drop the reserved path.
+    ``task_id`` narrows both arms to one card (task deletion refuses on the
+    deleted card's own ownership, not on anything else the store owns).
+    """
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "task_external_bindings" in tables:
+        if task_id is None:
+            yield from (row[0] for row in conn.execute("SELECT DISTINCT worktree FROM task_external_bindings"))
+        else:
+            yield from (row[0] for row in conn.execute(
+                "SELECT DISTINCT worktree FROM task_external_bindings WHERE task_id = ?", (task_id,)))
+    if "tasks" in tables:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "execution_kind" in columns:
+            if task_id is None:
+                yield from (row[0] for row in conn.execute(
+                    "SELECT workspace_path FROM tasks WHERE execution_kind='external_session' "
+                    "AND workspace_path IS NOT NULL"))
+            else:
+                yield from (row[0] for row in conn.execute(
+                    "SELECT workspace_path FROM tasks WHERE execution_kind='external_session' "
+                    "AND workspace_path IS NOT NULL AND id = ?", (task_id,)))
+
+
+def _store_owns_external_workspace(
+    conn: sqlite3.Connection, path: str | None = None, *, task_id: str | None = None,
+) -> bool | None:
+    """Does this store (or one of its tasks) own an external workspace?
+
+    The single ownership predicate behind every removal route: the binding
+    history (``task_external_bindings``) and every ``external_session`` card's
+    reserved ``workspace_path``, including never-claimed cards. With ``path``,
+    ownership means the path overlaps a recorded workspace; without one, any
+    recorded workspace counts (board removal's history check). ``task_id``
+    narrows the question to one card's own ownership (task deletion).
+
+    Overlap follows :func:`_externally_owned_workspace`: either path contains
+    the other. ``None`` means the store could not be read (unknown ownership);
+    callers decide how to fail, and every removal route fails closed.
+    """
+    try:
+        sources = list(_external_workspace_paths(conn, task_id))
+        if path is None:
+            return bool(sources)
+        target = Path(path).expanduser().resolve()
+        for source in sources:
+            owned_path = Path(source).expanduser().resolve()
+            if target.is_relative_to(owned_path) or owned_path.is_relative_to(target):
+                return True
+        return False
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return None
+
+
+def _own_external_paths_detail(conn: sqlite3.Connection, path: str | None) -> str | None:
+    """Human-readable ``<task_id> at <path>`` list of THIS store's own external
+    reservations overlapping ``path`` (any reservation when ``path`` is None).
+
+    Companion to :func:`_store_owns_external_workspace`: same inputs, but the
+    answer is the evidence (which card, which path) so refusal messages can
+    name the card the user must resolve instead of blaming another store.
+    Unreadable inputs yield ``None`` — callers already fail closed.
+    """
+    try:
+        target = Path(path).expanduser().resolve() if path is not None else None
+        found: list[str] = []
+        for task_id, source in _own_external_path_rows(conn):
+            if target is None:
+                found.append(f"task {task_id} at {source}")
+                continue
+            owned_path = Path(source).expanduser().resolve()
+            if target.is_relative_to(owned_path) or owned_path.is_relative_to(target):
+                found.append(f"task {task_id} at {source}")
+        return "; ".join(found) if found else None
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return None
+
+
+def _own_external_path_rows(conn: sqlite3.Connection):
+    """``(task_id, workspace_path)`` for every external reservation this store holds.
+
+    The never-claimed arm keeps ``tasks.id`` so the refusal can name the card;
+    the bindings arm falls back to the bound task id. Overlapping paths are
+    filtered by the caller (:func:`_own_external_paths_detail`).
+    """
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "task_external_bindings" in tables:
+        for row in conn.execute(
+            "SELECT task_id, worktree FROM task_external_bindings WHERE worktree IS NOT NULL"
+        ):
+            yield row[0], row[1]
+    if "tasks" in tables:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "execution_kind" in columns:
+            for row in conn.execute(
+                "SELECT id, workspace_path FROM tasks WHERE execution_kind='external_session' "
+                "AND workspace_path IS NOT NULL"
+            ):
+                yield row[0], row[1]
+
+
+def _externally_owned_workspace(conn: sqlite3.Connection | None, path: str) -> bool:
+    """Fail closed at removal: a session owns overlapping paths on every board.
+
+    Inspect other boards read-only, without initialisation or migration. Neither
+    attempt closure nor a board archive grants ownership of the session's files.
+    """
+    return _externally_owned_workspace_detail(conn, path)[0]
+
+
+def _externally_owned_workspace_detail(
+    conn: sqlite3.Connection | None, path: str,
+) -> tuple[bool, Optional[str]]:
+    """``_externally_owned_workspace`` with the reason as a human-readable detail.
+
+    Returns ``(owned, detail)``. ``owned`` is exactly what the boolean gate
+    answers (True also when ownership could not be read — fail closed); the
+    detail names the owning card/binding, the board's own store, or the store
+    whose ownership could not be read, so refusal messages can say why.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    def _probe_all(dbs) -> Optional[tuple[bool, Optional[str]]]:
+        """Probe each store read-only; the first unreadable or owning one
+        wins. ``None`` means every store cleared the path."""
+        for db in dbs:
+            try:
+                if db.resolve() == current or not (db.exists() or db.is_symlink()):
+                    continue
+                other = connect_tracked(db.resolve().as_uri() + "?mode=ro", uri=True)
+            except (OSError, sqlite3.Error):
+                # sqlite refuses some stores at OPEN (mode 000, dangling
+                # symlink target) — and a mode-000 board DIRECTORY makes the
+                # existence probe itself raise EACCES. Ownership there is
+                # unknowable, which is fail-closed — and the refusal must
+                # name the store rather than claim another store owns a path.
+                return True, (
+                    f"kanban store {db} could not be read to rule out external "
+                    f"ownership of {path}")
+            with contextlib.closing(other):
+                owns = _store_owns_external_workspace(other, path)
+                if owns is not False:
+                    detail = (
+                        f"kanban store {db} could not be read to rule out external "
+                        f"ownership of {path}" if owns is None else
+                        f"kanban store {db} owns a path overlapping {path}")
+                    return True, detail
+        return None
+
+    try:
+        current = None
+        if conn is not None:
+            # ``None`` (unreadable store) is ownership: fail closed, keep the path.
+            if _store_owns_external_workspace(conn, path) is not False:
+                return True, None  # the caller's own store; remove_board reports it separately
+            current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        paths = {_kb.kanban_home() / "kanban.db"}
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pin:
+            paths.add(Path(pin).expanduser())
+        root = _kb.boards_root()
+        if root.exists():
+            for entry in root.iterdir():
+                if entry.is_dir() and entry.name != "_archived":
+                    paths.add(entry / "kanban.db")
+        failed = _probe_all(paths)
+        if failed is not None:
+            return failed
+        # ``boards/_archived/<slug>/kanban.db``: enumerating the archive tree
+        # is itself a read of it. A mode-000 ``_archived`` directory raises
+        # right here — inside the per-store failure wording, not the generic
+        # handler — so the refusal names the unreadable tree and the hint
+        # tail never degrades to ``(None)``.
+        if root.exists():
+            archived = root / "_archived"
+            if archived.is_dir():
+                try:
+                    children = [child / "kanban.db" for child in archived.iterdir() if child.is_dir()]
+                except (OSError, sqlite3.Error):
+                    return True, (
+                        f"kanban stores under {archived} could not be read to rule out "
+                        f"external ownership of {path}")
+                failed = _probe_all(children)
+                if failed is not None:
+                    return failed
+        return False, None
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return True, None
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -117,6 +313,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
+        from hermes_cli.kanban_execution import execution_kind_of
+        if execution_kind_of(conn, task_id) != "worker":
+            return
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
             return
@@ -141,7 +340,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":
             _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _cleanup_worktree_workspace(task_id, path, row["branch_name"], conn=conn)
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
@@ -150,7 +349,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # ``workspace_kind='scratch'`` with a user path pointing at a real
             # source tree; without this, completion would rmtree the user's data.
             # See #28818.
-            if _is_managed_scratch_path(wp):
+            if _is_managed_scratch_path(wp) and not _externally_owned_workspace(conn, str(wp)):
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
@@ -171,7 +370,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None
+    task_id: str, path: str, branch_name: Optional[str] = None,
+    *, conn: sqlite3.Connection | None = None,
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
@@ -185,7 +385,7 @@ def _cleanup_worktree_workspace(
         return  # CLI safety predicates unavailable — preserve
     try:
         wp = Path(path).expanduser()
-        if not wp.is_dir():
+        if not wp.is_dir() or _externally_owned_workspace(conn, path):
             return
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
@@ -229,6 +429,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             (task_id,),
         ).fetchall()
         for (parent_id,) in parents:
+            from hermes_cli.kanban_execution import execution_kind_of
+            if execution_kind_of(conn, parent_id) != "worker":
+                continue
             row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
             if (
                 not row
@@ -238,10 +441,10 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ):
                 continue
             if row["workspace_kind"] == "worktree":
-                _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
+                _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"], conn=conn)
                 continue
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
+            if wp.is_dir() and _is_managed_scratch_path(wp) and not _externally_owned_workspace(conn, str(wp)):
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:

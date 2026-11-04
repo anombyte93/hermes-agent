@@ -27,6 +27,7 @@ from hermes_cli.kanban_output import (
     _fmt_counts, _fmt_model_truth_line, _fmt_route, _fmt_task_line, _fmt_ts,
     _json_out, _obj_dict, _print_json, _task_to_dict,
 )
+from hermes_cli.kanban_external import external_command
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -231,6 +232,9 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
+    elif action == "external":
+        if getattr(args, "external_action", None) == "status":
+            return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
     try:
@@ -433,6 +437,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         try:
             task_id = kb.create_task(
                 conn, title=args.title, body=args.body, assignee=args.assignee,
+                execution_kind=getattr(args, "execution_kind", "worker"),
                 created_by=args.created_by or _profile_author(),
                 workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
                 project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -463,11 +468,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
-        if task.status == "ready" and task.assignee:
+        if task.execution_kind == "worker" and task.status == "ready" and task.assignee:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
-        if task.status in ("ready", "todo"):
+        if task.execution_kind == "worker" and task.status in ("ready", "todo"):
             stranded = kb.unknown_assignee_message(task.assignee)
             if stranded:
                 print(f"\n⚠  {stranded}", file=sys.stderr)
@@ -561,11 +566,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if rc:
         return rc
     graph = None
+    binding = None
     want_json = getattr(args, "json", False)
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             return _err(f"no such task: {args.task_id}")
+        if task.execution_kind == "external_session":
+            from hermes_cli.kanban_db_external import external_status
+            binding = external_status(conn, task.id)["binding"]
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
@@ -587,6 +596,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            "binding": binding,
         })
         return 0
 
@@ -595,6 +605,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    field("execution", task.execution_kind or "UNKNOWN")
+    if binding is not None:
+        field("binding", json.dumps(binding, ensure_ascii=False))
     if task.status == "blocked" and task.block_reason:
         field("blocked", task.block_reason)
     if task.last_failure_error and task.last_failure_error.startswith("provider usage limit (HTTP 429)"):
@@ -1414,7 +1427,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 _HANDLERS = {
-    "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+    "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm, "external": external_command,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,

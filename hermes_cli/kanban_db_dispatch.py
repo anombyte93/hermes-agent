@@ -24,6 +24,8 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_execution import execution_kind_of
+
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
@@ -116,6 +118,8 @@ class DispatchResult:
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
     acting on the fallback rule rather than explicit assignments."""
+    skipped_external_session: list[str] = field(default_factory=list)
+    """External or unreadable execution kinds refused by the final dispatch guard."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -461,7 +465,7 @@ def heartbeat_worker(
     """
     now = int(time.time())
     with _kb.write_txn(conn):
-        sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
+        sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND execution_kind = 'worker' AND status = 'running'"
         params: tuple = (now, task_id)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -552,7 +556,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.execution_kind = 'worker' AND t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -667,7 +671,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.execution_kind = 'worker' AND t.status = 'running'"
     ).fetchall()
 
     for row in rows:
@@ -765,7 +769,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     reconciled: list[str] = []
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
-        "WHERE status = 'running' "
+        "WHERE execution_kind = 'worker' AND status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
@@ -1064,7 +1068,7 @@ def _reclaim_dead_workers(
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE execution_kind = 'worker' AND status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
@@ -1645,7 +1649,7 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+        "WHERE execution_kind = 'worker' AND status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
     if not rows:
@@ -1674,7 +1678,7 @@ def spawnable_ready_ids(conn: sqlite3.Connection) -> set[str]:
     entirely cap-deferred is waiting, not stuck."""
     rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL AND assignee != '' "
+        "WHERE execution_kind = 'worker' AND status = 'ready' AND assignee IS NOT NULL AND assignee != '' "
         "AND claim_lock IS NULL"
     ).fetchall()
     profile_exists = _profile_exists_fn()
@@ -1960,7 +1964,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE execution_kind = 'worker' AND status = 'running'"
             ).fetchone()[0]
         )
     except Exception:
@@ -2025,7 +2029,7 @@ def count_running_by_assignee(conn: sqlite3.Connection) -> dict[str, int]:
         row["assignee"]: int(row["n"])
         for row in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "WHERE execution_kind = 'worker' AND status = 'running' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         )
     }
@@ -2365,6 +2369,9 @@ def _dispatch_lane_task(
     normalised by :func:`parse_assignee_groups`.
     """
     task_id = row["id"]
+    if execution_kind_of(conn, task_id) != "worker":
+        result.skipped_external_session.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2509,6 +2516,8 @@ def _apply_default_assignee(
     by the default, not "unassigned but secretly routed". ``dry_run`` reports
     without writing. Returns False when the write failed.
     """
+    if execution_kind_of(conn, task_id) != "worker":
+        return False
     if dry_run:
         return True
     try:
@@ -2620,8 +2629,8 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
+        "SELECT id, assignee, execution_kind FROM tasks "
+        f"WHERE execution_kind = 'worker' AND status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
 
@@ -2636,7 +2645,8 @@ def _any_spawnable_review(
     so it reserves no slot either."""
     rows = [
         row for row in review_rows
-        if row["assignee"] and _kb.assignee_not_allowed_message(
+        if _kb._row_get(row, "execution_kind") == "worker"
+        and row["assignee"] and _kb.assignee_not_allowed_message(
             row["assignee"], allowed_assignees, board_slug) is None
     ]
     if not rows:

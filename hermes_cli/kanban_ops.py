@@ -384,7 +384,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "WHERE status = 'archived' AND execution_kind = 'worker'"
         ).fetchall()
     for row in rows:
         if row["workspace_kind"] == "worktree":
@@ -408,7 +408,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         except ValueError:
             # Safety: never delete outside the scratch root.
             continue
-        if path.exists() and path.is_dir():
+        if path.exists() and path.is_dir() and not kbw._externally_owned_workspace(None, str(path)):
             shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
 

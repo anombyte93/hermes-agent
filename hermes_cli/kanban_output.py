@@ -21,7 +21,7 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_retries", "model_override", "provider_override", "no_fallback",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
-    "block_reason",
+    "block_reason", "execution_kind",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
@@ -66,7 +66,13 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""
     failed = False
     for tid in ids:
-        if op(tid):
+        try:
+            ok = op(tid)
+        except ValueError as exc:
+            failed = True
+            print(f"{tid}: {exc}", file=sys.stderr)
+            continue
+        if ok:
             print(ok_msg(tid))
         else:
             failed = True

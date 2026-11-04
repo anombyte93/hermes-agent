@@ -271,6 +271,10 @@ class _KanbanDispatcher:
                 for tid in triage_ids:
                     if attempted >= auto_decompose_per_tick:
                         break
+                    from hermes_cli.kanban_execution import execution_kind_of
+                    with _kbc().connect_closing(board=slug) as conn:
+                        if execution_kind_of(conn, tid) != "worker":
+                            continue
                     attempted += 1
                     successes += self._decompose_one(_decomp, slug, tid)
             finally:
