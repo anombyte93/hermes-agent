@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -298,3 +301,144 @@ def test_invalid_slug_with_a_root_pin_returns_the_pin(world, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
     with pytest.raises(ValueError):
         kb.workspaces_root(board="Bad Slug!")
+
+
+# --- Defect G (round 10): boards export with no slug keeps the pin ----------
+
+
+def _export_titles(archive: Path) -> list[str]:
+    """Task titles inside an export archive, read straight from the packed
+    store (``<slug>/kanban.db`` member)."""
+    import sqlite3
+    import tarfile
+
+    with tarfile.open(archive, "r:gz") as tar:
+        member = next(m for m in tar.getmembers()
+                      if PurePosixPath(m.name).name == "kanban.db")
+        extracted = tar.extractfile(member)
+        assert extracted is not None
+        data = extracted.read()
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        try:
+            return [r[0] for r in conn.execute("SELECT title FROM tasks ORDER BY title")]
+        finally:
+            conn.close()
+    finally:
+        os.unlink(tmp)
+
+
+def _cli_boards_export(home: Path, pin: Path, tmp_path: Path,
+                       out: Path, *, board_env: str) -> subprocess.CompletedProcess:
+    """``hermes kanban boards export`` in a fresh interpreter with a temp HOME
+    and the pin set, the way a dispatched worker runs it. ``home`` is the
+    worker's own ``HERMES_HOME`` (root B in the disagreeing-roots shape)."""
+    cli_home = tmp_path / "cli-home"
+    cli_home.mkdir(exist_ok=True)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(cli_home),
+        "HERMES_HOME": str(home),
+        "HERMES_KANBAN_DB": str(pin),
+        "HERMES_KANBAN_BOARD": board_env,
+        "LANG": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "boards", "export",
+         "-o", str(out)],
+        cwd=str(_WORKTREE), env=env, capture_output=True, text=True, timeout=180,
+    )
+
+
+def test_boards_export_no_slug_env_active_board_reads_the_pin(world, monkeypatch, tmp_path):
+    """Defect G: under a ``HERMES_KANBAN_DB`` pin, ``boards export`` with no
+    slug is NOT an explicit slug — it must export the pin's store (1 card),
+    not the active board's own store, when the active board comes from
+    ``HERMES_KANBAN_BOARD``."""
+    home, pin = world
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    args = argparse.Namespace(
+        boards_action="export", slug=None, output=str(tmp_path / "e1.tar.gz"),
+        no_attachments=False, include_logs=False, json=True,
+    )
+    assert cli._dispatch_boards(args) == 0
+    titles = _export_titles(tmp_path / "e1.tar.gz")
+    assert titles == ["pinned card"], titles
+
+
+def test_boards_export_no_slug_current_file_active_board_reads_the_pin(world, monkeypatch, tmp_path):
+    """Defect G: the same, with the active board set the way another session's
+    ``boards switch other`` leaves it — the global current-board file. The
+    export still reads the pin, not other's own store."""
+    home, pin = world
+    kb.set_current_board("other")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    args = argparse.Namespace(
+        boards_action="export", slug=None, output=str(tmp_path / "e2.tar.gz"),
+        no_attachments=False, include_logs=False, json=True,
+    )
+    assert cli._dispatch_boards(args) == 0
+    titles = _export_titles(tmp_path / "e2.tar.gz")
+    assert titles == ["pinned card"], titles
+
+
+def test_boards_export_no_slug_disagreeing_roots_real_cli_reads_the_pin(world, tmp_path):
+    """Defect G, the dispatched-worker shape, real CLI entry point: the pin
+    points at root A's worker-board store, ``HERMES_KANBAN_BOARD=worker-board``
+    and the worker's own root B disagrees. ``boards export`` with no slug must
+    export the pin's store (the worker's own card), not root B's local card."""
+    home, pin = world
+    # Root B has its own worker-board with its own card; the pin stays on
+    # root A's store (the fixture's pin holds "pinned card").
+    root_b = tmp_path / "root-b"
+    (root_b / ".hermes").mkdir(parents=True)
+    saved_env = {k: os.environ.get(k) for k in
+                 ("HERMES_HOME", "HOME", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")}
+    saved_home = Path.home
+    os.environ["HERMES_HOME"] = str(root_b / ".hermes")
+    os.environ["HOME"] = str(root_b)
+    Path.home = lambda: root_b
+    try:
+        kb._INITIALIZED_PATHS.clear()
+        import hermes_constants
+        saved_memo = hermes_constants._default_hermes_root_memo
+        hermes_constants._default_hermes_root_memo = None
+        try:
+            kb.create_board("worker-board")
+            with kbc.connect_closing(board="worker-board") as conn:
+                kb.create_task(conn, title="root-b local card", assignee="fixture")
+        finally:
+            hermes_constants._default_hermes_root_memo = saved_memo
+            kb._INITIALIZED_PATHS.clear()
+    finally:
+        Path.home = saved_home
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    out = tmp_path / "worker-export.tar.gz"
+    result = _cli_boards_export(root_b / ".hermes", pin, tmp_path, out,
+                                board_env="worker-board")
+    assert result.returncode == 0, result.stderr
+    titles = _export_titles(out)
+    assert titles == ["pinned card"], titles
+
+
+def test_boards_export_typed_slug_under_the_pin_reads_that_boards_own_store(world, monkeypatch, tmp_path):
+    """A TYPED slug stays explicit: ``boards export other`` under the pin
+    exports other's own store, not the pin."""
+    home, pin = world
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    args = argparse.Namespace(
+        boards_action="export", slug="other", output=str(tmp_path / "e4.tar.gz"),
+        no_attachments=False, include_logs=False, json=True,
+    )
+    assert cli._dispatch_boards(args) == 0
+    titles = _export_titles(tmp_path / "e4.tar.gz")
+    assert titles == ["other's card"], titles
