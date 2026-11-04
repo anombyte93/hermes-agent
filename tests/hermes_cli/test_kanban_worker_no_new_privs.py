@@ -332,7 +332,9 @@ def test_spawn_fails_closed_when_candidate_fails_ownership_check(monkeypatch, tm
     def untrusted_lstat(path, *args, **kwargs):
         if str(path) == candidate:
             # Regular executable file owned by uid 1000, not root.
-            return os.stat_result((0o100755, 0, 1000, 1000, 1, 1, 47200, 1, 1, 1))
+            # Sequence order: st_mode, st_ino, st_dev, st_nlink, st_uid,
+            # st_gid, st_size, st_atime, st_mtime, st_ctime.
+            return os.stat_result((0o100755, 0, 0, 1, 1000, 1000, 47200, 1, 1, 1))
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(pr, "_SETPRIV_CANDIDATES", [candidate])
@@ -347,6 +349,126 @@ def test_spawn_fails_closed_when_candidate_fails_ownership_check(monkeypatch, tm
 
     with pytest.raises(RuntimeError, match="no_new_privs"):
         kbd._default_spawn(_make_task(), str(tmp_path / "ws"))
+
+
+_STAT_DIR_LAYOUT = {
+    "/": (0o040755, 0),
+    "/usr": (0o040755, 0),
+    "/usr/bin": (0o040755, 0),
+}
+
+
+def _dir_stat(uid=0, mode=0o040755):
+    # Sequence order: st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid,
+    # st_size, st_atime, st_mtime, st_ctime.
+    return os.stat_result((mode, 0, 0, 1, uid, uid, 4096, 1, 1, 1))
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "weak_dir_label,patch_stat",
+    [
+        pytest.param(
+            "uid1000",
+            lambda path, real_stat: (
+                _dir_stat(uid=1000) if str(path) == "/usr/bin" else real_stat(path)
+            ),
+            id="parent-dir-user-owned",
+        ),
+        pytest.param(
+            "group-writable-0775",
+            lambda path, real_stat: (
+                _dir_stat(mode=0o040775) if str(path) == "/usr/bin" else real_stat(path)
+            ),
+            id="parent-dir-group-writable",
+        ),
+        pytest.param(
+            "world-writable-0777",
+            lambda path, real_stat: (
+                _dir_stat(mode=0o040777) if str(path) == "/usr/bin" else real_stat(path)
+            ),
+            id="parent-dir-world-writable",
+        ),
+    ],
+)
+def test_spawn_fails_closed_when_a_parent_directory_is_untrusted(
+    monkeypatch, tmp_path, weak_dir_label, patch_stat
+):
+    """D2 (gen-17 defect 1): the directory check is load-bearing. A candidate
+    whose file passes every file-level check but whose parent directory is
+    user-owned or group/world-writable must be REJECTED — with the directory
+    check skipped (mutant ``weak_dir = ''``), each of these spawns would
+    proceed unflagged. The stat is monkeypatched; nothing is ever chowned."""
+    import tools.process_registry as pr
+
+    candidate = "/usr/bin/setpriv"
+    real_stat = os.stat
+    real_lstat = os.lstat
+
+    def weak_dir_stat(path, *args, **kwargs):
+        return patch_stat(path, real_stat)
+
+    def passthrough_lstat(path, *args, **kwargs):
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(pr, "_SETPRIV_CANDIDATES", [candidate])
+    monkeypatch.setattr(os, "stat", weak_dir_stat)
+    monkeypatch.setattr(os, "lstat", passthrough_lstat)
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda cmd, **kw: (_ for _ in ()).throw(AssertionError("spawned"))
+    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="no_new_privs") as excinfo:
+        kbd._default_spawn(_make_task(), str(tmp_path / "ws"))
+    assert "directory /usr/bin" in str(excinfo.value)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "bad_mode_label,file_mode",
+    [
+        pytest.param("group-writable-0775", 0o100775, id="file-group-writable"),
+        pytest.param("world-writable-0757", 0o100757, id="file-world-writable"),
+    ],
+)
+def test_spawn_fails_closed_when_candidate_file_is_group_or_world_writable(
+    monkeypatch, tmp_path, bad_mode_label, file_mode
+):
+    """D2 (gen-17 defect 1): the file write-bit check is load-bearing. A
+    root-owned regular executable whose mode is g+w (0775) or o+w (0757)
+    must be REJECTED — with the file check loosened to w-only (mutant
+    ``0o022`` → ``0o002``), the g+w rows would spawn unflagged. The stat is
+    monkeypatched; nothing is ever chmodded."""
+    import tools.process_registry as pr
+
+    candidate = "/usr/bin/setpriv"
+    real_lstat = os.lstat
+
+    def writable_lstat(path, *args, **kwargs):
+        if str(path) == candidate:
+            # Root-owned regular executable with the bad write bit set.
+            # Sequence order: st_mode, st_ino, st_dev, st_nlink, st_uid,
+            # st_gid, st_size, st_atime, st_mtime, st_ctime.
+            return os.stat_result((file_mode, 0, 0, 1, 0, 0, 47200, 1, 1, 1))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(pr, "_SETPRIV_CANDIDATES", [candidate])
+    monkeypatch.setattr(os, "lstat", writable_lstat)
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda cmd, **kw: (_ for _ in ()).throw(AssertionError("spawned"))
+    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="no_new_privs") as excinfo:
+        kbd._default_spawn(_make_task(), str(tmp_path / "ws"))
+    assert "group- or world-writable" in str(excinfo.value)
 
 
 def test_non_linux_platform_spawns_exactly_as_today(monkeypatch, tmp_path):
