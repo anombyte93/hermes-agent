@@ -280,6 +280,52 @@ def test_amend_refused_when_task_completes_inside_the_txn_window(kanban_home):
         conn_b.close()
 
 
+def test_amend_noop_refused_when_body_becomes_current_inside_the_txn_window(kanban_home):
+    """Two connections: B commits the amend's exact new body while A's amend
+    is still parked on its BEGIN IMMEDIATE, so A's in-transaction read finds
+    the body already current. The no-op refusal must come from that read —
+    deciding it before the transaction would record a ``body_edited`` event
+    (with an old-body hash for a body that is already gone) for a no-op."""
+    with kbc.connect() as setup:
+        tid = kb.create_task(setup, title="noop race card", body="old")
+
+    conn_b = kbc.connect()
+    result: dict[str, object] = {}
+    try:
+        conn_b.execute("BEGIN IMMEDIATE")
+        conn_b.execute("UPDATE tasks SET body = ? WHERE id = ?", (NEW_BODY, tid))
+
+        def amend_from_a():
+            # Connections are thread-affine: A opens its own inside the thread.
+            conn_a = kbc.connect()
+            try:
+                result["ok"] = keo.amend_open_task(conn_a, tid, body=NEW_BODY)
+            except Exception as exc:  # refusal or lock exhaustion — never a silent write
+                result["ok"] = f"raised {type(exc).__name__}"
+            finally:
+                conn_a.close()
+
+        thread = threading.Thread(target=amend_from_a)
+        thread.start()
+        # Hold B's write lock long enough that A is parked on its BEGIN
+        # IMMEDIATE when the body change commits (loose bound; the assertions
+        # hold under either interleaving).
+        time.sleep(0.5)
+        conn_b.execute("COMMIT")
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+        # Whatever A saw, B's body stands and no edit event may exist: A
+        # changed nothing. A lock timeout is acceptable, a landed "edit" is not.
+        with kbc.connect() as check:
+            task = _task(check, tid)
+            assert task.body == NEW_BODY
+            assert _edited_events(check, tid) == []
+        assert result["ok"] is not True
+    finally:
+        conn_b.close()
+
+
 # ---------------------------------------------------------------------------
 # Worker boundary: a delegated child can never reach the write
 # ---------------------------------------------------------------------------
