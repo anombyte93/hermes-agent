@@ -700,9 +700,11 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             # None (unreadable store) is ownership: fail closed, keep the board.
             history = _store_owns_external_workspace(conn)
             # Evidence for the refusal messages below: which of THIS store's
-            # cards reserve paths inside the board directory. Computed while
-            # the connection is open.
+            # cards reserve paths inside the board directory (gate (b)), and
+            # every reservation the store holds (the history check owns any
+            # path, wherever it points). Computed while the connection is open.
             own_paths = _own_external_paths_detail(conn, str(d))
+            own_any = _own_external_paths_detail(conn, None)
     except sqlite3.Error as exc:
         raise ValueError(
             f"board_unreadable: cannot verify external ownership on {normed!r}; "
@@ -713,13 +715,26 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # Fail closed: refuse on ownership (True) or an unreadable store (None);
     # only a verified no-ownership (False) may hard-delete.
     if not archive and history is not False:
-        # Name the board's own reservation the user must resolve first; the
-        # archive route refuses too whenever the own store owns any path, so
-        # pointing at it here would send the user to a dead end.
+        # Name the board's own reservation the user must resolve first, and
+        # the route that actually works: when no active binding exists and
+        # gate (b) is False on the board directory, `archive=True` succeeds
+        # (A4's closed-history shape) — name it. When the reservation lies
+        # INSIDE the board directory the archive route refuses too, so say so
+        # instead of sending the user down a dead end (release and delete
+        # both refuse on closed history).
+        archive_would = not _externally_owned_workspace_detail(None, str(d))[0]
+        if archive_would:
+            raise ValueError(
+                f"external_binding_history: board {normed!r}'s own cards reserve external "
+                f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
+                "release or clear those reservations before removal, or archive the board "
+                f"instead (`hermes kanban boards rm {normed}` keeps the board's bytes and "
+                "retains the reserved paths)")
         raise ValueError(
             f"external_binding_history: board {normed!r}'s own cards reserve external "
-            f"workspaces ({own_paths or f'see `hermes kanban --board {normed} list`'}); "
-            "release or clear those reservations before removal")
+            f"workspaces ({own_any or own_paths or f'see `hermes kanban --board {normed} list`'}); "
+            "release or clear those reservations before removal — the archive route "
+            "refuses too (a reserved path lies inside the board directory)")
     # Gate (b): before ANY filesystem removal of the board directory (delete
     # or archive-move), ask whether any store owns a path overlapping it —
     # another board's external card or live binding may sit inside this

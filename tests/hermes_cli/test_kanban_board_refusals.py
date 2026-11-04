@@ -312,3 +312,47 @@ def test_own_card_reserving_path_inside_own_board_is_named(kanban_tmp_home):
     assert tid in hint and str(x) in hint, hint
     assert kb.board_dir("selfowner").is_dir()
     assert (x / "proof").read_bytes() == b"owned"
+
+
+# --- Defect 2: the history hint must not be a dead end ---
+
+def test_history_refusal_names_the_archive_route_when_it_would_succeed(kanban_tmp_home):
+    """Case A (the verdict's fixture A shape): the board's own card reserves a
+    path OUTSIDE the board directory. Hard delete refuses on binding history;
+    the archive route would succeed (no active binding, gate (b) False on the
+    board directory), so the refusal must NAME it — not send the user to a
+    release/delete route that refuses."""
+    x = _own_x_outside_home(kanban_tmp_home, "never_claimed")
+    with pytest.raises(ValueError) as exc:
+        kb.remove_board("holder-b", archive=False)
+    msg = str(exc.value)
+    assert "external_binding_history" in msg
+    assert str(x) in msg, msg
+    assert "archive" in msg, msg  # the route that actually works is named
+    assert "another store" not in msg, msg
+    assert kb.board_dir("holder-b").is_dir()
+    assert (x / "work").read_bytes() == b"live work"
+    # Control: the named route really does succeed.
+    assert kb.remove_board("holder-b", archive=True)["action"] == "archived"
+    assert (x / "work").read_bytes() == b"live work"
+
+
+def test_history_refusal_points_only_at_the_card_when_archive_refuses_too(kanban_tmp_home):
+    """Case B: the board's own card reserves a path INSIDE the board
+    directory. Both routes refuse, so the hint must point at the card and say
+    the archive route refuses too — never offer archive as the way out."""
+    kb.create_board("selfblock")
+    x = kb.board_dir("selfblock") / "workspaces" / "reserved"
+    x.mkdir(parents=True)
+    (x / "proof").write_bytes(b"owned")
+    with kbc.connect_closing(board="selfblock") as conn:
+        tid = kb.create_task(conn, title="reserved", execution_kind="external_session",
+                             workspace_kind="dir", workspace_path=str(x))
+    with pytest.raises(ValueError) as exc:
+        kb.remove_board("selfblock", archive=False)
+    msg = str(exc.value)
+    assert "external_binding_history" in msg
+    assert tid in msg and str(x) in msg, msg
+    assert "archive route refuses" in msg, msg
+    assert kb.board_dir("selfblock").is_dir()
+    assert (x / "proof").read_bytes() == b"owned"
