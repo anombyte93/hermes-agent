@@ -123,25 +123,37 @@ def test_edit_amend_non_utf8_body_file_refused_as_usage(kanban_home, tmp_path, c
         assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
 
 
-def test_edit_amend_usage_errors(kanban_home, tmp_path):
+def test_edit_amend_usage_errors(kanban_home, tmp_path, capsys):
     tid = _make(tmp_path, "usage card")
     empty = tmp_path / "empty.md"
     empty.write_text("   \n", encoding="utf-8")
 
-    # Neither mode.
-    out = kc.run_slash(f"edit {tid}")
-    assert "usage" in out.lower()
-    # Both modes.
-    out = kc.run_slash(f"edit {tid} --result r --body-file {_body_file(tmp_path, NEW_BODY)}")
-    assert "usage" in out.lower() or "--result" in out
-    # Empty body file.
-    out = kc.run_slash(f"edit {tid} --body-file {empty}")
-    assert "blank" in out.lower() or "empty" in out.lower()
-    # Missing file.
-    out = kc.run_slash(f"edit {tid} --body-file {tmp_path / 'nope.md'}")
-    assert "nope.md" in out or "read" in out.lower()
+    def _run(*argv: str) -> tuple[int, str]:
+        rc = _edit(tid, *argv)
+        out = capsys.readouterr()
+        return rc, out.out + out.err
+
+    # Neither mode: exit 2, one usage line.
+    rc, combined = _run()
+    assert rc == 2, combined
+    assert "usage" in combined.lower()
+    assert "pass --result" in combined
+    # Both modes: exit 2, one usage line.
+    rc, combined = _run("--result", "r", "--body-file", _body_file(tmp_path, NEW_BODY))
+    assert rc == 2, combined
+    assert "--result" in combined and "cannot be combined" in combined
+    # Empty body file: exit 2, refused as blank.
+    rc, combined = _run("--body-file", str(empty))
+    assert rc == 2, combined
+    assert "blank" in combined.lower()
+    # Missing file: exit 2, refused as unreadable.
+    rc, combined = _run("--body-file", str(tmp_path / "nope.md"))
+    assert rc == 2, combined
+    assert "cannot read --body-file" in combined
     with kbc.connect() as conn:
-        assert kb.get_task(conn, tid).body == "Original brief."
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.body == "Original brief."
         assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
 
 
@@ -220,15 +232,25 @@ def test_edit_result_mode_still_takes_summary_and_metadata(kanban_home, tmp_path
     assert "Edited" in out.out
 
 
-def test_edit_amend_done_card_refuses_with_pointer_to_result(kanban_home, tmp_path):
+def test_edit_amend_done_card_refuses_with_pointer_to_result(kanban_home, tmp_path, capsys):
     tid = _make(tmp_path, "done via cli")
     with kbc.connect() as conn:
         kb.claim_task(conn, tid)
         assert kb.complete_task(conn, tid, summary="done") is True
-    out = kc.run_slash(f"edit {tid} --body-file {_body_file(tmp_path, NEW_BODY)}")
-    assert "--result" in out
+    body_path = _body_file(tmp_path, NEW_BODY)
+    rc = _edit(tid, "--body-file", body_path)
+    out = capsys.readouterr()
+    # The refusal is the status gate, not a bad file or a usage error: rc 1,
+    # the done-card pointer names --result, and nothing was written.
+    assert rc == 1, out
+    combined = out.out + out.err
+    assert "is done" in combined and "--result" in combined
+    assert "cannot read" not in combined and "usage" not in combined.lower()
     with kbc.connect() as conn:
-        assert kb.get_task(conn, tid).body == "Original brief."
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.body == "Original brief."
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "body_edited"] == []
 
 
 def test_edit_amend_archived_card_refuses(kanban_home, tmp_path):
