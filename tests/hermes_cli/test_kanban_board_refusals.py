@@ -517,3 +517,55 @@ def test_mode000_board_directory_ops_prune_names_ownership_unreadable(kanban_tmp
     assert owned is True
     assert reason is not None and "could not be read" in reason, gate
     assert "owns the worktree" not in (reason or ""), gate
+
+
+# --- Defect D (round 9): a mode-000 boards/_archived DIRECTORY ---------------
+
+
+@pytest.fixture
+def mode000_archived(kanban_tmp_home):
+    """A mode-000 ``boards/_archived`` directory: ``iterdir`` on it raises
+    EACCES, which used to fall into the generic handler and print "(None)"."""
+    import os
+    archived = kb.boards_root() / "_archived"
+    archived.mkdir(parents=True)
+    os.chmod(archived, 0)
+    yield archived
+    os.chmod(archived, 0o755)
+
+
+def test_mode000_archived_directory_remove_board_names_the_archive_tree(kanban_tmp_home, mode000_archived):
+    """Defect D, archive/hint route: with a mode-000 ``boards/_archived``,
+    holder-b's refusal names the unreadable archive tree — the hint tail is
+    never "(None)" and never claims another store's external session."""
+    x = _own_x_outside_home(kanban_tmp_home, "never_claimed")
+    with pytest.raises(ValueError) as exc:
+        kb.remove_board("holder-b", archive=False)
+    msg = str(exc.value)
+    assert "could not be read" in msg, msg
+    assert str(mode000_archived) in msg, msg
+    assert "(None)" not in msg, msg
+    assert "another store's external session" not in msg, msg
+    assert kb.board_dir("holder-b").is_dir()
+    assert (x / "work").read_bytes() == b"live work"
+
+
+def test_mode000_archived_directory_gc_prune_names_ownership_unreadable(kanban_tmp_home, mode000_archived):
+    """Defect D, worktree_gc route: the kept line says ownership could not be
+    read, not 'external session owns the worktree'."""
+    from hermes_cli import worktree_gc
+    gate = worktree_gc._externally_owned_or_unanswerable(str(kanban_tmp_home / "some-tree"))
+    owned, reason = gate if isinstance(gate, tuple) else (gate, None)
+    assert owned is True
+    assert reason is not None and "could not be read" in reason, gate
+    assert "owns the worktree" not in (reason or ""), gate
+
+
+def test_mode000_archived_directory_ops_prune_names_ownership_unreadable(kanban_tmp_home, mode000_archived):
+    """Defect D, worktree_ops route: same shape as the gc route."""
+    from hermes_cli import worktree_ops
+    gate = worktree_ops._externally_owned_or_unanswerable(str(kanban_tmp_home / "some-tree"))
+    owned, reason = gate if isinstance(gate, tuple) else (gate, None)
+    assert owned is True
+    assert reason is not None and "could not be read" in reason, gate
+    assert "owns the worktree" not in (reason or ""), gate

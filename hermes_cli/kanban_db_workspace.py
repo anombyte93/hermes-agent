@@ -238,25 +238,10 @@ def _externally_owned_workspace_detail(
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    try:
-        current = None
-        if conn is not None:
-            # ``None`` (unreadable store) is ownership: fail closed, keep the path.
-            if _store_owns_external_workspace(conn, path) is not False:
-                return True, None  # the caller's own store; remove_board reports it separately
-            current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
-        paths = {_kb.kanban_home() / "kanban.db"}
-        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
-        if pin:
-            paths.add(Path(pin).expanduser())
-        root = _kb.boards_root()
-        if root.exists():
-            for entry in root.iterdir():
-                if entry.is_dir() and entry.name != "_archived":
-                    paths.add(entry / "kanban.db")
-                elif entry.name == "_archived" and entry.is_dir():
-                    paths.update(child / "kanban.db" for child in entry.iterdir() if child.is_dir())
-        for db in paths:
+    def _probe_all(dbs) -> Optional[tuple[bool, Optional[str]]]:
+        """Probe each store read-only; the first unreadable or owning one
+        wins. ``None`` means every store cleared the path."""
+        for db in dbs:
             try:
                 if db.resolve() == current or not (db.exists() or db.is_symlink()):
                     continue
@@ -278,6 +263,44 @@ def _externally_owned_workspace_detail(
                         f"ownership of {path}" if owns is None else
                         f"kanban store {db} owns a path overlapping {path}")
                     return True, detail
+        return None
+
+    try:
+        current = None
+        if conn is not None:
+            # ``None`` (unreadable store) is ownership: fail closed, keep the path.
+            if _store_owns_external_workspace(conn, path) is not False:
+                return True, None  # the caller's own store; remove_board reports it separately
+            current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        paths = {_kb.kanban_home() / "kanban.db"}
+        pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pin:
+            paths.add(Path(pin).expanduser())
+        root = _kb.boards_root()
+        if root.exists():
+            for entry in root.iterdir():
+                if entry.is_dir() and entry.name != "_archived":
+                    paths.add(entry / "kanban.db")
+        failed = _probe_all(paths)
+        if failed is not None:
+            return failed
+        # ``boards/_archived/<slug>/kanban.db``: enumerating the archive tree
+        # is itself a read of it. A mode-000 ``_archived`` directory raises
+        # right here — inside the per-store failure wording, not the generic
+        # handler — so the refusal names the unreadable tree and the hint
+        # tail never degrades to ``(None)``.
+        if root.exists():
+            archived = root / "_archived"
+            if archived.is_dir():
+                try:
+                    children = [child / "kanban.db" for child in archived.iterdir() if child.is_dir()]
+                except (OSError, sqlite3.Error):
+                    return True, (
+                        f"kanban stores under {archived} could not be read to rule out "
+                        f"external ownership of {path}")
+                failed = _probe_all(children)
+                if failed is not None:
+                    return failed
         return False, None
     except (OSError, RuntimeError, ValueError, sqlite3.Error):
         return True, None
