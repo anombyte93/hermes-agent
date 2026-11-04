@@ -278,6 +278,44 @@ def test_path_shim_is_not_used_and_real_flag_is_set(synthetic_spawn_env, monkeyp
 
 
 @pytest.mark.linux_only
+def test_bin_candidate_checks_the_resolved_usr_directory(monkeypatch, tmp_path):
+    """/bin/setpriv resolves through /usr on a merged-usr box, and /usr is
+    never a lexical parent of the /bin spelling — a weak /usr must still
+    reject the candidate (gen-17 defect 3: the walk was lexical only, so
+    /usr/bin/setpriv was rejected for /usr while /bin/setpriv, the same
+    inode through the same /usr, was accepted). The stat is monkeypatched;
+    nothing is ever chowned."""
+    import tools.process_registry as pr
+
+    real_stat = os.stat
+
+    def weak_usr_stat(path, *args, **kwargs):
+        if str(path) == "/usr":
+            # A directory owned by uid 1000 instead of root.
+            return os.stat_result((0o040755, 0, 1000, 1000, 1000, 1000, 4096, 1, 1, 1))
+        return real_stat(path, *args, **kwargs)
+
+    popen_calls: list[list[str]] = []
+
+    def fail_popen(cmd, **kwargs):
+        popen_calls.append(list(cmd))
+        raise AssertionError("an unflagged worker must never be launched")
+
+    monkeypatch.setattr(pr, "_SETPRIV_CANDIDATES", ["/bin/setpriv"])
+    monkeypatch.setattr(os, "stat", weak_usr_stat)
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="no_new_privs") as excinfo:
+        kbd._default_spawn(_make_task(), str(tmp_path / "ws"))
+    assert "directory /usr is not owned by root" in str(excinfo.value)
+    assert popen_calls == []
+
+
+@pytest.mark.linux_only
 def test_spawn_fails_closed_when_candidate_fails_ownership_check(monkeypatch, tmp_path):
     """D2: an untrusted setpriv candidate (not owned by root) makes the spawn
     raise; nothing is launched.

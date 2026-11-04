@@ -303,47 +303,63 @@ def _setpriv_trusted_path() -> str:
     unit prepends worker-writable directories to PATH, so a worker could
     plant a shim that strips the flag and later workers would spawn
     unflagged with no error. Trust only a fixed absolute path whose file
-    and every directory on its path are owned by root (uid 0) and are not
-    group- or world-writable.
+    and every directory component are owned by root (uid 0) and are not
+    group- or world-writable, checked on the path as written AND on its
+    resolved real path: a lexical-only walk misses a weak directory behind
+    a symlinked component (merged-usr ``/bin`` → ``/usr/bin``).
     """
     rejected: list[str] = []
     for candidate in _SETPRIV_CANDIDATES:
-        path = Path(candidate)
-        try:
+        reason = _untrusted_candidate_reason(candidate)
+        if reason is None:
+            return candidate
+        rejected.append(f"{candidate}: {reason}")
+    if rejected:
+        _setpriv_trusted_path.reason = "; ".join(rejected)  # type: ignore[attr-defined]
+    else:
+        _setpriv_trusted_path.reason = "no candidates"  # type: ignore[attr-defined]
+    return ""
+
+
+def _candidate_check_paths(candidate: str) -> tuple[str, ...]:
+    """The paths to check for *candidate*: as written, plus its resolved real
+    path when that differs (symlinked directory components)."""
+    resolved = os.path.realpath(candidate)
+    if resolved != candidate:
+        return (candidate, resolved)
+    return (candidate,)
+
+
+def _untrusted_candidate_reason(candidate: str) -> Optional[str]:
+    """Why *candidate* is untrusted, or ``None`` when the file and every
+    directory component of both the path as written and its resolved real
+    path are root-owned and not group- or world-writable."""
+    try:
+        for path_str in _candidate_check_paths(candidate):
+            path = Path(path_str)
             # Lstat the candidate itself (a symlink is untrusted as an
             # exec target); stat (follow) every parent so the check covers
             # the directory the kernel actually resolves through.
             file_st = os.lstat(path)
             mode = file_st.st_mode
             if stat.S_ISLNK(mode):
-                rejected.append(f"{candidate}: symlink")
-                continue
+                return f"{path_str}: symlink"
             if not stat.S_ISREG(mode):
-                rejected.append(f"{candidate}: not a regular file")
-                continue
+                return f"{path_str}: not a regular file"
             if file_st.st_uid != 0:
-                rejected.append(f"{candidate}: not owned by root (uid {file_st.st_uid})")
-                continue
+                return f"{path_str}: not owned by root (uid {file_st.st_uid})"
             if mode & 0o022:
-                rejected.append(f"{candidate}: group- or world-writable ({stat.filemode(mode)})")
-                continue
+                return f"{path_str}: group- or world-writable ({stat.filemode(mode)})"
             if not os.access(path, os.X_OK):
-                rejected.append(f"{candidate}: not executable")
-                continue
-            weak_dir = _untrusted_path_directory(candidate)
+                return f"{path_str}: not executable"
+            weak_dir = _untrusted_path_directory(path_str)
             if weak_dir:
-                rejected.append(f"{candidate}: {weak_dir}")
-                continue
-            return candidate
-        except FileNotFoundError:
-            rejected.append(f"{candidate}: not present")
-        except OSError as exc:
-            rejected.append(f"{candidate}: {exc}")
-    if rejected:
-        _setpriv_trusted_path.reason = "; ".join(rejected)  # type: ignore[attr-defined]
-    else:
-        _setpriv_trusted_path.reason = "no candidates"  # type: ignore[attr-defined]
-    return ""
+                return weak_dir
+    except FileNotFoundError:
+        return "not present"
+    except OSError as exc:
+        return str(exc)
+    return None
 
 
 def _untrusted_path_directory(candidate: str) -> str:
