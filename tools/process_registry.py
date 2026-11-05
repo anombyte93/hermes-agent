@@ -294,6 +294,130 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
 _scope_degraded_warned = False
 
 
+def _setpriv_trusted_path() -> str:
+    """The first system-owned setpriv from :data:`_SETPRIV_CANDIDATES` that is
+    safe to exec as the no_new_privs setter, or ``""`` with the rejection
+    reasons filled in.
+
+    A bare-name PATH lookup is not trusted (gen-17 defect 2): the gateway
+    unit prepends worker-writable directories to PATH, so a worker could
+    plant a shim that strips the flag and later workers would spawn
+    unflagged with no error. Trust only a fixed absolute path whose file
+    and every directory component are owned by root (uid 0) and are not
+    group- or world-writable, checked on the path as written AND on its
+    resolved real path: a lexical-only walk misses a weak directory behind
+    a symlinked component (merged-usr ``/bin`` → ``/usr/bin``).
+    """
+    rejected: list[str] = []
+    for candidate in _SETPRIV_CANDIDATES:
+        reason = _untrusted_candidate_reason(candidate)
+        if reason is None:
+            return candidate
+        rejected.append(f"{candidate}: {reason}")
+    if rejected:
+        _setpriv_trusted_path.reason = "; ".join(rejected)  # type: ignore[attr-defined]
+    else:
+        _setpriv_trusted_path.reason = "no candidates"  # type: ignore[attr-defined]
+    return ""
+
+
+def _candidate_check_paths(candidate: str) -> tuple[str, ...]:
+    """The paths to check for *candidate*: as written, plus its resolved real
+    path when that differs (symlinked directory components)."""
+    resolved = os.path.realpath(candidate)
+    if resolved != candidate:
+        return (candidate, resolved)
+    return (candidate,)
+
+
+def _untrusted_candidate_reason(candidate: str) -> Optional[str]:
+    """Why *candidate* is untrusted, or ``None`` when the file and every
+    directory component of both the path as written and its resolved real
+    path are root-owned and not group- or world-writable."""
+    try:
+        for path_str in _candidate_check_paths(candidate):
+            path = Path(path_str)
+            # Lstat the candidate itself (a symlink is untrusted as an
+            # exec target); stat (follow) every parent so the check covers
+            # the directory the kernel actually resolves through.
+            file_st = os.lstat(path)
+            mode = file_st.st_mode
+            if stat.S_ISLNK(mode):
+                return f"{path_str}: symlink"
+            if not stat.S_ISREG(mode):
+                return f"{path_str}: not a regular file"
+            if file_st.st_uid != 0:
+                return f"{path_str}: not owned by root (uid {file_st.st_uid})"
+            if mode & 0o022:
+                return f"{path_str}: group- or world-writable ({stat.filemode(mode)})"
+            if not os.access(path, os.X_OK):
+                return f"{path_str}: not executable"
+            weak_dir = _untrusted_path_directory(path_str)
+            if weak_dir:
+                return weak_dir
+    except FileNotFoundError:
+        return "not present"
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _untrusted_path_directory(candidate: str) -> str:
+    """Why *candidate's* directory chain is untrusted, or ``""`` when every
+    directory is root-owned and not group- or world-writable."""
+    for parent in Path(candidate).parents:
+        try:
+            st = os.stat(parent)
+        except OSError as exc:
+            return f"{parent}: {exc}"
+        if st.st_uid != 0:
+            return f"directory {parent} is not owned by root (uid {st.st_uid})"
+        if st.st_mode & 0o022:
+            return f"directory {parent} is group- or world-writable ({stat.filemode(st.st_mode)})"
+    return ""
+
+
+# Fixed system candidates, in order; never resolved through PATH (#195).
+_SETPRIV_CANDIDATES = ("/usr/bin/setpriv", "/bin/setpriv")
+
+
+def no_new_privs_argv(command: List[str]) -> List[str]:
+    """Prefix *command* with ``setpriv --no-new-privs --`` (#195).
+
+    Every Kanban card worker must carry the kernel ``no_new_privs`` flag so
+    it cannot gain privileges through a setuid binary (sudo, su, pkexec)
+    inside its own process tree, no matter what the card or the model asks
+    it to run. The flag set
+    before exec is inherited across exec and fork, and both Kanban spawn
+    forms exec in place (the direct argv and ``systemd-run --user --scope``
+    whose client execs the worker from the same Popen child), so one outer
+    wrap covers both. Routes that start a process for the uid without the
+    flag — the systemd user manager, an existing tmux server, cron, or
+    root-equivalent group membership — are outside this control (#201).
+
+    Fails closed: on Linux, a setpriv that is not a root-owned, non-writable
+    system binary raises rather than launching an unflagged worker — it is
+    resolved from the fixed :data:`_SETPRIV_CANDIDATES` list, never through
+    PATH, because the worker's uid can write to PATH directories the gateway
+    unit puts ahead of ``/usr/bin``. Non-Linux platforms never have the kernel
+    flag, so the command is returned unchanged (spawn behaves exactly as
+    today). A fork-time child callback is deliberately not used: it is
+    forbidden in this module (``tests/tools/test_windows_compat.py``) and
+    unsafe in the threaded dispatcher; ``setpriv`` execs in place, keeping
+    PID semantics identical.
+    """
+    if not _IS_LINUX:
+        return command
+    binary = _setpriv_trusted_path()
+    if not binary:
+        raise RuntimeError(
+            "cannot spawn Kanban worker without no_new_privs: no trusted system "
+            "`setpriv` found (install util-linux); candidates rejected: "
+            f"{getattr(_setpriv_trusted_path, 'reason', 'unknown')}"
+        )
+    return [binary, "--no-new-privs", "--", *command]
+
+
 def _warn_scope_degraded_once(detail: str) -> None:
     """Warn once per process: the condition is host-level and the probe verdict
     is cached, so this would otherwise fire on every cron dispatch."""

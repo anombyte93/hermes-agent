@@ -127,9 +127,13 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
-    # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    # the worker flags/subcommand through the real shared parser. #195: the
+    # dispatcher wraps the argv in `setpriv --no-new-privs --`, so skip that
+    # prefix before the hermes argv.
+    worker = captured["cmd"]
+    nnp = worker.index("--") + 1
+    assert worker[nnp : nnp + 3] == ["hermes", "-p", "elias"]
+    args = parser.parse_args(worker[nnp + 3:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"

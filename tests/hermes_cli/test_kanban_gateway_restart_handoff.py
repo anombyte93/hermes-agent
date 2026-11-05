@@ -75,14 +75,20 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
     monkeypatch.setattr("tools.process_registry._worker_memory_max_bytes", lambda: 536_870_912)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: {"systemd-run": "/usr/bin/systemd-run", "setpriv": "/usr/bin/setpriv"}.get(name),
+    )
 
     assert kbd._default_spawn(task, str(workspace)) == 4242
-    assert captured_cmd[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
+    # #195: setpriv --no-new-privs is outermost (the scope form execs in place,
+    # so the flag covers systemd-run AND the worker it execs), then the scope.
+    assert captured_cmd[:3] == ["/usr/bin/setpriv", "--no-new-privs", "--"]
+    assert captured_cmd[3:7] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
     unit_index = captured_cmd.index("--unit")
     assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
     assert "MemoryMax=536870912" in captured_cmd
-    separator = captured_cmd.index("--")
+    separator = captured_cmd.index("--", 3)
     assert captured_cmd[separator + 1 : separator + 4] == ["hermes", "-p", "coder"]
     assert captured_cwd == str(workspace)
     assert captured_env["HERMES_KANBAN_TASK"] == task.id
@@ -121,6 +127,7 @@ def test_managed_gateway_scope_builder_fails_closed_if_binary_disappears(
         kbd._default_spawn(task, str(workspace))
 
 
+@pytest.mark.linux_only
 def test_standalone_dispatcher_keeps_direct_worker_spawn(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -136,9 +143,13 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
         "tools.process_registry._systemd_run_user_scope_available",
         lambda: pytest.fail("scope probe must not run outside managed gateway"),
     )
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/setpriv" if name == "setpriv" else None)
 
     assert kbd._default_spawn(task, str(workspace)) == 4243
-    assert captured_cmd[:3] == ["hermes", "-p", "coder"]
+    # #195: even outside a managed gateway the worker argv is wrapped in
+    # setpriv --no-new-privs; the hermes argv follows the separator.
+    assert captured_cmd[:3] == ["/usr/bin/setpriv", "--no-new-privs", "--"]
+    assert captured_cmd[3:6] == ["hermes", "-p", "coder"]
 
 
 @pytest.mark.linux_only
