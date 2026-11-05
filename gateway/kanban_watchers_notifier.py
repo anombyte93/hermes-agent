@@ -372,6 +372,8 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "gave_up": lambda ev, n: (
         f"✖ {n.head} gave up: {format_budget_facts(_payload_mapping(ev))}"
         if _payload(ev, "limit") == "iteration_budget"
+        else f"✖ {n.head} gave up at its runtime limit ({format_timeout_budget(_payload_mapping(ev))})"
+        if _payload(ev, "limit") == "max_runtime"
         else f"✖ {n.head} gave up after repeated spawn failures{_clip(ev, 'error', _NL, 200)}",
         None, None,
     ),

@@ -70,25 +70,28 @@ def _attempt_base_head(
 
 
 def attempt_new_commit_count(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
-    """Commits run ``run_id`` added to the workspace; None when that cannot be proved.
+    """Commits of its own run ``run_id`` made that change a file; None when unprovable.
 
-    A closed run reads its harvest, which holds the boundary it used. An open run has
-    no harvest yet, so its claim-time boundary is walked with git. No boundary means
-    None: ``harvest_workspace`` then lists recent history, not this attempt's work.
+    See ``kanban_harvest.own_commit_count`` for what counts. A closed run reads the
+    boundary its harvest used; an open run has no harvest yet, so it uses the claim-time
+    stamp. No boundary means None: ``harvest_workspace`` then lists recent history, not
+    this attempt's work.
     """
-    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    row = conn.execute(
+        "SELECT metadata, started_at FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
     if row is None:
         return None
     harvest = _kb._json_dict(row["metadata"]).get("harvest")
     if isinstance(harvest, dict):
-        commits = harvest.get("commits")
-        return len(commits) if harvest.get("base_sha") and isinstance(commits, list) else None
+        base, head = harvest.get("base_sha"), harvest.get("head_sha") or "HEAD"
+    else:
+        base, head = _attempt_base_head(conn, task_id, run_id), "HEAD"
     task = _task_row(conn, task_id)
     workspace = task["workspace_path"] if task is not None else None
-    base = _attempt_base_head(conn, task_id, run_id)
     if not workspace or not base:
         return None
-    return _harvest.commit_count(workspace, base)
+    return _harvest.own_commit_count(workspace, base, head=head, since=int(row["started_at"] or 0))
 
 
 def _prior_run_head_sha(

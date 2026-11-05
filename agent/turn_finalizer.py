@@ -62,12 +62,10 @@ def _record_kanban_budget_exhausted(
     the resume note: without it the retry worker never sees it (hermes-agent#2).
 
     Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
-    consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
-    (``WHERE ended_at IS NULL``), so safe from multiple exit paths.
+    consecutive-failure circuit breaker.
 
-    This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
-    guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
-    from multiple exit paths.
+    This is a bounded fallback (#87096), safe to call from multiple exit paths: once the worker's run is
+    closed, by ``kanban_complete`` or an earlier call, ``_record_task_failure`` changes nothing.
     """
     try:
         from hermes_cli import kanban_db as _kb
@@ -89,7 +87,7 @@ def _record_kanban_budget_exhausted(
                 summary=summary,
                 budget={
                     "iterations": api_call_count, "max_iterations": max_iterations,
-                    "activity": activity,
+                    "activity": activity, "run_id": os.environ.get("HERMES_KANBAN_RUN_ID"),
                 },
             )
         finally:
@@ -187,8 +185,7 @@ def _resolve_budget_fallback(
     # Bounded fallback (#87096): budget was exhausted but none of the normal fallback paths were eligible
     # (interrupted / failed / anomalous exit_reason). If running as a kanban worker we must still record a
     # terminal outcome so the task does not remain in an ambiguous lifecycle state. The worker's run is
-    # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
-    # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
+    # closed via ``_record_task_failure``, which is a no-op if another path already closed it.
     if _kanban_task:
         _record_kanban_budget_exhausted(
             _kanban_task, api_call_count, agent.max_iterations, logger,

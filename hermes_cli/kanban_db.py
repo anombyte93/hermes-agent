@@ -1704,6 +1704,8 @@ def create_task(
 
     if execution_kind not in VALID_EXECUTION_KINDS:
         raise ValueError("execution_kind must be worker or external_session")
+    if max_turns is not None and not 1 <= int(max_turns) <= MAX_TASK_TURNS:
+        raise ValueError(f"max_turns must be between 1 and {MAX_TASK_TURNS} (got {max_turns})")
     if execution_kind == "external_session" and triage:
         raise ValueError("external_session refuses triage and decomposition")
     if execution_kind == "external_session" and (
@@ -4852,17 +4854,49 @@ RESUME_NOTE_MAX_TOOL_LINE_CHARS = 120
 # The full report is under "Prior attempts" (``_CTX_MAX_FIELD_BYTES``); this is the
 # lead that keeps the hoisted note about one comment long.
 RESUME_NOTE_MAX_SUMMARY_CHARS = 1200
+# The most a card may ask for with ``--max-turns``: twice the 150 evo runs on. A card's
+# worst case is ``5 * max_turns`` model calls (1500 here); one that needs more should be split.
+MAX_TASK_TURNS = 300
 # Tool completion lines in worker logs: ``  ┊ 💻 $  sleep 90  90.1s`` with one emoji
 # per tool (``⚡`` is only the default for a tool with no emoji), plus the plain
 # fallback ``⚡ tool_name``. Group 1 or 2 is the line without its prefix.
 _TOOL_LINE_RE = re.compile(r"^\s*┊\s*(\S.*?)\s*$|^\s*.*?(⚡\s*\S.*?)\s*$")
 # Same prefix, but no call happened: the pre-call spinner and the diff header.
 _TOOL_LINE_NOISE_RE = re.compile(r"^(?:\S+\s+)?preparing\b|^review diff\b")
+# These lines hold real commands, URLs and typed text, and the redactor only knows token
+# shapes, so a line is reduced to its verb, plus the path for the verbs that take one.
+_TOOL_LINE_PATH_VERBS = frozenset({"read", "write", "patch"})
+_TOOL_LINE_VERB_RE = re.compile(r"^[A-Za-z][\w-]{0,31}$")
+_TOOL_LINE_PATH_RE = re.compile(r"^[\w./~+-]+$")
+
+
+def _tool_line_label(call: str) -> Optional[str]:
+    """``verb`` or ``verb path`` from a tool line without its prefix; None if neither is
+    plain. Worker text never leaves here: this feeds the board, Discord and resume notes."""
+    tokens = call.split()
+    if tokens and tokens[0] != "$" and not tokens[0][0].isalnum():
+        tokens = tokens[1:]  # the tool's emoji
+    if not tokens:
+        return None
+    verb = "terminal" if tokens[0] == "$" else tokens[0]
+    if not _TOOL_LINE_VERB_RE.match(verb):
+        return None
+    if verb in _TOOL_LINE_PATH_VERBS and len(tokens) > 1 and _TOOL_LINE_PATH_RE.match(tokens[1]):
+        return f"{verb} {tokens[1]}"[:RESUME_NOTE_MAX_TOOL_LINE_CHARS]
+    return verb
+
+
+def _quote_report(text: str) -> str:
+    """Quote worker text inside a dispatcher note: a ``> `` on every line and no heading,
+    so the next worker cannot read a report as part of its brief."""
+    return "\n".join(
+        "> " + re.sub(r"^(\s*)#", r"\1\\#", line) for line in text.splitlines()
+    )
 
 
 def _last_tool_lines(log_path: Optional[str], cap: int) -> list[str]:
-    """Newest ``cap`` tool-call lines from a TUI-rendered worker log, plain text
-    (ANSI escapes stripped), order preserved, each bounded."""
+    """Newest ``cap`` tool calls from a TUI-rendered worker log as ``_tool_line_label``
+    gives them, order preserved."""
     if not log_path or cap <= 0:
         return []
     try:
@@ -4874,8 +4908,9 @@ def _last_tool_lines(log_path: Optional[str], cap: int) -> list[str]:
         m = _TOOL_LINE_RE.match(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line))
         if m:
             call = m.group(1) or m.group(2)
-            if not _TOOL_LINE_NOISE_RE.match(call):
-                hits.append(call[:RESUME_NOTE_MAX_TOOL_LINE_CHARS])
+            label = None if _TOOL_LINE_NOISE_RE.match(call) else _tool_line_label(call)
+            if label:
+                hits.append(label)
     return hits[-cap:]
 
 
@@ -4958,7 +4993,7 @@ def build_resume_note(
     report = str(summary).strip() if summary else ""
     if report:
         lines.append("Previous run's final report (its own claim; check it against the above):")
-        lines.append(report[:RESUME_NOTE_MAX_SUMMARY_CHARS])
+        lines.append(_quote_report(report[:RESUME_NOTE_MAX_SUMMARY_CHARS]))
         if len(report) > RESUME_NOTE_MAX_SUMMARY_CHARS:
             lines.append("_(cut here; the rest is under Prior attempts)_")
 

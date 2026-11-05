@@ -33,9 +33,10 @@ KANBAN_EARLY_WARNING_RATIO = 0.5
 KANBAN_DURABLE_WORK_NOTICE = (
     " One iteration is one model call, not one tool call, and at the limit you get one "
     "last reply with no tools, so nothing can be saved after it. A retry is a fresh session: "
-    "it sees your commits, the dirty file list and comments, never /tmp. Commit your work "
-    "in progress to the card's branch now and keep nothing durable in /tmp. If the blocker "
-    "is an external source, stop sourcing it and use the fallback the brief permits."
+    "it sees your commits, the dirty file list and comments, never /tmp. If this card "
+    "produces commits, commit your work in progress to the card's branch now. Keep nothing "
+    "durable in /tmp. If the blocker is an external source, stop sourcing it and use the "
+    "fallback the brief permits."
 )
 
 
@@ -97,8 +98,8 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
     if final_due and kanban_worker:
         notice += (
             " While tools are still available, call kanban_complete only if all task "
-            "requirements are verified; otherwise commit, persist a kanban_comment handoff "
-            "naming what is committed and what is left, and continue. A diff or commit "
+            "requirements are verified; otherwise, commit if this card produces commits, persist "
+            "a kanban_comment handoff naming what is done and what is left, and continue. A diff or commit "
             "alone is not completion evidence."
         )
     # Only the current tool-result tail is mutable; an older turn may already be cached.

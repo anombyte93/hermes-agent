@@ -439,8 +439,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         return _err(f"kanban: --max-runtime: {exc}", 2)
     max_turns = getattr(args, "max_turns", None)
-    if max_turns is not None and max_turns < 1:
-        return _err(f"kanban: --max-turns must be >= 1 (got {max_turns})", 2)
+    if max_turns is not None and not 1 <= max_turns <= kb.MAX_TASK_TURNS:
+        return _err(
+            f"kanban: --max-turns must be between 1 and {kb.MAX_TASK_TURNS} (got {max_turns}); "
+            "split a card that needs more", 2,
+        )
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "

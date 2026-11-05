@@ -33,7 +33,7 @@ import re
 from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
-from gateway.kanban_timeout_format import format_budget_facts
+from gateway.kanban_timeout_format import format_budget_facts, format_timeout_budget
 
 DISCORD_MESSAGE_LIMIT = 2000
 OUTCOME_LIMIT = 180
@@ -237,6 +237,8 @@ def render_discord_kanban_notice(
         outcome = f"Gave up: {format_budget_facts(payload)}."
     elif kind == "budget_warning":
         outcome = f"Nearly out of turns: {format_budget_facts(payload)}."
+    elif kind == "gave_up" and payload.get("limit") == "max_runtime":
+        outcome = f"Gave up at its runtime limit: {format_timeout_budget(payload)}."
     elif kind == "gave_up":
         err = _one_line(payload.get("error"))
         outcome = "Gave up after repeated spawn failures" + (f": {err}" if err else ".")

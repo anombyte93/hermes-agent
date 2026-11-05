@@ -55,6 +55,9 @@ LIMIT_RUNTIME = "max_runtime"
 
 # Largest final report kept on an exhausted run; ``build_worker_context`` caps its own view.
 RUN_SUMMARY_MAX_CHARS = 16 * 1024
+# The tool named in an agent status line: "executing tool: terminal", "tool completed:
+# patch (0.2s)", "sequential tool running (40s): terminal".
+_ACTIVITY_TOOL_RE = re.compile(r"\btools?\b[^:]*:\s*([A-Za-z][\w-]{0,31})")
 
 
 def auto_block_reason(outcome: str, failures: int, error: Optional[str]) -> str:
@@ -657,7 +660,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                event_payload_extra={
+                    "pid": pid, "sigkill": killed, "retry_status": retry_status,
+                    "limit": LIMIT_RUNTIME, "limit_seconds": limit,
+                },
             )
     return timed_out
 
@@ -1324,11 +1330,14 @@ def detect_crashed_workers(
 
 
 def _last_activity(task_id: str, fallback: Optional[str] = None) -> Optional[str]:
-    """Newest tool line in the worker log, else the caller's own description; bounded
-    and redacted, because it lands on the board. None rather than a guess."""
+    """The worker's last tool as verb and path: from its log, else the tool named in the
+    caller's status text. Never the status text itself, because this reaches the board
+    and Discord. None rather than a guess."""
     lines = _kb._last_tool_lines(_worker_log_path(task_id), 1)
-    text = lines[0] if lines else (fallback or "").strip()
-    return _kb.redact_review_value(text)[:_kb.RESUME_NOTE_MAX_TOOL_LINE_CHARS] if text else None
+    if lines:
+        return lines[0]
+    named = _ACTIVITY_TOOL_RE.search(fallback or "")
+    return named.group(1) if named else None
 
 
 def report_budget_crossing(
@@ -1359,6 +1368,13 @@ def report_budget_crossing(
             conn.close()
     except Exception as exc:
         _kb._log.debug("kanban budget report for %s: %s", task_id, exc)
+
+
+def _budget_run_is_closed(current_run_id: Optional[int], worker_run_id: Any) -> bool:
+    """True when the exhausted worker's run is over: no open run, or a successor's."""
+    if current_run_id is None:
+        return True
+    return bool(worker_run_id) and str(worker_run_id) != str(current_run_id)
 
 
 def _attempt_progress(
@@ -1415,14 +1431,16 @@ def _record_task_failure(
     ``summary``: the worker's final report, kept on the run this closes
     (``end_run=True`` only) and quoted in its resume note.
 
-    ``budget``: ``{iterations, max_iterations, activity}`` from an exhausted worker. Adds
-    ``limit`` and the worker's facts to the run and its outcome event, and writes one
-    ``budget_exhausted`` event.
+    ``budget``: ``{iterations, max_iterations, activity, run_id}`` from an exhausted
+    worker. Adds ``limit`` and the worker's facts to the run and its outcome event, and
+    writes one ``budget_exhausted`` event. It changes nothing once the worker's run is
+    closed: a worker that called ``kanban_complete`` on its last turn did not fail.
 
-    A ``PROGRESS_EXEMPT_OUTCOMES`` run whose attempt added commits leaves the counter
-    alone, up to ``PROGRESS_EXEMPT_CEILING`` times per card. It never applies to
-    ``force_trip``, to a card with an explicit ``max_retries`` (the parent named its
-    limit), or when the attempt's commit boundary cannot be proved.
+    A ``PROGRESS_EXEMPT_OUTCOMES`` run with commits of its own that change a file
+    (``attempt_new_commit_count``) leaves the counter alone, once per run and up to
+    ``PROGRESS_EXEMPT_CEILING`` times per card. It never applies to ``force_trip``, to a
+    card with an explicit ``max_retries`` (the parent named its limit), or when the
+    attempt's commit boundary cannot be proved.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1445,6 +1463,8 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if budget is not None and _budget_run_is_closed(row["current_run_id"], budget.get("run_id")):
+            return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1461,11 +1481,13 @@ def _record_task_failure(
 
         exempt_payload = None
         if new_commits and task_override is None:
-            used = conn.execute(
-                "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?",
-                (task_id, PROGRESS_EXEMPT_EVENT),
-            ).fetchone()["n"]
-            if used < PROGRESS_EXEMPT_CEILING:
+            spent = conn.execute(
+                "SELECT COUNT(*) AS used, COALESCE(SUM(run_id = ?), 0) AS this_run "
+                "FROM task_events WHERE task_id = ? AND kind = ?",
+                (progress_run_id, task_id, PROGRESS_EXEMPT_EVENT),
+            ).fetchone()
+            used = spent["used"]
+            if used < PROGRESS_EXEMPT_CEILING and not spent["this_run"]:
                 failures -= 1
                 exempt_payload = {
                     "new_commits": new_commits, "exempt_runs": used + 1,
@@ -1765,11 +1787,14 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR. Dispatcher
+    # comments do not count: a resume note quotes the worker's report, and citing a PR
+    # there is not opening one.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
+        "SELECT body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? AND author != ?",
+        (task_id, pr_cutoff, _kb.RESUME_NOTE_AUTHOR),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return "active_pr"
