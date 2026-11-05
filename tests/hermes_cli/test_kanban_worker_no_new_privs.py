@@ -279,21 +279,40 @@ def test_path_shim_is_not_used_and_real_flag_is_set(synthetic_spawn_env, monkeyp
 
 @pytest.mark.linux_only
 def test_bin_candidate_checks_the_resolved_usr_directory(monkeypatch, tmp_path):
-    """/bin/setpriv resolves through /usr on a merged-usr box, and /usr is
-    never a lexical parent of the /bin spelling — a weak /usr must still
-    reject the candidate (gen-17 defect 3: the walk was lexical only, so
-    /usr/bin/setpriv was rejected for /usr while /bin/setpriv, the same
-    inode through the same /usr, was accepted). The stat is monkeypatched;
-    nothing is ever chowned."""
+    """A candidate reached through a symlinked directory component must be
+    checked at its RESOLVED path too: /bin/setpriv -> /usr/bin/setpriv
+    (merged-usr) must be rejected when /usr is weak, even though /usr is
+    never a lexical parent of the /bin spelling (gen-17 defect 3: the walk
+    was lexical only, so /usr/bin/setpriv was rejected for /usr while
+    /bin/setpriv, the same inode through the same /usr, was accepted).
+
+    Host-independent: this host's /bin layout and a real setpriv are never
+    consulted — realpath and stat are monkeypatched to MODEL a merged-usr
+    box with a user-owned /usr, so the test proves the same thing on any
+    host. Nothing is ever chowned."""
     import tools.process_registry as pr
 
     real_stat = os.stat
+    real_lstat = os.lstat
+    real_realpath = os.path.realpath
+
+    def merged_usr_realpath(path, *args, **kwargs):
+        # Model a merged-usr host — /bin -> usr/bin — whatever this host's
+        # own /bin happens to be.
+        if str(path) == "/bin/setpriv":
+            return "/usr/bin/setpriv"
+        return real_realpath(path, *args, **kwargs)
 
     def weak_usr_stat(path, *args, **kwargs):
         if str(path) == "/usr":
             # A directory owned by uid 1000 instead of root.
-            return os.stat_result((0o040755, 0, 1000, 1000, 1000, 1000, 4096, 1, 1, 1))
+            # Sequence order: st_mode, st_ino, st_dev, st_nlink, st_uid,
+            # st_gid, st_size, st_atime, st_mtime, st_ctime.
+            return os.stat_result((0o040755, 0, 0, 1, 1000, 1000, 4096, 1, 1, 1))
         return real_stat(path, *args, **kwargs)
+
+    def passthrough_lstat(path, *args, **kwargs):
+        return real_lstat(path, *args, **kwargs)
 
     popen_calls: list[list[str]] = []
 
@@ -302,7 +321,9 @@ def test_bin_candidate_checks_the_resolved_usr_directory(monkeypatch, tmp_path):
         raise AssertionError("an unflagged worker must never be launched")
 
     monkeypatch.setattr(pr, "_SETPRIV_CANDIDATES", ["/bin/setpriv"])
+    monkeypatch.setattr(os.path, "realpath", merged_usr_realpath)
     monkeypatch.setattr(os, "stat", weak_usr_stat)
+    monkeypatch.setattr(os, "lstat", passthrough_lstat)
     monkeypatch.setattr(subprocess, "Popen", fail_popen)
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
