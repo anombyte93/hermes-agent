@@ -333,6 +333,38 @@ def workspace_head(workspace_path: "str | Path") -> "str | None":
     return _git_ok(ws, "rev-parse", "HEAD")
 
 
+def own_commit_count(
+    workspace_path: "str | Path", base_sha: str, *, head: str = "HEAD", since: int = 0,
+) -> "int | None":
+    """Commits in ``base_sha..head`` a worker can claim as its own, ``None`` when git
+    cannot say. A commit counts when it sits on the branch's first-parent line, is not a
+    merge, was committed at or after ``since``, changes a path in the workspace and is
+    not a copy of one on the base's side, so an empty commit, a merge, a pull of older
+    history, a no-op amend and a rebase of older commits earn nothing. Nor does any run
+    that ends with no net change from ``base_sha``, which covers a commit and its undo.
+
+    Git cannot tell who made a commit, so a commit another card makes in a shared
+    worktree during the run still counts, and so does a pull of commits made during it.
+    A rewrite that changes a patch counts too, such as a squash or a rebase with a
+    resolved conflict, unless the run's net change is empty.
+    """
+    ws = Path(workspace_path).expanduser() if workspace_path else None
+    if ws is None or not ws.is_dir():
+        return None
+    net = _git(ws, "diff", "--quiet", base_sha, head, "--", ".")
+    if net is not None and net.returncode == 0:
+        return 0
+    # The ``.`` pathspec is what drops a commit that changes nothing here. ``--cherry-pick``
+    # matches by patch id, because a rewrite gives old work a new commit time.
+    proc = _git(
+        ws, "log", "--first-parent", "--no-merges", "--cherry-pick", "--right-only",
+        "--format=%ct", f"{base_sha}...{head}", "--", ".",
+    )
+    if proc is None or proc.returncode != 0:
+        return None
+    return sum(1 for line in (proc.stdout or "").split() if line.isdigit() and int(line) >= since)
+
+
 def harvest_workspace(
     workspace_path: "str | Path",
     base_sha: "str | None",

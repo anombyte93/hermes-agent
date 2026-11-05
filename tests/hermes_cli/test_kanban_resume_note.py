@@ -258,8 +258,8 @@ def test_rate_limited_reclaim_does_not_count_failure(kanban_home, monkeypatch):
 def test_worker_context_hoists_newest_dispatcher_note(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ctx note", assignee="a")
-        kb.add_comment(conn, tid, "dispatcher", "note one from run 1")
-        kb.add_comment(conn, tid, "dispatcher", "note two from run 2")
+        kb.add_comment(conn, tid, "dispatcher", f"{kb.RESUME_NOTE_MARKER} — run 1: note one from run 1")
+        kb.add_comment(conn, tid, "dispatcher", f"{kb.RESUME_NOTE_MARKER} — run 2: note two from run 2")
         # A closed prior run: the hoisted note must sit above the attempt
         # history it belongs to, and ``_ctx_prior_attempts`` renders nothing
         # without at least one ended run.

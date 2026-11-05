@@ -39,18 +39,33 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
+def _kanban_exhausted_report(final_response: Any) -> Optional[str]:
+    """The worker's final text for ``run.summary``; None when the summary call produced
+    only a placeholder, which is not a report the next worker should read."""
+    from agent.chat_completion_helpers import _EMPTY_SUMMARY_RESPONSE
+
+    text = flatten_message_text(final_response).strip() if final_response else ""
+    if not text or text == _EMPTY_SUMMARY_RESPONSE:
+        return None
+    if text.startswith("I reached the maximum iterations (") and "couldn't summarize" in text:
+        return None
+    return text
+
+
 def _record_kanban_budget_exhausted(
-    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
+    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger,
+    summary: Optional[str] = None, activity: Optional[str] = None,
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
 
-    Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
-    consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
-    (``WHERE ended_at IS NULL``), so safe from multiple exit paths.
+    ``summary`` is the worker's final toolless reply. It lands on the closing run and in
+    the resume note: without it the retry worker never sees it (hermes-agent#2).
 
-    This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
-    guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
-    from multiple exit paths.
+    Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
+    consecutive-failure circuit breaker.
+
+    This is a bounded fallback (#87096), safe to call from multiple exit paths: once the worker's run is
+    closed, by ``kanban_complete`` or an earlier call, ``_record_task_failure`` changes nothing.
     """
     try:
         from hermes_cli import kanban_db as _kb
@@ -69,6 +84,11 @@ def _record_kanban_budget_exhausted(
                 release_claim=True,
                 end_run=True,
                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                summary=summary,
+                budget={
+                    "iterations": api_call_count, "max_iterations": max_iterations,
+                    "activity": activity, "run_id": os.environ.get("HERMES_KANBAN_RUN_ID"),
+                },
             )
         finally:
             with suppress(Exception):
@@ -165,10 +185,13 @@ def _resolve_budget_fallback(
     # Bounded fallback (#87096): budget was exhausted but none of the normal fallback paths were eligible
     # (interrupted / failed / anomalous exit_reason). If running as a kanban worker we must still record a
     # terminal outcome so the task does not remain in an ambiguous lifecycle state. The worker's run is
-    # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
-    # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
+    # closed via ``_record_task_failure``, which is a no-op if another path already closed it.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        _record_kanban_budget_exhausted(
+            _kanban_task, api_call_count, agent.max_iterations, logger,
+            summary=_kanban_exhausted_report(final_response),
+            activity=getattr(agent, "_last_activity_desc", None),
+        )
     return final_response, _turn_exit_reason, preserved_verification_fallback
 
 

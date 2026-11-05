@@ -1211,7 +1211,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--branch <name>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
-                                [--max-retries N]
+                                [--max-retries N] [--max-turns N]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
@@ -1270,6 +1270,14 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+`--max-turns N` is the card's iteration budget. The dispatcher passes it to the worker as `chat --max-turns N`, overriding the profile's `agent.max_turns`. One turn is one model call, not one tool call. The worker context prints the limit on a `Max turns:` line. The most a card may ask for is 300 (`MAX_TASK_TURNS`), and anything above it is refused, so a card that needs more should be split. This caps the flag, not a profile. With the default failure limit a run costs its budget plus one summary call, for at most 5 runs: 1505 model calls for a card flagged at 300, and 755 for an unset card on a profile of 150. Delegated children get fresh budgets on top.
+
+A worker that hits its budget or its `--max-runtime` limit after making commits of its own does not count toward the breaker, once per run and up to 3 such runs per card over its whole life; after that every run counts, so a card can never loop on trivial commits. Worst case without a human is 5 runs. A card with an explicit `--max-retries` gets no exemption.
+
+A commit counts when it sits on the branch's first-parent line, is not a merge, was committed after the run started, changes a file and is not a copy of a commit on the base's side. An empty commit, a merge, a pull of older history, a no-op amend and a rebase of older commits earn nothing, and neither does a run that ends with no net change, which covers a commit and its undo. Git cannot say who made a commit, so another card's commit in a shared worktree during the run still counts, and so does a pull of commits made during it. A rewrite that changes a patch counts too, such as a squash or a rebase with a resolved conflict, unless the run's net change is empty.
+
+A worker that calls `kanban_complete` on its last turn did not exhaust anything: once its run is closed, the exhausted path changes nothing.
 
 ### Concurrency, scheduling, and child promotion config
 
@@ -1661,7 +1669,10 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
-| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `timed_out` | `{limit, pid, elapsed_seconds, limit_seconds, sigkill}` | `limit` says which one ran out. `max_runtime`: the limit was exceeded and the dispatcher SIGTERM'd (then SIGKILL'd) the worker. `iteration_budget`: the worker ran out of turns, and the payload carries the fields of `budget_exhausted` instead of `pid`, `elapsed_seconds`, `limit_seconds` and `sigkill`. |
+| `budget_checkpoint` | `{stage, iterations, max_iterations, new_commits, last_activity}` | The worker reached half its iteration budget. A quiet record. `new_commits` is this run's own commits that change a file, or null when that cannot be proved. `last_activity` is the last tool's verb, plus the path for `read`, `write` and `patch`; command text never reaches the board. |
+| `budget_warning` | same | The worker reached its final budget warning (90% unless `agent.budget_warning_ratio` says otherwise). Delivered to subscribers and reported by a watcher, so someone can check the card is going well. |
+| `budget_exhausted` | `{limit, iterations, max_iterations, new_commits, last_activity, retry_status, blocked}` | The worker ran out of iterations. Written beside `timed_out` or `gave_up`, which also carry `limit: iteration_budget`. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
@@ -1669,7 +1680,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `completion_contract_refused` | `{contract, problems}` | `complete_task` refused the handoff under `kanban.completion_contract: strict`: metadata claims (e.g. a forged `head_sha`) failed verification against the workspace. The task stays `running`; `problems` lists each unverified claim. The worker fixes its metadata and retries. |
 | `completion_warnings` | `{contract, problems}` | The handoff was accepted under `warn` (or the default) but some claims could not be verified. `problems` lists each one; the same list is stored verbatim on the run (`completion_warnings` metadata) and rendered as a `completion-contract` comment. |
-| `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
+| `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. A run that hit a limit adds `limit`: `iteration_budget` with the fields of `budget_exhausted`, or `max_runtime` with `limit_seconds`. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 

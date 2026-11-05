@@ -550,6 +550,7 @@ _TURN_STATE: Dict[str, Any] = {
     # Intermediate pressure warnings made models give up early; ordinary conversations
     # remain opt-in. Dispatcher workers receive a bounded completion checkpoint.
     "_iteration_budget_warning_injected": False,
+    "_iteration_budget_early_warning_injected": False,
     "_budget_exhausted_injected": False,
     "_budget_grace_call": False,
     "_run_budget_started_at": None,  # set by turn_context.prepare_turn when a budget is active
