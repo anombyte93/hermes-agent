@@ -825,6 +825,8 @@ class Task:
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
+    # Worker iteration cap for this card (``chat --max-turns``); None -> profile's agent.max_turns.
+    max_turns: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
     goal_mode: bool = False
@@ -868,7 +870,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract", "execution_kind",
+    "current_step_key", "max_retries", "max_turns", "session_id", "completion_contract", "execution_kind",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1045,6 +1047,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
     max_retries          INTEGER,
+    -- Per-task iteration budget for the worker: the dispatcher passes
+    -- ``chat --max-turns N``, which outranks the profile's ``agent.max_turns``.
+    -- One turn is one model call. NULL = the profile's limit.
+    max_turns            INTEGER,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -1670,7 +1676,7 @@ def create_task(
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
-    block_reason: Optional[str] = None, no_fallback: bool = False,
+    block_reason: Optional[str] = None, no_fallback: bool = False, max_turns: Optional[int] = None,
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
@@ -1685,6 +1691,7 @@ def create_task(
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``no_fallback``: the worker runs with fallback_providers disabled (#107).
+    ``max_turns``: the worker's iteration budget, overriding the profile's.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1810,8 +1817,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        block_reason, no_fallback, execution_kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        block_reason, no_fallback, execution_kind, max_turns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1822,7 +1829,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                         block_reason if task_status == "blocked" else None,
-                        1 if no_fallback else 0, execution_kind,
+                        1 if no_fallback else 0, execution_kind, _opt_int(max_turns),
                     ),
                 )
                 for pid in parents:
@@ -1846,6 +1853,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "no_fallback": bool(no_fallback) or None,
+                        "max_turns": _opt_int(max_turns),
                         "execution_kind": execution_kind,
                     },
                 )
@@ -4453,6 +4461,23 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
+def _ctx_turn_limit(task: Task) -> Optional[str]:
+    """The ``Max turns`` value for the header: the card's own, else, inside this
+    card's worker (whose HERMES_HOME is the assignee profile), the profile's. Elsewhere
+    the profile is not knowable, so no line rather than the reader's own limit."""
+    if task.max_turns is not None:
+        return f"{task.max_turns} (card)"
+    if os.environ.get("HERMES_KANBAN_TASK") != task.id:
+        return None
+    try:
+        from hermes_cli.config import load_config
+
+        limit = (load_config().get("agent") or {}).get("max_turns")
+    except Exception:
+        return None
+    return f"{limit} (profile)" if isinstance(limit, int) and not isinstance(limit, bool) else None
+
+
 def _ctx_header(lines: list[str], task: Task) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
@@ -4469,6 +4494,9 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+    turn_limit = _ctx_turn_limit(task)
+    if turn_limit:
+        lines.append(f"Max turns: {turn_limit}; one turn is one model call, not one tool call")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
@@ -4789,7 +4817,8 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 # parent" precedent on the align-apple-feel wave (2026-09-13).
 RESUME_NOTE_AUTHOR = "dispatcher"
 # Marker every generated note starts with; used for per-run idempotency in
-# the dispatcher. Never render user/worker text inside a generated note.
+# the dispatcher. Worker text inside a note (its final report, its tool lines)
+# has the marker masked by ``build_resume_note`` so it can never spoof that scan.
 RESUME_NOTE_MARKER = "Resume note (dispatcher)"
 
 
@@ -4819,15 +4848,21 @@ def _ctx_resume_note(lines: list[str], comments: list[Comment]) -> None:
 RESUME_NOTE_MAX_COMMITS = 15
 RESUME_NOTE_MAX_STATUS = 20
 RESUME_NOTE_MAX_LOG_TOOL_LINES = 5
-# TUI-rendered tool-call markers in worker logs: ``┊ ⚡ tool_nam…   0.0s`` and
-# the plain fallback ``⚡ tool_name``. The name column is truncated by the TUI
-# (~8 chars); that's still enough to name the last action taken.
-_TOOL_LINE_RE = re.compile(r"^\s*.*⚡\s*(\S+)")
+RESUME_NOTE_MAX_TOOL_LINE_CHARS = 120
+# The full report is under "Prior attempts" (``_CTX_MAX_FIELD_BYTES``); this is the
+# lead that keeps the hoisted note about one comment long.
+RESUME_NOTE_MAX_SUMMARY_CHARS = 1200
+# Tool completion lines in worker logs: ``  ┊ 💻 $  sleep 90  90.1s`` with one emoji
+# per tool (``⚡`` is only the default for a tool with no emoji), plus the plain
+# fallback ``⚡ tool_name``. Group 1 or 2 is the line without its prefix.
+_TOOL_LINE_RE = re.compile(r"^\s*┊\s*(\S.*?)\s*$|^\s*.*?(⚡\s*\S.*?)\s*$")
+# Same prefix, but no call happened: the pre-call spinner and the diff header.
+_TOOL_LINE_NOISE_RE = re.compile(r"^(?:\S+\s+)?preparing\b|^review diff\b")
 
 
 def _last_tool_lines(log_path: Optional[str], cap: int) -> list[str]:
-    """Newest ``cap`` tool-call marker lines from a TUI-rendered worker log,
-    plain text (ANSI escapes stripped), order preserved."""
+    """Newest ``cap`` tool-call lines from a TUI-rendered worker log, plain text
+    (ANSI escapes stripped), order preserved, each bounded."""
     if not log_path or cap <= 0:
         return []
     try:
@@ -4838,7 +4873,9 @@ def _last_tool_lines(log_path: Optional[str], cap: int) -> list[str]:
     for line in raw.decode(errors="replace").splitlines():
         m = _TOOL_LINE_RE.match(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line))
         if m:
-            hits.append(f"⚡ {m.group(1)}")
+            call = m.group(1) or m.group(2)
+            if not _TOOL_LINE_NOISE_RE.match(call):
+                hits.append(call[:RESUME_NOTE_MAX_TOOL_LINE_CHARS])
     return hits[-cap:]
 
 
@@ -4857,16 +4894,16 @@ def build_resume_note(
 
     ``base_sha``: explicit base (task metadata wins). ``None``: derive from
     ``git merge-base HEAD <default branch>`` (origin/main → main → master).
-    ``run``: the just-closed ``Run`` (or a mapping with ``outcome``/``error``).
+    ``run``: the just-closed ``Run`` (or a mapping with ``outcome``/``error``/``summary``).
     """
     lines: list[str] = []
 
     # --- Run outcome first: the one line that always exists. ---
-    outcome = error = None
+    outcome = error = summary = None
     if isinstance(run, Run):
-        outcome, error = run.outcome, run.error
+        outcome, error, summary = run.outcome, run.error, run.summary
     elif isinstance(run, dict):
-        outcome, error = run.get("outcome"), run.get("error")
+        outcome, error, summary = run.get("outcome"), run.get("error"), run.get("summary")
     if outcome:
         lines.append(f"Previous run outcome: {outcome}")
     if error:
@@ -4909,13 +4946,28 @@ def build_resume_note(
     else:
         lines.append("No workspace path recorded for this task.")
 
+    git_evidence = list(lines)
+
     # --- Worker log evidence, best-effort. ---
     tool_lines = _last_tool_lines(log_path, RESUME_NOTE_MAX_LOG_TOOL_LINES)
     if tool_lines:
         lines.append("Last tool calls (oldest→newest):")
         lines.extend(tool_lines)
 
-    return "\n".join(lines)
+    # --- The worker's own last word: a claim, so it goes after the evidence. ---
+    report = str(summary).strip() if summary else ""
+    if report:
+        lines.append("Previous run's final report (its own claim; check it against the above):")
+        lines.append(report[:RESUME_NOTE_MAX_SUMMARY_CHARS])
+        if len(report) > RESUME_NOTE_MAX_SUMMARY_CHARS:
+            lines.append("_(cut here; the rest is under Prior attempts)_")
+
+    note = "\n".join(lines).replace(RESUME_NOTE_MARKER, "[resume note]")
+    try:
+        return redact_review_value(note)
+    except Exception:
+        # Tool lines and the report are worker text; a shorter note beats an unredacted one.
+        return "\n".join(git_evidence).replace(RESUME_NOTE_MARKER, "[resume note]")
 
 
 def _resolve_git_base(workspace: str) -> Optional[str]:

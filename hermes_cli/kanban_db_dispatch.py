@@ -34,6 +34,28 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# A run that ran out of allowance (iteration budget or max runtime) after committing
+# work made progress, so it does not move ``consecutive_failures``. The exemption is
+# capped per card, across its whole life, so trivial commits cannot loop forever: after
+# this many exempt runs every run counts again. Worst case without a human: this many
+# exempt runs plus ``DEFAULT_FAILURE_LIMIT`` counted ones, so five runs.
+PROGRESS_EXEMPT_CEILING = 3
+PROGRESS_EXEMPT_OUTCOMES = frozenset({"timed_out"})
+PROGRESS_EXEMPT_EVENT = "breaker_exempt_progress"
+
+# A worker reports its iteration budget to the board so a watcher can look while it runs.
+# ``budget_checkpoint`` is the quiet half-way record. ``budget_warning`` (nearly out) and
+# ``budget_exhausted`` are what a watcher treats as a problem. Exhaustion also stamps
+# ``limit`` on the run and its outcome event, so it reads apart from a runtime kill even
+# though both close as ``timed_out``.
+BUDGET_EVENT_BY_STAGE = {"early": "budget_checkpoint", "final": "budget_warning"}
+BUDGET_EXHAUSTED_EVENT = "budget_exhausted"
+LIMIT_ITERATIONS = "iteration_budget"
+LIMIT_RUNTIME = "max_runtime"
+
+# Largest final report kept on an exhausted run; ``build_worker_context`` caps its own view.
+RUN_SUMMARY_MAX_CHARS = 16 * 1024
+
 
 def auto_block_reason(outcome: str, failures: int, error: Optional[str]) -> str:
     """Reason stamped by every dispatcher auto-block, as one pure string build.
@@ -609,6 +631,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             if cur.rowcount == 1:
                 payload = {
                     "pid": pid,
+                    "limit": LIMIT_RUNTIME,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
                     "sigkill": killed,
@@ -1300,6 +1323,69 @@ def detect_crashed_workers(
     return sweep.crashed
 
 
+def _last_activity(task_id: str, fallback: Optional[str] = None) -> Optional[str]:
+    """Newest tool line in the worker log, else the caller's own description; bounded
+    and redacted, because it lands on the board. None rather than a guess."""
+    lines = _kb._last_tool_lines(_worker_log_path(task_id), 1)
+    text = lines[0] if lines else (fallback or "").strip()
+    return _kb.redact_review_value(text)[:_kb.RESUME_NOTE_MAX_TOOL_LINE_CHARS] if text else None
+
+
+def report_budget_crossing(
+    task_id: str, *, stage: str, iterations: int, max_iterations: int,
+    activity: Optional[str] = None,
+) -> None:
+    """Record, from the worker, that its run crossed a budget warning. Never raises: a
+    report that cannot be written must not cost the worker a turn or its run."""
+    try:
+        conn = _kbc.connect()
+        try:
+            row = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            run_id = row["current_run_id"] if row is not None else None
+            if run_id is None:
+                return
+            from hermes_cli.kanban_harvest_run import attempt_new_commit_count
+
+            payload = {
+                "stage": stage, "iterations": iterations, "max_iterations": max_iterations,
+                "new_commits": attempt_new_commit_count(conn, task_id, run_id),
+                "last_activity": _last_activity(task_id, activity),
+            }
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, task_id, BUDGET_EVENT_BY_STAGE[stage], payload, run_id=run_id)
+        finally:
+            conn.close()
+    except Exception as exc:
+        _kb._log.debug("kanban budget report for %s: %s", task_id, exc)
+
+
+def _attempt_progress(
+    conn: sqlite3.Connection, task_id: str, outcome: str, force_trip: bool,
+) -> tuple[Optional[int], Optional[int]]:
+    """``(run_id, new commits)`` of the attempt this failure closes; commits is None when
+    the outcome is not a limit or the count is unprovable. Never raises: a failed read
+    leaves the run counted, which is today's behaviour."""
+    if force_trip or outcome not in PROGRESS_EXEMPT_OUTCOMES:
+        return None, None
+    try:
+        from hermes_cli.kanban_harvest_run import attempt_new_commit_count
+
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = row["current_run_id"] if row is not None else None
+        if run_id is None:
+            # Timeout path: the caller closed the run before counting the failure.
+            latest = _kb.latest_run(conn, task_id)
+            run_id = latest.id if latest is not None else None
+        return run_id, attempt_new_commit_count(conn, task_id, run_id) if run_id else None
+    except Exception as exc:
+        _kb._log.debug("kanban progress count for %s: %s", task_id, exc)
+        return None, None
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1311,6 +1397,8 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    summary: Optional[str] = None,
+    budget: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1323,10 +1411,33 @@ def _record_task_failure(
     ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
+
+    ``summary``: the worker's final report, kept on the run this closes
+    (``end_run=True`` only) and quoted in its resume note.
+
+    ``budget``: ``{iterations, max_iterations, activity}`` from an exhausted worker. Adds
+    ``limit`` and the worker's facts to the run and its outcome event, and writes one
+    ``budget_exhausted`` event.
+
+    A ``PROGRESS_EXEMPT_OUTCOMES`` run whose attempt added commits leaves the counter
+    alone, up to ``PROGRESS_EXEMPT_CEILING`` times per card. It never applies to
+    ``force_trip``, to a card with an explicit ``max_retries`` (the parent named its
+    limit), or when the attempt's commit boundary cannot be proved.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
+    if summary is not None:
+        summary = _kb.redact_review_value(summary)[:RUN_SUMMARY_MAX_CHARS] or None
+    # Git runs outside the write txn; a stale count here only decides one exemption.
+    progress_run_id, new_commits = _attempt_progress(conn, task_id, outcome, force_trip)
+    budget_facts = {}
+    if budget is not None:
+        budget_facts = {
+            "limit": LIMIT_ITERATIONS, "iterations": budget.get("iterations"),
+            "max_iterations": budget.get("max_iterations"), "new_commits": new_commits,
+            "last_activity": _last_activity(task_id, budget.get("activity")),
+        }
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
@@ -1348,7 +1459,24 @@ def _record_task_failure(
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
 
+        exempt_payload = None
+        if new_commits and task_override is None:
+            used = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?",
+                (task_id, PROGRESS_EXEMPT_EVENT),
+            ).fetchone()["n"]
+            if used < PROGRESS_EXEMPT_CEILING:
+                failures -= 1
+                exempt_payload = {
+                    "new_commits": new_commits, "exempt_runs": used + 1,
+                    "ceiling": PROGRESS_EXEMPT_CEILING, "failures": failures,
+                }
+
         if not (force_trip or failures >= effective_limit):
+            if exempt_payload:
+                _kb._append_event(
+                    conn, task_id, PROGRESS_EXEMPT_EVENT, exempt_payload, run_id=progress_run_id,
+                )
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
@@ -1367,17 +1495,22 @@ def _record_task_failure(
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
                 run_id = _kb._end_run(
-                    conn, task_id, outcome=outcome, status=outcome, error=error,
-                    metadata={"failures": failures, "retry_status": retry_status},
+                    conn, task_id, outcome=outcome, status=outcome, error=error, summary=summary,
+                    metadata={"failures": failures, "retry_status": retry_status, **budget_facts},
                 )
                 _kb._append_event(
                     conn, task_id, outcome,
-                    {"error": error, "failures": failures, "retry_status": retry_status},
+                    {"error": error, "failures": failures, "retry_status": retry_status, **budget_facts},
                     run_id=run_id,
                 )
+                if budget_facts:
+                    _kb._append_event(
+                        conn, task_id, BUDGET_EXHAUSTED_EVENT,
+                        {**budget_facts, "retry_status": retry_status, "blocked": False}, run_id=run_id,
+                    )
                 if run_id is not None:
                     _write_resume_note(
-                        conn, task_id, run_id, outcome=outcome, error=error,
+                        conn, task_id, run_id, outcome=outcome, error=error, summary=summary,
                     )
             return False
 
@@ -1409,22 +1542,29 @@ def _record_task_failure(
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                conn, task_id, outcome="gave_up", status="gave_up", error=error, summary=summary,
                 metadata={
                     "failures": failures,
                     "trigger_outcome": outcome,
                     "effective_limit": effective_limit,
                     "limit_source": limit_source,
                     "retry_status": retry_status,
+                    **budget_facts,
                 },
             )
             if run_id is not None:
                 _write_resume_note(
-                    conn, task_id, run_id, outcome="gave_up", error=error,
+                    conn, task_id, run_id, outcome="gave_up", error=error, summary=summary,
                 )
         if event_payload_extra:
             payload.update(event_payload_extra)
+        payload.update(budget_facts)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        if budget_facts:
+            _kb._append_event(
+                conn, task_id, BUDGET_EXHAUSTED_EVENT,
+                {**budget_facts, "retry_status": retry_status, "blocked": True}, run_id=run_id,
+            )
         return True
 
 
@@ -1463,7 +1603,7 @@ def _worker_log_path(task_id: str) -> Optional[str]:
 
 def _write_resume_note(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int], *,
-    outcome: str, error: Optional[str] = None,
+    outcome: str, error: Optional[str] = None, summary: Optional[str] = None,
 ) -> None:
     """Insert the idempotent resume-note comment for ``run_id``.
 
@@ -1475,7 +1615,9 @@ def _write_resume_note(
     try:
         if run_id is not None and conn.execute(
             "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND body LIKE ?",
-            (task_id, _kb.RESUME_NOTE_AUTHOR, f"%{_kb.RESUME_NOTE_MARKER}%run {run_id}%"),
+            # Anchored to the note's own first line: the body quotes worker text, and
+            # "run 7" in an older note's report must not read as run 7's note existing.
+            (task_id, _kb.RESUME_NOTE_AUTHOR, f"{_kb.RESUME_NOTE_MARKER} — run {run_id} closed as %"),
         ).fetchone():
             return
         row = conn.execute(
@@ -1502,7 +1644,7 @@ def _write_resume_note(
                 base_sha = candidate.strip()
         note_body = _kb.build_resume_note(
             workspace_path, base_sha=base_sha,
-            run={"outcome": outcome, "error": error},
+            run={"outcome": outcome, "error": error, "summary": summary},
             log_path=_worker_log_path(task_id),
         )
         body = (
@@ -3085,6 +3227,9 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     if task.no_fallback:
         # Card pin (#107): a 429/provider error blocks the card, never switches family.
         cmd.append("--no-fallback")
+    if task.max_turns is not None:
+        # CLI arg outranks the profile's agent.max_turns (``HermesCLI._init_turn_limits``).
+        cmd.extend(["--max-turns", str(task.max_turns)])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the

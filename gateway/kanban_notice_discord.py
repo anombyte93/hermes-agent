@@ -33,6 +33,8 @@ import re
 from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
+from gateway.kanban_timeout_format import format_budget_facts
+
 DISCORD_MESSAGE_LIMIT = 2000
 OUTCOME_LIMIT = 180
 TITLE_LIMIT = 200
@@ -48,6 +50,7 @@ MARKERS = {
     "gave_up": "⚠️",
     "crashed": "⚠️",
     "timed_out": "⚠️",
+    "budget_warning": "⚠️",
     "review_requested": "👀",
     "started": "▶️",
     "status": "🔄",
@@ -230,11 +233,17 @@ def render_discord_kanban_notice(
     elif kind == "blocked":
         reason = _one_line(payload.get("reason"))
         outcome = f"Blocked: {reason}" if reason else "Blocked."
+    elif kind == "gave_up" and payload.get("limit") == "iteration_budget":
+        outcome = f"Gave up: {format_budget_facts(payload)}."
+    elif kind == "budget_warning":
+        outcome = f"Nearly out of turns: {format_budget_facts(payload)}."
     elif kind == "gave_up":
         err = _one_line(payload.get("error"))
         outcome = "Gave up after repeated spawn failures" + (f": {err}" if err else ".")
     elif kind == "crashed":
         outcome = "Worker crashed; the dispatcher will retry."
+    elif kind == "timed_out" and payload.get("limit") == "iteration_budget":
+        outcome = f"Ran out of turns: {format_budget_facts(payload)}; will retry."
     elif kind == "timed_out":
         try:
             limit = int(payload.get("limit_seconds") or 0)

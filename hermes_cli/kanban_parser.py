@@ -261,6 +261,10 @@ _SPECS = [
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
                   f"{kb.DEFAULT_FAILURE_LIMIT})."),
+        _arg("--max-turns", type=int, metavar="N", dest="max_turns",
+             help="Worker iteration budget for this card (passed as chat --max-turns N), "
+                  "overriding the profile's agent.max_turns. One turn is one model call, "
+                  "not one tool call. Omit to use the profile's limit."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "

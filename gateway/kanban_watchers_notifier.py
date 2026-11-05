@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 
-from gateway.kanban_timeout_format import format_timeout_budget
+from gateway.kanban_timeout_format import format_budget_facts, format_timeout_budget
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 
 
@@ -40,7 +40,7 @@ _EXTERNAL_WAKE_KINDS = (
     "external_completed", "external_review_requested", "external_changes_requested", "external_released",
 )
 _EXTERNAL_KINDS = (*_EXTERNAL_WAKE_KINDS, "external_claimed", "external_handed_over")
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", *_EXTERNAL_KINDS)
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "signaled", "protocol_violation", "output_limit_reached", "timed_out", "budget_warning", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", *_EXTERNAL_KINDS)
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "signaled", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", *_EXTERNAL_WAKE_KINDS)
@@ -370,7 +370,10 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": lambda ev, n: (
-        f"✖ {n.head} gave up after repeated spawn failures{_clip(ev, 'error', _NL, 200)}", None, None,
+        f"✖ {n.head} gave up: {format_budget_facts(_payload_mapping(ev))}"
+        if _payload(ev, "limit") == "iteration_budget"
+        else f"✖ {n.head} gave up after repeated spawn failures{_clip(ev, 'error', _NL, 200)}",
+        None, None,
     ),
     "crashed": lambda ev, n: (f"✖ {n.head} worker crashed (pid gone); dispatcher will retry", None, None),
     "signaled": lambda ev, n: (
@@ -388,6 +391,9 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     ),
     "timed_out": lambda ev, n: (
         f"⏱ {n.head} timed out ({format_timeout_budget(_payload_mapping(ev))}); will retry", None, None,
+    ),
+    "budget_warning": lambda ev, n: (
+        f"🧮 {n.head} is nearly out of turns: {format_budget_facts(_payload_mapping(ev))}", None, None,
     ),
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,

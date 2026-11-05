@@ -26,6 +26,32 @@ ITERATION_BUDGET_WARNING_TEMPLATE = (
     "iterations. Checkpoint durable progress now, then continue the task; do not stop "
     "solely because of this warning."
 )
+# Kanban workers also get a checkpoint at half budget, when committing is still cheap. The
+# later warning arrives after most of the budget is gone. dot-agents' new-card.sh Finish
+# block asks for the same commit, so the two say one thing.
+KANBAN_EARLY_WARNING_RATIO = 0.5
+KANBAN_DURABLE_WORK_NOTICE = (
+    " One iteration is one model call, not one tool call, and at the limit you get one "
+    "last reply with no tools, so nothing can be saved after it. A retry is a fresh session: "
+    "it sees your commits, the dirty file list and comments, never /tmp. Commit your work "
+    "in progress to the card's branch now and keep nothing durable in /tmp. If the blocker "
+    "is an external source, stop sourcing it and use the fallback the brief permits."
+)
+
+
+def _report_budget_crossing(agent: Any, stage: str, budget: Any) -> None:
+    """Tell the board what the worker was just told, so a watcher can look while it runs."""
+    import os
+
+    try:
+        from hermes_cli.kanban_db_dispatch import report_budget_crossing
+
+        report_budget_crossing(
+            os.environ["HERMES_KANBAN_TASK"], stage=stage, iterations=budget.used,
+            max_iterations=budget.max_total, activity=getattr(agent, "_last_activity_desc", None),
+        )
+    except Exception as exc:
+        logger.debug("kanban budget report failed: %s", exc)
 
 
 def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
@@ -52,17 +78,28 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
         or budget.max_total <= 1
         or budget.max_total >= sys.maxsize
         or getattr(agent, "_iteration_budget_warning_injected", False)
-        or budget.used < min(ratio * budget.max_total, budget.max_total - 1)
     ):
+        return False
+    final_due = budget.used >= min(ratio * budget.max_total, budget.max_total - 1)
+    early_due = (
+        kanban_worker
+        and ratio > KANBAN_EARLY_WARNING_RATIO
+        and not getattr(agent, "_iteration_budget_early_warning_injected", False)
+        and budget.used >= KANBAN_EARLY_WARNING_RATIO * budget.max_total
+    )
+    if not (final_due or early_due):
         return False
     notice = ITERATION_BUDGET_WARNING_TEMPLATE.format(
         used=budget.used, maximum=budget.max_total
     )
     if kanban_worker:
+        notice += KANBAN_DURABLE_WORK_NOTICE
+    if final_due and kanban_worker:
         notice += (
             " While tools are still available, call kanban_complete only if all task "
-            "requirements are verified; otherwise persist a kanban_comment handoff and "
-            "continue. A diff or commit alone is not completion evidence."
+            "requirements are verified; otherwise commit, persist a kanban_comment handoff "
+            "naming what is committed and what is left, and continue. A diff or commit "
+            "alone is not completion evidence."
         )
     # Only the current tool-result tail is mutable; an older turn may already be cached.
     from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -77,7 +114,11 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
         message["content"] = [*(content or []), {"type": "text", "text": notice}]
     else:
         return False
-    agent._iteration_budget_warning_injected = True
+    agent._iteration_budget_early_warning_injected = True
+    if final_due:
+        agent._iteration_budget_warning_injected = True
+    if kanban_worker:
+        _report_budget_crossing(agent, "final" if final_due else "early", budget)
     return True
 
 

@@ -438,6 +438,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
         return _err(f"kanban: --max-runtime: {exc}", 2)
+    max_turns = getattr(args, "max_turns", None)
+    if max_turns is not None and max_turns < 1:
+        return _err(f"kanban: --max-turns must be >= 1 (got {max_turns})", 2)
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
@@ -459,6 +462,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_retries=max_retries, model_override=getattr(args, "model_override", None),
                 provider_override=getattr(args, "provider_override", None),
                 no_fallback=bool(getattr(args, "no_fallback", False)),
+                max_turns=max_turns,
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
@@ -645,6 +649,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             field("model", _line)
     if task.no_fallback:
         field("fallback", "disabled (--no-fallback)")
+    if task.max_turns is not None:
+        field("max-turns", f"{task.max_turns} (task)")
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")

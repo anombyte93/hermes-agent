@@ -1211,7 +1211,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--branch <name>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
-                                [--max-retries N]
+                                [--max-retries N] [--max-turns N]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
@@ -1270,6 +1270,10 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+`--max-turns N` is the card's iteration budget. The dispatcher passes it to the worker as `chat --max-turns N`, overriding the profile's `agent.max_turns`. One turn is one model call, not one tool call. The worker context prints the limit on a `Max turns:` line.
+
+A worker that hits its budget or its `--max-runtime` limit after committing does not count toward the breaker, up to 3 such runs per card over its whole life; after that every run counts, so a card can never loop on trivial commits. Worst case without a human is 5 runs. A card with an explicit `--max-retries` gets no exemption.
 
 ### Concurrency, scheduling, and child promotion config
 
@@ -1661,7 +1665,10 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
-| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `timed_out` | `{limit, pid, elapsed_seconds, limit_seconds, sigkill}` | `limit` says which one ran out. `max_runtime`: the limit was exceeded and the dispatcher SIGTERM'd (then SIGKILL'd) the worker. `iteration_budget`: the worker ran out of turns, and the payload carries the fields of `budget_exhausted` instead of `pid`, `elapsed_seconds`, `limit_seconds` and `sigkill`. |
+| `budget_checkpoint` | `{stage, iterations, max_iterations, new_commits, last_activity}` | The worker reached half its iteration budget. A quiet record. `new_commits` is this run's commits, or null when that cannot be proved. |
+| `budget_warning` | same | The worker reached its final budget warning (90% unless `agent.budget_warning_ratio` says otherwise). Delivered to subscribers and reported by a watcher, so someone can check the card is going well. |
+| `budget_exhausted` | `{limit, iterations, max_iterations, new_commits, last_activity, retry_status, blocked}` | The worker ran out of iterations. Written beside `timed_out` or `gave_up`, which also carry `limit: iteration_budget`. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |

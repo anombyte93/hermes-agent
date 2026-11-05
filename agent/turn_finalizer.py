@@ -39,10 +39,27 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
+def _kanban_exhausted_report(final_response: Any) -> Optional[str]:
+    """The worker's final text for ``run.summary``; None when the summary call produced
+    only a placeholder, which is not a report the next worker should read."""
+    from agent.chat_completion_helpers import _EMPTY_SUMMARY_RESPONSE
+
+    text = flatten_message_text(final_response).strip() if final_response else ""
+    if not text or text == _EMPTY_SUMMARY_RESPONSE:
+        return None
+    if text.startswith("I reached the maximum iterations (") and "couldn't summarize" in text:
+        return None
+    return text
+
+
 def _record_kanban_budget_exhausted(
-    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
+    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger,
+    summary: Optional[str] = None, activity: Optional[str] = None,
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
+
+    ``summary`` is the worker's final toolless reply. It lands on the closing run and in
+    the resume note: without it the retry worker never sees it (hermes-agent#2).
 
     Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
@@ -69,6 +86,11 @@ def _record_kanban_budget_exhausted(
                 release_claim=True,
                 end_run=True,
                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                summary=summary,
+                budget={
+                    "iterations": api_call_count, "max_iterations": max_iterations,
+                    "activity": activity,
+                },
             )
         finally:
             with suppress(Exception):
@@ -168,7 +190,11 @@ def _resolve_budget_fallback(
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        _record_kanban_budget_exhausted(
+            _kanban_task, api_call_count, agent.max_iterations, logger,
+            summary=_kanban_exhausted_report(final_response),
+            activity=getattr(agent, "_last_activity_desc", None),
+        )
     return final_response, _turn_exit_reason, preserved_verification_fallback
 
 

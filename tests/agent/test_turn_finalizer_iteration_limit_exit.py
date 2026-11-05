@@ -193,7 +193,25 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         release_claim=True,
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
+        summary="composed report",
+        budget={"iterations": 60, "max_iterations": 60, "activity": None},
     )
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("real final report", "real final report"),
+    ("  padded  ", "padded"),
+    (None, None),
+    ("", None),
+    ("I reached the iteration limit and couldn't generate a summary.", None),
+    ("I reached the maximum iterations (60) but couldn't summarize. Error: boom", None),
+    # Only the exact placeholders are dropped, never a report that happens to mention one.
+    ("I reached the maximum iterations (60) and committed abc123.", "I reached the maximum iterations (60) and committed abc123."),
+])
+def test_exhausted_report_keeps_real_text_and_drops_placeholders(text, expected):
+    from agent.turn_finalizer import _kanban_exhausted_report
+
+    assert _kanban_exhausted_report(text) == expected
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):

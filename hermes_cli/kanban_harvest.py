@@ -333,6 +333,15 @@ def workspace_head(workspace_path: "str | Path") -> "str | None":
     return _git_ok(ws, "rev-parse", "HEAD")
 
 
+def commit_count(workspace_path: "str | Path", base_sha: str) -> "int | None":
+    """Commits in ``base_sha..HEAD``, ``None`` when git cannot say."""
+    ws = Path(workspace_path).expanduser() if workspace_path else None
+    if ws is None or not ws.is_dir():
+        return None
+    out = _git_ok(ws, "rev-list", "--count", f"{base_sha}..HEAD")
+    return int(out) if out and out.isdigit() else None
+
+
 def harvest_workspace(
     workspace_path: "str | Path",
     base_sha: "str | None",

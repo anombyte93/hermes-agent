@@ -69,6 +69,28 @@ def _attempt_base_head(
     return _prior_run_head_sha(conn, task_id, exclude_run_id=run_id)
 
 
+def attempt_new_commit_count(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
+    """Commits run ``run_id`` added to the workspace; None when that cannot be proved.
+
+    A closed run reads its harvest, which holds the boundary it used. An open run has
+    no harvest yet, so its claim-time boundary is walked with git. No boundary means
+    None: ``harvest_workspace`` then lists recent history, not this attempt's work.
+    """
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        return None
+    harvest = _kb._json_dict(row["metadata"]).get("harvest")
+    if isinstance(harvest, dict):
+        commits = harvest.get("commits")
+        return len(commits) if harvest.get("base_sha") and isinstance(commits, list) else None
+    task = _task_row(conn, task_id)
+    workspace = task["workspace_path"] if task is not None else None
+    base = _attempt_base_head(conn, task_id, run_id)
+    if not workspace or not base:
+        return None
+    return _harvest.commit_count(workspace, base)
+
+
 def _prior_run_head_sha(
     conn: sqlite3.Connection, task_id: str, exclude_run_id: Optional[int],
 ) -> Optional[str]:
@@ -144,6 +166,7 @@ def attach_run_harvest(
         harvest = _harvest.harvest_workspace(
             workspace_path, base_sha, log_path=log_path if log_path.exists() else None,
         )
+        harvest["base_sha"] = base_sha
         # Worker self-report comes from the run's own metadata (the worker
         # supplied it at complete time) — not from prior runs.
         self_report = metadata if isinstance(metadata, dict) else {}
