@@ -4544,7 +4544,10 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
             f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
         )
         if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+            # A run that did not complete left a claim, not a handoff, and this section
+            # follows the real brief, so it gets the resume note's quoting.
+            summary = _ctx_cap(run.summary)
+            lines.append(summary if outcome == "completed" else _quote_report(summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
         meta_line = _ctx_metadata_line(run.metadata)
@@ -4827,13 +4830,14 @@ RESUME_NOTE_MARKER = "Resume note (dispatcher)"
 def _ctx_resume_note(lines: list[str], comments: list[Comment]) -> None:
     """Hoist the newest dispatcher resume note verbatim above the attempt
     history so the retry worker reads the previous attempt's real state
-    before anything else. Only ``author == RESUME_NOTE_AUTHOR`` comments
-    qualify; everything else stays in the comment thread below. Newest =
-    last in ``list_comments`` order (``created_at ASC`` with insert order
-    breaking same-second ties)."""
+    before anything else. A comment qualifies with ``author == RESUME_NOTE_AUTHOR`` and
+    the note's own first words, because ``kanban comment --author`` is free text;
+    everything else stays in the framed comment thread below. Newest = last in
+    ``list_comments`` order (``created_at ASC`` with insert order breaking same-second
+    ties)."""
     newest = None
     for c in comments:
-        if c.author == RESUME_NOTE_AUTHOR:
+        if c.author == RESUME_NOTE_AUTHOR and c.body.startswith(f"{RESUME_NOTE_MARKER} — run "):
             newest = c
     if newest is None:
         return
@@ -4854,13 +4858,15 @@ RESUME_NOTE_MAX_TOOL_LINE_CHARS = 120
 # The full report is under "Prior attempts" (``_CTX_MAX_FIELD_BYTES``); this is the
 # lead that keeps the hoisted note about one comment long.
 RESUME_NOTE_MAX_SUMMARY_CHARS = 1200
-# The most a card may ask for with ``--max-turns``: twice the 150 evo runs on. A card's
-# worst case is ``5 * max_turns`` model calls (1500 here); one that needs more should be split.
+# The most a card may ask for with ``--max-turns``: twice the 150 evo runs on. A card that needs
+# more should be split. This caps the flag, not a profile. With the default failure limit a run
+# costs its budget plus one summary call, for at most 5 runs: 1505 calls for a card flagged at
+# this limit, 755 for an unset card on evo. Delegated children get fresh budgets on top.
 MAX_TASK_TURNS = 300
 # Tool completion lines in worker logs: ``  ┊ 💻 $  sleep 90  90.1s`` with one emoji
 # per tool (``⚡`` is only the default for a tool with no emoji), plus the plain
 # fallback ``⚡ tool_name``. Group 1 or 2 is the line without its prefix.
-_TOOL_LINE_RE = re.compile(r"^\s*┊\s*(\S.*?)\s*$|^\s*.*?(⚡\s*\S.*?)\s*$")
+_TOOL_LINE_RE = re.compile(r"^\s*┊\s*(\S.*?)\s*$|^\s*(⚡\s*\S.*?)\s*$")
 # Same prefix, but no call happened: the pre-call spinner and the diff header.
 _TOOL_LINE_NOISE_RE = re.compile(r"^(?:\S+\s+)?preparing\b|^review diff\b")
 # These lines hold real commands, URLs and typed text, and the redactor only knows token
@@ -4887,7 +4893,7 @@ def _tool_line_label(call: str) -> Optional[str]:
 
 
 def _quote_report(text: str) -> str:
-    """Quote worker text inside a dispatcher note: a ``> `` on every line and no heading,
+    """Quote worker text inside the worker context: a ``> `` on every line and no heading,
     so the next worker cannot read a report as part of its brief."""
     return "\n".join(
         "> " + re.sub(r"^(\s*)#", r"\1\\#", line) for line in text.splitlines()

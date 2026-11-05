@@ -50,6 +50,7 @@ def _report_budget_crossing(agent: Any, stage: str, budget: Any) -> None:
         report_budget_crossing(
             os.environ["HERMES_KANBAN_TASK"], stage=stage, iterations=budget.used,
             max_iterations=budget.max_total, activity=getattr(agent, "_last_activity_desc", None),
+            worker_run_id=os.environ.get("HERMES_KANBAN_RUN_ID"),
         )
     except Exception as exc:
         logger.debug("kanban budget report failed: %s", exc)

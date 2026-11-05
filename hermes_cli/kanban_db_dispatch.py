@@ -1342,7 +1342,7 @@ def _last_activity(task_id: str, fallback: Optional[str] = None) -> Optional[str
 
 def report_budget_crossing(
     task_id: str, *, stage: str, iterations: int, max_iterations: int,
-    activity: Optional[str] = None,
+    activity: Optional[str] = None, worker_run_id: Any = None,
 ) -> None:
     """Record, from the worker, that its run crossed a budget warning. Never raises: a
     report that cannot be written must not cost the worker a turn or its run."""
@@ -1353,7 +1353,7 @@ def report_budget_crossing(
                 "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             run_id = row["current_run_id"] if row is not None else None
-            if run_id is None:
+            if _budget_run_is_closed(run_id, worker_run_id):
                 return
             from hermes_cli.kanban_harvest_run import attempt_new_commit_count
 
