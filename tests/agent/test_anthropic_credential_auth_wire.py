@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from run_agent import AIAgent
 
 import anthropic
 import httpx
@@ -10,7 +10,7 @@ import pytest
 
 from agent import anthropic_adapter, anthropic_credentials
 from agent.agent_init import _init_anthropic_client
-from agent.anthropic_adapter import build_anthropic_client, build_anthropic_kwargs
+from agent.anthropic_adapter import build_anthropic_kwargs
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 
@@ -30,8 +30,8 @@ def isolated_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk", anthropic)
     monkeypatch.setattr(anthropic_adapter, "_claude_code_version_cache", "2.1.74")
     monkeypatch.setattr(
-        anthropic_credentials, "refresh_anthropic_oauth_pure",
-        lambda *a, **kw: pytest.fail("Unexpired synthetic credentials must not refresh"),
+        anthropic_credentials, "_post_oauth_token",
+        lambda *a, **kw: pytest.fail("Unexpected OAuth network request"),
     )
     return home
 
@@ -52,6 +52,37 @@ def wire_requests(monkeypatch):
     return requests
 
 
+def _native_agent(token, base_url, provider="anthropic"):
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = provider
+    agent.model = "claude-fable-5-1"
+    agent.api_mode = "anthropic_messages"
+    agent.base_url = base_url
+    agent.quiet_mode = True
+    agent._disable_streaming = True
+    _init_anthropic_client(agent, token, base_url, None)
+    return agent
+
+
+def _send_through_preflight(agent, kwargs, request_path):
+    """Neither the shared nor request-local lifecycle is replaced by a mock."""
+    try:
+        if request_path == "shared":
+            response = agent._anthropic_messages_create(kwargs)
+        else:
+            client = agent._create_request_anthropic_client(reason="auth_wire_test")
+            try:
+                with client.with_options(timeout=10) as cloned:
+                    response = agent._anthropic_messages_create(kwargs, client=cloned)
+            finally:
+                agent._close_request_anthropic_client(client, reason="auth_wire_test_complete")
+        assert response.content[0].text == "fixture"
+    finally:
+        agent._anthropic_client.close()
+
+
+@pytest.mark.parametrize("request_path", ["shared", "request-clone"])
+@pytest.mark.parametrize("discovery", ["borrowed-oauth", "sdk-defaults", "oauth-refresh"])
 @pytest.mark.parametrize("token,oauth,pool_kind", [
     pytest.param("sk-ant-" + "scoped-synthetic", False, "api_key", id="generic-api"),
     pytest.param("sk-ant-api03-" + "synthetic", False, "api_key", id="console-api"),
@@ -62,7 +93,7 @@ def wire_requests(monkeypatch):
     pytest.param("cc-" + "synthetic", True, "oauth", id="claude-code"),
 ])
 def test_profile_credential_keeps_its_auth_on_the_sdk_wire(
-    isolated_profile, wire_requests, monkeypatch, token, oauth, pool_kind
+    isolated_profile, wire_requests, monkeypatch, token, oauth, pool_kind, request_path, discovery
 ):
     isolated_profile.joinpath("config.yaml").write_text(
         "model:\n  provider: anthropic\n  default: claude-fable-5-1\n"
@@ -81,23 +112,48 @@ def test_profile_credential_keeps_its_auth_on_the_sdk_wire(
     pool = runtime["credential_pool"]
     assert len(pool.entries()) == 1
     assert pool.entries()[0].auth_type == ("oauth" if oauth else "api_key")
-    agent = SimpleNamespace(provider=runtime["provider"], quiet_mode=True)
-    _init_anthropic_client(agent, runtime["api_key"], runtime["base_url"], None)
-    # Both competing SDK env defaults must be suppressed, including after a clone.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-synthetic-api-key")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "unrelated-synthetic-bearer")
+    agent = _native_agent(runtime["api_key"], runtime["base_url"], runtime["provider"])
+    # Make an unrelated borrowed subscription available AFTER profile selection.
+    borrowed = anthropic_credentials.claude_code_credentials_path()
+    borrowed.parent.mkdir(parents=True)
+    borrowed.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-" + "oat01-competing-synthetic", "expiresAt": 0,
+    }}))
+    assert anthropic_credentials.read_claude_code_credentials()["accessToken"] != token
+    expected_token = token
+    refresh_calls = []
+    if discovery == "sdk-defaults":
+        # Both SDK defaults compete; discovery returns the incidental paid API key.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-synthetic-api-key")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "unrelated-synthetic-bearer")
+    elif discovery == "oauth-refresh" and oauth:
+        # Follow the actual expired-grant read/refresh/commit path, intercepting
+        # only the token-endpoint POST, not resolution or client lifecycle.
+        expected_token = "sk-ant-" + "oat01-refreshed-synthetic"
+        monkeypatch.setenv("ANTHROPIC_TOKEN", token)
+        borrowed.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": token, "refreshToken": "synthetic-refresh", "expiresAt": 1,
+        }}))
+
+        def refresh_post(*args, **kwargs):
+            refresh_calls.append(kwargs["what"])
+            return {"access_token": expected_token, "refresh_token": "synthetic-rotated", "expires_in": 3600}
+
+        monkeypatch.setattr(anthropic_credentials, "_post_oauth_token", refresh_post)
     kwargs = build_anthropic_kwargs(
         model="claude-fable-5-1",
         messages=[{"role": "system", "content": "Hermes Agent"}, {"role": "user", "content": "fixture"}],
         tools=None, max_tokens=128000, reasoning_config={"enabled": True, "effort": "xhigh"},
         is_oauth=agent._is_anthropic_oauth,
     )
-    with agent._anthropic_client as client:
-        with client.with_options(timeout=10) as cloned:
-            cloned.messages.create(**kwargs)
+    _send_through_preflight(agent, kwargs, request_path)
+    assert refresh_calls == (["refresh"] if discovery == "oauth-refresh" and oauth else [])
+    if refresh_calls:
+        assert anthropic_credentials.read_claude_code_credentials()["accessToken"] == expected_token
+    assert agent._anthropic_api_key == expected_token
     assert len(wire_requests) == 1
     request = wire_requests[0]
-    expected = {"authorization": f"Bearer {token}"} if oauth else {"x-api-key": token}
+    expected = {"authorization": f"Bearer {expected_token}"} if oauth else {"x-api-key": expected_token}
     actual = {name: request.headers[name] for name in ("authorization", "x-api-key") if name in request.headers}
     assert actual == expected
     assert request.url.path == "/v1/messages"
@@ -127,12 +183,11 @@ def test_endpoint_auth_precedence_survives_sdk_cloning(
 ):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-synthetic-api-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "unrelated-synthetic-bearer")
-    with build_anthropic_client(token, base_url) as client:
-        with client.with_options(timeout=10) as cloned:
-            cloned.messages.create(
-                model="synthetic-model", max_tokens=1,
-                messages=[{"role": "user", "content": "fixture"}],
-            )
+    agent = _native_agent(token, base_url)
+    _send_through_preflight(agent, {
+        "model": "synthetic-model", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "fixture"}],
+    }, "request-clone")
     assert len(wire_requests) == 1
     request = wire_requests[0]
     expected_value = f"Bearer {token}" if auth_header == "authorization" else token

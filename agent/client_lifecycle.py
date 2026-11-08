@@ -858,12 +858,17 @@ class ClientLifecycleMixin:
         return ok
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
-        # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
-        # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
+        from agent.anthropic_credentials import _is_oauth_token
+        from agent.anthropic_endpoints import _is_third_party_anthropic_endpoint
+
+        # Preflight may refresh an OAuth session, never rediscover an API key's
+        # replacement subscription. Explicit route/pool changes own auth-kind swaps.
         if (
             self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key")
             or self.provider != "anthropic"
-            or base_url_host_matches(getattr(self, "_anthropic_base_url", "") or "", "azure.com")
+            or _is_third_party_anthropic_endpoint(getattr(self, "_anthropic_base_url", None))
+            or not isinstance(self._anthropic_api_key, str)
+            or not _is_oauth_token(self._anthropic_api_key)
         ):
             return False
         try:
@@ -873,7 +878,9 @@ class ClientLifecycleMixin:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
         new_token = new_token.strip() if isinstance(new_token, str) else ""
-        if not new_token or new_token == self._anthropic_api_key:
+        # Discovery can now prefer an incidental paid API key. An OAuth session
+        # must not change billing/auth kind merely because that key is available.
+        if not new_token or new_token == self._anthropic_api_key or not _is_oauth_token(new_token):
             return False
         with suppress(Exception):
             self._anthropic_client.close()
