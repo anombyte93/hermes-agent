@@ -55,10 +55,14 @@ def _first_env(*names: str) -> str:
 
 
 def _is_oauth_token(key: str) -> bool:
-    """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for sk-ant-api* Console keys."""
+    """Recognise known OAuth/setup tokens (sk-ant-oat*, eyJ JWTs, cc-).
+
+    The generic sk-ant- namespace also contains API credentials. It is not
+    evidence of a subscription grant; only known OAuth formats use Bearer auth.
+    """
     if not key or key.startswith("sk-ant-api"):
         return False
-    return key.startswith(("sk-ant-", "eyJ", "cc-"))
+    return key.startswith(("sk-ant-oat", "eyJ", "cc-"))
 
 
 class CredentialPersistError(RuntimeError):
